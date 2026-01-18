@@ -1,7 +1,15 @@
-[workspace]
-members = ["crates/core"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "interchangedb"
 version = "0.1.0"
 edition = "2021"
+authors = ["Erich"]
+description = "A database with runtime-swappable buffer pool eviction policies"
+license = "MIT"
+
+[dependencies]
+thiserror = "1.0"
+parking_lot = "0.12"
+
+[dev-dependencies]
+proptest = "1.0"
+criterion = "0.5"

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// # Example
 /// ```
-/// use interchangedb_core::PageId;
+/// use interchangedb::PageId;
 ///
 /// let page_id = PageId::new(42);
 /// assert!(page_id.is_valid());
@@ -68,7 +68,7 @@ impl fmt::Display for PageId {
 ///
 /// # Example
 /// ```
-/// use interchangedb_core::FrameId;
+/// use interchangedb::FrameId;
 ///
 /// let frame_id = FrameId::new(5);
 /// // Can use directly as index: frames[frame_id.0]
@@ -116,7 +116,7 @@ impl fmt::Display for FrameId {
 ///
 /// # Example
 /// ```
-/// use interchangedb_core::Page;
+/// use interchangedb::Page;
 ///
 /// let mut page = Page::new();
 /// page.as_mut_slice()[0] = 0xFF;
@@ -193,7 +193,7 @@ impl Clone for Page {
 ///
 /// # Example
 /// ```
-/// use interchangedb_core::BufferPoolStats;
+/// use interchangedb::BufferPoolStats;
 /// use std::sync::atomic::Ordering;
 ///
 /// let stats = BufferPoolStats::new();
@@ -279,7 +279,7 @@ impl Default for BufferPoolStats {
 ///
 /// # Example
 /// ```
-/// use interchangedb_core::BufferPoolStats;
+/// use interchangedb::BufferPoolStats;
 ///
 /// let stats = BufferPoolStats::new();
 /// // ... update stats ...

@@ -17,7 +17,7 @@
 //!
 //! # Example
 //! ```
-//! use interchangedb_core::{Page, PageId, PAGE_SIZE};
+//! use interchangedb::{Page, PageId, PAGE_SIZE};
 //!
 //! let page_id = PageId::new(42);
 //! let mut page = Page::new();
@@ -34,8 +34,8 @@ pub mod error;
 pub mod types;
 
 // Re-export commonly used items at crate root
-// This allows users to write: use interchangedb_core::PageId;
-// Instead of:            use interchangedb_core::types::PageId;
+// This allows users to write: use interchangedb::PageId;
+// Instead of:            use interchangedb::types::PageId;
 pub use config::PAGE_SIZE;
 pub use error::{Error, Result};
 pub use types::{BufferPoolStats, FrameId, Page, PageId, StatsSnapshot};
