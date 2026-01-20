@@ -28,7 +28,6 @@ mod tests {
 
     #[test]
     fn test_page_size_is_power_of_two() {
-        // Page size should be a power of 2 for alignment
         assert!(PAGE_SIZE.is_power_of_two());
         assert_eq!(PAGE_SIZE, 4096);
     }

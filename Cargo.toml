@@ -9,7 +9,12 @@ license = "MIT"
 [dependencies]
 thiserror = "1.0"
 parking_lot = "0.12"
+crc32fast = "1.3"
 
 [dev-dependencies]
 proptest = "1.0"
 criterion = "0.5"
+tempfile = "3.10"
+
+[lints.clippy]
+all = "warn"

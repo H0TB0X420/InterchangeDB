@@ -56,9 +56,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            // I/O errors have a source (the underlying std::io::Error)
             Error::Io(e) => Some(e),
-            // Our custom errors don't have a source
             _ => None,
         }
     }
@@ -80,7 +78,10 @@ mod tests {
         assert_eq!(format!("{}", err), "Page 42 not found");
 
         let err = Error::NoFreeFrames;
-        assert_eq!(format!("{}", err), "No free frames available in buffer pool");
+        assert_eq!(
+            format!("{}", err),
+            "No free frames available in buffer pool"
+        );
     }
 
     #[test]
@@ -89,14 +90,13 @@ mod tests {
         let err: Error = io_err.into();
 
         match err {
-            Error::Io(_) => {} // Success
+            Error::Io(_) => {}
             _ => panic!("Expected Io error"),
         }
     }
 
     #[test]
     fn test_result_type_alias() {
-        // This function returns our Result type
         fn might_fail() -> Result<u32> {
             Ok(42)
         }

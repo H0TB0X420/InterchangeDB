@@ -1,41 +1,77 @@
-//! Core types and constants for InterchangeDB.
+//! InterchangeDB - A database with runtime-swappable buffer pool eviction policies.
 //!
-//! This crate provides fundamental abstractions used throughout the database:
-//!
-//! # Types
-//! - [`Page`] - A 4KB unit of storage (the fundamental I/O unit)
-//! - [`PageId`] - Identifier for pages on disk
-//! - [`FrameId`] - Identifier for frames in the buffer pool
-//! - [`BufferPoolStats`] - Statistics tracking for buffer pool performance
-//!
-//! # Constants
-//! - [`PAGE_SIZE`] - Size of a page in bytes (4096)
-//!
-//! # Error Handling
-//! - [`Error`] - Unified error type
-//! - [`Result<T>`] - Convenient result alias
-//!
-//! # Example
+//! # Architecture
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                         InterchangeDB                           │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │  ┌─────────────────────────────────────────────────────────┐   │
+//! │  │              Query Layer (execution/)                    │   │
+//! │  │         SQL Parser → Planner → Executor                  │   │
+//! │  └─────────────────────────────────────────────────────────┘   │
+//! │                              ↓                                  │
+//! │  ┌─────────────────────────────────────────────────────────┐   │
+//! │  │           Transaction Layer (concurrency/)               │   │
+//! │  │      TransactionManager + MVCC + ConcurrencyControl      │   │
+//! │  └─────────────────────────────────────────────────────────┘   │
+//! │                              ↓                                  │
+//! │  ┌─────────────────────────────────────────────────────────┐   │
+//! │  │       Index Layer (index/)  [Compile-Time Swappable]    │   │
+//! │  │              B-tree  ←─OR─→  LSM-tree                    │   │
+//! │  └─────────────────────────────────────────────────────────┘   │
+//! │                              ↓                                  │
+//! │  ┌─────────────────────────────────────────────────────────┐   │
+//! │  │       Buffer Pool (buffer/)  [Runtime Swappable]        │   │
+//! │  │   ┌─────────────────────────────────────────────────┐   │   │
+//! │  │   │  Eviction Policies: LRU | CLOCK | LRU-K | 2Q    │   │   │
+//! │  │   │            (hot-swappable at runtime)            │   │   │
+//! │  │   └─────────────────────────────────────────────────┘   │   │
+//! │  │      BufferPoolManager + Frame + Statistics              │   │
+//! │  └─────────────────────────────────────────────────────────┘   │
+//! │                              ↓                                  │
+//! │  ┌─────────────────────────────────────────────────────────┐   │
+//! │  │           Storage Layer (storage/)                       │   │
+//! │  │     DiskManager + Page + PageHeader + recovery/WAL       │   │
+//! │  └─────────────────────────────────────────────────────────┘   │
+//! └─────────────────────────────────────────────────────────────────┘
 //! ```
-//! use interchangedb::{Page, PageId, PAGE_SIZE};
 //!
-//! let page_id = PageId::new(42);
-//! let mut page = Page::new();
+//! # Modules
+//! - [`common`] - Shared primitives (PageId, FrameId, Error, config)
+//! - [`buffer`] - Buffer pool management and eviction policies
+//! - [`storage`] - Disk I/O and page formats
+//! - [`index`] - Index structures (B-tree)
+//! - [`recovery`] - Write-ahead logging and crash recovery
+//! - [`concurrency`] - Transaction management and MVCC
+//! - [`execution`] - Query execution
 //!
-//! // Write some data
-//! page.as_mut_slice()[0] = 0xFF;
+//! # Quick Start
+//! ```no_run
+//! use interchangedb::storage::DiskManager;
+//! use interchangedb::common::PageId;
 //!
-//! assert_eq!(PAGE_SIZE, 4096);
+//! // Create a new database file
+//! let mut dm = DiskManager::create("my_database.db").unwrap();
+//!
+//! // Allocate and write a page
+//! let page_id = dm.allocate_page().unwrap();
 //! ```
 
-// Declare modules
-pub mod config;
-pub mod error;
-pub mod types;
+// Core modules
+pub mod buffer;
+pub mod common;
+pub mod storage;
 
-// Re-export commonly used items at crate root
-// This allows users to write: use interchangedb::PageId;
-// Instead of:            use interchangedb::types::PageId;
-pub use config::PAGE_SIZE;
-pub use error::{Error, Result};
-pub use types::{BufferPoolStats, FrameId, Page, PageId, StatsSnapshot};
+// Future modules (placeholders)
+pub mod concurrency;
+pub mod execution;
+pub mod index;
+pub mod recovery;
+
+// Re-export commonly used items at crate root for convenience
+pub use common::config::PAGE_SIZE;
+pub use common::{Error, FrameId, PageId, Result};
+
+pub use buffer::{BufferPoolStats, Frame, StatsSnapshot, BufferPoolManager};
+pub use storage::page::{Page, PageHeader, PageType};
+pub use storage::DiskManager;
