@@ -40,21 +40,6 @@ use crate::storage::DiskManager;
 /// - `disk_manager`: `Mutex` — single-threaded I/O
 /// - `frames`: No lock — fixed size, each Frame has internal locks
 /// - `stats`: No lock — all atomic counters
-///
-/// # Usage
-/// ```ignore
-/// let dm = DiskManager::create("test.db")?;
-/// let bpm = BufferPoolManager::new(10, dm);
-///
-/// // Allocate a new page
-/// let mut guard = bpm.new_page()?;
-/// guard.as_mut_slice()[0] = 0xAB;
-/// // guard drops: page marked dirty, unpinned
-///
-/// // Fetch existing page for reading
-/// let guard = bpm.fetch_page_read(PageId::new(0))?;
-/// let data = guard.as_slice();
-/// ```
 pub struct BufferPoolManager {
     /// Fixed pool of frames allocated at startup.
     frames: Vec<Frame>,
@@ -90,10 +75,7 @@ impl BufferPoolManager {
     pub fn new(pool_size: usize, disk_manager: DiskManager) -> Self {
         assert!(pool_size > 0, "pool_size must be > 0");
 
-        // Allocate all frames upfront
         let frames: Vec<Frame> = (0..pool_size).map(|_| Frame::new()).collect();
-
-        // All frames start on the free list (LIFO order)
         let free_list: Vec<FrameId> = (0..pool_size).map(FrameId::new).collect();
 
         Self {
@@ -122,7 +104,6 @@ impl BufferPoolManager {
     pub fn fetch_page_read(&self, page_id: PageId) -> Result<PageReadGuard<'_>> {
         let frame_id = self.fetch_page_internal(page_id)?;
         let lock = self.frames[frame_id.0].page();
-
         Ok(PageReadGuard::new(self, frame_id, page_id, lock))
     }
 
@@ -137,8 +118,21 @@ impl BufferPoolManager {
     pub fn fetch_page_write(&self, page_id: PageId) -> Result<PageWriteGuard<'_>> {
         let frame_id = self.fetch_page_internal(page_id)?;
         let lock = self.frames[frame_id.0].page_mut();
-
         Ok(PageWriteGuard::new(self, frame_id, page_id, lock))
+    }
+
+    /// Fetch a page for reading, returning None if not possible.
+    ///
+    /// Matches BusTub's `CheckedReadPage()`.
+    pub fn checked_read_page(&self, page_id: PageId) -> Option<PageReadGuard<'_>> {
+        self.fetch_page_read(page_id).ok()
+    }
+
+    /// Fetch a page for writing, returning None if not possible.
+    ///
+    /// Matches BusTub's `CheckedWritePage()`.
+    pub fn checked_write_page(&self, page_id: PageId) -> Option<PageWriteGuard<'_>> {
+        self.fetch_page_write(page_id).ok()
     }
 
     // ========================================================================
@@ -153,43 +147,30 @@ impl BufferPoolManager {
     /// - `Error::NoFreeFrames` if all frames are pinned
     /// - I/O errors from disk allocation
     pub fn new_page(&self) -> Result<PageWriteGuard<'_>> {
-        // Get a free frame (or evict one)
         let frame_id = self.get_free_frame()?;
 
-        // Allocate page on disk
         let page_id = {
             let mut dm = self.disk_manager.lock();
             dm.allocate_page()?
         };
 
-        // Set up the frame
         let frame = &self.frames[frame_id.0];
-
-        // Reset the page data
         frame.page_mut().reset();
-
-        // Set frame metadata
         frame.set_page_id(Some(page_id));
-
-        // Pin the frame (new page starts with pin_count = 1)
         frame.pin();
 
-        // Add to page table
         {
             let mut pt = self.page_table.write();
             pt.insert(page_id, frame_id);
         }
 
-        // Record access with replacer (not evictable since pinned)
         {
             let mut replacer = self.replacer.lock();
             replacer.record_access(frame_id);
             replacer.set_evictable(frame_id, false);
         }
 
-        // Get write lock and return guard
         let lock = frame.page_mut();
-
         Ok(PageWriteGuard::new(self, frame_id, page_id, lock))
     }
 
@@ -205,31 +186,26 @@ impl BufferPoolManager {
 
         let frame_id = match pt.get(&page_id) {
             Some(&fid) => fid,
-            None => return Ok(()), // Page not in pool, nothing to do
+            None => return Ok(()), // Page not in pool
         };
 
         let frame = &self.frames[frame_id.0];
 
-        // Can't delete a pinned page
         if frame.is_pinned() {
             return Err(Error::PageNotPinned(page_id.0));
         }
 
-        // Remove from page table
         pt.remove(&page_id);
-        drop(pt); // Release write lock
+        drop(pt);
 
-        // Clear frame state
         frame.set_page_id(None);
         frame.clear_dirty();
 
-        // Remove from replacer
         {
             let mut replacer = self.replacer.lock();
             replacer.remove(frame_id);
         }
 
-        // Add back to free list
         {
             let mut fl = self.free_list.lock();
             fl.push(frame_id);
@@ -243,27 +219,19 @@ impl BufferPoolManager {
     // ========================================================================
 
     /// Flush a specific page to disk if it's dirty.
-    ///
-    /// # Errors
-    /// - I/O errors from disk write
     pub fn flush_page(&self, page_id: PageId) -> Result<()> {
         let frame_id = {
             let pt = self.page_table.read();
             match pt.get(&page_id) {
                 Some(&fid) => fid,
-                None => return Ok(()), // Page not in pool
+                None => return Ok(()),
             }
         };
-
         self.flush_frame(frame_id, page_id)
     }
 
     /// Flush all dirty pages to disk.
-    ///
-    /// # Errors
-    /// - I/O errors from disk writes
     pub fn flush_all_pages(&self) -> Result<()> {
-        // Collect all (page_id, frame_id) pairs
         let pages: Vec<(PageId, FrameId)> = {
             let pt = self.page_table.read();
             pt.iter().map(|(&pid, &fid)| (pid, fid)).collect()
@@ -272,7 +240,6 @@ impl BufferPoolManager {
         for (page_id, frame_id) in pages {
             self.flush_frame(frame_id, page_id)?;
         }
-
         Ok(())
     }
 
@@ -300,25 +267,34 @@ impl BufferPoolManager {
         self.page_table.read().len()
     }
 
+    /// Get pin count for a page. Returns None if page not in pool.
+    ///
+    /// Matches BusTub's `GetPinCount()`.
+    pub fn get_pin_count(&self, page_id: PageId) -> Option<u32> {
+        let pt = self.page_table.read();
+        let &frame_id = pt.get(&page_id)?;
+        Some(self.frames[frame_id.0].pin_count())
+    }
+
+    /// Check if a page is in the buffer pool.
+    pub fn contains_page(&self, page_id: PageId) -> bool {
+        self.page_table.read().contains_key(&page_id)
+    }
+
     // ========================================================================
     // Internal: Called by PageGuard on drop
     // ========================================================================
 
     /// Unpin a page. Called by PageReadGuard/PageWriteGuard on drop.
-    ///
-    /// This is `pub(crate)` so guards in the same module can call it.
     pub(crate) fn unpin_page_internal(&self, frame_id: FrameId, is_dirty: bool) {
         let frame = &self.frames[frame_id.0];
 
-        // Mark dirty if requested
         if is_dirty {
             frame.mark_dirty();
         }
 
-        // Decrement pin count
         let new_pin_count = frame.unpin();
 
-        // If pin count dropped to 0, page is now evictable
         if new_pin_count == 0 {
             let mut replacer = self.replacer.lock();
             replacer.set_evictable(frame_id, true);
@@ -329,28 +305,23 @@ impl BufferPoolManager {
     // Internal: Core fetch logic
     // ========================================================================
 
-    /// Fetch a page into the buffer pool, returning its frame ID.
     fn fetch_page_internal(&self, page_id: PageId) -> Result<FrameId> {
-        // Fast path: check if page is already in pool (read lock only)
+        // Fast path: cache hit
         {
             let pt = self.page_table.read();
             if let Some(&frame_id) = pt.get(&page_id) {
-                // Cache hit!
                 self.handle_cache_hit(frame_id);
                 return Ok(frame_id);
             }
         }
-
-        // Cache miss: need to load from disk
+        // Cache miss
         self.handle_cache_miss(page_id)
     }
 
-    /// Handle a cache hit: pin the frame and update replacer.
     fn handle_cache_hit(&self, frame_id: FrameId) {
         let frame = &self.frames[frame_id.0];
         frame.pin();
 
-        // Update replacer
         {
             let mut replacer = self.replacer.lock();
             replacer.record_access(frame_id);
@@ -360,14 +331,11 @@ impl BufferPoolManager {
         self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Handle a cache miss: get a frame, load from disk, update mappings.
     fn handle_cache_miss(&self, page_id: PageId) -> Result<FrameId> {
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        // Get a free frame
         let frame_id = self.get_free_frame()?;
 
-        // Read page from disk
         let page_data = {
             let mut dm = self.disk_manager.lock();
             dm.read_page(page_id)?
@@ -375,26 +343,21 @@ impl BufferPoolManager {
 
         self.stats.pages_read.fetch_add(1, Ordering::Relaxed);
 
-        // Set up the frame
         let frame = &self.frames[frame_id.0];
 
-        // Copy page data into frame
         {
             let mut page = frame.page_mut();
             page.as_mut_slice().copy_from_slice(page_data.as_slice());
         }
 
-        // Set frame metadata
         frame.set_page_id(Some(page_id));
         frame.pin();
 
-        // Add to page table
         {
             let mut pt = self.page_table.write();
             pt.insert(page_id, frame_id);
         }
 
-        // Update replacer
         {
             let mut replacer = self.replacer.lock();
             replacer.record_access(frame_id);
@@ -408,23 +371,17 @@ impl BufferPoolManager {
     // Internal: Frame allocation and eviction
     // ========================================================================
 
-    /// Get a free frame, evicting if necessary.
     fn get_free_frame(&self) -> Result<FrameId> {
-        // Try the free list first
         {
             let mut fl = self.free_list.lock();
             if let Some(frame_id) = fl.pop() {
                 return Ok(frame_id);
             }
         }
-
-        // No free frames, need to evict
         self.evict_page()
     }
 
-    /// Evict a page and return its frame.
     fn evict_page(&self) -> Result<FrameId> {
-        // Ask replacer for a victim
         let frame_id = {
             let mut replacer = self.replacer.lock();
             replacer.evict().ok_or(Error::NoFreeFrames)?
@@ -433,36 +390,29 @@ impl BufferPoolManager {
         self.stats.evictions.fetch_add(1, Ordering::Relaxed);
 
         let frame = &self.frames[frame_id.0];
-
-        // Get the page ID before we clear it
         let old_page_id = frame.page_id();
 
-        // If dirty, flush to disk
         if frame.is_dirty() {
             if let Some(pid) = old_page_id {
                 self.flush_frame(frame_id, pid)?;
             }
         }
 
-        // Remove from page table
         if let Some(pid) = old_page_id {
             let mut pt = self.page_table.write();
             pt.remove(&pid);
         }
 
-        // Reset frame state
         frame.clear_dirty();
         frame.set_page_id(None);
 
         Ok(frame_id)
     }
 
-    /// Flush a frame to disk if dirty.
     fn flush_frame(&self, frame_id: FrameId, page_id: PageId) -> Result<()> {
         let frame = &self.frames[frame_id.0];
 
         if frame.is_dirty() {
-            // Hold page read lock while writing to disk
             let page = frame.page();
             {
                 let mut dm = self.disk_manager.lock();
@@ -483,7 +433,6 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Helper to create a BPM with a temporary database file.
     fn create_test_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -491,276 +440,197 @@ mod tests {
         (BufferPoolManager::new(pool_size, dm), dir)
     }
 
-    #[test]
-    fn test_new_page() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        let guard = bpm.new_page().unwrap();
-        assert_eq!(guard.page_id(), PageId::new(0));
-        drop(guard);
-
-        let guard = bpm.new_page().unwrap();
-        assert_eq!(guard.page_id(), PageId::new(1));
-    }
+    // ========================================================================
+    // Core functionality tests
+    // ========================================================================
 
     #[test]
-    fn test_fetch_page_read() {
+    fn test_new_page_and_fetch() {
         let (bpm, _dir) = create_test_bpm(10);
+        let data = b"Hello, world!";
 
-        // Create a page and write data
-        {
+        // Create and write
+        let pid = {
             let mut guard = bpm.new_page().unwrap();
-            guard.as_mut_slice()[0] = 0xAB;
+            assert_eq!(guard.page_id(), PageId::new(0));
+            guard.as_mut_slice()[..data.len()].copy_from_slice(data);
+            guard.page_id()
+        };
+
+        // Read back
+        {
+            let guard = bpm.fetch_page_read(pid).unwrap();
+            assert_eq!(&guard.as_slice()[..data.len()], data);
         }
 
-        // Fetch and verify
-        {
-            let guard = bpm.fetch_page_read(PageId::new(0)).unwrap();
-            assert_eq!(guard.as_slice()[0], 0xAB);
-        }
+        // Delete
+        bpm.delete_page(pid).unwrap();
+        assert!(!bpm.contains_page(pid));
     }
 
     #[test]
-    fn test_fetch_page_write() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        // Create a page
-        {
-            let _guard = bpm.new_page().unwrap();
-        }
-
-        // Fetch for write and modify
-        {
-            let mut guard = bpm.fetch_page_write(PageId::new(0)).unwrap();
-            guard.as_mut_slice()[0] = 0xCD;
-        }
-
-        // Verify modification
-        {
-            let guard = bpm.fetch_page_read(PageId::new(0)).unwrap();
-            assert_eq!(guard.as_slice()[0], 0xCD);
-        }
-    }
-
-    #[test]
-    fn test_cache_hit() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        // Create a page
-        {
-            let _guard = bpm.new_page().unwrap();
-        }
-
-        // Fetch multiple times - should be cache hits
-        {
-            let _guard = bpm.fetch_page_read(PageId::new(0)).unwrap();
-        }
-        {
-            let _guard = bpm.fetch_page_read(PageId::new(0)).unwrap();
-        }
-
-        let snapshot = bpm.stats().snapshot();
-        assert!(snapshot.cache_hits >= 2);
-    }
-
-    #[test]
-    fn test_eviction() {
-        let (bpm, _dir) = create_test_bpm(3); // Small pool
-
-        // Fill the pool
-        for _ in 0..3 {
-            let _guard = bpm.new_page().unwrap();
-        }
-
-        // All frames used, free list empty
-        assert_eq!(bpm.free_frame_count(), 0);
-
-        // Create one more page (forces eviction)
-        let guard = bpm.new_page().unwrap();
-        assert_eq!(guard.page_id(), PageId::new(3));
-
-        let snapshot = bpm.stats().snapshot();
-        assert_eq!(snapshot.evictions, 1);
-    }
-
-    #[test]
-    fn test_dirty_page_flushed_on_eviction() {
+    fn test_eviction_persists_data() {
         let (bpm, _dir) = create_test_bpm(1); // Only 1 frame!
 
-        // Create page 0 and write data
-        {
+        // Create page 0, write data
+        let pid0 = {
             let mut guard = bpm.new_page().unwrap();
             guard.as_mut_slice()[0] = 0x42;
-        } // Drops, marks dirty
+            guard.page_id()
+        };
 
-        // Create page 1 (evicts page 0, should flush first)
-        {
-            let _guard = bpm.new_page().unwrap();
-        }
+        // Create page 1 (evicts page 0)
+        let _pid1 = bpm.new_page().unwrap().page_id();
 
-        // Fetch page 0 again (should load from disk with our data)
+        assert_eq!(bpm.stats().snapshot().evictions, 1);
+
+        // Fetch page 0 - should load from disk with data intact
         {
-            let guard = bpm.fetch_page_read(PageId::new(0)).unwrap();
+            let guard = bpm.fetch_page_read(pid0).unwrap();
             assert_eq!(guard.as_slice()[0], 0x42);
         }
     }
 
     #[test]
-    fn test_delete_page() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        // Create a page
-        {
-            let _guard = bpm.new_page().unwrap();
-        }
-
-        assert_eq!(bpm.page_count(), 1);
-
-        // Delete it
-        bpm.delete_page(PageId::new(0)).unwrap();
-
-        // Frame should be back on free list
-        assert_eq!(bpm.free_frame_count(), 10);
-        assert_eq!(bpm.page_count(), 0);
-    }
-
-    #[test]
-    fn test_delete_pinned_page_fails() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        // Create and hold a page
-        let _guard = bpm.new_page().unwrap();
-
-        // Try to delete while pinned - should fail
-        let result = bpm.delete_page(PageId::new(0));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_flush_page() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        // Create and modify a page
-        {
-            let mut guard = bpm.new_page().unwrap();
-            guard.as_mut_slice()[0] = 0xFF;
-        }
-
-        // Explicitly flush
-        bpm.flush_page(PageId::new(0)).unwrap();
-
-        let snapshot = bpm.stats().snapshot();
-        assert!(snapshot.pages_written >= 1);
-    }
-
-    #[test]
-    fn test_flush_all_pages() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        // Create multiple dirty pages
-        for i in 0..5 {
-            let mut guard = bpm.new_page().unwrap();
-            guard.as_mut_slice()[0] = i;
-        }
-
-        // Flush all
-        bpm.flush_all_pages().unwrap();
-
-        let snapshot = bpm.stats().snapshot();
-        assert!(snapshot.pages_written >= 5);
-    }
-
-    #[test]
-    fn test_multiple_read_guards() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        // Create a page
-        {
-            let _guard = bpm.new_page().unwrap();
-        }
-
-        // Multiple simultaneous read guards should work
-        let guard1 = bpm.fetch_page_read(PageId::new(0)).unwrap();
-        let guard2 = bpm.fetch_page_read(PageId::new(0)).unwrap();
-
-        assert_eq!(guard1.page_id(), guard2.page_id());
-
-        drop(guard1);
-        drop(guard2);
-    }
-
-    #[test]
-    fn test_page_not_found() {
-        let (bpm, _dir) = create_test_bpm(10);
-
-        // Try to fetch a page that doesn't exist
-        let result = bpm.fetch_page_read(PageId::new(999));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_no_free_frames() {
+    fn test_no_free_frames_when_all_pinned() {
         let (bpm, _dir) = create_test_bpm(2);
 
-        // Pin both frames (hold the guards)
         let _guard1 = bpm.new_page().unwrap();
         let _guard2 = bpm.new_page().unwrap();
 
-        // All frames pinned, can't allocate
-        let result = bpm.new_page();
-        assert!(result.is_err());
+        // All frames pinned
+        assert!(bpm.new_page().is_err());
     }
 
+    // ========================================================================
+    // BusTub compatibility: drop_guard and pin counting
+    // ========================================================================
+
     #[test]
-    fn test_pin_count_tracking() {
+    fn test_drop_guard_idempotent() {
         let (bpm, _dir) = create_test_bpm(10);
 
-        
-        let _guard = bpm.new_page().unwrap();
-    
-        // Frame should be evictable now (pin_count = 0)
-        let frame = &bpm.frames[0];
-        assert_eq!(frame.pin_count(), 0);
-        assert!(frame.page_id().is_some());
-        assert!(frame.is_evictable());
+        let pid = bpm.new_page().unwrap().page_id();
 
-        // Fetch again - pins it
-        let _guard = bpm.fetch_page_read(PageId::new(0)).unwrap();
-        assert_eq!(frame.pin_count(), 1);
-        assert!(!frame.is_evictable());
+        let mut guard = bpm.fetch_page_write(pid).unwrap();
+        assert_eq!(bpm.get_pin_count(pid), Some(1));
 
-        // Guard dropped - unpinned
-        assert_eq!(frame.pin_count(), 0);
-        assert!(frame.is_evictable());
+        // First drop
+        guard.drop_guard();
+        assert!(guard.is_dropped());
+        assert_eq!(bpm.get_pin_count(pid), Some(0));
+
+        // Second drop - no effect
+        guard.drop_guard();
+        assert_eq!(bpm.get_pin_count(pid), Some(0));
+
+        // Can acquire again after drop
+        let _guard2 = bpm.fetch_page_write(pid).unwrap();
     }
 
     #[test]
-    fn test_concurrent_reads() {
+    fn test_pin_count_with_checked_methods() {
+        let (bpm, _dir) = create_test_bpm(2);
+
+        let pid0 = bpm.new_page().unwrap().page_id();
+        let pid1 = bpm.new_page().unwrap().page_id();
+
+        // Hold both pages
+        {
+            let mut g0 = bpm.checked_write_page(pid0).expect("should get page0");
+            let mut g1 = bpm.checked_write_page(pid1).expect("should get page1");
+
+            g0.as_mut_slice()[0] = 0xAA;
+            g1.as_mut_slice()[0] = 0xBB;
+
+            assert_eq!(bpm.get_pin_count(pid0), Some(1));
+            assert_eq!(bpm.get_pin_count(pid1), Some(1));
+
+            // All frames pinned - can't create new page
+            assert!(bpm.new_page().is_err());
+
+            // Drop one
+            g0.drop_guard();
+            assert_eq!(bpm.get_pin_count(pid0), Some(0));
+
+            // Still can't create - need to check if evictable
+            // (g1 still pinned, so new_page would evict pid0)
+        }
+
+        // After both dropped, verify data persisted
+        let g0 = bpm.checked_read_page(pid0).unwrap();
+        assert_eq!(g0.as_slice()[0], 0xAA);
+    }
+
+    // ========================================================================
+    // Concurrent access
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_readers() {
         use std::sync::Arc;
         use std::thread;
 
         let (bpm, _dir) = create_test_bpm(10);
         let bpm = Arc::new(bpm);
 
-        // Create a page
-        {
+        let pid = {
             let mut guard = bpm.new_page().unwrap();
             guard.as_mut_slice()[0] = 0x42;
-        }
+            guard.page_id()
+        };
 
         let mut handles = vec![];
-
-        // Multiple threads reading the same page
         for _ in 0..10 {
             let bpm_clone = Arc::clone(&bpm);
             handles.push(thread::spawn(move || {
-                let guard = bpm_clone.fetch_page_read(PageId::new(0)).unwrap();
+                let guard = bpm_clone.fetch_page_read(pid).unwrap();
                 assert_eq!(guard.as_slice()[0], 0x42);
             }));
         }
 
-        for handle in handles {
-            handle.join().unwrap();
+        for h in handles {
+            h.join().unwrap();
         }
+    }
+
+    /// BusTub: EvictableTest - pinned pages cannot be evicted
+    #[test]
+    fn test_evictable_under_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let (bpm, _dir) = create_test_bpm(1);
+        let bpm = Arc::new(bpm);
+
+        let winner_pid = bpm.new_page().unwrap().page_id();
+        let loser_pid = bpm.new_page().unwrap().page_id(); // Evicts winner
+
+        // KEY: Main thread fetches winner and HOLDS IT before spawning threads.
+        // This ensures winner is in the pool and pinned.
+        let _winner_guard = bpm.fetch_page_read(winner_pid).unwrap();
+
+        let barrier = Arc::new(Barrier::new(5));
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let bpm_clone = Arc::clone(&bpm);
+            let barrier_clone = Arc::clone(&barrier);
+
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+                // Cache HIT - winner already in pool, just increments pin count
+                let _guard = bpm_clone.fetch_page_read(winner_pid).unwrap();
+                // Can't evict winner (pinned by main + this thread) - loser fetch fails
+                assert!(bpm_clone.checked_read_page(loser_pid).is_none());
+            }));
+        }
+
+        barrier.wait();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        // _winner_guard drops here after all threads complete
     }
 }

@@ -4,7 +4,8 @@
 //! - [`PageReadGuard`] - Shared read access (multiple allowed)
 //! - [`PageWriteGuard`] - Exclusive write access (auto-marks dirty)
 //!
-//! Both guards auto-unpin the page when dropped.
+//! Both guards auto-unpin the page when dropped. The `drop_guard()` method
+//! allows explicit early release and is safe to call multiple times.
 
 use std::ops::{Deref, DerefMut};
 
@@ -13,7 +14,6 @@ use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use crate::common::{FrameId, PageId};
 use crate::storage::page::Page;
 
-// Forward declaration - BufferPoolManager will be in the same module
 use super::buffer_pool_manager::BufferPoolManager;
 
 /// Guard for read-only page access.
@@ -24,8 +24,10 @@ use super::buffer_pool_manager::BufferPoolManager;
 /// # Example
 /// ```ignore
 /// let guard = bpm.fetch_page_read(page_id)?;
-/// let data = guard.as_slice();  // Deref to &Page
-/// // guard drops here, page unpinned
+/// let data = guard.as_slice();
+///
+/// // Explicit early release (optional, matches BusTub's Drop())
+/// guard.drop_guard();
 /// ```
 pub struct PageReadGuard<'a> {
     /// Reference back to BPM for unpin on drop.
@@ -35,13 +37,14 @@ pub struct PageReadGuard<'a> {
     /// Page ID for convenience.
     page_id: PageId,
     /// Lock guard providing access to page data.
-    lock: RwLockReadGuard<'a, Page>,
+    /// Option allows take() for explicit drop.
+    lock: Option<RwLockReadGuard<'a, Page>>,
+    /// Whether this guard has been dropped.
+    dropped: bool,
 }
 
 impl<'a> PageReadGuard<'a> {
     /// Create a new read guard.
-    ///
-    /// Called by `BufferPoolManager::fetch_page_read()`.
     pub(crate) fn new(
         bpm: &'a BufferPoolManager,
         frame_id: FrameId,
@@ -52,7 +55,8 @@ impl<'a> PageReadGuard<'a> {
             bpm,
             frame_id,
             page_id,
-            lock,
+            lock: Some(lock),
+            dropped: false,
         }
     }
 
@@ -67,6 +71,24 @@ impl<'a> PageReadGuard<'a> {
     pub fn frame_id(&self) -> FrameId {
         self.frame_id
     }
+
+    /// Check if this guard has been dropped.
+    #[inline]
+    pub fn is_dropped(&self) -> bool {
+        self.dropped
+    }
+
+    /// Explicitly drop the guard, releasing the lock and unpinning the page.
+    ///
+    /// Safe to call multiple times - subsequent calls are no-ops.
+    /// Matches BusTub's `Drop()` method on page guards.
+    pub fn drop_guard(&mut self) {
+        if !self.dropped {
+            self.dropped = true;
+            self.lock.take(); // Release the lock first
+            self.bpm.unpin_page_internal(self.frame_id, false);
+        }
+    }
 }
 
 impl Deref for PageReadGuard<'_> {
@@ -74,14 +96,15 @@ impl Deref for PageReadGuard<'_> {
 
     #[inline]
     fn deref(&self) -> &Page {
-        &self.lock
+        self.lock
+            .as_ref()
+            .expect("PageReadGuard used after drop_guard()")
     }
 }
 
 impl Drop for PageReadGuard<'_> {
     fn drop(&mut self) {
-        // Read guard: not dirty
-        self.bpm.unpin_page_internal(self.frame_id, false);
+        self.drop_guard();
     }
 }
 
@@ -93,8 +116,10 @@ impl Drop for PageReadGuard<'_> {
 /// # Example
 /// ```ignore
 /// let mut guard = bpm.fetch_page_write(page_id)?;
-/// guard.as_mut_slice()[0] = 0xFF;  // DerefMut to &mut Page
-/// // guard drops here, page marked dirty and unpinned
+/// guard.as_mut_slice()[0] = 0xFF;
+///
+/// // Explicit early release (optional)
+/// guard.drop_guard();
 /// ```
 pub struct PageWriteGuard<'a> {
     /// Reference back to BPM for unpin on drop.
@@ -104,13 +129,14 @@ pub struct PageWriteGuard<'a> {
     /// Page ID for convenience.
     page_id: PageId,
     /// Lock guard providing access to page data.
-    lock: RwLockWriteGuard<'a, Page>,
+    /// Option allows take() for explicit drop.
+    lock: Option<RwLockWriteGuard<'a, Page>>,
+    /// Whether this guard has been dropped.
+    dropped: bool,
 }
 
 impl<'a> PageWriteGuard<'a> {
     /// Create a new write guard.
-    ///
-    /// Called by `BufferPoolManager::fetch_page_write()`.
     pub(crate) fn new(
         bpm: &'a BufferPoolManager,
         frame_id: FrameId,
@@ -121,7 +147,8 @@ impl<'a> PageWriteGuard<'a> {
             bpm,
             frame_id,
             page_id,
-            lock,
+            lock: Some(lock),
+            dropped: false,
         }
     }
 
@@ -136,6 +163,24 @@ impl<'a> PageWriteGuard<'a> {
     pub fn frame_id(&self) -> FrameId {
         self.frame_id
     }
+
+    /// Check if this guard has been dropped.
+    #[inline]
+    pub fn is_dropped(&self) -> bool {
+        self.dropped
+    }
+
+    /// Explicitly drop the guard, releasing the lock and unpinning the page.
+    ///
+    /// Safe to call multiple times - subsequent calls are no-ops.
+    /// The page is marked dirty on first drop.
+    pub fn drop_guard(&mut self) {
+        if !self.dropped {
+            self.dropped = true;
+            self.lock.take(); // Release the lock first
+            self.bpm.unpin_page_internal(self.frame_id, true); // Always dirty
+        }
+    }
 }
 
 impl Deref for PageWriteGuard<'_> {
@@ -143,20 +188,23 @@ impl Deref for PageWriteGuard<'_> {
 
     #[inline]
     fn deref(&self) -> &Page {
-        &self.lock
+        self.lock
+            .as_ref()
+            .expect("PageWriteGuard used after drop_guard()")
     }
 }
 
 impl DerefMut for PageWriteGuard<'_> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Page {
-        &mut self.lock
+        self.lock
+            .as_mut()
+            .expect("PageWriteGuard used after drop_guard()")
     }
 }
 
 impl Drop for PageWriteGuard<'_> {
     fn drop(&mut self) {
-        // Write guard: always dirty
-        self.bpm.unpin_page_internal(self.frame_id, true);
+        self.drop_guard();
     }
 }
