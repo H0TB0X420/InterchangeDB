@@ -6,6 +6,10 @@ authors = ["Erich"]
 description = "A database with runtime-swappable buffer pool eviction policies"
 license = "MIT"
 
+[lib]
+name = "interchangedb"
+path = "src/lib.rs"
+
 [dependencies]
 thiserror = "1.0"
 parking_lot = "0.12"

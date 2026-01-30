@@ -1,24 +1,24 @@
-//! FIFO (First-In-First-Out) replacement policy.
+//! FIFO (First-In-First-Out) page replacement policy.
 //!
-//! Simple placeholder policy for initial BufferPoolManager testing.
-//! Will be replaced by LRU/CLOCK/LRU-K/2Q implementations.
+//! This is a simple baseline eviction policy where pages are evicted
+//! in the order they were first accessed.
 
 use std::collections::{HashSet, VecDeque};
 
-use crate::common::FrameId;
+use crate::common::{FrameId, PageId};
 
-/// A simple FIFO eviction policy.
+/// FIFO replacement policy.
 ///
-/// Evicts pages in the order they were added to the pool.
-/// Pinned pages are skipped during eviction.
+/// Evicts pages in the order they were first brought into the buffer pool.
+/// Once a frame is in the queue, re-accessing it does NOT move it to the back.
 pub struct FifoReplacer {
-    /// Queue of frame IDs in insertion order (front = oldest).
+    /// Queue of frame IDs in access order (front = oldest).
     queue: VecDeque<FrameId>,
 
-    /// Set for O(1) membership check.
+    /// Set of frame IDs currently in the queue (for O(1) membership check).
     in_queue: HashSet<FrameId>,
 
-    /// Frames that are currently evictable (pin_count == 0).
+    /// Set of frame IDs that are evictable (pin_count == 0).
     evictable: HashSet<FrameId>,
 }
 
@@ -34,15 +34,22 @@ impl FifoReplacer {
 
     /// Record that a frame was accessed.
     ///
-    /// For FIFO, only adds to queue if not already present.
-    pub fn record_access(&mut self, frame_id: FrameId) {
+    /// For FIFO, we only add the frame to the queue on first access.
+    /// Subsequent accesses do NOT reorder the frame.
+    ///
+    /// # Arguments
+    /// * `frame_id` - The frame that was accessed
+    /// * `_page_id` - The page ID (unused for FIFO, but needed for LRU-K)
+    pub fn record_access(&mut self, frame_id: FrameId, _page_id: PageId) {
         if !self.in_queue.contains(&frame_id) {
             self.queue.push_back(frame_id);
             self.in_queue.insert(frame_id);
         }
     }
 
-    /// Mark a frame as evictable (pin_count dropped to 0).
+    /// Set whether a frame is evictable.
+    ///
+    /// A frame is evictable when its pin_count reaches 0.
     pub fn set_evictable(&mut self, frame_id: FrameId, evictable: bool) {
         if evictable {
             self.evictable.insert(frame_id);
@@ -51,29 +58,37 @@ impl FifoReplacer {
         }
     }
 
-    /// Select a victim frame for eviction.
+    /// Evict the oldest evictable frame.
     ///
-    /// Returns the oldest evictable frame, or None if all frames are pinned.
+    /// Returns the frame ID of the evicted frame, or None if no frames are evictable.
+    ///
+    /// **Important**: This implementation does NOT remove non-evictable frames from
+    /// the queue. It finds the first evictable frame and only removes that one.
     pub fn evict(&mut self) -> Option<FrameId> {
-        while let Some(frame_id) = self.queue.pop_front() {
-            self.in_queue.remove(&frame_id);
+        // Find the position of the first evictable frame
+        let position = self.queue.iter()
+            .position(|&fid| self.evictable.contains(&fid))?;
 
-            if self.evictable.remove(&frame_id) {
-                return Some(frame_id);
-            }
-            // Frame is pinned or removed, skip it
-        }
-        None
+        // Remove only that frame
+        let frame_id = self.queue.remove(position)?;
+        self.in_queue.remove(&frame_id);
+        self.evictable.remove(&frame_id);
+
+        Some(frame_id)
     }
 
     /// Remove a frame from the replacer entirely.
     ///
     /// Called when a page is deleted from the buffer pool.
     pub fn remove(&mut self, frame_id: FrameId) {
-        self.in_queue.remove(&frame_id);
+        // Remove from evictable set
         self.evictable.remove(&frame_id);
-        // Note: We don't remove from queue (expensive O(n)).
-        // The evict() loop will skip it since it's not in in_queue.
+
+        // Remove from queue tracking
+        if self.in_queue.remove(&frame_id) {
+            // Also remove from actual queue
+            self.queue.retain(|&fid| fid != frame_id);
+        }
     }
 
     /// Number of evictable frames.
@@ -97,9 +112,9 @@ mod tests {
         let mut replacer = FifoReplacer::new();
 
         // Add frames 0, 1, 2
-        replacer.record_access(FrameId::new(0));
-        replacer.record_access(FrameId::new(1));
-        replacer.record_access(FrameId::new(2));
+        replacer.record_access(FrameId::new(0), PageId::new(100));
+        replacer.record_access(FrameId::new(1), PageId::new(101));
+        replacer.record_access(FrameId::new(2), PageId::new(102));
 
         // Mark all evictable
         replacer.set_evictable(FrameId::new(0), true);
@@ -119,9 +134,9 @@ mod tests {
     fn test_fifo_skips_pinned() {
         let mut replacer = FifoReplacer::new();
 
-        replacer.record_access(FrameId::new(0));
-        replacer.record_access(FrameId::new(1));
-        replacer.record_access(FrameId::new(2));
+        replacer.record_access(FrameId::new(0), PageId::new(100));
+        replacer.record_access(FrameId::new(1), PageId::new(101));
+        replacer.record_access(FrameId::new(2), PageId::new(102));
 
         // Only frame 1 is evictable
         replacer.set_evictable(FrameId::new(0), false);
@@ -137,8 +152,8 @@ mod tests {
     fn test_fifo_remove() {
         let mut replacer = FifoReplacer::new();
 
-        replacer.record_access(FrameId::new(0));
-        replacer.record_access(FrameId::new(1));
+        replacer.record_access(FrameId::new(0), PageId::new(100));
+        replacer.record_access(FrameId::new(1), PageId::new(101));
         replacer.set_evictable(FrameId::new(0), true);
         replacer.set_evictable(FrameId::new(1), true);
 
@@ -153,9 +168,9 @@ mod tests {
     fn test_fifo_reaccess_no_reorder() {
         let mut replacer = FifoReplacer::new();
 
-        replacer.record_access(FrameId::new(0));
-        replacer.record_access(FrameId::new(1));
-        replacer.record_access(FrameId::new(0)); // Access again - should NOT reorder
+        replacer.record_access(FrameId::new(0), PageId::new(100));
+        replacer.record_access(FrameId::new(1), PageId::new(101));
+        replacer.record_access(FrameId::new(0), PageId::new(100)); // Access again - should NOT reorder
 
         replacer.set_evictable(FrameId::new(0), true);
         replacer.set_evictable(FrameId::new(1), true);
@@ -163,5 +178,63 @@ mod tests {
         // FIFO: frame 0 was first, should be evicted first
         assert_eq!(replacer.evict(), Some(FrameId::new(0)));
         assert_eq!(replacer.evict(), Some(FrameId::new(1)));
+    }
+
+    /// Test that failed eviction attempts don't corrupt the queue.
+    ///
+    /// This was the bug: when all frames are pinned, evict() would empty
+    /// the queue, making future evictions impossible even after unpinning.
+    #[test]
+    fn test_failed_evict_preserves_queue() {
+        let mut replacer = FifoReplacer::new();
+
+        // Add frames
+        replacer.record_access(FrameId::new(0), PageId::new(100));
+        replacer.record_access(FrameId::new(1), PageId::new(101));
+
+        // All pinned (not evictable)
+        replacer.set_evictable(FrameId::new(0), false);
+        replacer.set_evictable(FrameId::new(1), false);
+
+        // Evict fails - but queue should remain intact
+        assert_eq!(replacer.evict(), None);
+        assert_eq!(replacer.evict(), None);
+        assert_eq!(replacer.evict(), None);
+
+        // Now unpin frame 1
+        replacer.set_evictable(FrameId::new(1), true);
+
+        // Frame 0 is first in queue but not evictable, frame 1 should be evicted
+        assert_eq!(replacer.evict(), Some(FrameId::new(1)));
+
+        // Now unpin frame 0
+        replacer.set_evictable(FrameId::new(0), true);
+        assert_eq!(replacer.evict(), Some(FrameId::new(0)));
+    }
+
+    #[test]
+    fn test_evict_only_removes_evicted_frame() {
+        let mut replacer = FifoReplacer::new();
+
+        // Add frames in order: 0, 1, 2
+        replacer.record_access(FrameId::new(0), PageId::new(100));
+        replacer.record_access(FrameId::new(1), PageId::new(101));
+        replacer.record_access(FrameId::new(2), PageId::new(102));
+
+        // 0 pinned, 1 evictable, 2 pinned
+        replacer.set_evictable(FrameId::new(0), false);
+        replacer.set_evictable(FrameId::new(1), true);
+        replacer.set_evictable(FrameId::new(2), false);
+
+        // Evict should skip 0, evict 1, leave 2 in queue
+        assert_eq!(replacer.evict(), Some(FrameId::new(1)));
+
+        // Unpin 0 and 2
+        replacer.set_evictable(FrameId::new(0), true);
+        replacer.set_evictable(FrameId::new(2), true);
+
+        // Should evict in original order: 0 then 2
+        assert_eq!(replacer.evict(), Some(FrameId::new(0)));
+        assert_eq!(replacer.evict(), Some(FrameId::new(2)));
     }
 }

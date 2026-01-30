@@ -139,7 +139,24 @@ impl BufferPoolManager {
     // Public API: Create and delete pages
     // ========================================================================
 
+    /// Allocate a new page ID on disk.
+    ///
+    /// This just allocates the page ID without bringing it into the buffer pool.
+    /// Use `fetch_page_write()` to actually load the page.
+    ///
+    /// Matches BusTub's `NewPage()` which only allocates the ID.
+    ///
+    /// # Errors
+    /// - I/O errors from disk allocation
+    pub fn allocate_page_id(&self) -> Result<PageId> {
+        let mut dm = self.disk_manager.lock();
+        dm.allocate_page()
+    }
+
     /// Allocate a new page on disk and load it into the buffer pool.
+    ///
+    /// This is a convenience method that combines `allocate_page_id()` and
+    /// `fetch_page_write()`. For BusTub-style usage, call them separately.
     ///
     /// Returns a write guard for the new page.
     ///
@@ -147,14 +164,25 @@ impl BufferPoolManager {
     /// - `Error::NoFreeFrames` if all frames are pinned
     /// - I/O errors from disk allocation
     pub fn new_page(&self) -> Result<PageWriteGuard<'_>> {
+        // Allocate page ID first (this always succeeds unless I/O error)
+        let page_id = self.allocate_page_id()?;
+
+        // Now try to bring it into the buffer pool
+        // If this fails with NoFreeFrames, the page ID is "leaked" on disk
+        // but that's acceptable - BusTub has the same behavior
+        self.fetch_page_write_new(page_id)
+    }
+
+    /// Fetch a newly allocated page for writing.
+    ///
+    /// Unlike `fetch_page_write`, this initializes the page to zeros
+    /// instead of reading from disk (since it's a new page).
+    fn fetch_page_write_new(&self, page_id: PageId) -> Result<PageWriteGuard<'_>> {
         let frame_id = self.get_free_frame()?;
 
-        let page_id = {
-            let mut dm = self.disk_manager.lock();
-            dm.allocate_page()?
-        };
-
         let frame = &self.frames[frame_id.0];
+
+        // Initialize to zeros (new page)
         frame.page_mut().reset();
         frame.set_page_id(Some(page_id));
         frame.pin();
@@ -166,7 +194,7 @@ impl BufferPoolManager {
 
         {
             let mut replacer = self.replacer.lock();
-            replacer.record_access(frame_id);
+            replacer.record_access(frame_id, page_id);
             replacer.set_evictable(frame_id, false);
         }
 
@@ -310,7 +338,7 @@ impl BufferPoolManager {
         {
             let pt = self.page_table.read();
             if let Some(&frame_id) = pt.get(&page_id) {
-                self.handle_cache_hit(frame_id);
+                self.handle_cache_hit(frame_id, page_id);
                 return Ok(frame_id);
             }
         }
@@ -318,13 +346,13 @@ impl BufferPoolManager {
         self.handle_cache_miss(page_id)
     }
 
-    fn handle_cache_hit(&self, frame_id: FrameId) {
+    fn handle_cache_hit(&self, frame_id: FrameId, page_id: PageId) {
         let frame = &self.frames[frame_id.0];
         frame.pin();
 
         {
             let mut replacer = self.replacer.lock();
-            replacer.record_access(frame_id);
+            replacer.record_access(frame_id, page_id);
             replacer.set_evictable(frame_id, false);
         }
 
@@ -360,7 +388,7 @@ impl BufferPoolManager {
 
         {
             let mut replacer = self.replacer.lock();
-            replacer.record_access(frame_id);
+            replacer.record_access(frame_id, page_id);
             replacer.set_evictable(frame_id, false);
         }
 
