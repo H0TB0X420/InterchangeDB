@@ -15,8 +15,10 @@ mod frame;
 mod page_guard;
 pub mod replacer;
 mod stats;
+pub mod swap;
 
 pub use buffer_pool_manager::BufferPoolManager;
 pub use frame::Frame;
 pub use page_guard::{PageReadGuard, PageWriteGuard};
 pub use stats::{BufferPoolStats, StatsSnapshot};
+pub use swap::{SwapMode, SwapResult};

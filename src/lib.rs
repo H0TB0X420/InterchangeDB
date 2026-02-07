@@ -75,3 +75,4 @@ pub use common::{Error, FrameId, PageId, Result};
 pub use buffer::{BufferPoolStats, Frame, StatsSnapshot, BufferPoolManager};
 pub use storage::page::{Page, PageHeader, PageType};
 pub use storage::DiskManager;
+pub use storage::{ScanIterator, StorageEngine, StorageStatus};

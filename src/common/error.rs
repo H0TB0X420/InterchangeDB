@@ -38,6 +38,26 @@ pub enum Error {
     ///
     /// This indicates a bug - unpinning should match pinning.
     PageNotPinned(u32),
+
+    // =========================================================================
+    // Storage Engine Errors
+    // =========================================================================
+
+    /// Key not found in storage engine.
+    ///
+    /// Returned when an operation requires an existing key (e.g., update-only).
+    KeyNotFound(Vec<u8>),
+
+    /// Storage data is corrupted.
+    ///
+    /// Checksum mismatch, invalid format, or structural inconsistency.
+    StorageCorrupted(String),
+
+    /// Key exceeds maximum allowed length.
+    KeyTooLarge(usize),
+
+    /// Value exceeds maximum allowed length.
+    ValueTooLarge(usize),
 }
 
 impl fmt::Display for Error {
@@ -49,6 +69,10 @@ impl fmt::Display for Error {
             Error::InvalidPageId(pid) => write!(f, "Invalid page ID: {}", pid),
             Error::BufferPoolFull => write!(f, "Buffer pool is full"),
             Error::PageNotPinned(pid) => write!(f, "Page {} is not pinned", pid),
+            Error::KeyNotFound(key) => write!(f, "Key not found: {:?}", key),
+            Error::StorageCorrupted(msg) => write!(f, "Storage corrupted: {}", msg),
+            Error::KeyTooLarge(size) => write!(f, "Key too large: {} bytes", size),
+            Error::ValueTooLarge(size) => write!(f, "Value too large: {} bytes", size),
         }
     }
 }

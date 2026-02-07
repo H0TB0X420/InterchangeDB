@@ -39,6 +39,9 @@ pub struct BufferPoolStats {
 
     /// Number of pages written to disk.
     pub pages_written: AtomicU64,
+
+    /// Number of eviction policy swaps performed.
+    pub policy_swaps: AtomicU64,
 }
 
 impl BufferPoolStats {
@@ -50,6 +53,7 @@ impl BufferPoolStats {
             evictions: AtomicU64::new(0),
             pages_read: AtomicU64::new(0),
             pages_written: AtomicU64::new(0),
+            policy_swaps: AtomicU64::new(0),
         }
     }
 
@@ -76,6 +80,7 @@ impl BufferPoolStats {
             evictions: self.evictions.load(Ordering::Relaxed),
             pages_read: self.pages_read.load(Ordering::Relaxed),
             pages_written: self.pages_written.load(Ordering::Relaxed),
+            policy_swaps: self.policy_swaps.load(Ordering::Relaxed),
         }
     }
 
@@ -86,6 +91,7 @@ impl BufferPoolStats {
         self.evictions.store(0, Ordering::Relaxed);
         self.pages_read.store(0, Ordering::Relaxed);
         self.pages_written.store(0, Ordering::Relaxed);
+        self.policy_swaps.store(0, Ordering::Relaxed);
     }
 }
 
@@ -116,6 +122,7 @@ pub struct StatsSnapshot {
     pub evictions: u64,
     pub pages_read: u64,
     pub pages_written: u64,
+    pub policy_swaps: u64,
 }
 
 impl StatsSnapshot {
@@ -134,10 +141,11 @@ impl fmt::Display for StatsSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Stats {{ hits: {}, misses: {}, evictions: {}, hit_rate: {:.2}% }}",
+            "Stats {{ hits: {}, misses: {}, evictions: {}, swaps: {}, hit_rate: {:.2}% }}",
             self.cache_hits,
             self.cache_misses,
             self.evictions,
+            self.policy_swaps,
             self.hit_rate() * 100.0
         )
     }

@@ -9,9 +9,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use std::time::Instant;
+
 use parking_lot::{Mutex, RwLock};
 
-use crate::buffer::replacer::FifoReplacer;
+use crate::buffer::replacer::{EvictionPolicy, FifoReplacer};
+use crate::buffer::swap::{SwapMode, SwapResult};
 use crate::buffer::{BufferPoolStats, Frame, PageReadGuard, PageWriteGuard};
 use crate::common::{Error, FrameId, PageId, Result};
 use crate::storage::DiskManager;
@@ -28,7 +31,7 @@ use crate::storage::DiskManager;
 /// │  └──────────────┘  └───────────────────────────────────┘   │
 /// │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
 /// │  │  free_list   │  │   replacer   │  │disk_manager  │      │
-/// │  │ Vec<FrameId> │  │ FifoReplacer │  │   Mutex      │      │
+/// │  │ Vec<FrameId> │  │ dyn Policy   │  │   Mutex      │      │
 /// │  └──────────────┘  └──────────────┘  └──────────────┘      │
 /// └─────────────────────────────────────────────────────────────┘
 /// ```
@@ -51,7 +54,8 @@ pub struct BufferPoolManager {
     free_list: Mutex<Vec<FrameId>>,
 
     /// Eviction policy for selecting victim frames.
-    replacer: Mutex<FifoReplacer>,
+    /// Uses trait object for runtime policy swapping.
+    replacer: Mutex<Box<dyn EvictionPolicy>>,
 
     /// Handles all disk I/O.
     disk_manager: Mutex<DiskManager>,
@@ -82,7 +86,7 @@ impl BufferPoolManager {
             frames,
             page_table: RwLock::new(HashMap::new()),
             free_list: Mutex::new(free_list),
-            replacer: Mutex::new(FifoReplacer::new()),
+            replacer: Mutex::new(Box::new(FifoReplacer::new())),
             disk_manager: Mutex::new(disk_manager),
             stats: BufferPoolStats::new(),
             pool_size,
@@ -307,6 +311,84 @@ impl BufferPoolManager {
     /// Check if a page is in the buffer pool.
     pub fn contains_page(&self, page_id: PageId) -> bool {
         self.page_table.read().contains_key(&page_id)
+    }
+
+    /// Get the name of the current eviction policy.
+    pub fn get_policy_name(&self) -> &'static str {
+        self.replacer.lock().name()
+    }
+
+    // ========================================================================
+    // Public API: Policy swapping
+    // ========================================================================
+
+    /// Swap the eviction policy at runtime.
+    ///
+    /// # Arguments
+    /// * `new_policy` - The new eviction policy to use
+    /// * `mode` - `Cold` (fresh start) or `Warm` (transfer hot page knowledge)
+    ///
+    /// # How it works
+    /// 1. Snapshots the current page table (frame → page mappings)
+    /// 2. Acquires the replacer lock (brief blocking period)
+    /// 3. For warm swap: exports state from old policy, imports into new
+    /// 4. Re-registers all in-pool frames with the new policy
+    /// 5. Sets correct evictability based on current pin counts
+    ///
+    /// # Warm vs Cold
+    /// - **Cold**: New policy starts with no access pattern knowledge. Good when
+    ///   changing workload characteristics entirely.
+    /// - **Warm**: Transfers "hot page" scores so the new policy knows which pages
+    ///   are frequently accessed. Avoids a burst of poor eviction decisions.
+    pub fn swap_policy(&self, new_policy: Box<dyn EvictionPolicy>, mode: SwapMode) -> SwapResult {
+        // Snapshot frame-to-page mappings (released before locking replacer)
+        let frame_mappings: Vec<(FrameId, PageId)> = {
+            let pt = self.page_table.read();
+            pt.iter().map(|(&pid, &fid)| (fid, pid)).collect()
+        };
+
+        let start = Instant::now();
+        let mut replacer = self.replacer.lock();
+
+        let old_name = replacer.name();
+        let pages_transferred;
+
+        match mode {
+            SwapMode::Cold => {
+                pages_transferred = 0;
+                *replacer = new_policy;
+            }
+            SwapMode::Warm => {
+                let state = replacer.export_state();
+                pages_transferred = state.hot_pages.len();
+                *replacer = new_policy;
+                replacer.import_state(&state);
+            }
+        }
+
+        let new_name = replacer.name();
+
+        // Re-register all in-pool frames with the new policy
+        for &(frame_id, page_id) in &frame_mappings {
+            replacer.record_access(frame_id, page_id);
+
+            let evictable = !self.frames[frame_id.0].is_pinned();
+            replacer.set_evictable(frame_id, evictable);
+        }
+
+        let swap_duration = start.elapsed();
+        drop(replacer);
+
+        self.stats.policy_swaps.fetch_add(1, Ordering::Relaxed);
+
+        SwapResult {
+            old_policy: old_name,
+            new_policy: new_name,
+            mode,
+            pages_transferred,
+            frames_registered: frame_mappings.len(),
+            swap_duration,
+        }
     }
 
     // ========================================================================
@@ -660,5 +742,262 @@ mod tests {
             h.join().unwrap();
         }
         // _winner_guard drops here after all threads complete
+    }
+
+    #[test]
+    fn test_get_policy_name() {
+        let (bpm, _dir) = create_test_bpm(10);
+        assert_eq!(bpm.get_policy_name(), "fifo");
+    }
+
+    // ========================================================================
+    // Policy swap tests
+    // ========================================================================
+
+    #[test]
+    fn test_cold_swap_idle() {
+        use crate::buffer::replacer::LruReplacer;
+
+        let (bpm, _dir) = create_test_bpm(10);
+        assert_eq!(bpm.get_policy_name(), "fifo");
+
+        let result = bpm.swap_policy(
+            Box::new(LruReplacer::new(10)),
+            SwapMode::Cold,
+        );
+
+        assert_eq!(result.old_policy, "fifo");
+        assert_eq!(result.new_policy, "lru");
+        assert_eq!(result.mode, SwapMode::Cold);
+        assert_eq!(result.pages_transferred, 0);
+        assert_eq!(result.frames_registered, 0);
+        assert_eq!(bpm.get_policy_name(), "lru");
+        assert_eq!(bpm.stats().snapshot().policy_swaps, 1);
+    }
+
+    #[test]
+    fn test_cold_swap_with_pages_in_pool() {
+        use crate::buffer::replacer::LruReplacer;
+
+        let (bpm, _dir) = create_test_bpm(5);
+
+        // Create some pages (all unpinned after guard drops)
+        let pid0 = bpm.new_page().unwrap().page_id();
+        let pid1 = bpm.new_page().unwrap().page_id();
+        let pid2 = bpm.new_page().unwrap().page_id();
+
+        assert_eq!(bpm.page_count(), 3);
+
+        let result = bpm.swap_policy(
+            Box::new(LruReplacer::new(5)),
+            SwapMode::Cold,
+        );
+
+        assert_eq!(result.frames_registered, 3);
+        assert_eq!(result.pages_transferred, 0);
+        assert_eq!(bpm.get_policy_name(), "lru");
+
+        // All pages should still be accessible after swap
+        let g0 = bpm.fetch_page_read(pid0).unwrap();
+        let g1 = bpm.fetch_page_read(pid1).unwrap();
+        let g2 = bpm.fetch_page_read(pid2).unwrap();
+        drop((g0, g1, g2));
+    }
+
+    #[test]
+    fn test_warm_swap_preserves_hot_pages() {
+        use crate::buffer::replacer::LruReplacer;
+
+        let (bpm, _dir) = create_test_bpm(3);
+
+        // Create 3 pages with written data
+        let pid0 = {
+            let mut g = bpm.new_page().unwrap();
+            g.as_mut_slice()[0] = 0xAA;
+            g.page_id()
+        };
+        let pid1 = {
+            let mut g = bpm.new_page().unwrap();
+            g.as_mut_slice()[0] = 0xBB;
+            g.page_id()
+        };
+        let pid2 = {
+            let mut g = bpm.new_page().unwrap();
+            g.as_mut_slice()[0] = 0xCC;
+            g.page_id()
+        };
+
+        // Re-access pid2 to make it "hot" under FIFO → doesn't matter for FIFO,
+        // but the export scores will reflect insertion order
+        let _ = bpm.fetch_page_read(pid2).unwrap();
+
+        let result = bpm.swap_policy(
+            Box::new(LruReplacer::new(3)),
+            SwapMode::Warm,
+        );
+
+        assert_eq!(result.old_policy, "fifo");
+        assert_eq!(result.new_policy, "lru");
+        assert_eq!(result.mode, SwapMode::Warm);
+        assert_eq!(result.frames_registered, 3);
+        assert!(result.pages_transferred > 0);
+
+        // All data intact after warm swap
+        {
+            let g = bpm.fetch_page_read(pid0).unwrap();
+            assert_eq!(g.as_slice()[0], 0xAA);
+        }
+        {
+            let g = bpm.fetch_page_read(pid1).unwrap();
+            assert_eq!(g.as_slice()[0], 0xBB);
+        }
+        {
+            let g = bpm.fetch_page_read(pid2).unwrap();
+            assert_eq!(g.as_slice()[0], 0xCC);
+        }
+    }
+
+    #[test]
+    fn test_warm_swap_eviction_order() {
+        use crate::buffer::replacer::LruReplacer;
+
+        let (bpm, _dir) = create_test_bpm(3);
+
+        // Create 3 pages. Under FIFO, insertion order: pid0, pid1, pid2
+        let pid0 = bpm.new_page().unwrap().page_id();
+        let pid1 = bpm.new_page().unwrap().page_id();
+        let pid2 = bpm.new_page().unwrap().page_id();
+
+        // Warm swap to LRU — imported scores should preserve FIFO ordering:
+        // pid0 coldest (lowest score), pid2 hottest (highest score)
+        bpm.swap_policy(
+            Box::new(LruReplacer::new(3)),
+            SwapMode::Warm,
+        );
+
+        // Pool is full (3/3). Creating a new page forces eviction.
+        // With imported scores, pid0 should be evicted first (coldest).
+        let _pid3 = bpm.new_page().unwrap().page_id();
+
+        assert!(!bpm.contains_page(pid0), "pid0 should have been evicted (coldest)");
+        assert!(bpm.contains_page(pid1));
+        assert!(bpm.contains_page(pid2));
+    }
+
+    #[test]
+    fn test_swap_with_pinned_pages() {
+        use crate::buffer::replacer::LruReplacer;
+
+        let (bpm, _dir) = create_test_bpm(3);
+
+        let pid0 = bpm.new_page().unwrap().page_id();
+        let _pid1 = bpm.new_page().unwrap().page_id();
+
+        // Hold pid0 pinned during swap
+        let _guard = bpm.fetch_page_read(pid0).unwrap();
+
+        bpm.swap_policy(
+            Box::new(LruReplacer::new(3)),
+            SwapMode::Cold,
+        );
+
+        // pid0 is pinned → should NOT be evictable after swap
+        // pid1 is unpinned → should be evictable
+        // Create a 3rd page (uses free frame, no eviction needed)
+        let _pid2 = bpm.new_page().unwrap().page_id();
+
+        // Now pool is full. Create 4th → must evict. pid0 is pinned, so pid1 is evicted.
+        let _pid3 = bpm.new_page().unwrap().page_id();
+        assert!(bpm.contains_page(pid0), "pinned page should not be evicted");
+    }
+
+    #[test]
+    fn test_multiple_consecutive_swaps() {
+        use crate::buffer::replacer::{ClockReplacer, LruReplacer, LruKReplacer};
+
+        let (bpm, _dir) = create_test_bpm(5);
+
+        // Create some pages
+        let pid0 = {
+            let mut g = bpm.new_page().unwrap();
+            g.as_mut_slice()[0] = 0x11;
+            g.page_id()
+        };
+        let pid1 = {
+            let mut g = bpm.new_page().unwrap();
+            g.as_mut_slice()[0] = 0x22;
+            g.page_id()
+        };
+
+        // FIFO → LRU (warm)
+        bpm.swap_policy(Box::new(LruReplacer::new(5)), SwapMode::Warm);
+        assert_eq!(bpm.get_policy_name(), "lru");
+
+        // LRU → Clock (cold)
+        bpm.swap_policy(Box::new(ClockReplacer::new()), SwapMode::Cold);
+        assert_eq!(bpm.get_policy_name(), "clock");
+
+        // Clock → LRU-K (warm)
+        bpm.swap_policy(Box::new(LruKReplacer::new(2)), SwapMode::Warm);
+        assert_eq!(bpm.get_policy_name(), "lru-k");
+
+        assert_eq!(bpm.stats().snapshot().policy_swaps, 3);
+
+        // Data integrity preserved through all swaps
+        {
+            let g = bpm.fetch_page_read(pid0).unwrap();
+            assert_eq!(g.as_slice()[0], 0x11);
+        }
+        {
+            let g = bpm.fetch_page_read(pid1).unwrap();
+            assert_eq!(g.as_slice()[0], 0x22);
+        }
+    }
+
+    #[test]
+    fn test_swap_during_active_workload() {
+        use crate::buffer::replacer::LruReplacer;
+        use std::sync::Arc;
+        use std::thread;
+
+        let (bpm, _dir) = create_test_bpm(10);
+        let bpm = Arc::new(bpm);
+
+        // Create pages
+        let mut pids = vec![];
+        for i in 0..5u8 {
+            let mut g = bpm.new_page().unwrap();
+            g.as_mut_slice()[0] = i;
+            pids.push(g.page_id());
+        }
+
+        // Spawn readers in background
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let bpm_clone = Arc::clone(&bpm);
+            let pids_clone = pids.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..20 {
+                    for &pid in &pids_clone {
+                        if let Ok(g) = bpm_clone.fetch_page_read(pid) {
+                            let _ = g.as_slice()[0];
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Swap while readers are active
+        bpm.swap_policy(Box::new(LruReplacer::new(10)), SwapMode::Warm);
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify data integrity after concurrent swap
+        for (i, &pid) in pids.iter().enumerate() {
+            let g = bpm.fetch_page_read(pid).unwrap();
+            assert_eq!(g.as_slice()[0], i as u8);
+        }
     }
 }
