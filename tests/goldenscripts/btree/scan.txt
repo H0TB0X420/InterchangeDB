@@ -1,0 +1,37 @@
+# Range scan: full, start-only, start+end, empty range.
+
+# Populate 5 keys.
+(put apple 1)
+(put banana 2)
+(put cherry 3)
+(put date 4)
+(put elderberry 5)
+---
+ok
+
+# Full scan returns all keys in sorted order.
+scan
+---
+apple => 1
+banana => 2
+cherry => 3
+date => 4
+elderberry => 5
+
+# Scan from a start key (inclusive).
+scan cherry
+---
+cherry => 3
+date => 4
+elderberry => 5
+
+# Scan with start and end (exclusive end).
+scan banana date
+---
+banana => 2
+cherry => 3
+
+# Scan with start beyond all keys returns empty.
+scan zzz
+---
+ok

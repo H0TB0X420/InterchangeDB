@@ -74,6 +74,7 @@
 //! - Comer, "The Ubiquitous B-Tree" (1979)
 //! - BusTub CMU 15-445 B+Tree implementation
 
+pub mod engine;
 mod context;
 mod iterator;
 mod node;
@@ -89,6 +90,7 @@ pub use page_layout::{
     encode_internal_node, encode_leaf_node,
 };
 pub use iterator::BTreeScanIterator;
+pub use engine::BTreeEngine;
 pub use tree::BTree;
 
 use crate::common::PageId;

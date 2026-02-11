@@ -1,0 +1,25 @@
+# Basic BPM lifecycle: new_page, write, read, pool_info.
+
+# Fresh pool state.
+pool_info
+---
+pool_size: 10
+page_count: 0
+free_frames: 10
+policy: fifo
+
+# Allocate a page, write data, read it back.
+new_page
+write 0 hello
+read 0
+---
+page_id: 0
+data: hello
+
+# Pool state after one page.
+pool_info
+---
+pool_size: 10
+page_count: 1
+free_frames: 9
+policy: fifo

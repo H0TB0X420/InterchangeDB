@@ -686,7 +686,7 @@ mod tests {
 
         // Set p high to force eviction from T2
         replacer.p = 100;
-        while let Some(_) = replacer.evict() {}
+        while replacer.evict().is_some() {}
 
         // B2 now has pages
         assert!(!replacer.b2.is_empty());

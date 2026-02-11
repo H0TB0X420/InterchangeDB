@@ -20,6 +20,8 @@ lru = "0.12"
 proptest = "1.0"
 criterion = "0.5"
 tempfile = "3.10"
+goldenscript = "0.7"
+test_each_file = "0.3"
 
 [[bench]]
 name = "eviction_policies"

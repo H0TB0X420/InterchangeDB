@@ -299,6 +299,11 @@ impl BufferPoolManager {
         self.page_table.read().len()
     }
 
+    /// Get the total number of pages allocated on disk.
+    pub fn disk_page_count(&self) -> u32 {
+        self.disk_manager.lock().page_count()
+    }
+
     /// Get pin count for a page. Returns None if page not in pool.
     ///
     /// Matches BusTub's `GetPinCount()`.

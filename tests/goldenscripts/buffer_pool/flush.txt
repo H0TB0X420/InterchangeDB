@@ -1,0 +1,33 @@
+# Flush: write dirty pages to disk explicitly.
+
+# Allocate and write.
+new_page
+write 0 first
+---
+page_id: 0
+
+# Flush specific page.
+flush 0
+stats
+---
+cache_hits: 1
+cache_misses: 0
+evictions: 0
+pages_read: 0
+pages_written: 1
+
+# Write new data, then flush all.
+write 0 second
+flush
+stats
+---
+cache_hits: 2
+cache_misses: 0
+evictions: 0
+pages_read: 0
+pages_written: 2
+
+# Read back to confirm.
+read 0
+---
+data: second

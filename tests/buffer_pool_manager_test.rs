@@ -323,8 +323,8 @@ fn test_drop() {
         }
     } // This drops all of the guards.
 
-    for i in 0..FRAMES {
-        assert_eq!(bpm.get_pin_count(page_ids[i]), Some(0));
+    for pid in page_ids.iter().take(FRAMES) {
+        assert_eq!(bpm.get_pin_count(*pid), Some(0));
     }
 
     // Get a new write page and edit it. We will retrieve it later.

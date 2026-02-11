@@ -1,0 +1,42 @@
+# Policy swap: cold and warm swaps between eviction policies.
+
+# Default policy is fifo.
+pool_info
+---
+pool_size: 10
+page_count: 0
+free_frames: 10
+policy: fifo
+
+# Create some pages so frames are registered.
+(new_page)
+(new_page)
+(new_page)
+---
+ok
+
+# Cold swap to lru.
+swap_policy lru mode=cold
+pool_info
+---
+old_policy: fifo
+new_policy: lru
+mode: cold
+frames_registered: 3
+pool_size: 10
+page_count: 3
+free_frames: 7
+policy: lru
+
+# Warm swap to clock.
+swap_policy clock mode=warm
+pool_info
+---
+old_policy: lru
+new_policy: clock
+mode: warm
+frames_registered: 3
+pool_size: 10
+page_count: 3
+free_frames: 7
+policy: clock

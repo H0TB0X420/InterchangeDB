@@ -1,0 +1,39 @@
+# Eviction: fill pool, trigger eviction, verify data preserved on disk.
+
+# Use a tiny pool to force eviction.
+set pool_size=3
+---
+ok
+
+# Fill all 3 frames with data.
+new_page
+write 0 page_zero
+new_page
+write 1 page_one
+new_page
+write 2 page_two
+pool_info
+---
+page_id: 0
+page_id: 1
+page_id: 2
+pool_size: 3
+page_count: 3
+free_frames: 0
+policy: fifo
+
+# Allocate a 4th page — evicts the oldest (page 0).
+new_page
+stats
+---
+page_id: 3
+cache_hits: 3
+cache_misses: 0
+evictions: 1
+pages_read: 0
+pages_written: 1
+
+# Re-fetch the evicted page. Data is preserved on disk.
+read 0
+---
+data: page_zero
