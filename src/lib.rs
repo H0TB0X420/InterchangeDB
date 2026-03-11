@@ -41,7 +41,7 @@
 //! - [`buffer`] - Buffer pool management and eviction policies
 //! - [`storage`] - Disk I/O and page formats
 //! - [`index`] - Index structures (B-tree)
-//! - [`recovery`] - Write-ahead logging and crash recovery
+//! - [`wal`] - Write-ahead logging and crash recovery
 //! - [`concurrency`] - Transaction management and MVCC
 //! - [`execution`] - Query execution
 //!
@@ -60,13 +60,14 @@
 // Core modules
 pub mod buffer;
 pub mod common;
+pub mod database;
 pub mod storage;
 
 // Future modules (placeholders)
 pub mod concurrency;
 pub mod execution;
 pub mod index;
-pub mod recovery;
+pub mod wal;
 
 // Re-export commonly used items at crate root for convenience
 pub use common::config::PAGE_SIZE;
@@ -77,3 +78,5 @@ pub use storage::page::{Page, PageHeader, PageType};
 pub use storage::DiskManager;
 pub use storage::{ScanIterator, StorageEngine, StorageStatus};
 pub use index::btree::BTreeEngine;
+pub use index::lsm::LsmEngine;
+pub use database::{Database, BTreeDatabase, LsmDatabase};

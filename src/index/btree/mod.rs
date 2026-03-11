@@ -38,23 +38,33 @@
 //!
 //! ## Page Layout
 //!
+//! Every page starts with a 13-byte `PageHeader` prefix (page_type, checksum, LSN).
+//!
 //! ```text
-//! Internal Node:
+//! Internal Node (25-byte header):
 //! ┌──────────────────────────────────────────────────┐
-//! │ Header (12 bytes)                                │
+//! │ PageHeader (13 bytes)                            │
+//! │ ├─ page_type: u8 (BTreeInternal=2)               │
+//! │ ├─ checksum: u32                                 │
+//! │ ├─ lsn: u64                                      │
+//! ├──────────────────────────────────────────────────┤
+//! │ Node Header (12 bytes)                           │
 //! │ ├─ node_type: u8                                 │
 //! │ ├─ size: u16                                     │
 //! │ ├─ max_size: u16                                 │
 //! │ ├─ _reserved: [u8; 7]                            │
 //! ├──────────────────────────────────────────────────┤
-//! │ Keys: [len:u16 | key_bytes...]...                │
-//! ├──────────────────────────────────────────────────┤
-//! │ Children: [PageId; size+1]                       │
+//! │ Entries: [key_len:u16 | key | child:u32]...      │
 //! └──────────────────────────────────────────────────┘
 //!
-//! Leaf Node:
+//! Leaf Node (33-byte header):
 //! ┌──────────────────────────────────────────────────┐
-//! │ Header (20 bytes)                                │
+//! │ PageHeader (13 bytes)                            │
+//! │ ├─ page_type: u8 (BTreeLeaf=3)                   │
+//! │ ├─ checksum: u32                                 │
+//! │ ├─ lsn: u64                                      │
+//! ├──────────────────────────────────────────────────┤
+//! │ Node Header (20 bytes)                           │
 //! │ ├─ node_type: u8                                 │
 //! │ ├─ size: u16                                     │
 //! │ ├─ max_size: u16                                 │
@@ -94,6 +104,7 @@ pub use engine::BTreeEngine;
 pub use tree::BTree;
 
 use crate::common::PageId;
+use crate::storage::page::{PageHeader, PageType};
 
 /// B+Tree header page - stores only the root page ID.
 ///
@@ -107,8 +118,11 @@ pub struct BTreeHeaderPage {
 }
 
 impl BTreeHeaderPage {
-    /// Size of the header page data in bytes.
-    pub const SIZE: usize = 4;
+    /// Size of the header page data in bytes (PageHeader + root_page_id).
+    pub const SIZE: usize = PageHeader::SIZE + 4;
+
+    /// Offset of root_page_id within the page (after PageHeader prefix).
+    const ROOT_OFFSET: usize = PageHeader::SIZE;
 
     /// Create a new header page with no root (empty tree).
     pub fn new() -> Self {
@@ -124,12 +138,44 @@ impl BTreeHeaderPage {
 
     /// Encode header page to bytes.
     pub fn encode(&self, buf: &mut [u8]) {
-        buf[0..4].copy_from_slice(&self.root_page_id.0.to_le_bytes());
+        let page_header = PageHeader::new(PageType::Data);
+        page_header.write_to(buf);
+        buf[Self::ROOT_OFFSET..Self::ROOT_OFFSET + 4]
+            .copy_from_slice(&self.root_page_id.0.to_le_bytes());
+
+        // Compute and store checksum if this is a full page buffer.
+        if buf.len() >= crate::common::config::PAGE_SIZE {
+            let checksum = PageHeader::compute_checksum(buf);
+            buf[PageHeader::OFFSET_CHECKSUM..PageHeader::OFFSET_CHECKSUM + 4]
+                .copy_from_slice(&checksum.to_le_bytes());
+        }
     }
 
     /// Decode header page from bytes.
     pub fn decode(buf: &[u8]) -> Self {
-        let root_page_id = PageId::new(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+        // Verify checksum if this is a full page buffer with a stored checksum.
+        if buf.len() >= crate::common::config::PAGE_SIZE {
+            let stored_checksum = u32::from_le_bytes([
+                buf[PageHeader::OFFSET_CHECKSUM],
+                buf[PageHeader::OFFSET_CHECKSUM + 1],
+                buf[PageHeader::OFFSET_CHECKSUM + 2],
+                buf[PageHeader::OFFSET_CHECKSUM + 3],
+            ]);
+            if stored_checksum != 0 {
+                let computed = PageHeader::compute_checksum(buf);
+                assert_eq!(
+                    stored_checksum, computed,
+                    "header page checksum mismatch"
+                );
+            }
+        }
+
+        let root_page_id = PageId::new(u32::from_le_bytes([
+            buf[Self::ROOT_OFFSET],
+            buf[Self::ROOT_OFFSET + 1],
+            buf[Self::ROOT_OFFSET + 2],
+            buf[Self::ROOT_OFFSET + 3],
+        ]));
         Self { root_page_id }
     }
 }
@@ -156,7 +202,7 @@ mod tests {
         let mut header = BTreeHeaderPage::new();
         header.root_page_id = PageId::new(42);
 
-        let mut buf = [0u8; BTreeHeaderPage::SIZE];
+        let mut buf = vec![0u8; BTreeHeaderPage::SIZE];
         header.encode(&mut buf);
 
         let decoded = BTreeHeaderPage::decode(&buf);
@@ -167,7 +213,7 @@ mod tests {
     #[test]
     fn test_header_page_empty_roundtrip() {
         let header = BTreeHeaderPage::new();
-        let mut buf = [0u8; BTreeHeaderPage::SIZE];
+        let mut buf = vec![0u8; BTreeHeaderPage::SIZE];
         header.encode(&mut buf);
 
         let decoded = BTreeHeaderPage::decode(&buf);

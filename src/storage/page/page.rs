@@ -6,7 +6,7 @@
 
 use crate::common::config::PAGE_SIZE;
 
-use super::page_header::PageHeader;
+use super::page_header::{PageHeader, PageType};
 
 /// A page of data (4KB, 4KB-aligned).
 ///
@@ -85,8 +85,14 @@ impl Page {
 
     /// Compute and store checksum in the header.
     ///
-    /// Call this after all modifications to the page are complete.
+    /// Only applies to pages with a valid PageType (non-Invalid). Raw/uninitialized
+    /// pages (byte 0 == 0) are left unchanged to avoid corrupting user data at
+    /// bytes 1-4 where the checksum field lives.
     pub fn update_checksum(&mut self) {
+        // Skip uninitialized pages that haven't written a PageHeader.
+        if PageType::from_u8(self.data[PageHeader::OFFSET_PAGE_TYPE]) == PageType::Invalid {
+            return;
+        }
         let checksum = PageHeader::compute_checksum(&self.data);
         let checksum_bytes = checksum.to_le_bytes();
         self.data[PageHeader::OFFSET_CHECKSUM..PageHeader::OFFSET_CHECKSUM + 4]

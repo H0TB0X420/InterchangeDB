@@ -12,13 +12,13 @@ use crate::common::PageId;
 pub const MAX_TOMBSTONES: usize = 8;
 
 /// Internal node header size in bytes.
-/// Layout: node_type(1) + size(2) + max_size(2) + reserved(7) = 12 bytes
-pub const INTERNAL_HEADER_SIZE: usize = 12;
+/// Layout: PageHeader(13) + node_type(1) + size(2) + max_size(2) + reserved(7) = 25 bytes
+pub const INTERNAL_HEADER_SIZE: usize = 25;
 
 /// Leaf node header size in bytes.
-/// Layout: node_type(1) + size(2) + max_size(2) + next_page_id(4) +
-///         prev_page_id(4) + tombstone_count(2) + reserved(5) = 20 bytes
-pub const LEAF_HEADER_SIZE: usize = 20;
+/// Layout: PageHeader(13) + node_type(1) + size(2) + max_size(2) + next_page_id(4) +
+///         prev_page_id(4) + tombstone_count(2) + reserved(5) = 33 bytes
+pub const LEAF_HEADER_SIZE: usize = 33;
 
 /// Node type discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

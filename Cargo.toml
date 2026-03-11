@@ -35,5 +35,9 @@ harness = false
 name = "btree_bench"
 harness = false
 
+[[bench]]
+name = "lsm_bench"
+harness = false
+
 [lints.clippy]
 all = "warn"

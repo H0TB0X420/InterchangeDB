@@ -4,3 +4,4 @@
 //! - B-tree (primary index structure)
 
 pub mod btree;
+pub mod lsm;

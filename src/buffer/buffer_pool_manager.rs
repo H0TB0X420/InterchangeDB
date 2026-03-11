@@ -528,6 +528,9 @@ impl BufferPoolManager {
         let frame = &self.frames[frame_id.0];
 
         if frame.is_dirty() {
+            // Checksum is computed at encode time (encode_leaf_node, encode_internal_node,
+            // BTreeHeaderPage::encode) when the page data is finalized. This avoids
+            // corrupting raw pages that don't have a PageHeader prefix.
             let page = frame.page();
             {
                 let mut dm = self.disk_manager.lock();

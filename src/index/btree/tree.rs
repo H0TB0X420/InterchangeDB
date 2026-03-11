@@ -11,6 +11,7 @@ use super::context::Context;
 
 use super::iterator::BTreeScanIterator;
 
+use crate::storage::page::PageHeader;
 use super::node::{NodeType, LeafNode, InternalNode};
 use super::page_layout::{
     decode_leaf_node, decode_internal_node,
@@ -179,7 +180,7 @@ impl<'a> BTree<'a> {
 
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
-            let node_type = NodeType::from_u8(data[0])
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
                 .ok_or_else(|| Error::StorageCorrupted(
                     format!("Invalid node type at page {}", current_guard.page_id().0)
                 ))?;
@@ -514,7 +515,7 @@ impl<'a> BTree<'a> {
 
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
-            let node_type = NodeType::from_u8(data[0])
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
                 .ok_or_else(|| Error::StorageCorrupted(
                     format!("Invalid node type at page {}", current_guard.page_id().0)
                 ))?;
@@ -1217,7 +1218,7 @@ impl<'a> BTree<'a> {
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
 
-            let node_type = NodeType::from_u8(data[0])
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
                 .ok_or_else(|| Error::StorageCorrupted(
                     format!("Invalid node type at page {}", current_guard.page_id().0)
                 ))?;
@@ -1252,7 +1253,7 @@ impl<'a> BTree<'a> {
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
 
-            let node_type = NodeType::from_u8(data[0])
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
                 .ok_or_else(|| Error::StorageCorrupted(
                     format!("Invalid node type at page {}", current_guard.page_id().0)
                 ))?;
@@ -1352,9 +1353,9 @@ impl<'a> BTree<'a> {
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
 
-            let node_type = NodeType::from_u8(data[0])
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
                 .ok_or_else(|| Error::StorageCorrupted(
-                    format!("Invalid node type {} at page {}", data[0], current_guard.page_id().0)
+                    format!("Invalid node type {} at page {}", data[PageHeader::SIZE], current_guard.page_id().0)
                 ))?;
 
             match node_type {
@@ -1382,7 +1383,7 @@ impl<'a> BTree<'a> {
         let guard = self.bpm.fetch_page_read(page_id)?;
         let data = guard.as_slice();
 
-        let node_type = NodeType::from_u8(data[0])
+        let node_type = NodeType::from_u8(data[PageHeader::SIZE])
             .ok_or_else(|| Error::StorageCorrupted(
                 format!("Invalid node type at page {}", page_id.0)
             ))?;
@@ -1401,7 +1402,7 @@ impl<'a> BTree<'a> {
         let guard = self.bpm.fetch_page_read(page_id)?;
         let data = guard.as_slice();
 
-        let node_type = NodeType::from_u8(data[0])
+        let node_type = NodeType::from_u8(data[PageHeader::SIZE])
             .ok_or_else(|| Error::StorageCorrupted(
                 format!("Invalid node type at page {}", page_id.0)
             ))?;
@@ -1610,7 +1611,7 @@ mod tests {
         // Tree should no longer have leaf as root (internal node created)
         let root_id = tree.get_root_page_id().unwrap().unwrap();
         let guard = bpm.fetch_page_read(root_id).unwrap();
-        let node_type = NodeType::from_u8(guard.as_slice()[0]).unwrap();
+        let node_type = NodeType::from_u8(guard.as_slice()[PageHeader::SIZE]).unwrap();
         assert_eq!(node_type, NodeType::Internal, "Root should be internal after split");
     }
 

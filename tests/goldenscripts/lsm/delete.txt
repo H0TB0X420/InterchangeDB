@@ -1,0 +1,38 @@
+# Delete semantics: removal, surroundings, and re-insert.
+# LSM tracks tombstones unlike B-tree.
+
+# Insert several keys.
+(put a 1)
+(put b 2)
+(put c 3)
+(put d 4)
+(put e 5)
+status
+---
+keys: 5
+size: 10
+tombstones: 0
+
+# Delete a middle key, verify neighbors still present.
+delete c
+get b
+get c
+get d
+status
+---
+b => 2
+c => None
+d => 4
+keys: 4
+size: 8
+tombstones: 1
+
+# Re-insert the deleted key with a new value.
+put c 33
+get c
+status
+---
+c => 33
+keys: 5
+size: 11
+tombstones: 1

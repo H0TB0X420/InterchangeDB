@@ -1,0 +1,29 @@
+# Point operations: get, put, delete on individual keys.
+
+# Get on empty tree returns None.
+get foo
+---
+foo => None
+
+# Put a key, then get it back.
+put foo bar
+get foo
+---
+foo => bar
+
+# Delete the key, verify gone.
+delete foo
+get foo
+---
+foo => None
+
+# Delete a non-existent key is a no-op.
+delete ghost
+---
+ok
+
+# Re-insert a previously deleted key.
+put foo baz
+get foo
+---
+foo => baz

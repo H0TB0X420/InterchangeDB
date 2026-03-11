@@ -1,0 +1,31 @@
+# Overwrite behavior: put replaces existing values.
+
+# Insert a key.
+put key value1
+get key
+status
+---
+key => value1
+keys: 1
+size: 9
+tombstones: 0
+
+# Overwrite with a new value. Key count stays at 1.
+put key value2
+get key
+status
+---
+key => value2
+keys: 1
+size: 9
+tombstones: 0
+
+# Overwrite again with a shorter value.
+put key v3
+get key
+status
+---
+key => v3
+keys: 1
+size: 5
+tombstones: 0

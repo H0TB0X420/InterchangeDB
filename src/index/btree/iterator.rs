@@ -10,6 +10,7 @@ use std::ops::Bound;
 use crate::buffer::BufferPoolManager;
 use crate::common::{PageId, Result, Error};
 
+use crate::storage::page::PageHeader;
 use super::node::NodeType;
 use super::page_layout::decode_leaf_node;
 
@@ -82,7 +83,7 @@ impl<'a> BTreeScanIterator<'a> {
         let data = guard.as_slice();
 
         // Validate node type — return error, not assert (could be BPM issue).
-        let node_type = NodeType::from_u8(data[0])
+        let node_type = NodeType::from_u8(data[PageHeader::SIZE])
             .ok_or_else(|| Error::StorageCorrupted(
                 format!("Invalid node type at page {}", self.current_page_id.0)
             ))?;

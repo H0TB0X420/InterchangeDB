@@ -1,17 +1,19 @@
 //! B+Tree node serialization to/from page bytes.
 //!
 //! Handles encoding nodes to fit within a 4KB page and decoding them back.
+//! Every page starts with a 13-byte [`PageHeader`] prefix (page_type, checksum, LSN).
 //!
 //! ## Internal Node Layout
 //!
 //! ```text
 //! Offset  Size  Field
 //! ------  ----  -----
-//! 0       1     node_type (0 = Internal)
-//! 1       2     size (number of entries)
-//! 3       2     max_size
-//! 5       7     reserved
-//! 12      var   entries: [key_len:u16, key_bytes..., child:u32]...
+//! 0       13    PageHeader (page_type=BTreeInternal, checksum, lsn)
+//! 13      1     node_type (0 = Internal)
+//! 14      2     size (number of entries)
+//! 16      2     max_size
+//! 18      7     reserved
+//! 25      var   entries: [key_len:u16, key_bytes..., child:u32]...
 //! ```
 //!
 //! ## Leaf Node Layout
@@ -19,19 +21,21 @@
 //! ```text
 //! Offset  Size  Field
 //! ------  ----  -----
-//! 0       1     node_type (1 = Leaf)
-//! 1       2     size (number of entries)
-//! 3       2     max_size
-//! 5       4     next_page_id
-//! 9       4     prev_page_id
-//! 13      2     tombstone_count
-//! 15      5     reserved
-//! 20      var   tombstones: [u16; tombstone_count]
+//! 0       13    PageHeader (page_type=BTreeLeaf, checksum, lsn)
+//! 13      1     node_type (1 = Leaf)
+//! 14      2     size (number of entries)
+//! 16      2     max_size
+//! 18      4     next_page_id
+//! 22      4     prev_page_id
+//! 26      2     tombstone_count
+//! 28      5     reserved
+//! 33      var   tombstones: [u16; tombstone_count]
 //! var     var   entries: [key_len:u16, key_bytes..., val_len:u16, val_bytes...]...
 //! ```
 
 use crate::common::config::PAGE_SIZE;
 use crate::common::PageId;
+use crate::storage::page::{PageHeader, PageType};
 
 use super::node::{
     InternalNode, LeafNode, NodeType,
@@ -44,9 +48,13 @@ use super::node::{
 pub fn encode_internal_node(node: &InternalNode, buf: &mut [u8]) -> usize {
     assert!(buf.len() >= PAGE_SIZE);
 
-    let mut offset = 0;
+    // Write PageHeader prefix.
+    let page_header = PageHeader::new(PageType::BTreeInternal);
+    page_header.write_to(buf);
 
-    // Header
+    let mut offset = PageHeader::SIZE;
+
+    // Node header
     buf[offset] = NodeType::Internal as u8;
     offset += 1;
 
@@ -79,12 +87,33 @@ pub fn encode_internal_node(node: &InternalNode, buf: &mut [u8]) -> usize {
         offset += 4;
     }
 
+    // Compute and store checksum over the full page buffer.
+    let checksum = PageHeader::compute_checksum(buf);
+    buf[PageHeader::OFFSET_CHECKSUM..PageHeader::OFFSET_CHECKSUM + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+
     offset
 }
 
 /// Decode an internal node from a page buffer.
 pub fn decode_internal_node(buf: &[u8]) -> InternalNode {
-    let mut offset = 0;
+    // Verify page checksum if one has been stored (non-zero).
+    let stored_checksum = u32::from_le_bytes([
+        buf[PageHeader::OFFSET_CHECKSUM],
+        buf[PageHeader::OFFSET_CHECKSUM + 1],
+        buf[PageHeader::OFFSET_CHECKSUM + 2],
+        buf[PageHeader::OFFSET_CHECKSUM + 3],
+    ]);
+    if stored_checksum != 0 {
+        let computed = PageHeader::compute_checksum(buf);
+        assert_eq!(
+            stored_checksum, computed,
+            "internal node page checksum mismatch"
+        );
+    }
+
+    // Skip PageHeader prefix.
+    let mut offset = PageHeader::SIZE;
 
     // Verify node type
     let node_type = buf[offset];
@@ -140,9 +169,13 @@ pub fn decode_internal_node(buf: &[u8]) -> InternalNode {
 pub fn encode_leaf_node(node: &LeafNode, buf: &mut [u8]) -> usize {
     assert!(buf.len() >= PAGE_SIZE);
 
-    let mut offset = 0;
+    // Write PageHeader prefix.
+    let page_header = PageHeader::new(PageType::BTreeLeaf);
+    page_header.write_to(buf);
 
-    // Header
+    let mut offset = PageHeader::SIZE;
+
+    // Node header
     buf[offset] = NodeType::Leaf as u8;
     offset += 1;
 
@@ -199,12 +232,33 @@ pub fn encode_leaf_node(node: &LeafNode, buf: &mut [u8]) -> usize {
         offset += value.len();
     }
 
+    // Compute and store checksum over the full page buffer.
+    let checksum = PageHeader::compute_checksum(buf);
+    buf[PageHeader::OFFSET_CHECKSUM..PageHeader::OFFSET_CHECKSUM + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+
     offset
 }
 
 /// Decode a leaf node from a page buffer.
 pub fn decode_leaf_node(buf: &[u8]) -> LeafNode {
-    let mut offset = 0;
+    // Verify page checksum if one has been stored (non-zero).
+    let stored_checksum = u32::from_le_bytes([
+        buf[PageHeader::OFFSET_CHECKSUM],
+        buf[PageHeader::OFFSET_CHECKSUM + 1],
+        buf[PageHeader::OFFSET_CHECKSUM + 2],
+        buf[PageHeader::OFFSET_CHECKSUM + 3],
+    ]);
+    if stored_checksum != 0 {
+        let computed = PageHeader::compute_checksum(buf);
+        assert_eq!(
+            stored_checksum, computed,
+            "leaf node page checksum mismatch"
+        );
+    }
+
+    // Skip PageHeader prefix.
+    let mut offset = PageHeader::SIZE;
 
     // Verify node type
     let node_type = buf[offset];
@@ -379,8 +433,8 @@ mod tests {
         let max_size = calculate_leaf_max_size(8, 8);
 
         // Each entry: 2 + 8 + 2 + 8 = 20 bytes
-        // Available: 4096 - 20 - 16 = 4060 bytes
-        // Expected: 4060 / 20 = 203 entries
+        // Available: 4096 - 33 - 16 = 4047 bytes
+        // Expected: 4047 / 20 = 202 entries
         assert!(max_size > 100);
         assert!(max_size < 300);
     }
@@ -391,8 +445,8 @@ mod tests {
         let max_size = calculate_internal_max_size(8);
 
         // Each entry: 2 + 8 + 4 = 14 bytes
-        // Available: 4096 - 12 = 4084 bytes
-        // Expected: 4084 / 14 = 291 entries
+        // Available: 4096 - 25 = 4071 bytes
+        // Expected: 4071 / 14 = 290 entries
         assert!(max_size > 200);
         assert!(max_size < 400);
     }
