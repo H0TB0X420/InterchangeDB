@@ -127,6 +127,56 @@ impl LogRecord {
         }
     }
 
+    /// Create a Begin record for a transaction.
+    pub fn begin(txn_id: u64) -> Self {
+        Self {
+            lsn: Lsn::INVALID,
+            txn_id,
+            prev_lsn: Lsn::INVALID,
+            payload: LogPayload::Begin,
+        }
+    }
+
+    /// Create a Commit record for a transaction.
+    pub fn commit(txn_id: u64, prev_lsn: Lsn, commit_ts: u64) -> Self {
+        Self {
+            lsn: Lsn::INVALID,
+            txn_id,
+            prev_lsn,
+            payload: LogPayload::Commit { commit_ts },
+        }
+    }
+
+    /// Create an Abort record for a transaction.
+    pub fn abort(txn_id: u64, prev_lsn: Lsn) -> Self {
+        Self {
+            lsn: Lsn::INVALID,
+            txn_id,
+            prev_lsn,
+            payload: LogPayload::Abort,
+        }
+    }
+
+    /// Create a Put record for an explicit transaction.
+    pub fn txn_put(txn_id: u64, prev_lsn: Lsn, key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self {
+            lsn: Lsn::INVALID,
+            txn_id,
+            prev_lsn,
+            payload: LogPayload::Put { key, value },
+        }
+    }
+
+    /// Create a Delete record for an explicit transaction.
+    pub fn txn_delete(txn_id: u64, prev_lsn: Lsn, key: Vec<u8>) -> Self {
+        Self {
+            lsn: Lsn::INVALID,
+            txn_id,
+            prev_lsn,
+            payload: LogPayload::Delete { key },
+        }
+    }
+
     /// Create a Checkpoint record.
     pub fn checkpoint(active_txn_ids: Vec<u64>) -> Self {
         Self {

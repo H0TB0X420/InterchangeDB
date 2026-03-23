@@ -58,6 +58,19 @@ pub enum Error {
 
     /// Value exceeds maximum allowed length.
     ValueTooLarge(usize),
+
+    // =========================================================================
+    // Transaction Errors
+    // =========================================================================
+
+    /// Operation on a transaction that is not active (committed, aborted, or unknown).
+    TxnNotActive(u64),
+
+    /// Too many concurrent active transactions.
+    TxnLimit(usize),
+
+    /// Lock acquisition timed out waiting for a conflicting lock to release.
+    LockTimeout,
 }
 
 impl fmt::Display for Error {
@@ -73,6 +86,11 @@ impl fmt::Display for Error {
             Error::StorageCorrupted(msg) => write!(f, "Storage corrupted: {}", msg),
             Error::KeyTooLarge(size) => write!(f, "Key too large: {} bytes", size),
             Error::ValueTooLarge(size) => write!(f, "Value too large: {} bytes", size),
+            Error::TxnNotActive(id) => write!(f, "Transaction {} is not active", id),
+            Error::TxnLimit(max) => {
+                write!(f, "Too many active transactions (limit: {})", max)
+            }
+            Error::LockTimeout => write!(f, "Lock acquisition timed out"),
         }
     }
 }

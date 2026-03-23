@@ -67,6 +67,7 @@ pub mod storage;
 pub mod concurrency;
 pub mod execution;
 pub mod index;
+pub mod txn;
 pub mod wal;
 
 // Re-export commonly used items at crate root for convenience
@@ -80,3 +81,4 @@ pub use storage::{ScanIterator, StorageEngine, StorageStatus};
 pub use index::btree::BTreeEngine;
 pub use index::lsm::LsmEngine;
 pub use database::{Database, BTreeDatabase, LsmDatabase};
+pub use txn::{TxnId, TxnMode, TxnState, TransactionManager, LockManager, LockMode};
