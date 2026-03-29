@@ -64,10 +64,13 @@ pub fn recover<E: StorageEngine>(
                 records_redone += 1;
             }
             // Skip non-data records in auto-commit mode.
+            // TxnPut/TxnDelete are skipped here — handled by multi-txn recovery (Subtask 9).
             LogPayload::Begin
             | LogPayload::Commit { .. }
             | LogPayload::Abort
-            | LogPayload::Checkpoint { .. } => {}
+            | LogPayload::Checkpoint { .. }
+            | LogPayload::TxnPut { .. }
+            | LogPayload::TxnDelete { .. } => {}
         }
     }
 

@@ -246,6 +246,12 @@ impl TransactionManager {
         self.active_txns.len()
     }
 
+    /// Peek at the next transaction ID without consuming it.
+    /// Used by Database to write Begin WAL record before calling begin().                                                
+    pub fn next_txn_id_peek(&self) -> u64 {                     
+          self.next_txn_id                                        
+    }    
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------

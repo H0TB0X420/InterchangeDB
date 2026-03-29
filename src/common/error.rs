@@ -71,6 +71,15 @@ pub enum Error {
 
     /// Lock acquisition timed out waiting for a conflicting lock to release.
     LockTimeout,
+
+    ///Deadlock detected, this transaction was chosen as victim
+    Deadlock(u64),
+
+    /// Attmepted a write on a read-only txn
+    TxnReadOnly(u64),
+
+    /// Txn ops require WAL (use Database::open)
+    TxnNotSupported,
 }
 
 impl fmt::Display for Error {
@@ -86,12 +95,14 @@ impl fmt::Display for Error {
             Error::StorageCorrupted(msg) => write!(f, "Storage corrupted: {}", msg),
             Error::KeyTooLarge(size) => write!(f, "Key too large: {} bytes", size),
             Error::ValueTooLarge(size) => write!(f, "Value too large: {} bytes", size),
-            Error::TxnNotActive(id) => write!(f, "Transaction {} is not active", id),
-            Error::TxnLimit(max) => {
-                write!(f, "Too many active transactions (limit: {})", max)
-            }
+            Error::TxnNotActive(txn_id) => write!(f, "Transaction {} is not active", txn_id),
+            Error::Deadlock(txn_id) => write!(f, "Deadlock detected: transaction {} aborted", txn_id),
+            Error::TxnLimit(max) => write!(f, "Too many active transactions (limit: {})", max),
             Error::LockTimeout => write!(f, "Lock acquisition timed out"),
+            Error::TxnReadOnly(txn_id) => write!(f, "Transaction {} is read-only", txn_id),
+            Error::TxnNotSupported => write!(f, "Transactions require WAL (use Database::open)"),
         }
+
     }
 }
 

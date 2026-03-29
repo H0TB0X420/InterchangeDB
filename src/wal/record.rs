@@ -50,6 +50,8 @@ pub enum LogRecordType {
     Commit = 4,
     Abort = 5,
     Checkpoint = 6,
+    TxnPut = 7,
+    TxnDelete = 8,
 }
 
 impl LogRecordType {
@@ -62,6 +64,8 @@ impl LogRecordType {
             4 => Some(Self::Commit),
             5 => Some(Self::Abort),
             6 => Some(Self::Checkpoint),
+            7 => Some(Self::TxnPut),
+            8 => Some(Self::TxnDelete),
             _ => None,
         }
     }
@@ -91,6 +95,19 @@ pub enum LogPayload {
 
     /// Checkpoint with list of active transaction IDs.
     Checkpoint { active_txn_ids: Vec<u64> },
+
+    ///Txn put with old value for undo
+    TxnPut {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        old_value: Option<Vec<u8>>,
+    },
+
+    /// Txn delete with old value for undo.
+    TxnDelete {
+        key: Vec<u8>,
+        old_value: Option<Vec<u8>>,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,22 +175,22 @@ impl LogRecord {
     }
 
     /// Create a Put record for an explicit transaction.
-    pub fn txn_put(txn_id: u64, prev_lsn: Lsn, key: Vec<u8>, value: Vec<u8>) -> Self {
+    pub fn txn_put(txn_id: u64, prev_lsn: Lsn, key: Vec<u8>, value: Vec<u8>, old_value: Option<Vec<u8>>) -> Self {
         Self {
             lsn: Lsn::INVALID,
             txn_id,
             prev_lsn,
-            payload: LogPayload::Put { key, value },
+            payload: LogPayload::TxnPut { key, value, old_value },
         }
     }
 
     /// Create a Delete record for an explicit transaction.
-    pub fn txn_delete(txn_id: u64, prev_lsn: Lsn, key: Vec<u8>) -> Self {
+    pub fn txn_delete(txn_id: u64, prev_lsn: Lsn, key: Vec<u8>, old_value: Option<Vec<u8>>) -> Self {
         Self {
             lsn: Lsn::INVALID,
             txn_id,
             prev_lsn,
-            payload: LogPayload::Delete { key },
+            payload: LogPayload::TxnDelete { key, old_value },
         }
     }
 
@@ -196,6 +213,8 @@ impl LogRecord {
             LogPayload::Commit { .. } => LogRecordType::Commit,
             LogPayload::Abort => LogRecordType::Abort,
             LogPayload::Checkpoint { .. } => LogRecordType::Checkpoint,
+            LogPayload::TxnPut { .. } => LogRecordType::TxnPut,
+            LogPayload::TxnDelete { .. } => LogRecordType::TxnDelete,
         }
     }
 
@@ -329,6 +348,20 @@ impl LogRecord {
             LogPayload::Commit { .. } => 8,
             LogPayload::Abort => 0,
             LogPayload::Checkpoint { active_txn_ids } => 4 + active_txn_ids.len() * 8,
+            LogPayload::TxnPut {key, value, old_value } => {
+                let base = 2 + key.len() + 2 + value.len() + 1 ;
+                match old_value {
+                    Some(ov) => base + 2 + ov.len(),
+                    None => base,
+                }
+            }
+            LogPayload::TxnDelete { key, old_value } => {
+                let base = 2 + key.len() + 1;
+                match old_value {
+                    Some(ov) => base + 2 + ov.len(),
+                    None => base,
+                }
+            }
         }
     }
 
@@ -354,6 +387,32 @@ impl LogRecord {
                 buf.extend_from_slice(&(active_txn_ids.len() as u32).to_le_bytes());
                 for txn_id in active_txn_ids {
                     buf.extend_from_slice(&txn_id.to_le_bytes());
+                }
+            }
+            LogPayload::TxnPut { key, value, old_value } => {
+                buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+                buf.extend_from_slice(key);
+                buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
+                buf.extend_from_slice(value);
+                match old_value {
+                    Some(ov) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&(ov.len() as u16).to_le_bytes());
+                        buf.extend_from_slice(ov);
+                    }
+                    None => buf.push(0),
+                }
+            }
+            LogPayload::TxnDelete { key, old_value } => {
+                buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+                buf.extend_from_slice(key);
+                match old_value {
+                    Some(ov) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&(ov.len() as u16).to_le_bytes());
+                        buf.extend_from_slice(ov);
+                    }
+                    None => buf.push(0),
                 }
             }
         }
@@ -435,6 +494,62 @@ impl LogRecord {
                     active_txn_ids.push(txn_id);
                 }
                 Ok(LogPayload::Checkpoint { active_txn_ids })
+            }
+            LogRecordType::TxnPut => {
+                // Layout: key_len:u16 | key | val_len:u16 | value | has_old:u8 | [old_len:u16 | old]
+                if buf.len() < 4 {
+                    return Err(Error::StorageCorrupted("WAL TxnPut too short".into()));
+                }
+                let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                if buf.len() < 2 + key_len + 2 {
+                    return Err(Error::StorageCorrupted("WAL TxnPut truncated at key".into()));
+                }
+                let key = buf[2..2 + key_len].to_vec();
+                let vo = 2 + key_len;
+                let val_len = u16::from_le_bytes([buf[vo], buf[vo + 1]]) as usize;
+                if buf.len() < vo + 2 + val_len + 1 {
+                    return Err(Error::StorageCorrupted("WAL TxnPut truncated at value".into()));
+                }
+                let value = buf[vo + 2..vo + 2 + val_len].to_vec();
+                let oo = vo + 2 + val_len;
+                let old_value = if buf[oo] == 1 {
+                    if buf.len() < oo + 3 {
+                        return Err(Error::StorageCorrupted("WAL TxnPut truncated at old_len".into()));
+                    }
+                    let ol = u16::from_le_bytes([buf[oo + 1], buf[oo + 2]]) as usize;
+                    if buf.len() < oo + 3 + ol {
+                        return Err(Error::StorageCorrupted("WAL TxnPut truncated at old_value".into()));
+                    }
+                    Some(buf[oo + 3..oo + 3 + ol].to_vec())
+                } else {
+                    None
+                };
+                Ok(LogPayload::TxnPut { key, value, old_value })
+            }
+            LogRecordType::TxnDelete => {
+                // Layout: key_len:u16 | key | has_old:u8 | [old_len:u16 | old]
+                if buf.len() < 2 {
+                    return Err(Error::StorageCorrupted("WAL TxnDelete too short".into()));
+                }
+                let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                if buf.len() < 2 + key_len + 1 {
+                    return Err(Error::StorageCorrupted("WAL TxnDelete truncated".into()));
+                }
+                let key = buf[2..2 + key_len].to_vec();
+                let oo = 2 + key_len;
+                let old_value = if buf[oo] == 1 {
+                    if buf.len() < oo + 3 {
+                        return Err(Error::StorageCorrupted("WAL TxnDelete truncated at old_len".into()));
+                    }
+                    let ol = u16::from_le_bytes([buf[oo + 1], buf[oo + 2]]) as usize;
+                    if buf.len() < oo + 3 + ol {
+                        return Err(Error::StorageCorrupted("WAL TxnDelete truncated at old_value".into()));
+                    }
+                    Some(buf[oo + 3..oo + 3 + ol].to_vec())
+                } else {
+                    None
+                };
+                Ok(LogPayload::TxnDelete { key, old_value })
             }
         }
     }
@@ -681,7 +796,7 @@ mod tests {
     #[test]
     fn from_u8_invalid() {
         assert_eq!(LogRecordType::from_u8(0), None);
-        assert_eq!(LogRecordType::from_u8(7), None);
+        assert_eq!(LogRecordType::from_u8(9), None);
         assert_eq!(LogRecordType::from_u8(255), None);
     }
 
@@ -735,5 +850,96 @@ mod tests {
         let (decoded2, consumed2) = LogRecord::decode(&buf[consumed1..]).unwrap();
         assert_eq!(decoded2, r2);
         assert_eq!(consumed1 + consumed2, buf.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // TxnPut / TxnDelete roundtrip tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_txn_put_with_old_value() {
+        // Overwrite case: old_value captures what existed before the put.
+        let record = LogRecord {
+            lsn: Lsn::new(20),
+            txn_id: 5,
+            prev_lsn: Lsn::new(19),
+            payload: LogPayload::TxnPut {
+                key: b"user:1".to_vec(),
+                value: b"alice_v2".to_vec(),
+                old_value: Some(b"alice_v1".to_vec()),
+            },
+        };
+        let encoded = record.encode();
+        let (decoded, consumed) = LogRecord::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn roundtrip_txn_put_without_old_value() {
+        // Insert case: key didn't exist before, old_value is None.
+        let record = LogRecord {
+            lsn: Lsn::new(21),
+            txn_id: 5,
+            prev_lsn: Lsn::new(20),
+            payload: LogPayload::TxnPut {
+                key: b"user:2".to_vec(),
+                value: b"bob".to_vec(),
+                old_value: None,
+            },
+        };
+        let encoded = record.encode();
+        let (decoded, consumed) = LogRecord::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn roundtrip_txn_delete_with_old_value() {
+        // Delete of existing key: old_value captures what was there.
+        let record = LogRecord {
+            lsn: Lsn::new(30),
+            txn_id: 7,
+            prev_lsn: Lsn::new(29),
+            payload: LogPayload::TxnDelete {
+                key: b"session:abc".to_vec(),
+                old_value: Some(b"token_data".to_vec()),
+            },
+        };
+        let encoded = record.encode();
+        let (decoded, consumed) = LogRecord::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn roundtrip_txn_delete_without_old_value() {
+        // Delete of non-existent key: old_value is None.
+        let record = LogRecord {
+            lsn: Lsn::new(31),
+            txn_id: 7,
+            prev_lsn: Lsn::new(30),
+            payload: LogPayload::TxnDelete {
+                key: b"ghost_key".to_vec(),
+                old_value: None,
+            },
+        };
+        let encoded = record.encode();
+        let (decoded, consumed) = LogRecord::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn txn_record_type_discriminants() {
+        assert_eq!(LogRecordType::from_u8(7), Some(LogRecordType::TxnPut));
+        assert_eq!(LogRecordType::from_u8(8), Some(LogRecordType::TxnDelete));
+
+        // Verify constructors produce the correct type tag.
+        let txn_put = LogRecord::txn_put(1, Lsn::INVALID, vec![1], vec![2], None);
+        assert_eq!(txn_put.record_type(), LogRecordType::TxnPut);
+
+        let txn_del = LogRecord::txn_delete(1, Lsn::INVALID, vec![1], None);
+        assert_eq!(txn_del.record_type(), LogRecordType::TxnDelete);
     }
 }
