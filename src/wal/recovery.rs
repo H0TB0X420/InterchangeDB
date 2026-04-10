@@ -10,10 +10,11 @@
 //! non-existent key is a no-op.
 
 use std::time::Instant;
+use std::collections::HashSet;
 
 use crate::common::Result;
 use crate::storage::StorageEngine;
-use crate::wal::{LogPayload, Lsn, WalReader};
+use crate::wal::{LogPayload, LogRecord, Lsn, WalReader};
 
 /// Statistics from a recovery run.
 #[derive(Debug, Clone)]
@@ -22,6 +23,9 @@ pub struct RecoveryStats {
     pub records_scanned: u64,
     /// Records actually replayed into the engine (Put + Delete).
     pub records_redone: u64,
+    pub records_undone: u64,
+    pub txns_committed: u64,
+    pub txns_undone: u64,
     /// Wall-clock duration of recovery.
     pub duration: std::time::Duration,
 }
@@ -46,37 +50,128 @@ pub fn recover<E: StorageEngine>(
     } else {
         Lsn::new(0)
     };
+    
+    let records: Vec<LogRecord> = reader
+        .scan_forward(start_lsn)
+        .collect::<Result<Vec<_>>>()?;
 
-    let mut records_scanned: u64 = 0;
-    let mut records_redone: u64 = 0;
 
-    for result in reader.scan_forward(start_lsn) {
-        let record = result?;
-        records_scanned += 1;
+    let records_scanned = records.len() as u64;
+    let (committed, aborted) = analyze_transactions(&records);
+    let records_redone = redo_committed(engine, &records, &committed)?;
+    let (records_undone, txns_undone) = undo_uncommitted(engine, &records, &committed,&aborted)?;
 
-        match record.payload {
-            LogPayload::Put { ref key, ref value } => {
-                engine.put(key, value)?;
-                records_redone += 1;
-            }
-            LogPayload::Delete { ref key } => {
-                engine.delete(key)?;
-                records_redone += 1;
-            }
-            // Skip non-data records in auto-commit mode.
-            // TxnPut/TxnDelete are skipped here — handled by multi-txn recovery (Subtask 9).
-            LogPayload::Begin
-            | LogPayload::Commit { .. }
-            | LogPayload::Abort
-            | LogPayload::Checkpoint { .. }
-            | LogPayload::TxnPut { .. }
-            | LogPayload::TxnDelete { .. } => {}
-        }
-    }
-
+  
     Ok(RecoveryStats {
         records_scanned,
         records_redone,
+        records_undone,
+        txns_committed: committed.len() as u64,
+        txns_undone,
         duration: start.elapsed(),
     })
+}
+
+fn analyze_transactions(records: &[LogRecord]) -> (HashSet<u64>, HashSet<u64>) {
+    let mut committed = HashSet::new();
+    let mut aborted = HashSet::new();
+
+    for record in records {
+        match &record.payload {
+            LogPayload::Commit {..} => {
+                committed.insert(record.txn_id);
+            }
+            LogPayload::Abort => {
+                aborted.insert(record.txn_id);
+            }
+            _ => {}
+        }
+    }
+    
+    (committed, aborted)
+}
+
+fn redo_committed<E: StorageEngine>(
+    engine: &mut E,
+    records: &[LogRecord],
+    committed: &HashSet<u64>,
+    ) -> Result<u64> {
+    let mut redone: u64 = 0;
+
+    for record in records {
+        match &record.payload {
+            LogPayload::Put {key, value} => {
+                engine.put(key, value)?;
+                redone += 1;
+            }
+            LogPayload::Delete {key} => {
+                engine.delete(key)?;
+                redone += 1;
+            }
+            LogPayload::TxnPut { key, value, .. } => {
+                if committed.contains(&record.txn_id) {
+                    engine.put(key, value)?;
+                    redone += 1;
+                }
+            }
+            LogPayload::TxnDelete {key, ..} => {
+                if committed.contains(&record.txn_id){
+                    engine.delete(key)?;
+                    redone += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(redone)
+}
+
+fn undo_uncommitted<E: StorageEngine>(
+    engine: &mut E,
+    records: &[LogRecord],
+    committed: &HashSet<u64>,
+    aborted: &HashSet<u64>,
+    ) -> Result<(u64, u64)> {
+        
+    let mut uncommitted = HashSet::new();
+    for record in records {
+        if record.txn_id != 0 
+            && !committed.contains(&record.txn_id)
+            && !aborted.contains(&record.txn_id)
+            {
+                uncommitted.insert(record.txn_id);
+            }
+    }
+
+    if uncommitted.is_empty() {
+        return Ok((0,0))
+    }
+
+    let mut undone: u64 = 0;
+
+    for record in records.iter().rev() {
+        if !uncommitted.contains(&record.txn_id) {
+            continue;
+        }
+
+        match &record.payload {
+            LogPayload::TxnPut { key, old_value, .. } => {
+                match old_value {
+                    Some(ov) => engine.put(key, ov)?,
+                    None => { let _ = engine.delete(key); }
+                }
+                undone += 1;
+            }
+            LogPayload::TxnDelete { key, old_value } => {
+                if let Some(ov) = old_value {
+                    engine.put(key, ov)?;
+                }
+                undone += 1;
+            }
+            _ => {}
+        }
+    }
+    let txns_undone = uncommitted.len() as u64;
+    Ok((undone, txns_undone))
 }

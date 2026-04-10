@@ -469,8 +469,7 @@ impl LockManager {
 /// HOW: For each key with waiters, add an edge from each waiter to each holder. When the waiter's
 /// requested mode is incompatible with the granted mode. Edges represent "this waiter is blocked
 /// by this hold"
-/// WHY: A cycle means deadlock. No txn in the cycle can make progress
-
+/// WHY: A cycle means deadlock. No txn in the cycle can make progress.
     fn build_wait_for_graph(state: &LockState) -> HashMap<TxnId, HashSet<TxnId>> {
         let mut graph: HashMap<TxnId, HashSet<TxnId>> = HashMap::new();
         for entry in state.lock_table.values(){
@@ -505,10 +504,7 @@ impl LockManager {
 fn detect_cycle(graph: &HashMap<TxnId, HashSet<TxnId>>,
                 start_txn: TxnId,
                 ) -> Option<Vec<TxnId>> {
-    let start_neighbors = match graph.get(&start_txn) {
-            Some(neighbors) => neighbors,
-            None => return None,
-    };
+    let start_neighbors = graph.get(&start_txn)?;
 
     let mut parent: HashMap<TxnId,TxnId> = HashMap::new();
     let mut queue: VecDeque<TxnId> = VecDeque::new();
@@ -544,10 +540,10 @@ fn detect_cycle(graph: &HashMap<TxnId, HashSet<TxnId>>,
                 cycle.push(start_txn);
                 return Some(cycle);
             }
-            if !parent.contains_key(&neighbor) {
-                parent.insert(neighbor, current);
+            if let std::collections::hash_map::Entry::Vacant(e) = parent.entry(neighbor) {
+                e.insert(current);
                 queue.push_back(neighbor);
-                }
+            }
             }
         }
         None

@@ -75,6 +75,10 @@ pub struct ArcReplacer {
 
     /// Imported page scores waiting for frame assignment.
     pending_page_scores: HashMap<PageId, u64>,
+
+    /// Tracks whether evict_for_page already adapted p for a ghost hit.
+    /// Consumed by record_access to avoid double-adaptation.
+    pending_adaptation: PendingAdaptation,
 }
 
 /// Tracks which list a frame belongs to.
@@ -82,6 +86,20 @@ pub struct ArcReplacer {
 enum ListLocation {
     T1,
     T2,
+}
+
+/// Tracks whether evict_for_page already adapted p for a ghost hit.
+///
+/// When evict_for_page detects that the incoming page is in B1 or B2,
+/// it adapts p immediately (matching the paper's order: adapt → REPLACE).
+/// record_access then checks this to avoid double-adaptation.
+/// The PageId ensures stale state from a different page is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAdaptation {
+    /// No pending adaptation.
+    None,
+    /// p was already adapted for this page in evict_for_page.
+    Done(PageId),
 }
 
 impl ArcReplacer {
@@ -102,6 +120,7 @@ impl ArcReplacer {
             frame_to_page: HashMap::new(),
             evictable: HashSet::new(),
             pending_page_scores: HashMap::new(),
+            pending_adaptation: PendingAdaptation::None,
         }
     }
 
@@ -283,31 +302,43 @@ impl EvictionPolicy for ArcReplacer {
         let b2_hit = self.in_b2(page_id);
 
         if b1_hit {
-            // Case II: Page in B1 → adapt p upward, move to T2
-            self.remove_from_b1(page_id);
-
-            // Increase p: delta = max(1, |B2| / |B1|)
-            let delta = if self.b1.is_empty() {
-                1
+            // Case II: Page in B1 → adapt p upward, move to T2.
+            let already_adapted = matches!(
+                self.pending_adaptation,
+                PendingAdaptation::Done(pid) if pid == page_id
+            );
+            if already_adapted {
+                // evict_for_page already adapted p with correct ghost sizes.
+                self.pending_adaptation = PendingAdaptation::None;
             } else {
-                std::cmp::max(1, self.b2.len() / self.b1.len().max(1))
-            };
-            self.p = std::cmp::min(self.c, self.p.saturating_add(delta));
+                // Fallback (evict() was used). Compute delta BEFORE removal
+                // so |B1| reflects the original size (paper's order).
+                let delta = std::cmp::max(1, self.b2.len() / self.b1.len().max(1));
+                self.p = std::cmp::min(self.c, self.p.saturating_add(delta));
+            }
+
+            // Remove from B1 AFTER delta computation (paper: "move x from B1 to T2").
+            self.remove_from_b1(page_id);
 
             // Add to T2 (MRU)
             self.t2.push_back(frame_id);
             self.frame_location.insert(frame_id, ListLocation::T2);
         } else if b2_hit {
-            // Case III: Page in B2 → adapt p downward, move to T2
-            self.remove_from_b2(page_id);
-
-            // Decrease p: delta = max(1, |B1| / |B2|)
-            let delta = if self.b2.is_empty() {
-                1
+            // Case III: Page in B2 → adapt p downward, move to T2.
+            let already_adapted = matches!(
+                self.pending_adaptation,
+                PendingAdaptation::Done(pid) if pid == page_id
+            );
+            if already_adapted {
+                self.pending_adaptation = PendingAdaptation::None;
             } else {
-                std::cmp::max(1, self.b1.len() / self.b2.len().max(1))
-            };
-            self.p = self.p.saturating_sub(delta);
+                // Fallback: compute delta BEFORE removal (paper's order).
+                let delta = std::cmp::max(1, self.b1.len() / self.b2.len().max(1));
+                self.p = self.p.saturating_sub(delta);
+            }
+
+            // Remove from B2 AFTER delta computation (paper: "move x from B2 to T2").
+            self.remove_from_b2(page_id);
 
             // Add to T2 (MRU)
             self.t2.push_back(frame_id);
@@ -340,9 +371,38 @@ impl EvictionPolicy for ArcReplacer {
             return None;
         }
 
-        // Use REPLACE subroutine
-        // We don't have a B2 hit context here, so pass false
+        // Fallback: no incoming page context, so in_b2=false and no p adaptation.
+        // Callers that know the incoming page should use evict_for_page instead.
+        self.pending_adaptation = PendingAdaptation::None;
         self.replace(false)
+    }
+
+    fn evict_for_page(&mut self, incoming_page: PageId) -> Option<FrameId> {
+        if self.evictable.is_empty() {
+            return None;
+        }
+
+        // Paper's order: check ghost lists → adapt p → REPLACE(x, p).
+        // Delta uses original ghost sizes (x still in B1/B2).
+        let in_b1 = self.in_b1(incoming_page);
+        let in_b2 = self.in_b2(incoming_page);
+
+        if in_b1 {
+            // Case II adaptation: increase p (favor recency).
+            let delta = std::cmp::max(1, self.b2.len() / self.b1.len().max(1));
+            self.p = std::cmp::min(self.c, self.p.saturating_add(delta));
+            self.pending_adaptation = PendingAdaptation::Done(incoming_page);
+        } else if in_b2 {
+            // Case III adaptation: decrease p (favor frequency).
+            let delta = std::cmp::max(1, self.b1.len() / self.b2.len().max(1));
+            self.p = self.p.saturating_sub(delta);
+            self.pending_adaptation = PendingAdaptation::Done(incoming_page);
+        } else {
+            self.pending_adaptation = PendingAdaptation::None;
+        }
+
+        // REPLACE with updated p and correct in_b2 flag.
+        self.replace(in_b2)
     }
 
     fn remove(&mut self, frame_id: FrameId) {

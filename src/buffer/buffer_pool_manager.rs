@@ -182,7 +182,7 @@ impl BufferPoolManager {
     /// Unlike `fetch_page_write`, this initializes the page to zeros
     /// instead of reading from disk (since it's a new page).
     fn fetch_page_write_new(&self, page_id: PageId) -> Result<PageWriteGuard<'_>> {
-        let frame_id = self.get_free_frame()?;
+        let frame_id = self.get_free_frame(page_id)?;
 
         let frame = &self.frames[frame_id.0];
 
@@ -449,7 +449,7 @@ impl BufferPoolManager {
     fn handle_cache_miss(&self, page_id: PageId) -> Result<FrameId> {
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        let frame_id = self.get_free_frame()?;
+        let frame_id = self.get_free_frame(page_id)?;
 
         let page_data = {
             let mut dm = self.disk_manager.lock();
@@ -486,20 +486,20 @@ impl BufferPoolManager {
     // Internal: Frame allocation and eviction
     // ========================================================================
 
-    fn get_free_frame(&self) -> Result<FrameId> {
+    fn get_free_frame(&self, incoming_page: PageId) -> Result<FrameId> {
         {
             let mut fl = self.free_list.lock();
             if let Some(frame_id) = fl.pop() {
                 return Ok(frame_id);
             }
         }
-        self.evict_page()
+        self.evict_page(incoming_page)
     }
 
-    fn evict_page(&self) -> Result<FrameId> {
+    fn evict_page(&self, incoming_page: PageId) -> Result<FrameId> {
         let frame_id = {
             let mut replacer = self.replacer.lock();
-            replacer.evict().ok_or(Error::NoFreeFrames)?
+            replacer.evict_for_page(incoming_page).ok_or(Error::NoFreeFrames)?
         };
 
         self.stats.evictions.fetch_add(1, Ordering::Relaxed);

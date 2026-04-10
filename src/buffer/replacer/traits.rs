@@ -142,6 +142,17 @@ pub trait EvictionPolicy: Send {
     /// The chosen frame is removed from the policy's tracking structures.
     fn evict(&mut self) -> Option<FrameId>;
 
+    /// Select and remove the next frame to evict, given the incoming page.
+    ///
+    /// Policies that need the incoming page context for eviction decisions
+    /// override this. ARC uses it to check B2 ghost membership and adapt p
+    /// before REPLACE, matching the paper's algorithm order.
+    ///
+    /// The default delegates to `evict()`, ignoring the hint.
+    fn evict_for_page(&mut self, _incoming_page: PageId) -> Option<FrameId> {
+        self.evict()
+    }
+
     /// Remove a frame from the policy entirely.
     ///
     /// Called when a page is deleted from the buffer pool. The frame should

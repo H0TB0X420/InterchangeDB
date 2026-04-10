@@ -1,23 +1,29 @@
 //! Eviction policy benchmarks.
 //!
-//! Compares all six eviction policies across four workload patterns.
-//! Tracks both throughput (ops/sec via criterion) and hit rate.
+//! Compares all six eviction policies across five workload patterns
+//! (hit rate + throughput) and a dedicated ARC Theorem 4 survival test.
 //!
-//! ## Workloads
+//! ## Workloads (hit rate + throughput)
 //! - **Sequential**: linear scan through pages 0..N
 //! - **Random**: uniform random page access
 //! - **Zipfian**: skewed access — a few hot pages get most accesses
-//! - **LoopingScan**: repeated sequential scans (exposes LRU thrashing)
+//! - **CyclicScan**: repeated cyclic scans (exposes ARC/LRU thrashing on cyclic access)
 //! - **ScanPlusHot**: hot pages mixed with a large sequential scan (classic scan resistance test)
 //!
+//! ## Hot Page Survival (ARC Theorem 4)
+//! Measures what fraction of hot pages remain in cache after a one-time
+//! sequential scan. This directly tests scan resistance — aggregate hit rate
+//! masks the effect because O(pool_size) misses are invisible in long traces.
+//!
 //! ## Expected relative performance
-//! | Workload     | Best performers         | Worst performers       |
-//! |-------------|------------------------|------------------------|
-//! | Sequential  | All similar (no reuse) | —                      |
-//! | Random      | All similar            | —                      |
-//! | Zipfian     | LRU, LRU-K, 2Q, ARC   | FIFO                   |
-//! | LoopingScan | 2Q                     | LRU, FIFO, Clock       |
-//! | ScanPlusHot | LRU-K, 2Q, ARC        | FIFO, Clock, LRU       |
+//! | Workload      | Best performers         | Worst performers       |
+//! |--------------|------------------------|------------------------|
+//! | Sequential   | All similar (no reuse) | —                      |
+//! | Random       | All similar            | —                      |
+//! | Zipfian      | LRU, LRU-K, 2Q, ARC   | FIFO                   |
+//! | CyclicScan   | 2Q                     | LRU, FIFO, Clock, ARC  |
+//! | ScanPlusHot  | LRU-K, 2Q, ARC        | FIFO, Clock, LRU       |
+//! | Survival     | LRU-K, 2Q, ARC        | FIFO, Clock, LRU       |
 //!
 //! ## Running
 //! ```sh
@@ -45,9 +51,11 @@ enum Workload {
     Random,
     /// Skewed access: ~80% of accesses hit ~20% of pages.
     Zipfian,
-    /// Repeated sequential scans: 0..S, 0..S, 0..S, ...
-    /// where S > pool_size. Exposes LRU thrashing.
-    LoopingScan,
+    /// Repeated cyclic scans: 0..S, 0..S, 0..S, ...
+    /// where S > pool_size. Exposes the difference between "scan resistant"
+    /// (protects T2 from one-time scans) and "cycle resistant" (handles
+    /// repeated loops). ARC degenerates to LRU here; 2Q does not.
+    CyclicScan,
     /// Hot pages mixed with a sequential scan.
     /// ~50% of accesses hit a small hot set, ~50% are a linear scan
     /// over a range larger than the pool. Scan-resistant policies
@@ -61,17 +69,18 @@ impl Workload {
             Workload::Sequential => "sequential",
             Workload::Random => "random",
             Workload::Zipfian => "zipfian",
-            Workload::LoopingScan => "looping_scan",
+            Workload::CyclicScan => "cyclic_scan",
             Workload::ScanPlusHot => "scan+hot",
         }
     }
 
+    /// Workloads for hit rate and criterion throughput benchmarks.
     fn all() -> &'static [Workload] {
         &[
             Workload::Sequential,
             Workload::Random,
             Workload::Zipfian,
-            Workload::LoopingScan,
+            Workload::CyclicScan,
             Workload::ScanPlusHot,
         ]
     }
@@ -79,7 +88,7 @@ impl Workload {
 
 /// Generates a sequence of page accesses for a given workload.
 ///
-/// `pool_size` is used by LoopingScan to set the scan range just above the pool capacity.
+/// `pool_size` is used by CyclicScan to set the scan range just above the pool capacity.
 fn generate_access_sequence(
     workload: Workload,
     num_pages: usize,
@@ -120,7 +129,7 @@ fn generate_access_sequence(
                 seq.push(PageId::new(page as u32));
             }
         }
-        Workload::LoopingScan => {
+        Workload::CyclicScan => {
             // Scan range slightly larger than pool, creating repeated full scans.
             // This is the classic scenario where LRU thrashes but scan-resistant
             // policies (LRU-K, 2Q, ARC) can retain some useful pages.
@@ -225,8 +234,8 @@ impl SimulatedPool {
         let frame_id = if let Some(fid) = self.free_list.pop() {
             fid
         } else {
-            // Evict
-            let victim = self.policy.evict().expect("no evictable frames");
+            // Evict — pass incoming page so ARC can check B2 before REPLACE.
+            let victim = self.policy.evict_for_page(page_id).expect("no evictable frames");
             if let Some(old_page) = self.frame_to_page[victim.0].take() {
                 self.page_table.remove(&old_page);
             }
@@ -246,6 +255,11 @@ impl SimulatedPool {
         } else {
             self.hits as f64 / total as f64
         }
+    }
+
+    /// Check if a page is currently in the cache.
+    fn contains_page(&self, page_id: PageId) -> bool {
+        self.page_table.contains_key(&page_id)
     }
 }
 
@@ -366,6 +380,124 @@ fn print_hit_rate_summary() {
     }
 }
 
+// ============================================================================
+// Hot page survival report (ARC Theorem 4)
+// ============================================================================
+
+/// Measure hot page survival after a one-time sequential scan.
+///
+/// ARC Theorem 4 states: a single pass through N > c cold pages does not
+/// evict any page from T2. This directly tests that claim by:
+/// 1. Warming up a hot set (Zipfian, enough touches for T2/Am promotion)
+/// 2. Running a one-time sequential scan over cold pages (disjoint from hot set)
+/// 3. Counting how many hot pages are still in the cache
+///
+/// The metric is **survival rate**, not hit rate. A one-time scan costs at
+/// most O(c) misses which is invisible in aggregate hit rate, but survival
+/// rate exposes whether the policy protected its hot set.
+fn print_survival_summary() {
+    let factories = policy_factories();
+    let pool_size = POOL_SIZE;
+    let num_pages = NUM_PAGES;
+    let hot_set_size = pool_size / 4;
+
+    // Hot pages: 0..hot_set_size
+    let hot_pages: Vec<PageId> = (0..hot_set_size)
+        .map(|i| PageId::new(i as u32))
+        .collect();
+
+    // Cold page range: disjoint from hot set.
+    let cold_start = hot_set_size;
+    let cold_range = num_pages - hot_set_size;
+
+    // Warmup: three-phase approach that establishes hot pages in the
+    // protected queue for ALL scan-resistant policies:
+    //
+    // Phase A: Access each hot page 3 times.
+    //   - ARC: first access → T1, second → T2 (promoted). Third → T2 MRU.
+    //   - LRU-K: accumulates K=2 backward distance history.
+    //   - 2Q: enters A1in, re-accesses stay in A1in (no promotion yet).
+    //   - LRU: moves to MRU position.
+    //
+    // Phase B: Flood with pool_size cold pages.
+    //   - ARC: cold pages churn through T1; hot pages safe in T2.
+    //   - 2Q: cold pages fill pool, eventually evict hot from A1in → A1out.
+    //   - LRU: cold pages push hot pages toward LRU end.
+    //
+    // Phase C: Access each hot page once.
+    //   - ARC: T2 hit (already protected). No change.
+    //   - 2Q: A1out ghost hit → promoted to Am. Now protected!
+    //   - LRU-K: refreshes backward distance.
+    //   - LRU: moves back to MRU position.
+    let mut warmup_seq = Vec::new();
+
+    // Phase A: establish hot pages (3 touches each)
+    for _ in 0..3 {
+        for &page_id in &hot_pages {
+            warmup_seq.push(page_id);
+        }
+    }
+
+    // Phase B: cold flood (fills pool, forces A1in evictions for 2Q).
+    // Uses cold pages from [cold_start, cold_start + pool_size).
+    let warmup_cold_end = cold_start + pool_size;
+    for i in 0..pool_size {
+        warmup_seq.push(PageId::new((cold_start + (i % cold_range)) as u32));
+    }
+
+    // Phase C: re-access hot pages (ghost hit → Am for 2Q)
+    for &page_id in &hot_pages {
+        warmup_seq.push(page_id);
+    }
+
+    // Scan: one-time sequential pass over NOVEL cold pages.
+    // Uses a disjoint range from the warmup cold pages to avoid ghost
+    // list hits. Ghost hits would promote scan pages to T2/Am, polluting
+    // the protected queue and defeating the purpose of the test.
+    //
+    // Available novel cold pages: [warmup_cold_end, num_pages).
+    let scan_cold_start = warmup_cold_end;
+    let scan_cold_range = num_pages - scan_cold_start;
+    assert!(scan_cold_range > pool_size, "not enough novel cold pages for scan");
+    let scan_length = scan_cold_range; // one access per unique cold page
+    let scan_seq: Vec<PageId> = (0..scan_length)
+        .map(|i| PageId::new((scan_cold_start + i) as u32))
+        .collect();
+
+    println!();
+    println!("## Hot Page Survival After One-Time Scan (ARC Theorem 4)");
+    println!("Pool={}, hot_set={}, scan={} cold pages", pool_size, hot_set_size, scan_length);
+    println!();
+    println!("| {:>10} | {:>10} | {:>10} |", "Policy", "survived", "survival %");
+    println!("|{:-<12}|{:-<12}|{:-<12}|", "", "", "");
+
+    for factory in &factories {
+        let policy = (factory.make)(pool_size);
+        let mut pool = SimulatedPool::new(policy, pool_size);
+
+        // Phase 1: warmup — establish hot pages in cache
+        for &page_id in &warmup_seq {
+            pool.access(page_id);
+        }
+
+        // Phase 2: one-time sequential scan — try to displace hot pages
+        for &page_id in &scan_seq {
+            pool.access(page_id);
+        }
+
+        // Measure: how many hot pages survived?
+        let surviving = hot_pages.iter()
+            .filter(|&&pid| pool.contains_page(pid))
+            .count();
+        let survival_pct = surviving as f64 / hot_pages.len() as f64 * 100.0;
+
+        println!(
+            "| {:>10} | {:>7}/{:<2} | {:>9.1}% |",
+            factory.name, surviving, hot_pages.len(), survival_pct
+        );
+    }
+}
+
 criterion_group!(benches, bench_eviction_policies);
 
 fn main() {
@@ -373,6 +505,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "summary") {
         print_hit_rate_summary();
+        print_survival_summary();
         return;
     }
 

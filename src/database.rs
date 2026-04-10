@@ -23,14 +23,14 @@ use std::ops::RangeBounds;
 use std::path::Path;
 
 use crate::buffer::BufferPoolManager;
+use crate::common::Error;
 use crate::common::Result;
 use crate::index::btree::BTreeEngine;
 use crate::index::lsm::LsmEngine;
 use crate::storage::{ScanIterator, StorageEngine, StorageStatus};
-use crate::wal::{LogRecord, Wal, LogPayload};
-use crate::common::Error;
-use crate::txn::{TransactionManager, TxnId, TxnMode};
 use crate::txn::lock_manager::LockMode;
+use crate::txn::{TransactionManager, TxnId, TxnMode};
+use crate::wal::{LogPayload, LogRecord, Wal};
 
 /// A database instance parameterized by storage engine.
 ///
@@ -59,7 +59,11 @@ impl<E: StorageEngine> Database<E> {
     /// This preserves backward compatibility — all existing tests continue
     /// to work unchanged.
     pub fn new(engine: E) -> Self {
-        Self { engine, wal: None , txn_manager: None}
+        Self {
+            engine,
+            wal: None,
+            txn_manager: None,
+        }
     }
 
     /// Open a WAL-enabled database.
@@ -72,11 +76,8 @@ impl<E: StorageEngine> Database<E> {
 
         // Run recovery: replay WAL records into the engine.
         let reader = wal.reader()?;
-        let _stats = crate::wal::recovery::recover(
-            &reader,
-            &mut engine,
-            wal.last_checkpoint_lsn(),
-        )?;
+        let _stats =
+            crate::wal::recovery::recover(&reader, &mut engine, wal.last_checkpoint_lsn())?;
 
         Ok(Self {
             engine,
@@ -184,7 +185,8 @@ impl<E: StorageEngine> Database<E> {
         // Step 1: Flush engine data to disk.
         self.engine.flush()?;
 
-        let active_txn_ids = self.txn_manager
+        let active_txn_ids = self
+            .txn_manager
             .as_ref()
             .map(|mgr| mgr.active_txn_ids())
             .unwrap_or_default();
@@ -203,7 +205,7 @@ impl<E: StorageEngine> Database<E> {
         Ok(())
     }
 
-    pub fn begin_txn(&mut self, mode:TxnMode) -> Result<TxnId> {
+    pub fn begin_txn(&mut self, mode: TxnMode) -> Result<TxnId> {
         let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
 
@@ -231,7 +233,7 @@ impl<E: StorageEngine> Database<E> {
         let mut record = LogRecord::commit(txn_id.0, prev_lsn, commit_ts);
         wal.append(&mut record)?;
         wal.sync()?;
-        
+
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
         txn_mgr.lock_manager().release_all(txn_id);
         txn_mgr.commit(txn_id)?;
@@ -239,62 +241,68 @@ impl<E: StorageEngine> Database<E> {
         Ok(())
     }
 
-    pub fn txn_get(&mut self, txn_id: TxnId, key: &[u8]) -> 
-Result<Option<Vec<u8>>> {
-                
+    pub fn txn_get(&mut self, txn_id: TxnId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
-        txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Shared)?;
+        txn_mgr
+            .lock_manager()
+            .acquire(txn_id, key, LockMode::Shared)?;
         self.engine.get(key)
     }
 
-    pub fn txn_put(&mut self, txn_id: TxnId, key: &[u8], value: &[u8]) -> Result<()>
-    {
+    pub fn txn_put(&mut self, txn_id: TxnId, key: &[u8], value: &[u8]) -> Result<()> {
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
         if txn_mgr.mode(txn_id)? == TxnMode::ReadOnly {
             return Err(Error::TxnReadOnly(txn_id.0));
         }
-        
-        txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Exclusive)?;
-        
+
+        txn_mgr
+            .lock_manager()
+            .acquire(txn_id, key, LockMode::Exclusive)?;
+
         let old_value = self.engine.get(key)?;
         let prev_lsn = self.txn_manager.as_ref().unwrap().last_lsn(txn_id)?;
         let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
-        let mut record = LogRecord::txn_put(
-            txn_id.0, prev_lsn, key.to_vec(), value.to_vec(), old_value,
-        );
+        let mut record =
+            LogRecord::txn_put(txn_id.0, prev_lsn, key.to_vec(), value.to_vec(), old_value);
         let lsn = wal.append(&mut record);
         wal.sync()?;
 
-        self.txn_manager.as_mut().unwrap().update_last_lsn(txn_id, lsn?)?;
-         self.engine.put(key, value)
+        self.txn_manager
+            .as_mut()
+            .unwrap()
+            .update_last_lsn(txn_id, lsn?)?;
+        self.engine.put(key, value)
     }
 
     pub fn txn_delete(&mut self, txn_id: TxnId, key: &[u8]) -> Result<()> {
-         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
+        let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
         if txn_mgr.mode(txn_id)? == TxnMode::ReadOnly {
             return Err(Error::TxnReadOnly(txn_id.0));
         }
-        
-        txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Exclusive)?;
-        
+
+        txn_mgr
+            .lock_manager()
+            .acquire(txn_id, key, LockMode::Exclusive)?;
+
         let old_value = self.engine.get(key)?;
         let prev_lsn = self.txn_manager.as_ref().unwrap().last_lsn(txn_id)?;
         let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
-        let mut record = LogRecord::txn_delete(
-            txn_id.0, prev_lsn, key.to_vec(), old_value,
-        );
+        let mut record = LogRecord::txn_delete(txn_id.0, prev_lsn, key.to_vec(), old_value);
         let lsn = wal.append(&mut record);
         wal.sync()?;
 
-        self.txn_manager.as_mut().unwrap().update_last_lsn(txn_id, lsn?)?;
-        self.engine.delete(key)        
+        self.txn_manager
+            .as_mut()
+            .unwrap()
+            .update_last_lsn(txn_id, lsn?)?;
+        self.engine.delete(key)
     }
 
     pub fn txn_abort(&mut self, txn_id: TxnId) -> Result<()> {
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
         let last_lsn = txn_mgr.last_lsn(txn_id)?;
 
-        if last_lsn.is_valid() {    
+        if last_lsn.is_valid() {
             let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
             let reader = wal.reader()?;
 
@@ -302,22 +310,24 @@ Result<Option<Vec<u8>>> {
                 .scan_forward(crate::wal::Lsn::new(0))
                 .filter_map(|r| r.ok())
                 .filter(|r| r.txn_id == txn_id.0)
-                .collect(); //need to add to wal for O(1) random access 
+                .collect(); //need to add to wal for O(1) random access
                             //This is v ineffcient in comparison
 
             for record in txn_records.iter().rev() {
                 match &record.payload {
-                    LogPayload::TxnPut {key, old_value, .. } => {
-                        match old_value {
-                            Some(ov) => self.engine.put(key, ov)?,
-                            None => {let _ = self.engine(); }
+                    LogPayload::TxnPut { key, old_value, .. } => match old_value {
+                        Some(ov) => self.engine.put(key, ov)?,
+                        None => {
+                            let _ = self.engine.delete(key);
                         }
+                    },
+                    LogPayload::TxnDelete {
+                        key,
+                        old_value: Some(ov),
+                    } => {
+                        self.engine.put(key, ov)?;
                     }
-                    LogPayload::TxnDelete {key, old_value} => {
-                        if let Some(ov) = old_value {
-                            self.engine.put(key, ov)?;
-                        }
-                    }
+                    LogPayload::TxnDelete { .. } => {}
                     _ => {}
                 }
             }
@@ -334,7 +344,6 @@ Result<Option<Vec<u8>>> {
         txn_mgr.abort(txn_id)?;
 
         Ok(())
-
     }
 }
 
