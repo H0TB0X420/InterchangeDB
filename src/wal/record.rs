@@ -93,8 +93,8 @@ pub enum LogPayload {
     /// Abort transaction (no payload).
     Abort,
 
-    /// Checkpoint with list of active transaction IDs.
-    Checkpoint { active_txn_ids: Vec<u64> },
+    /// Checkpoint with list of active transaction IDs and oracle timestamp.
+    Checkpoint { active_txn_ids: Vec<u64>, oracle_ts: u64 },
 
     ///Txn put with old value for undo
     TxnPut {
@@ -195,12 +195,12 @@ impl LogRecord {
     }
 
     /// Create a Checkpoint record.
-    pub fn checkpoint(active_txn_ids: Vec<u64>) -> Self {
+    pub fn checkpoint(active_txn_ids: Vec<u64>, oracle_ts: u64) -> Self {
         Self {
             lsn: Lsn::INVALID,
             txn_id: 0,
             prev_lsn: Lsn::INVALID,
-            payload: LogPayload::Checkpoint { active_txn_ids },
+            payload: LogPayload::Checkpoint { active_txn_ids, oracle_ts },
         }
     }
 
@@ -347,7 +347,7 @@ impl LogRecord {
             LogPayload::Begin => 0,
             LogPayload::Commit { .. } => 8,
             LogPayload::Abort => 0,
-            LogPayload::Checkpoint { active_txn_ids } => 4 + active_txn_ids.len() * 8,
+            LogPayload::Checkpoint { active_txn_ids, .. } => 4 + active_txn_ids.len() * 8 + 8,
             LogPayload::TxnPut {key, value, old_value } => {
                 let base = 2 + key.len() + 2 + value.len() + 1 ;
                 match old_value {
@@ -383,11 +383,12 @@ impl LogRecord {
                 buf.extend_from_slice(&commit_ts.to_le_bytes());
             }
             LogPayload::Abort => {}
-            LogPayload::Checkpoint { active_txn_ids } => {
+            LogPayload::Checkpoint { active_txn_ids, oracle_ts } => {
                 buf.extend_from_slice(&(active_txn_ids.len() as u32).to_le_bytes());
                 for txn_id in active_txn_ids {
                     buf.extend_from_slice(&txn_id.to_le_bytes());
                 }
+                buf.extend_from_slice(&oracle_ts.to_le_bytes());
             }
             LogPayload::TxnPut { key, value, old_value } => {
                 buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
@@ -493,7 +494,13 @@ impl LogRecord {
                         u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
                     active_txn_ids.push(txn_id);
                 }
-                Ok(LogPayload::Checkpoint { active_txn_ids })
+                let ts_offset = 4 + count * 8;
+                let oracle_ts = if buf.len() >= ts_offset + 8 {
+                    u64::from_le_bytes(buf[ts_offset..ts_offset + 8].try_into().unwrap())
+                } else {
+                    0 // Backward compat: old checkpoint records without oracle_ts.
+                };
+                Ok(LogPayload::Checkpoint { active_txn_ids, oracle_ts })
             }
             LogRecordType::TxnPut => {
                 // Layout: key_len:u16 | key | val_len:u16 | value | has_old:u8 | [old_len:u16 | old]
@@ -646,6 +653,7 @@ mod tests {
             prev_lsn: Lsn::INVALID,
             payload: LogPayload::Checkpoint {
                 active_txn_ids: vec![1, 2, 3, 42],
+                oracle_ts: 500,
             },
         };
         let encoded = record.encode();
@@ -656,7 +664,7 @@ mod tests {
 
     #[test]
     fn roundtrip_checkpoint_empty() {
-        let record = LogRecord::checkpoint(vec![]);
+        let record = LogRecord::checkpoint(vec![], 0);
         let mut record = LogRecord {
             lsn: Lsn::new(50),
             ..record
@@ -804,7 +812,7 @@ mod tests {
     fn record_type_discriminant() {
         assert_eq!(LogRecord::put(vec![], vec![]).record_type(), LogRecordType::Put);
         assert_eq!(LogRecord::delete(vec![]).record_type(), LogRecordType::Delete);
-        assert_eq!(LogRecord::checkpoint(vec![]).record_type(), LogRecordType::Checkpoint);
+        assert_eq!(LogRecord::checkpoint(vec![], 0).record_type(), LogRecordType::Checkpoint);
     }
 
     #[test]

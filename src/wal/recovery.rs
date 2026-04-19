@@ -1,16 +1,17 @@
 //! Crash recovery — replays WAL records into the storage engine.
 //!
-//! In auto-commit mode, every fully-decoded WAL record is considered
-//! committed. Recovery is a simple forward scan: replay every `Put` and
-//! `Delete` into the engine. `Begin`/`Commit`/`Abort`/`Checkpoint`
-//! records are skipped.
+//! Three-phase recovery with MVCC awareness:
+//! 1. Analysis: scan forward, classify transactions (committed vs aborted vs uncommitted).
+//! 2. Redo: replay committed txn operations and auto-commit operations.
+//! 3. Under MVCC, uncommitted versions are NOT undone — they stay in the engine
+//!    but are invisible (their txn_id never appears in committed_txns).
+//!    GC in Phase 7 physically removes them.
 //!
 //! Recovery is idempotent — replaying the same WAL twice produces the
-//! same engine state, because `put` overwrites and `delete` on a
-//! non-existent key is a no-op.
+//! same engine state.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
-use std::collections::HashSet;
 
 use crate::common::Result;
 use crate::storage::StorageEngine;
@@ -21,23 +22,23 @@ use crate::wal::{LogPayload, LogRecord, Lsn, WalReader};
 pub struct RecoveryStats {
     /// Total records scanned (including skipped types).
     pub records_scanned: u64,
-    /// Records actually replayed into the engine (Put + Delete).
+    /// Records actually replayed into the engine.
     pub records_redone: u64,
-    pub records_undone: u64,
+    /// Number of committed transactions found.
     pub txns_committed: u64,
-    pub txns_undone: u64,
     /// Wall-clock duration of recovery.
     pub duration: std::time::Duration,
+    /// Committed transactions map: txn_id -> commit_ts.
+    /// Passed to TransactionManager for MVCC visibility checks.
+    pub committed_txns: HashMap<u64, u64>,
+    /// Oracle timestamp from the last checkpoint record.
+    /// Used to restore the oracle on reopen so timestamps don't collide.
+    pub checkpoint_oracle_ts: u64,
 }
 
 /// Replay WAL records into the engine, starting from `last_checkpoint_lsn`.
 ///
-/// This is the core recovery algorithm for auto-commit mode:
-/// 1. Forward scan from the last checkpoint (or beginning if none).
-/// 2. Replay every `Put`/`Delete` into the engine.
-/// 3. Skip `Begin`/`Commit`/`Abort`/`Checkpoint`.
-///
-/// Returns statistics about the recovery process.
+/// Returns recovery stats including the committed_txns map needed by MVCC.
 pub fn recover<E: StorageEngine>(
     reader: &WalReader,
     engine: &mut E,
@@ -50,72 +51,89 @@ pub fn recover<E: StorageEngine>(
     } else {
         Lsn::new(0)
     };
-    
+
     let records: Vec<LogRecord> = reader
         .scan_forward(start_lsn)
         .collect::<Result<Vec<_>>>()?;
 
-
     let records_scanned = records.len() as u64;
-    let (committed, aborted) = analyze_transactions(&records);
-    let records_redone = redo_committed(engine, &records, &committed)?;
-    let (records_undone, txns_undone) = undo_uncommitted(engine, &records, &committed,&aborted)?;
 
-  
+    // Phase 1: Analysis — who committed, who aborted, last checkpoint oracle_ts.
+    let (committed_map, aborted, checkpoint_oracle_ts) = analyze_transactions(&records);
+
+    // Phase 2: Redo — replay committed operations.
+    let committed_set: HashSet<u64> = committed_map.keys().copied().collect();
+    let records_redone = redo_committed(engine, &records, &committed_set)?;
+
+    // Phase 3: Under MVCC, no undo needed. Uncommitted versions are invisible
+    // because their txn_id won't be in committed_txns. GC handles cleanup.
+    let _ = aborted;
+
     Ok(RecoveryStats {
         records_scanned,
         records_redone,
-        records_undone,
-        txns_committed: committed.len() as u64,
-        txns_undone,
+        txns_committed: committed_map.len() as u64,
         duration: start.elapsed(),
+        committed_txns: committed_map,
+        checkpoint_oracle_ts,
     })
 }
 
-fn analyze_transactions(records: &[LogRecord]) -> (HashSet<u64>, HashSet<u64>) {
-    let mut committed = HashSet::new();
+/// Phase 1: Forward scan to classify transactions.
+/// Returns (committed: txn_id -> commit_ts, aborted: set, last checkpoint oracle_ts).
+fn analyze_transactions(records: &[LogRecord]) -> (HashMap<u64, u64>, HashSet<u64>, u64) {
+    let mut committed = HashMap::new();
     let mut aborted = HashSet::new();
+    let mut checkpoint_oracle_ts: u64 = 0;
 
     for record in records {
         match &record.payload {
-            LogPayload::Commit {..} => {
-                committed.insert(record.txn_id);
+            LogPayload::Commit { commit_ts } => {
+                committed.insert(record.txn_id, *commit_ts);
             }
             LogPayload::Abort => {
                 aborted.insert(record.txn_id);
             }
+            LogPayload::Checkpoint { oracle_ts, .. } => {
+                checkpoint_oracle_ts = *oracle_ts;
+            }
             _ => {}
         }
     }
-    
-    (committed, aborted)
+
+    (committed, aborted, checkpoint_oracle_ts)
 }
 
+/// Phase 2: Replay committed transaction writes and auto-commit operations.
 fn redo_committed<E: StorageEngine>(
     engine: &mut E,
     records: &[LogRecord],
     committed: &HashSet<u64>,
-    ) -> Result<u64> {
+) -> Result<u64> {
     let mut redone: u64 = 0;
 
     for record in records {
         match &record.payload {
-            LogPayload::Put {key, value} => {
+            // Auto-commit put (legacy format, txn_id == 0).
+            LogPayload::Put { key, value } => {
                 engine.put(key, value)?;
                 redone += 1;
             }
-            LogPayload::Delete {key} => {
+            // Auto-commit delete (legacy format, txn_id == 0).
+            LogPayload::Delete { key } => {
                 engine.delete(key)?;
                 redone += 1;
             }
+            // Transactional put (MVCC-encoded key+value) — redo only if committed.
             LogPayload::TxnPut { key, value, .. } => {
                 if committed.contains(&record.txn_id) {
                     engine.put(key, value)?;
                     redone += 1;
                 }
             }
-            LogPayload::TxnDelete {key, ..} => {
-                if committed.contains(&record.txn_id){
+            // Transactional delete — redo only if committed.
+            LogPayload::TxnDelete { key, .. } => {
+                if committed.contains(&record.txn_id) {
                     engine.delete(key)?;
                     redone += 1;
                 }
@@ -125,53 +143,4 @@ fn redo_committed<E: StorageEngine>(
     }
 
     Ok(redone)
-}
-
-fn undo_uncommitted<E: StorageEngine>(
-    engine: &mut E,
-    records: &[LogRecord],
-    committed: &HashSet<u64>,
-    aborted: &HashSet<u64>,
-    ) -> Result<(u64, u64)> {
-        
-    let mut uncommitted = HashSet::new();
-    for record in records {
-        if record.txn_id != 0 
-            && !committed.contains(&record.txn_id)
-            && !aborted.contains(&record.txn_id)
-            {
-                uncommitted.insert(record.txn_id);
-            }
-    }
-
-    if uncommitted.is_empty() {
-        return Ok((0,0))
-    }
-
-    let mut undone: u64 = 0;
-
-    for record in records.iter().rev() {
-        if !uncommitted.contains(&record.txn_id) {
-            continue;
-        }
-
-        match &record.payload {
-            LogPayload::TxnPut { key, old_value, .. } => {
-                match old_value {
-                    Some(ov) => engine.put(key, ov)?,
-                    None => { let _ = engine.delete(key); }
-                }
-                undone += 1;
-            }
-            LogPayload::TxnDelete { key, old_value } => {
-                if let Some(ov) = old_value {
-                    engine.put(key, ov)?;
-                }
-                undone += 1;
-            }
-            _ => {}
-        }
-    }
-    let txns_undone = uncommitted.len() as u64;
-    Ok((undone, txns_undone))
 }

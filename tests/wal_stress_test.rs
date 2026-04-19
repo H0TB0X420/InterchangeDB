@@ -183,7 +183,7 @@ fn overwrite_storm() {
             let got = db.get(&key).unwrap();
             assert_eq!(got, Some(expected), "key {} wrong version", idx);
         }
-        assert_eq!(db.status().keys, key_count as u64);
+        assert_eq!(db.scan(..).count(), key_count as usize);
     }
 }
 
@@ -283,7 +283,7 @@ fn large_values() {
             assert_eq!(got.len(), value_size, "key {} wrong value length", i);
             assert_eq!(got, expected, "key {} wrong value content", i);
         }
-        assert_eq!(db.status().keys, key_count as u64);
+        assert_eq!(db.scan(..).count(), key_count as usize);
     }
 }
 
@@ -489,7 +489,7 @@ fn idempotent_recovery_loop() {
             );
         }
 
-        assert_eq!(db.status().keys, 50, "attempt {}: wrong key count", attempt);
+        assert_eq!(db.scan(..).count(), 50, "attempt {}: wrong key count", attempt);
     }
 }
 

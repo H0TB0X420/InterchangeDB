@@ -28,9 +28,11 @@ use crate::common::Result;
 use crate::index::btree::BTreeEngine;
 use crate::index::lsm::LsmEngine;
 use crate::storage::{ScanIterator, StorageEngine, StorageStatus};
+use crate::txn::gc::{self, GcStats};
 use crate::txn::lock_manager::LockMode;
-use crate::txn::{TransactionManager, TxnId, TxnMode};
-use crate::wal::{LogPayload, LogRecord, Wal};
+use crate::txn::mvcc::{self, MvccValue};
+use crate::txn::{Snapshot, TransactionManager, TxnId, TxnMode};
+use crate::wal::{LogRecord, Wal};
 
 /// A database instance parameterized by storage engine.
 ///
@@ -76,13 +78,34 @@ impl<E: StorageEngine> Database<E> {
 
         // Run recovery: replay WAL records into the engine.
         let reader = wal.reader()?;
-        let _stats =
+        let stats =
             crate::wal::recovery::recover(&reader, &mut engine, wal.last_checkpoint_lsn())?;
+
+        // Seed the transaction manager with committed_txns from recovery.
+        // This is required for MVCC visibility — without it, recovered
+        // versions would be invisible (no txn_id in committed_txns).
+        let mut txn_mgr = TransactionManager::new();
+        let recovered: std::collections::HashMap<TxnId, crate::txn::Timestamp> = stats
+            .committed_txns
+            .into_iter()
+            .map(|(id, ts)| (TxnId::new(id), crate::txn::Timestamp::new(ts)))
+            .collect();
+        txn_mgr.load_committed_txns(recovered);
+
+        // Restore oracle timestamp from checkpoint. This ensures new timestamps
+        // don't collide with pre-existing versions after WAL truncation.
+        if stats.checkpoint_oracle_ts > 0 {
+            txn_mgr.set_checkpoint_ts(crate::txn::Timestamp(stats.checkpoint_oracle_ts));
+            // Advance oracle past the persisted value.
+            while txn_mgr.ts_oracle_peek().0 <= stats.checkpoint_oracle_ts {
+                txn_mgr.advance_oracle();
+            }
+        }
 
         Ok(Self {
             engine,
             wal: Some(wal),
-            txn_manager: Some(TransactionManager::new()),
+            txn_manager: Some(txn_mgr),
         })
     }
 
@@ -92,37 +115,100 @@ impl<E: StorageEngine> Database<E> {
     }
 
     /// Retrieve a value by key.
+    ///
+    /// If MVCC is enabled (WAL mode), creates a temporary snapshot at the
+    /// latest timestamp and reads through the MVCC layer. Otherwise: direct.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.engine.get(key)
+        if let Some(ref txn_mgr) = self.txn_manager {
+            // Use the higher of oracle peek and checkpoint_ts as read_ts.
+            // After reopen, oracle may be low but checkpoint_ts covers old data.
+            let oracle_ts = txn_mgr.ts_oracle_peek();
+            let ckpt_ts = txn_mgr.checkpoint_ts();
+            let read_ts = if ckpt_ts > oracle_ts { ckpt_ts } else { oracle_ts };
+            let snapshot = Snapshot {
+                read_ts,
+                active_txns: std::collections::HashSet::new(),
+            };
+            let committed = txn_mgr.committed_txns();
+            mvcc::mvcc_get(&self.engine, key, TxnId::AUTO_COMMIT, &snapshot, committed, ckpt_ts)
+        } else {
+            self.engine.get(key)
+        }
     }
 
     /// Insert or update a key-value pair.
     ///
-    /// If WAL is enabled: log → sync → apply. Otherwise: direct apply.
+    /// If MVCC is enabled, wraps in an implicit transaction (begin→put→commit).
+    /// Otherwise: direct apply.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        if let Some(ref mut wal) = self.wal {
-            let mut record = LogRecord::put(key.to_vec(), value.to_vec());
-            wal.append(&mut record)?;
-            wal.sync()?;
+        if self.wal.is_some() {
+            let txn = self.begin_txn(TxnMode::ReadWrite)?;
+            self.txn_put(txn, key, value)?;
+            self.commit_txn(txn)?;
+            Ok(())
+        } else {
+            self.engine.put(key, value)
         }
-        self.engine.put(key, value)
     }
 
     /// Delete a key.
     ///
-    /// If WAL is enabled: log → sync → apply. Otherwise: direct apply.
+    /// If MVCC is enabled, wraps in an implicit transaction (begin→delete→commit).
+    /// Otherwise: direct apply.
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
-        if let Some(ref mut wal) = self.wal {
-            let mut record = LogRecord::delete(key.to_vec());
-            wal.append(&mut record)?;
-            wal.sync()?;
+        if self.wal.is_some() {
+            let txn = self.begin_txn(TxnMode::ReadWrite)?;
+            self.txn_delete(txn, key)?;
+            self.commit_txn(txn)?;
+            Ok(())
+        } else {
+            self.engine.delete(key)
         }
-        self.engine.delete(key)
     }
 
     /// Scan a range of keys in sorted order.
+    ///
+    /// Under MVCC, returns the newest visible version of each user key.
+    /// Without MVCC (no WAL), delegates directly to the engine.
     pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Box<dyn ScanIterator + '_> {
-        self.engine.scan(range)
+        if self.txn_manager.is_none() {
+            return self.engine.scan(range);
+        }
+
+        // MVCC path: collect visible versions into a Vec, wrap in iterator.
+        let txn_mgr = self.txn_manager.as_ref().unwrap();
+        let oracle_ts = txn_mgr.ts_oracle_peek();
+        let ckpt_ts = txn_mgr.checkpoint_ts();
+        let read_ts = if ckpt_ts > oracle_ts { ckpt_ts } else { oracle_ts };
+        let snapshot = Snapshot {
+            read_ts,
+            active_txns: std::collections::HashSet::new(),
+        };
+        let committed = txn_mgr.committed_txns();
+
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(k) => k.clone(),
+            std::ops::Bound::Excluded(k) => {
+                let mut next = k.clone();
+                next.push(0);
+                next
+            }
+            std::ops::Bound::Unbounded => vec![],
+        };
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(k) | std::ops::Bound::Excluded(k) => k.clone(),
+            std::ops::Bound::Unbounded => vec![0xFF; 32],
+        };
+
+        let results = mvcc::mvcc_scan(
+            &self.engine, &start, &end,
+            TxnId::AUTO_COMMIT, &snapshot, committed, txn_mgr.checkpoint_ts(),
+        );
+
+        match results {
+            Ok(pairs) => Box::new(pairs.into_iter().map(Ok)),
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        }
     }
 
     /// Get engine statistics.
@@ -190,7 +276,12 @@ impl<E: StorageEngine> Database<E> {
             .as_ref()
             .map(|mgr| mgr.active_txn_ids())
             .unwrap_or_default();
-        let mut record = LogRecord::checkpoint(active_txn_ids);
+        let oracle_ts = self
+            .txn_manager
+            .as_ref()
+            .map(|mgr| mgr.ts_oracle_peek().0)
+            .unwrap_or(0);
+        let mut record = LogRecord::checkpoint(active_txn_ids, oracle_ts);
         let checkpoint_lsn = wal.append(&mut record)?;
 
         // Step 3: Sync WAL.
@@ -202,7 +293,29 @@ impl<E: StorageEngine> Database<E> {
         // Update cached checkpoint LSN.
         wal.last_checkpoint_lsn = checkpoint_lsn;
 
+        // Update MVCC checkpoint watermark.
+        if let Some(ref mut txn_mgr) = self.txn_manager {
+            txn_mgr.set_checkpoint_ts(crate::txn::Timestamp(oracle_ts));
+        }
+
         Ok(())
+    }
+
+    /// Run garbage collection — remove old MVCC versions no longer visible.
+    ///
+    /// Computes the low-water mark from active snapshots, scans the engine
+    /// for reclaimable versions, and physically deletes them.
+    pub fn gc(&mut self) -> Result<GcStats> {
+        let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
+
+        let active_timestamps = txn_mgr.active_read_timestamps();
+        let low_water_mark = active_timestamps.iter().min().copied()
+            .unwrap_or(txn_mgr.ts_oracle_peek());
+
+        let committed = txn_mgr.committed_txns().clone();
+        let checkpoint_ts = txn_mgr.checkpoint_ts();
+
+        gc::gc_collect(&mut self.engine, low_water_mark, &committed, checkpoint_ts)
     }
 
     pub fn begin_txn(&mut self, mode: TxnMode) -> Result<TxnId> {
@@ -221,16 +334,16 @@ impl<E: StorageEngine> Database<E> {
         Ok(txn_id)
     }
 
+    /// Commit a transaction — assign commit_ts, make writes visible.
     pub fn commit_txn(&mut self, txn_id: TxnId) -> Result<()> {
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
         let prev_lsn = txn_mgr.last_lsn(txn_id)?;
 
-        let commit_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
+        // Assign commit_ts from oracle — this is when our writes become visible.
+        let commit_ts = txn_mgr.assign_commit_ts(txn_id)?;
+
         let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
-        let mut record = LogRecord::commit(txn_id.0, prev_lsn, commit_ts);
+        let mut record = LogRecord::commit(txn_id.0, prev_lsn, commit_ts.0);
         wal.append(&mut record)?;
         wal.sync()?;
 
@@ -241,102 +354,76 @@ impl<E: StorageEngine> Database<E> {
         Ok(())
     }
 
+    /// Read a value within a transaction using snapshot isolation (no locks).
     pub fn txn_get(&mut self, txn_id: TxnId, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
-        txn_mgr
-            .lock_manager()
-            .acquire(txn_id, key, LockMode::Shared)?;
-        self.engine.get(key)
+        let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
+        let snapshot = txn_mgr.snapshot(txn_id)?;
+        let committed = txn_mgr.committed_txns();
+        mvcc::mvcc_get(&self.engine, key, txn_id, snapshot, committed, txn_mgr.checkpoint_ts())
     }
 
+    /// Put a key-value pair within a transaction. Creates a new MVCC version.
     pub fn txn_put(&mut self, txn_id: TxnId, key: &[u8], value: &[u8]) -> Result<()> {
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
         if txn_mgr.mode(txn_id)? == TxnMode::ReadOnly {
             return Err(Error::TxnReadOnly(txn_id.0));
         }
+        txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Exclusive)?;
 
-        txn_mgr
-            .lock_manager()
-            .acquire(txn_id, key, LockMode::Exclusive)?;
+        let begin_ts = self.txn_manager.as_ref().unwrap().begin_ts(txn_id)?;
+        let mvcc_key = mvcc::encode_mvcc_key(key, begin_ts);
+        let mvcc_val = mvcc::encode_mvcc_value(&MvccValue::Value {
+            txn_id,
+            data: value.to_vec(),
+        });
 
-        let old_value = self.engine.get(key)?;
         let prev_lsn = self.txn_manager.as_ref().unwrap().last_lsn(txn_id)?;
         let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
-        let mut record =
-            LogRecord::txn_put(txn_id.0, prev_lsn, key.to_vec(), value.to_vec(), old_value);
-        let lsn = wal.append(&mut record);
+        let mut record = LogRecord::txn_put(
+            txn_id.0, prev_lsn, mvcc_key.clone(), mvcc_val.clone(), None,
+        );
+        let lsn = wal.append(&mut record)?;
         wal.sync()?;
 
-        self.txn_manager
-            .as_mut()
-            .unwrap()
-            .update_last_lsn(txn_id, lsn?)?;
-        self.engine.put(key, value)
+        self.txn_manager.as_mut().unwrap().update_last_lsn(txn_id, lsn)?;
+        self.engine.put(&mvcc_key, &mvcc_val)
     }
 
+    /// Delete a key within a transaction. Writes a tombstone MVCC version.
     pub fn txn_delete(&mut self, txn_id: TxnId, key: &[u8]) -> Result<()> {
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
         if txn_mgr.mode(txn_id)? == TxnMode::ReadOnly {
             return Err(Error::TxnReadOnly(txn_id.0));
         }
+        txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Exclusive)?;
 
-        txn_mgr
-            .lock_manager()
-            .acquire(txn_id, key, LockMode::Exclusive)?;
+        let begin_ts = self.txn_manager.as_ref().unwrap().begin_ts(txn_id)?;
+        let mvcc_key = mvcc::encode_mvcc_key(key, begin_ts);
+        let mvcc_val = mvcc::encode_mvcc_value(&MvccValue::Tombstone { txn_id });
 
-        let old_value = self.engine.get(key)?;
         let prev_lsn = self.txn_manager.as_ref().unwrap().last_lsn(txn_id)?;
         let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
-        let mut record = LogRecord::txn_delete(txn_id.0, prev_lsn, key.to_vec(), old_value);
-        let lsn = wal.append(&mut record);
+        let mut record = LogRecord::txn_put(
+            txn_id.0, prev_lsn, mvcc_key.clone(), mvcc_val.clone(), None,
+        );
+        let lsn = wal.append(&mut record)?;
         wal.sync()?;
 
-        self.txn_manager
-            .as_mut()
-            .unwrap()
-            .update_last_lsn(txn_id, lsn?)?;
-        self.engine.delete(key)
+        self.txn_manager.as_mut().unwrap().update_last_lsn(txn_id, lsn)?;
+        self.engine.put(&mvcc_key, &mvcc_val)
     }
 
+    /// Abort a transaction — no undo needed under MVCC.
+    ///
+    /// Aborted versions stay in the engine but are invisible (txn_id never
+    /// appears in committed_txns). GC in Phase 7 removes them.
     pub fn txn_abort(&mut self, txn_id: TxnId) -> Result<()> {
-        let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;
-        let last_lsn = txn_mgr.last_lsn(txn_id)?;
+        let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
+        let prev_lsn = txn_mgr.last_lsn(txn_id)?;
 
-        if last_lsn.is_valid() {
-            let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
-            let reader = wal.reader()?;
-
-            let txn_records: Vec<_> = reader
-                .scan_forward(crate::wal::Lsn::new(0))
-                .filter_map(|r| r.ok())
-                .filter(|r| r.txn_id == txn_id.0)
-                .collect(); //need to add to wal for O(1) random access
-                            //This is v ineffcient in comparison
-
-            for record in txn_records.iter().rev() {
-                match &record.payload {
-                    LogPayload::TxnPut { key, old_value, .. } => match old_value {
-                        Some(ov) => self.engine.put(key, ov)?,
-                        None => {
-                            let _ = self.engine.delete(key);
-                        }
-                    },
-                    LogPayload::TxnDelete {
-                        key,
-                        old_value: Some(ov),
-                    } => {
-                        self.engine.put(key, ov)?;
-                    }
-                    LogPayload::TxnDelete { .. } => {}
-                    _ => {}
-                }
-            }
-        }
-
-        let prev_lsn = self.txn_manager.as_ref().unwrap().last_lsn(txn_id)?;
         let wal = self.wal.as_mut().ok_or(Error::TxnNotSupported)?;
         let mut record = LogRecord::abort(txn_id.0, prev_lsn);
-        let _ = wal.append(&mut record);
+        wal.append(&mut record)?;
         wal.sync()?;
 
         let txn_mgr = self.txn_manager.as_mut().ok_or(Error::TxnNotSupported)?;

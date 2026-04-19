@@ -149,3 +149,178 @@ pub fn decode_mvcc_value(encoded: &[u8]) -> Result<MvccValue> {
         )),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Visibility
+// ---------------------------------------------------------------------------
+
+/// Determine if a version is visible to a transaction's snapshot.
+///
+/// Rules (evaluated in order):
+/// 1. Own writes are always visible.
+/// 2. Pre-checkpoint versions are assumed committed (their Commit record
+///    may have been in a truncated WAL segment).
+/// 3. If the writer never committed (not in committed_txns), invisible.
+/// 4. If the writer committed after our snapshot, invisible.
+/// 5. If the writer was active when our snapshot was taken, invisible.
+/// 6. Otherwise, visible.
+///
+/// `checkpoint_ts` is the timestamp watermark: any version written by a txn
+/// not found in committed_txns whose begin_ts <= checkpoint_ts is assumed
+/// committed pre-checkpoint. Pass Timestamp::ZERO if no checkpoint exists.
+pub fn is_visible(
+    version_txn_id: TxnId,
+    version_ts: Timestamp,
+    my_txn_id: TxnId,
+    snapshot: &Snapshot,
+    committed_txns: &HashMap<TxnId, Timestamp>,
+    checkpoint_ts: Timestamp,
+) -> bool {
+    // Rule 1: own writes.
+    if version_txn_id == my_txn_id {
+        return true;
+    }
+
+    // Rule 2 & 3: determine commit_ts.
+    let commit_ts = match committed_txns.get(&version_txn_id) {
+        Some(ts) => *ts,
+        None => {
+            // Not in committed_txns. If version was written before checkpoint,
+            // it survived truncation — assume committed with commit_ts = version_ts.
+            if version_ts <= checkpoint_ts {
+                version_ts
+            } else {
+                return false; // Not committed, not pre-checkpoint → invisible.
+            }
+        }
+    };
+
+    // Rule 4: committed after our snapshot.
+    if commit_ts > snapshot.read_ts {
+        return false;
+    }
+
+    // Rule 5: was in-flight when we took our snapshot.
+    if snapshot.active_txns.contains(&version_txn_id) {
+        return false;
+    }
+
+    // Rule 6: visible.
+    true
+}
+
+// ---------------------------------------------------------------------------
+// MVCC read path
+// ---------------------------------------------------------------------------
+
+/// Find the newest visible version of a user key.
+///
+/// Scans the engine for all versions of the key (newest first due to
+/// inverted timestamp encoding). Returns the first visible version's data,
+/// or None if the key doesn't exist or is tombstoned.
+pub fn mvcc_get<E: StorageEngine>(
+    engine: &E,
+    user_key: &[u8],
+    my_txn_id: TxnId,
+    snapshot: &Snapshot,
+    committed_txns: &HashMap<TxnId, Timestamp>,
+    checkpoint_ts: Timestamp,
+) -> Result<Option<Vec<u8>>> {
+    let start = encode_mvcc_key_start(user_key);
+    let end = encode_mvcc_key_end(user_key);
+
+    // Scan all versions of this key, newest first.
+    let iter = engine.scan(start..=end);
+
+    for result in iter {
+        let (encoded_key, encoded_value) = result?;
+
+        // Decode and verify this is still the same user key.
+        let (found_key, version_ts) = decode_mvcc_key(&encoded_key)?;
+        if found_key != user_key {
+            break;
+        }
+
+        // Decode value to get txn_id and data/tombstone.
+        let mvcc_val = decode_mvcc_value(&encoded_value)?;
+
+        let version_txn_id = match &mvcc_val {
+            MvccValue::Value { txn_id, .. } => *txn_id,
+            MvccValue::Tombstone { txn_id } => *txn_id,
+        };
+
+        // Check visibility.
+        if !is_visible(version_txn_id, version_ts, my_txn_id, snapshot, committed_txns, checkpoint_ts) {
+            continue;
+        }
+
+        // First visible version found.
+        return match mvcc_val {
+            MvccValue::Value { data, .. } => Ok(Some(data)),
+            MvccValue::Tombstone { .. } => Ok(None),
+        };
+    }
+
+    // No visible version exists for this key.
+    Ok(None)
+}
+
+/// Scan a range of user keys, returning the newest visible version of each.
+///
+/// Iterates over MVCC-encoded keys in the engine, groups by user key,
+/// and emits only the first (newest) visible version per user key.
+/// Tombstoned keys are excluded from results.
+pub fn mvcc_scan<E: StorageEngine>(
+    engine: &E,
+    start_key: &[u8],
+    end_key: &[u8],
+    my_txn_id: TxnId,
+    snapshot: &Snapshot,
+    committed_txns: &HashMap<TxnId, Timestamp>,
+    checkpoint_ts: Timestamp,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let scan_start = encode_mvcc_key_start(start_key);
+    let scan_end = encode_mvcc_key_end(end_key);
+
+    let iter = engine.scan(scan_start..=scan_end);
+
+    let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut current_user_key: Option<Vec<u8>> = None;
+    let mut found_visible_for_current = false;
+
+    for result in iter {
+        let (encoded_key, encoded_value) = result?;
+        let (user_key, version_ts) = decode_mvcc_key(&encoded_key)?;
+
+        // Moved to a new user key — reset tracking.
+        if current_user_key.as_ref() != Some(&user_key) {
+            current_user_key = Some(user_key.clone());
+            found_visible_for_current = false;
+        }
+
+        // Already found the newest visible version for this key — skip older versions.
+        if found_visible_for_current {
+            continue;
+        }
+
+        let mvcc_val = decode_mvcc_value(&encoded_value)?;
+        let version_txn_id = match &mvcc_val {
+            MvccValue::Value { txn_id, .. } => *txn_id,
+            MvccValue::Tombstone { txn_id } => *txn_id,
+        };
+
+        if !is_visible(version_txn_id, version_ts, my_txn_id, snapshot, committed_txns, checkpoint_ts) {
+            continue;
+        }
+
+        // First visible version for this user key.
+        found_visible_for_current = true;
+        if let MvccValue::Value { data, .. } = mvcc_val {
+            results.push((user_key, data));
+        }
+        // If tombstone: key is deleted, don't emit. But mark found so we skip older versions.
+    }
+
+    Ok(results)
+}
+

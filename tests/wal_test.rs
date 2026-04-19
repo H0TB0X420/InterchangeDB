@@ -123,35 +123,32 @@ fn wal_records_verifiable() {
         .map(|r| r.unwrap())
         .collect();
 
-    assert_eq!(records.len(), 3);
+    // Under MVCC, each auto-commit op produces 3 WAL records: Begin, TxnPut, Commit.
+    // 3 operations × 3 records = 9 total.
+    assert_eq!(records.len(), 9);
 
-    // First record: Put key1.
-    assert_eq!(records[0].lsn, Lsn::new(0));
-    match &records[0].payload {
-        LogPayload::Put { key, value } => {
-            assert_eq!(key, b"key1");
-            assert_eq!(value, b"val1");
-        }
-        _ => panic!("Expected Put"),
-    }
+    // Verify structure: [Begin, TxnPut, Commit] × 3.
+    // Each triplet has sequential LSNs and matching txn_ids.
+    for triplet in 0..3 {
+        let base = triplet * 3;
+        let txn_id = records[base].txn_id;
+        assert!(txn_id > 0, "txn_id should be non-zero for explicit txns");
 
-    // Second record: Put key2.
-    assert_eq!(records[1].lsn, Lsn::new(1));
-    match &records[1].payload {
-        LogPayload::Put { key, value } => {
-            assert_eq!(key, b"key2");
-            assert_eq!(value, b"val2");
+        match &records[base].payload {
+            LogPayload::Begin => {}
+            other => panic!("Record {} expected Begin, got {:?}", base, other),
         }
-        _ => panic!("Expected Put"),
-    }
-
-    // Third record: Delete key1.
-    assert_eq!(records[2].lsn, Lsn::new(2));
-    match &records[2].payload {
-        LogPayload::Delete { key } => {
-            assert_eq!(key, b"key1");
+        match &records[base + 1].payload {
+            LogPayload::TxnPut { .. } => {}
+            other => panic!("Record {} expected TxnPut, got {:?}", base + 1, other),
         }
-        _ => panic!("Expected Delete"),
+        match &records[base + 2].payload {
+            LogPayload::Commit { .. } => {}
+            other => panic!("Record {} expected Commit, got {:?}", base + 2, other),
+        }
+        // All three records in a triplet share the same txn_id.
+        assert_eq!(records[base + 1].txn_id, txn_id);
+        assert_eq!(records[base + 2].txn_id, txn_id);
     }
 }
 

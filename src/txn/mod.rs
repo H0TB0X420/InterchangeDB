@@ -20,6 +20,7 @@
 //! Begin(txn=1, prev=INVALID) → Put(txn=1, prev=lsn0) → Put(txn=1, prev=lsn1) → Commit(txn=1, prev=lsn2)
 //! ```
 
+pub mod gc;
 pub mod lock_manager;
 pub mod mvcc;
 
@@ -77,6 +78,12 @@ impl fmt::Display for Timestamp {
 /// begin_ts and commit_ts to transactions.
 pub struct TimestampOracle {
     next_ts: AtomicU64,
+}
+
+impl Default for TimestampOracle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TimestampOracle {
@@ -250,6 +257,9 @@ pub struct TransactionManager {
     lock_manager: LockManager,
     ts_oracle: TimestampOracle,
     committed_txns: HashMap<TxnId, Timestamp>,
+    /// Watermark: versions written before this timestamp are assumed committed
+    /// even if their Commit record was in a truncated WAL segment.
+    checkpoint_ts: Timestamp,
 }
 
 impl Default for TransactionManager {
@@ -267,6 +277,7 @@ impl TransactionManager {
             lock_manager: LockManager::new(),
             ts_oracle: TimestampOracle::new(),
             committed_txns: HashMap::new(),
+            checkpoint_ts: Timestamp::ZERO,
         }
     }
 
@@ -354,6 +365,11 @@ impl TransactionManager {
         self.active_txns.len()
     }
 
+    /// Get all active snapshot read_ts values (for GC watermark computation).
+    pub fn active_read_timestamps(&self) -> Vec<Timestamp> {
+        self.active_txns.values().map(|txn| txn.begin_ts).collect()
+    }
+
     /// Peek at the next transaction ID without consuming it.
     /// Used by Database to write Begin WAL record before calling begin().                                                
     pub fn next_txn_id_peek(&self) -> u64 {
@@ -396,6 +412,48 @@ impl TransactionManager {
     /// Peek at the oracle's current timestamp (for auto-commit snapshots).
     pub fn ts_oracle_peek(&self) -> Timestamp {
         self.ts_oracle.peek()
+    }
+
+    /// Get the checkpoint watermark timestamp.
+    pub fn checkpoint_ts(&self) -> Timestamp {
+        self.checkpoint_ts
+    }
+
+    /// Update checkpoint watermark (called after successful checkpoint).
+    pub fn set_checkpoint_ts(&mut self, ts: Timestamp) {
+        self.checkpoint_ts = ts;
+    }
+
+    /// Advance the oracle by one tick. Used during recovery to skip past
+    /// persisted timestamps so new timestamps don't collide.
+    pub fn advance_oracle(&mut self) {
+        self.ts_oracle.next();
+    }
+
+    /// Seed the committed_txns map from recovery.
+    /// Also advances the oracle past recovered timestamps.
+    pub fn load_committed_txns(&mut self, recovered: HashMap<TxnId, Timestamp>) {
+        let mut max_ts: u64 = 0;
+        let mut max_txn_id: u64 = 0;
+        for (&txn_id, &ts) in &recovered {
+            if ts.0 > max_ts {
+                max_ts = ts.0;
+            }
+            if txn_id.0 > max_txn_id {
+                max_txn_id = txn_id.0;
+            }
+        }
+        self.committed_txns = recovered;
+        // Advance oracle past any recovered timestamp so new timestamps don't collide.
+        while self.ts_oracle.peek().0 <= max_ts {
+            self.ts_oracle.next();
+        }
+        // Advance txn_id counter past any recovered txn.
+        if max_txn_id >= self.next_txn_id {
+            self.next_txn_id = max_txn_id + 1;
+        }
+        // Set checkpoint watermark so pre-recovery versions are visible.
+        self.checkpoint_ts = Timestamp(max_ts);
     }
 
     // -----------------------------------------------------------------------
