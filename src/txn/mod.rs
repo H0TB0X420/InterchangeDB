@@ -21,15 +21,100 @@
 //! ```
 
 pub mod lock_manager;
+pub mod mvcc;
 
 use std::collections::HashMap;
 use std::fmt;
 
 use crate::common::{Error, Result};
 use crate::wal::Lsn;
-
 pub use lock_manager::{LockManager, LockMode};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+// ---------------------------------------------------------------------------
+// Timestamp — monotonic counter for MVCC version ordering
+// ---------------------------------------------------------------------------
+
+/// Monotonic timestamp for MVCC version ordering.
+///
+/// Assigned by `TimestampOracle`. Each transaction gets a `begin_ts` at start
+/// and a `commit_ts` at commit. Visibility rules use these to determine which
+/// versions a snapshot can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Timestamp(pub u64);
+
+impl Timestamp {
+    pub const INVALID: Timestamp = Timestamp(u64::MAX);
+    pub const ZERO: Timestamp = Timestamp(0);
+
+    pub fn new(value: u64) -> Self {
+        Timestamp(value)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        *self != Self::INVALID
+    }
+}
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Self::INVALID {
+            write!(f, "Ts(INVALID)")
+        } else {
+            write!(f, "Ts({})", self.0)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TimestampOracle — atomic monotonic timestamp generator
+// ---------------------------------------------------------------------------
+
+/// Assigns globally unique, monotonically increasing timestamps.
+///
+/// Thread-safe via atomic operations. Used by TransactionManager to assign
+/// begin_ts and commit_ts to transactions.
+pub struct TimestampOracle {
+    next_ts: AtomicU64,
+}
+
+impl TimestampOracle {
+    pub fn new() -> Self {
+        Self {
+            next_ts: AtomicU64::new(1),
+        }
+    }
+
+    /// Assign the next timestamp. Never returns the same value twice.
+    pub fn next(&self) -> Timestamp {
+        let ts = self.next_ts.fetch_add(1, Ordering::SeqCst);
+        assert!(ts < u64::MAX, "timestamp overflow");
+        Timestamp(ts)
+    }
+
+    /// Peek at the current value without consuming it.
+    pub fn peek(&self) -> Timestamp {
+        Timestamp(self.next_ts.load(Ordering::SeqCst))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot — frozen view of the database at transaction begin time
+// ---------------------------------------------------------------------------
+
+/// Captures what a transaction can see at the moment it begins.
+///
+/// A version is visible if its writer committed before `read_ts` AND
+/// was not in `active_txns` when the snapshot was taken.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// Versions committed at or before this timestamp are candidates for visibility.
+    pub read_ts: Timestamp,
+    /// Transactions that were active (uncommitted) when this snapshot was taken.
+    /// Their writes are invisible even if they commit with commit_ts <= read_ts.
+    pub active_txns: HashSet<TxnId>,
+}
 // ---------------------------------------------------------------------------
 // TxnId — newtype over u64, follows PageId/Lsn pattern
 // ---------------------------------------------------------------------------
@@ -115,17 +200,30 @@ pub struct Transaction {
     /// LSN of the most recent WAL record for this transaction.
     /// Updated after each append. Used as `prev_lsn` for the next record.
     pub last_lsn: Lsn,
+
+    pub begin_ts: Timestamp,
+    pub commit_ts: Option<Timestamp>,
+    pub snapshot: Snapshot,
 }
 
 impl Transaction {
     /// Create a new active transaction.
-    fn new(id: TxnId, mode: TxnMode, start_lsn: Lsn) -> Self {
+    fn new(
+        id: TxnId,
+        mode: TxnMode,
+        start_lsn: Lsn,
+        begin_ts: Timestamp,
+        snapshot: Snapshot,
+    ) -> Self {
         Self {
             id,
             state: TxnState::Active,
             mode,
             start_lsn,
             last_lsn: start_lsn,
+            begin_ts,
+            commit_ts: None,
+            snapshot,
         }
     }
 }
@@ -150,6 +248,8 @@ pub struct TransactionManager {
     active_txns: HashMap<TxnId, Transaction>,
     /// Key-level lock manager for transaction isolation.
     lock_manager: LockManager,
+    ts_oracle: TimestampOracle,
+    committed_txns: HashMap<TxnId, Timestamp>,
 }
 
 impl Default for TransactionManager {
@@ -165,6 +265,8 @@ impl TransactionManager {
             next_txn_id: 1,
             active_txns: HashMap::new(),
             lock_manager: LockManager::new(),
+            ts_oracle: TimestampOracle::new(),
+            committed_txns: HashMap::new(),
         }
     }
 
@@ -186,7 +288,13 @@ impl TransactionManager {
         let id = TxnId::new(self.next_txn_id);
         self.next_txn_id += 1;
 
-        let txn = Transaction::new(id, mode, start_lsn);
+        let begin_ts = self.ts_oracle.next();
+        let snapshot = Snapshot {
+            read_ts: begin_ts,
+            active_txns: self.active_txns.keys().copied().collect(),
+        };
+
+        let txn = Transaction::new(id, mode, start_lsn, begin_ts, snapshot);
         self.active_txns.insert(id, txn);
 
         Ok(id)
@@ -248,9 +356,47 @@ impl TransactionManager {
 
     /// Peek at the next transaction ID without consuming it.
     /// Used by Database to write Begin WAL record before calling begin().                                                
-    pub fn next_txn_id_peek(&self) -> u64 {                     
-          self.next_txn_id                                        
-    }    
+    pub fn next_txn_id_peek(&self) -> u64 {
+        self.next_txn_id
+    }
+
+    /// Get a transaction's snapshot (for MVCC reads).
+    pub fn snapshot(&self, txn_id: TxnId) -> Result<&Snapshot> {
+        self.active_txns
+            .get(&txn_id)
+            .map(|txn| &txn.snapshot)
+            .ok_or(Error::TxnNotActive(txn_id.0))
+    }
+
+    /// Get a transaction's begin timestamp.
+    pub fn begin_ts(&self, txn_id: TxnId) -> Result<Timestamp> {
+        self.active_txns
+            .get(&txn_id)
+            .map(|txn| txn.begin_ts)
+            .ok_or(Error::TxnNotActive(txn_id.0))
+    }
+
+    /// Access the committed transactions map (for visibility checks).
+    pub fn committed_txns(&self) -> &HashMap<TxnId, Timestamp> {
+        &self.committed_txns
+    }
+
+    /// Assign a commit timestamp and record it. Called during commit.
+    pub fn assign_commit_ts(&mut self, txn_id: TxnId) -> Result<Timestamp> {
+        let txn = self
+            .active_txns
+            .get_mut(&txn_id)
+            .ok_or(Error::TxnNotActive(txn_id.0))?;
+        let commit_ts = self.ts_oracle.next();
+        txn.commit_ts = Some(commit_ts);
+        self.committed_txns.insert(txn_id, commit_ts);
+        Ok(commit_ts)
+    }
+
+    /// Peek at the oracle's current timestamp (for auto-commit snapshots).
+    pub fn ts_oracle_peek(&self) -> Timestamp {
+        self.ts_oracle.peek()
+    }
 
     // -----------------------------------------------------------------------
     // Private helpers
