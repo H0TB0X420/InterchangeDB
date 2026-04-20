@@ -15,7 +15,7 @@
 //! Tag 1 = live value, tag 0 = tombstone (deletion marker).
 //! The txn_id identifies the writer for visibility checks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::common::{Error, Result};
 use crate::storage::StorageEngine;
@@ -168,6 +168,8 @@ pub fn decode_mvcc_value(encoded: &[u8]) -> Result<MvccValue> {
 /// `checkpoint_ts` is the timestamp watermark: any version written by a txn
 /// not found in committed_txns whose begin_ts <= checkpoint_ts is assumed
 /// committed pre-checkpoint. Pass Timestamp::ZERO if no checkpoint exists.
+// Visibility requires all 8 parameters for correctness — no clean way to reduce.
+#[allow(clippy::too_many_arguments)]
 pub fn is_visible(
     version_txn_id: TxnId,
     version_ts: Timestamp,
@@ -175,6 +177,7 @@ pub fn is_visible(
     snapshot: &Snapshot,
     committed_txns: &HashMap<TxnId, Timestamp>,
     checkpoint_ts: Timestamp,
+    known_uncommitted: &HashSet<TxnId>,
 ) -> bool {
     // Rule 1: own writes.
     if version_txn_id == my_txn_id {
@@ -185,12 +188,14 @@ pub fn is_visible(
     let commit_ts = match committed_txns.get(&version_txn_id) {
         Some(ts) => *ts,
         None => {
-            // Not in committed_txns. If version was written before checkpoint,
-            // it survived truncation — assume committed with commit_ts = version_ts.
-            if version_ts <= checkpoint_ts {
+            // Not in committed_txns. If version was written before checkpoint
+            // AND not known to be uncommitted, assume committed pre-checkpoint.
+            if version_ts <= checkpoint_ts
+                && !known_uncommitted.contains(&version_txn_id)
+            {
                 version_ts
             } else {
-                return false; // Not committed, not pre-checkpoint → invisible.
+                return false;
             }
         }
     };
@@ -225,6 +230,7 @@ pub fn mvcc_get<E: StorageEngine>(
     snapshot: &Snapshot,
     committed_txns: &HashMap<TxnId, Timestamp>,
     checkpoint_ts: Timestamp,
+    known_uncommitted: &HashSet<TxnId>,
 ) -> Result<Option<Vec<u8>>> {
     let start = encode_mvcc_key_start(user_key);
     let end = encode_mvcc_key_end(user_key);
@@ -250,7 +256,7 @@ pub fn mvcc_get<E: StorageEngine>(
         };
 
         // Check visibility.
-        if !is_visible(version_txn_id, version_ts, my_txn_id, snapshot, committed_txns, checkpoint_ts) {
+        if !is_visible(version_txn_id, version_ts, my_txn_id, snapshot, committed_txns, checkpoint_ts, known_uncommitted) {
             continue;
         }
 
@@ -278,6 +284,7 @@ pub fn mvcc_scan<E: StorageEngine>(
     snapshot: &Snapshot,
     committed_txns: &HashMap<TxnId, Timestamp>,
     checkpoint_ts: Timestamp,
+    known_uncommitted: &HashSet<TxnId>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let scan_start = encode_mvcc_key_start(start_key);
     let scan_end = encode_mvcc_key_end(end_key);
@@ -309,7 +316,7 @@ pub fn mvcc_scan<E: StorageEngine>(
             MvccValue::Tombstone { txn_id } => *txn_id,
         };
 
-        if !is_visible(version_txn_id, version_ts, my_txn_id, snapshot, committed_txns, checkpoint_ts) {
+        if !is_visible(version_txn_id, version_ts, my_txn_id, snapshot, committed_txns, checkpoint_ts, known_uncommitted) {
             continue;
         }
 

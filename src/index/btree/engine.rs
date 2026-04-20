@@ -43,13 +43,58 @@ pub struct BTreeEngine {
 }
 
 impl BTreeEngine {
-    /// Create a new B-tree engine with default node sizes.
+    /// Create or open a B-tree engine with default node sizes.
     ///
-    /// Allocates a header page on the buffer pool for the B-tree root pointer.
+    /// If the underlying disk already has pages (from a previous session),
+    /// reads the existing header page (page 0) to recover the tree structure.
+    /// Otherwise, allocates a fresh header page for a new tree.
     pub fn new(bpm: BufferPoolManager) -> Result<Self> {
         let leaf_max_size = calculate_leaf_max_size(DEFAULT_AVG_KEY_SIZE, DEFAULT_AVG_VALUE_SIZE);
         let internal_max_size = calculate_internal_max_size(DEFAULT_AVG_KEY_SIZE);
-        Self::build(bpm, leaf_max_size, internal_max_size, 0)
+
+        if bpm.disk_page_count() > 0 {
+            // Existing tree on disk — reopen by reading header from page 0.
+            Self::open_existing(bpm, leaf_max_size, internal_max_size)
+        } else {
+            // Empty disk — create fresh tree.
+            Self::build(bpm, leaf_max_size, internal_max_size, 0)
+        }
+    }
+
+    /// Reopen an existing B-tree by reading its header page from disk.
+    /// Falls back to creating fresh if page 0 doesn't look like a valid header.
+    fn open_existing(
+        bpm: BufferPoolManager,
+        leaf_max_size: u16,
+        internal_max_size: u16,
+    ) -> Result<Self> {
+        let header_page_id = PageId::new(0);
+
+        // Check if page 0 has been initialized (non-zero content).
+        let has_content = {
+            match bpm.fetch_page_read(header_page_id) {
+                Ok(guard) => {
+                    let result = guard.as_slice().iter().take(16).any(|&b| b != 0);
+                    drop(guard);
+                    result
+                }
+                Err(_) => false,
+            }
+        };
+
+        if has_content {
+            Ok(Self {
+                bpm,
+                header_page_id,
+                leaf_max_size,
+                internal_max_size,
+                max_tombstones: 0,
+                key_count: 0,
+                data_size: 0,
+            })
+        } else {
+            Self::build(bpm, leaf_max_size, internal_max_size, 0)
+        }
     }
 
     /// Create a new B-tree engine with explicit node sizes.

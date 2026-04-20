@@ -7,8 +7,7 @@
 //! - Deadlocks resolved (no indefinite hangs)
 //! - Serializable (concurrent results match some serial ordering)
 
-use std::sync::{Arc, Barrier};
-use std::thread;
+use std::sync::Arc;
 
 use tempfile::tempdir;
 
@@ -76,9 +75,8 @@ fn atomicity_abort() {
 
 #[test]
 fn dirty_read_prevention() {
-    // T1 writes a key. T2 tries to read it before T1 commits.
-    // Under strict 2PL, T2 should block on the X lock held by T1.
-    // We use a short timeout to detect the blocking.
+    // T1 writes a key but does NOT commit. T2 reads — must NOT see T1's write.
+    // Under MVCC: T2's snapshot excludes T1 (T1 is in active_txns at snapshot time).
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dm = DiskManager::create(&db_path).unwrap();
@@ -86,23 +84,29 @@ fn dirty_read_prevention() {
     let engine = BTreeEngine::new(bpm).unwrap();
     let mut db = Database::open(dir.path(), engine).unwrap();
 
-    // T1 writes key.
+    // Seed a pre-existing value.
+    db.put(b"secret", b"original").unwrap();
+
+    // T1 writes but does NOT commit.
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
-    db.txn_put(t1, b"secret", b"uncommitted").unwrap();
+    db.txn_put(t1, b"secret", b"dirty_value").unwrap();
 
-    // T2 tries to read — but T1 holds X lock on "secret".
-    // txn_get acquires S lock which conflicts with X.
-    // Since we're single-threaded here and both txns use same Database,
-    // T2's acquire will either deadlock-detect or succeed if T1 already committed.
-    // The key insight: T2 cannot see T1's uncommitted data.
-    // After T1 commits, T2 can read.
-    db.commit_txn(t1).unwrap();
-
+    // T2 starts while T1 is still active — must NOT see dirty_value.
     let t2 = db.begin_txn(TxnMode::ReadOnly).unwrap();
     let val = db.txn_get(t2, b"secret").unwrap();
-    // T2 sees the committed value, not an uncommitted one.
-    assert_eq!(val, Some(b"uncommitted".to_vec()));
+    assert_eq!(
+        val,
+        Some(b"original".to_vec()),
+        "T2 must see original value, NOT T1's uncommitted write"
+    );
     db.commit_txn(t2).unwrap();
+
+    // Now commit T1 — a new reader should see the committed value.
+    db.commit_txn(t1).unwrap();
+    let t3 = db.begin_txn(TxnMode::ReadOnly).unwrap();
+    let val_after = db.txn_get(t3, b"secret").unwrap();
+    assert_eq!(val_after, Some(b"dirty_value".to_vec()));
+    db.commit_txn(t3).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -143,59 +147,48 @@ fn lost_update_prevention() {
 
 #[test]
 fn deadlock_resolution_through_database() {
-    // Two txns create a deadlock through the Database API.
-    // T1 holds A, T2 holds B. T1 requests B (blocks), T2 requests A (deadlock).
-    // One gets Deadlock error.
+    // Single-threaded deadlock: T1 holds X on A, T2 holds X on B.
+    // T2 requests A → deadlock detected (T2 completes the cycle).
+    // This tests the lock manager's deadlock detection through the Database API.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Arc::new(std::sync::Mutex::new(
-        Database::open(dir.path(), engine).unwrap(),
-    ));
+    let mut db = Database::open(dir.path(), engine).unwrap();
 
-    // Setup: both txns acquire their first keys.
-    let (t1, t2) = {
-        let mut db = db.lock().unwrap();
-        let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
-        let t2 = db.begin_txn(TxnMode::ReadWrite).unwrap();
-        db.txn_put(t1, b"A", b"t1_owns_a").unwrap();
-        db.txn_put(t2, b"B", b"t2_owns_b").unwrap();
-        (t1, t2)
-    };
+    let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
+    let t2 = db.begin_txn(TxnMode::ReadWrite).unwrap();
 
-    let barrier = Arc::new(Barrier::new(2));
+    // T1 acquires X on "A", T2 acquires X on "B".
+    db.txn_put(t1, b"A", b"t1_a").unwrap();
+    db.txn_put(t2, b"B", b"t2_b").unwrap();
 
-    // T1 thread: requests B.
-    let db1 = db.clone();
-    let barrier1 = barrier.clone();
-    let t1_handle = thread::spawn(move || {
-        barrier1.wait();
-        let mut db = db1.lock().unwrap();
-        db.txn_put(t1, b"B", b"t1_wants_b")
-    });
+    // T2 requests X on "A" — T1 holds it. Under single-threaded execution,
+    // T1 is in active_txns but not blocking on a condvar, so the wait-for
+    // graph shows T2 → T1. But T1 also needs B (hasn't requested yet).
+    // Actually: in single-thread, T1 hasn't requested B yet, so there's no
+    // cycle. We need to make T1 request B first (it blocks), then T2 request A.
+    //
+    // Since single-threaded can't have T1 blocking, test write-write conflict
+    // directly: T2 tries to write a key T1 already holds → deadlock.
+    let result = db.txn_put(t2, b"A", b"t2_wants_a");
+    assert!(
+        matches!(
+            result,
+            Err(interchangedb::common::Error::Deadlock(_))
+                | Err(interchangedb::common::Error::LockTimeout)
+        ),
+        "T2 should be blocked by T1's X lock (deadlock or timeout), got: {:?}",
+        result
+    );
 
-    // T2 thread: requests A.
-    let db2 = db.clone();
-    let barrier2 = barrier.clone();
-    let t2_handle = thread::spawn(move || {
-        barrier2.wait();
-        let mut db = db2.lock().unwrap();
-        db.txn_put(t2, b"A", b"t2_wants_a")
-    });
+    // T2 is the victim — abort it.
+    db.txn_abort(t2).unwrap();
 
-    let r1 = t1_handle.join().unwrap();
-    let r2 = t2_handle.join().unwrap();
-
-    // At least one should get deadlock or timeout (since we hold a std::Mutex
-    // around the Database, the lock contention is at the Mutex level, not the
-    // LockManager level). With a std::Mutex wrapper, one thread runs fully
-    // before the other — so the second thread's txn_put may detect deadlock
-    // at the LockManager level, or both may succeed sequentially.
-    // The key assertion: no panics, both threads complete.
-    let _r1 = r1; // Either Ok or Err — both are valid outcomes.
-    let _r2 = r2;
+    // T1 can still commit successfully.
+    db.commit_txn(t1).unwrap();
+    assert_eq!(db.get(b"A").unwrap(), Some(b"t1_a".to_vec()));
 }
 
 // ---------------------------------------------------------------------------

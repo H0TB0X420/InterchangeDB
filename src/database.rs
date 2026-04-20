@@ -92,11 +92,23 @@ impl<E: StorageEngine> Database<E> {
             .collect();
         txn_mgr.load_committed_txns(recovered);
 
+        // Load uncommitted txn_ids so visibility doesn't assume they're committed.
+        let uncommitted: std::collections::HashSet<TxnId> = stats
+            .uncommitted_txns
+            .into_iter()
+            .map(TxnId::new)
+            .collect();
+        txn_mgr.load_uncommitted_txns(uncommitted);
+
         // Restore oracle timestamp from checkpoint. This ensures new timestamps
         // don't collide with pre-existing versions after WAL truncation.
+        // Only raise the checkpoint_ts — never lower it (load_committed_txns may
+        // have set it higher from post-checkpoint commit records).
         if stats.checkpoint_oracle_ts > 0 {
-            txn_mgr.set_checkpoint_ts(crate::txn::Timestamp(stats.checkpoint_oracle_ts));
-            // Advance oracle past the persisted value.
+            let ckpt_ts = crate::txn::Timestamp(stats.checkpoint_oracle_ts);
+            if ckpt_ts > txn_mgr.checkpoint_ts() {
+                txn_mgr.set_checkpoint_ts(ckpt_ts);
+            }
             while txn_mgr.ts_oracle_peek().0 <= stats.checkpoint_oracle_ts {
                 txn_mgr.advance_oracle();
             }
@@ -130,7 +142,8 @@ impl<E: StorageEngine> Database<E> {
                 active_txns: std::collections::HashSet::new(),
             };
             let committed = txn_mgr.committed_txns();
-            mvcc::mvcc_get(&self.engine, key, TxnId::AUTO_COMMIT, &snapshot, committed, ckpt_ts)
+            let uncommitted = txn_mgr.uncommitted_txns();
+            mvcc::mvcc_get(&self.engine, key, TxnId::AUTO_COMMIT, &snapshot, committed, ckpt_ts, uncommitted)
         } else {
             self.engine.get(key)
         }
@@ -200,9 +213,10 @@ impl<E: StorageEngine> Database<E> {
             std::ops::Bound::Unbounded => vec![0xFF; 32],
         };
 
+        let uncommitted = txn_mgr.uncommitted_txns();
         let results = mvcc::mvcc_scan(
             &self.engine, &start, &end,
-            TxnId::AUTO_COMMIT, &snapshot, committed, txn_mgr.checkpoint_ts(),
+            TxnId::AUTO_COMMIT, &snapshot, committed, txn_mgr.checkpoint_ts(), uncommitted,
         );
 
         match results {
@@ -359,7 +373,8 @@ impl<E: StorageEngine> Database<E> {
         let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
         let snapshot = txn_mgr.snapshot(txn_id)?;
         let committed = txn_mgr.committed_txns();
-        mvcc::mvcc_get(&self.engine, key, txn_id, snapshot, committed, txn_mgr.checkpoint_ts())
+        let uncommitted = txn_mgr.uncommitted_txns();
+        mvcc::mvcc_get(&self.engine, key, txn_id, snapshot, committed, txn_mgr.checkpoint_ts(), uncommitted)
     }
 
     /// Put a key-value pair within a transaction. Creates a new MVCC version.

@@ -34,6 +34,9 @@ pub struct RecoveryStats {
     /// Oracle timestamp from the last checkpoint record.
     /// Used to restore the oracle on reopen so timestamps don't collide.
     pub checkpoint_oracle_ts: u64,
+    /// Transactions that have WAL records but no Commit or Abort record.
+    /// These are genuinely uncommitted — their versions must be invisible.
+    pub uncommitted_txns: HashSet<u64>,
 }
 
 /// Replay WAL records into the engine, starting from `last_checkpoint_lsn`.
@@ -65,9 +68,19 @@ pub fn recover<E: StorageEngine>(
     let committed_set: HashSet<u64> = committed_map.keys().copied().collect();
     let records_redone = redo_committed(engine, &records, &committed_set)?;
 
-    // Phase 3: Under MVCC, no undo needed. Uncommitted versions are invisible
-    // because their txn_id won't be in committed_txns. GC handles cleanup.
-    let _ = aborted;
+    // Phase 3: Identify uncommitted transactions (Begin but no Commit/Abort).
+    // Their versions are in the engine but must be invisible.
+    let mut seen_txns: HashSet<u64> = HashSet::new();
+    for record in &records {
+        if record.txn_id != 0 {
+            seen_txns.insert(record.txn_id);
+        }
+    }
+    let uncommitted_txns: HashSet<u64> = seen_txns
+        .into_iter()
+        .filter(|id| !committed_set.contains(id))
+        .filter(|id| !aborted.contains(id))
+        .collect();
 
     Ok(RecoveryStats {
         records_scanned,
@@ -76,6 +89,7 @@ pub fn recover<E: StorageEngine>(
         duration: start.elapsed(),
         committed_txns: committed_map,
         checkpoint_oracle_ts,
+        uncommitted_txns,
     })
 }
 

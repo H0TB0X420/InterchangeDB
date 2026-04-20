@@ -257,6 +257,10 @@ pub struct TransactionManager {
     lock_manager: LockManager,
     ts_oracle: TimestampOracle,
     committed_txns: HashMap<TxnId, Timestamp>,
+    /// Transactions known to be uncommitted (Begin but no Commit/Abort in WAL).
+    /// Used by visibility to prevent the checkpoint_ts fallback from making
+    /// their versions visible.
+    uncommitted_txns: HashSet<TxnId>,
     /// Watermark: versions written before this timestamp are assumed committed
     /// even if their Commit record was in a truncated WAL segment.
     checkpoint_ts: Timestamp,
@@ -277,6 +281,7 @@ impl TransactionManager {
             lock_manager: LockManager::new(),
             ts_oracle: TimestampOracle::new(),
             committed_txns: HashMap::new(),
+            uncommitted_txns: HashSet::new(),
             checkpoint_ts: Timestamp::ZERO,
         }
     }
@@ -395,6 +400,16 @@ impl TransactionManager {
     /// Access the committed transactions map (for visibility checks).
     pub fn committed_txns(&self) -> &HashMap<TxnId, Timestamp> {
         &self.committed_txns
+    }
+
+    /// Access the known-uncommitted transactions set (for visibility checks).
+    pub fn uncommitted_txns(&self) -> &HashSet<TxnId> {
+        &self.uncommitted_txns
+    }
+
+    /// Load uncommitted txn_ids from recovery.
+    pub fn load_uncommitted_txns(&mut self, txns: HashSet<TxnId>) {
+        self.uncommitted_txns = txns;
     }
 
     /// Assign a commit timestamp and record it. Called during commit.
