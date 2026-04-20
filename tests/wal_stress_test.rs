@@ -90,7 +90,7 @@ fn crash_recovery_loop() {
     for iteration in 0u32..100 {
         // Open (runs recovery from prior iteration).
         {
-            let mut db = open_db(&data_dir);
+            let db = open_db(&data_dir);
 
             // Verify ground truth from previous iterations.
             for (key, value) in &expected {
@@ -162,7 +162,7 @@ fn overwrite_storm() {
 
     // Phase 1: overwrite every key many times.
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
         for version in 0..versions_per_key {
             for idx in 0..key_count {
                 let key = make_key(idx);
@@ -201,7 +201,7 @@ fn interleaved_checkpoints() {
     let mut rng = Rng::new(0xDEAD);
 
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
         let mut ops_since_checkpoint: u32 = 0;
 
         for i in 0u32..500 {
@@ -261,7 +261,7 @@ fn large_values() {
     let key_count = 50;
 
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
         for i in 0u32..key_count {
             let key = make_key(i);
             // Fill value with a recognizable pattern: the key index repeated.
@@ -301,7 +301,7 @@ fn delete_heavy() {
     let survivors: u32 = 50; // Only keys [0..50) survive.
 
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
 
         // Insert all keys.
         for i in 0..total_keys {
@@ -353,7 +353,7 @@ fn rapid_checkpoint_cycle() {
     let checkpoint_interval = 5u32;
 
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
 
         for i in 0..ops {
             let key = make_key(i % 30);
@@ -405,7 +405,7 @@ fn wal_reader_integrity_after_stress() {
 
     // Generate a busy workload.
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
         for i in 0u32..300 {
             let key = make_key(i % 50);
             if i % 7 == 0 {
@@ -455,7 +455,7 @@ fn idempotent_recovery_loop() {
 
     // Seed some data.
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
         for i in 0u32..100 {
             db.put(&make_key(i), &make_value(i, 0)).unwrap();
         }
@@ -509,7 +509,7 @@ fn mixed_workload_gauntlet() {
 
     // Run 5 "epochs". Each epoch: open, do work, crash.
     for epoch in 0u32..5 {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
 
         // Verify state from previous epochs.
         for (key, value) in &expected {
@@ -592,7 +592,7 @@ fn checkpoint_bounds_recovery_window() {
 
     // Phase 1: lots of data, then checkpoint, then a few more writes.
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
 
         for i in 0u32..200 {
             db.put(&make_key(i), &make_value(i, 0)).unwrap();
@@ -637,14 +637,14 @@ fn crash_mid_overwrite_consistency() {
 
     // Write version 0 and checkpoint to make it durable.
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
         db.put(&key, b"version_0").unwrap();
         db.checkpoint().unwrap();
     }
 
     // Now overwrite 100 times without checkpoint, then crash.
     {
-        let mut db = open_db(&data_dir);
+        let db = open_db(&data_dir);
         for v in 1u32..=100 {
             let value = format!("version_{}", v).into_bytes();
             db.put(&key, &value).unwrap();

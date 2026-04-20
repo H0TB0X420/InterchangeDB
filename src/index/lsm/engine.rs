@@ -5,6 +5,7 @@
 
 use std::ops::RangeBounds;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::common::Result;
 use crate::storage::engine::{ScanIterator, StorageEngine, StorageStatus};
@@ -13,12 +14,13 @@ use super::LsmTree;
 
 /// LSM-tree storage engine.
 ///
-/// Wraps an `LsmTree` with counter tracking for the `StorageEngine` trait.
+/// Wraps an `LsmTree` with atomic counter tracking for the `StorageEngine` trait.
+/// All methods take `&self` — interior mutability handled by LsmTree's internal Mutex.
 pub struct LsmEngine {
     tree: LsmTree,
-    key_count: u64,
-    data_size: u64,
-    tombstone_count: u64,
+    key_count: AtomicU64,
+    data_size: AtomicU64,
+    tombstone_count: AtomicU64,
 }
 
 impl LsmEngine {
@@ -31,9 +33,9 @@ impl LsmEngine {
         let (key_count, data_size) = Self::count_existing_data(&tree)?;
         Ok(Self {
             tree,
-            key_count,
-            data_size,
-            tombstone_count: 0,
+            key_count: AtomicU64::new(key_count),
+            data_size: AtomicU64::new(data_size),
+            tombstone_count: AtomicU64::new(0),
         })
     }
 
@@ -43,9 +45,9 @@ impl LsmEngine {
         let (key_count, data_size) = Self::count_existing_data(&tree)?;
         Ok(Self {
             tree,
-            key_count,
-            data_size,
-            tombstone_count: 0,
+            key_count: AtomicU64::new(key_count),
+            data_size: AtomicU64::new(data_size),
+            tombstone_count: AtomicU64::new(0),
         })
     }
 
@@ -71,38 +73,36 @@ impl StorageEngine for LsmEngine {
         self.tree.get(key)
     }
 
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         // Check if key already exists for counter tracking.
         let old_value = self.tree.get(key)?;
 
         match old_value {
             Some(old_val) => {
                 // Overwrite: adjust data_size for value change.
-                self.data_size = self.data_size
-                    .saturating_sub(old_val.len() as u64)
-                    + value.len() as u64;
+                self.data_size.fetch_sub(old_val.len() as u64, Ordering::Relaxed);
+                self.data_size.fetch_add(value.len() as u64, Ordering::Relaxed);
             }
             None => {
                 // New key.
-                self.key_count += 1;
-                self.data_size += (key.len() + value.len()) as u64;
+                self.key_count.fetch_add(1, Ordering::Relaxed);
+                self.data_size.fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
             }
         }
 
         self.tree.put(key.to_vec(), value.to_vec())
     }
 
-    fn delete(&mut self, key: &[u8]) -> Result<()> {
+    fn delete(&self, key: &[u8]) -> Result<()> {
         let old_value = self.tree.get(key)?;
 
         if let Some(old_val) = old_value {
             let entry_size = (key.len() + old_val.len()) as u64;
-            // saturating_sub: on recovery, the engine counters start at 0 but the
-            // tree may already contain keys from persisted SSTables. Deleting one
-            // of those "uncounted" keys would underflow without saturation.
-            self.key_count = self.key_count.saturating_sub(1);
-            self.data_size = self.data_size.saturating_sub(entry_size);
-            self.tombstone_count += 1;
+            // fetch_sub with Relaxed: approximate counters, saturation not needed
+            // because we only decrement when the key exists.
+            self.key_count.fetch_sub(1, Ordering::Relaxed);
+            self.data_size.fetch_sub(entry_size, Ordering::Relaxed);
+            self.tombstone_count.fetch_add(1, Ordering::Relaxed);
         }
 
         self.tree.delete(key.to_vec())
@@ -124,15 +124,15 @@ impl StorageEngine for LsmEngine {
 
         StorageStatus {
             name: "lsm",
-            keys: self.key_count,
-            size: self.data_size,
+            keys: self.key_count.load(Ordering::Relaxed),
+            size: self.data_size.load(Ordering::Relaxed),
             disk_size,
             live_disk_size: disk_size,
-            tombstones: self.tombstone_count,
+            tombstones: self.tombstone_count.load(Ordering::Relaxed),
         }
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&self) -> Result<()> {
         self.tree.flush_memtable()
     }
 }

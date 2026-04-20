@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn flush_creates_l0() {
         let dir = TempDir::new().unwrap();
-        let mut tree = LsmTree::open(dir.path()).unwrap();
+        let tree = LsmTree::open(dir.path()).unwrap();
         tree.put(b"key".to_vec(), b"value".to_vec()).unwrap();
         tree.flush_memtable().unwrap();
 
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn empty_flush_no_op() {
         let dir = TempDir::new().unwrap();
-        let mut tree = LsmTree::open(dir.path()).unwrap();
+        let tree = LsmTree::open(dir.path()).unwrap();
         tree.flush_memtable().unwrap();
         assert!(tree.level_state().levels[0].is_empty());
     }
@@ -378,7 +378,7 @@ mod tests {
     fn l0_compaction_triggered() {
         let dir = TempDir::new().unwrap();
         // Use a small memtable (64 bytes) so we can trigger multiple flushes quickly.
-        let mut tree = LsmTree::open_with_memtable_size(dir.path(), 64).unwrap();
+        let tree = LsmTree::open_with_memtable_size(dir.path(), 64).unwrap();
 
         // Insert enough data to trigger MAX_L0_SSTABLE_COUNT flushes.
         // With 64-byte limit, a single key-value pair of ~40 bytes should flush.
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn compaction_deduplication() {
         let dir = TempDir::new().unwrap();
-        let mut tree = LsmTree::open_with_memtable_size(dir.path(), 64).unwrap();
+        let tree = LsmTree::open_with_memtable_size(dir.path(), 64).unwrap();
 
         // Write the same key multiple times across flushes.
         for i in 0..10 {
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn tombstone_preservation() {
         let dir = TempDir::new().unwrap();
-        let mut tree = LsmTree::open_with_memtable_size(dir.path(), 64).unwrap();
+        let tree = LsmTree::open_with_memtable_size(dir.path(), 64).unwrap();
 
         // Insert a key, flush, delete it, flush again.
         tree.put(b"victim".to_vec(), b"alive".to_vec()).unwrap();

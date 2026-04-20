@@ -21,14 +21,14 @@ use interchangedb::txn::TxnMode;
 // Helper
 // ---------------------------------------------------------------------------
 
-fn setup_shared_db() -> (Arc<std::sync::Mutex<Database<BTreeEngine>>>, tempfile::TempDir) {
+fn setup_shared_db() -> (Arc<Database<BTreeEngine>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
-    (Arc::new(std::sync::Mutex::new(db)), dir)
+    (Arc::new(db), dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -39,7 +39,6 @@ fn setup_shared_db() -> (Arc<std::sync::Mutex<Database<BTreeEngine>>>, tempfile:
 fn atomicity_commit() {
     // Txn writes 3 keys + commit → all 3 visible.
     let (db, _dir) = setup_shared_db();
-    let mut db = db.lock().unwrap();
 
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(txn, b"a", b"1").unwrap();
@@ -56,7 +55,6 @@ fn atomicity_commit() {
 fn atomicity_abort() {
     // Txn writes 3 keys + abort → none visible.
     let (db, _dir) = setup_shared_db();
-    let mut db = db.lock().unwrap();
 
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(txn, b"a", b"1").unwrap();
@@ -82,7 +80,7 @@ fn dirty_read_prevention() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     // Seed a pre-existing value.
     db.put(b"secret", b"original").unwrap();
@@ -122,7 +120,7 @@ fn lost_update_prevention() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     db.put(b"counter", b"0").unwrap();
 
@@ -155,7 +153,7 @@ fn deadlock_resolution_through_database() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     let t2 = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -205,7 +203,7 @@ fn serialization_counter_increment() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     // Initialize 10 counters to 0.
     let counter_count = 10;

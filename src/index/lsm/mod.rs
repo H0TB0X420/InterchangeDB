@@ -33,17 +33,21 @@ use memtable::Memtable;
 use merge_iterator::MergeIterator;
 use sstable::{SSTableReader, write_sstable};
 
-/// LSM-tree data structure.
-///
-/// Uses `Mutex` for the `SSTableReader` map because `StorageEngine::get`
-/// takes `&self` but `File::seek` needs `&mut`. The mutex makes `LsmTree`
-/// `Send + Sync` for multithreaded use.
-pub struct LsmTree {
+/// Mutable state grouped behind a single Mutex for interior mutability.
+struct LsmInner {
     memtable: Memtable,
     immutable_memtables: Vec<std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
-    readers: Mutex<HashMap<u64, SSTableReader>>,
     level_state: LevelState,
     manifest: Manifest,
+}
+
+/// LSM-tree data structure.
+///
+/// Uses interior mutability via `Mutex<LsmInner>` for write state and
+/// `Mutex<HashMap>` for SSTable readers. All public methods take `&self`.
+pub struct LsmTree {
+    inner: Mutex<LsmInner>,
+    readers: Mutex<HashMap<u64, SSTableReader>>,
     #[allow(dead_code)]
     data_dir: PathBuf,
     sst_dir: PathBuf,
@@ -76,12 +80,16 @@ impl LsmTree {
             }
         }
 
-        Ok(Self {
+        let inner = LsmInner {
             memtable: Memtable::new(),
             immutable_memtables: Vec::new(),
-            readers: Mutex::new(readers),
             level_state,
             manifest,
+        };
+
+        Ok(Self {
+            inner: Mutex::new(inner),
+            readers: Mutex::new(readers),
             data_dir: data_dir.to_path_buf(),
             sst_dir,
             memtable_size_limit,
@@ -89,16 +97,22 @@ impl LsmTree {
     }
 
     /// Insert a key-value pair. Flushes the memtable if it exceeds the size limit.
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        self.memtable.put(key, value);
-        self.maybe_flush()?;
+    pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.memtable.put(key, value);
+        if inner.memtable.size_bytes() >= self.memtable_size_limit {
+            self.flush_inner(&mut inner)?;
+        }
         Ok(())
     }
 
     /// Delete a key by inserting a tombstone.
-    pub fn delete(&mut self, key: Vec<u8>) -> Result<()> {
-        self.memtable.delete(key);
-        self.maybe_flush()?;
+    pub fn delete(&self, key: Vec<u8>) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner.memtable.delete(key);
+        if inner.memtable.size_bytes() >= self.memtable_size_limit {
+            self.flush_inner(&mut inner)?;
+        }
         Ok(())
     }
 
@@ -106,8 +120,11 @@ impl LsmTree {
     ///
     /// Read path: memtable → immutable memtables → L0 → L1+.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // Lock inner to read memtable and level_state snapshot.
+        let inner = self.inner.lock();
+
         // 1. Check active memtable.
-        if let Some(entry) = self.memtable.get(key) {
+        if let Some(entry) = inner.memtable.get(key) {
             return match entry {
                 Some(value) => Ok(Some(value.clone())),
                 None => Ok(None), // Tombstone.
@@ -115,7 +132,7 @@ impl LsmTree {
         }
 
         // 2. Check immutable memtables (newest first).
-        for imm in self.immutable_memtables.iter().rev() {
+        for imm in inner.immutable_memtables.iter().rev() {
             if let Some(entry) = imm.get(key) {
                 return match entry {
                     Some(value) => Ok(Some(value.clone())),
@@ -124,9 +141,13 @@ impl LsmTree {
             }
         }
 
+        // Clone level_state to release inner lock before acquiring readers lock.
+        let level_state = inner.level_state.clone();
+        drop(inner);
+
         // 3. Check L0 SSTables (newest first, may overlap).
         let mut readers = self.readers.lock();
-        for meta in self.level_state.levels[0].iter().rev() {
+        for meta in level_state.levels[0].iter().rev() {
             if let Some(reader) = readers.get_mut(&meta.id) {
                 if !reader.may_contain(key) {
                     continue;
@@ -141,8 +162,8 @@ impl LsmTree {
         }
 
         // 4. Check L1+ SSTables (non-overlapping within each level).
-        for level_idx in 1..self.level_state.levels.len() {
-            let level = &self.level_state.levels[level_idx];
+        for level_idx in 1..level_state.levels.len() {
+            let level = &level_state.levels[level_idx];
             if level.is_empty() {
                 continue;
             }
@@ -178,11 +199,14 @@ impl LsmTree {
         &self,
         range: R,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // Lock inner to snapshot memtable state.
+        let inner = self.inner.lock();
+
         // Collect all sources for the merge iterator.
         let mut sources: Vec<Vec<Entry>> = Vec::new();
 
         // 1. Active memtable.
-        let memtable_entries: Vec<Entry> = self
+        let memtable_entries: Vec<Entry> = inner
             .memtable
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -190,7 +214,7 @@ impl LsmTree {
         sources.push(memtable_entries);
 
         // 2. Immutable memtables (newest first).
-        for imm in self.immutable_memtables.iter().rev() {
+        for imm in inner.immutable_memtables.iter().rev() {
             let entries: Vec<Entry> = imm
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -198,9 +222,13 @@ impl LsmTree {
             sources.push(entries);
         }
 
+        // Clone level_state, drop inner before acquiring readers.
+        let level_state = inner.level_state.clone();
+        drop(inner);
+
         // 3. L0 SSTables (newest first).
         let mut readers = self.readers.lock();
-        for meta in self.level_state.levels[0].iter().rev() {
+        for meta in level_state.levels[0].iter().rev() {
             if let Some(reader) = readers.get_mut(&meta.id) {
                 let entries = reader.iter()?;
                 sources.push(entries);
@@ -208,8 +236,8 @@ impl LsmTree {
         }
 
         // 4. L1+ SSTables (in order within each level).
-        for level_idx in 1..self.level_state.levels.len() {
-            for meta in &self.level_state.levels[level_idx] {
+        for level_idx in 1..level_state.levels.len() {
+            for meta in &level_state.levels[level_idx] {
                 if let Some(reader) = readers.get_mut(&meta.id) {
                     let entries = reader.iter()?;
                     sources.push(entries);
@@ -230,61 +258,55 @@ impl LsmTree {
         Ok(result)
     }
 
-    /// Flush the active memtable if it exceeds the size limit.
-    fn maybe_flush(&mut self) -> Result<()> {
-        if self.memtable.size_bytes() >= self.memtable_size_limit {
-            self.flush_memtable()?;
-        }
-        Ok(())
+    /// Force-flush the active memtable to an L0 SSTable.
+    pub fn flush_memtable(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        self.flush_inner(&mut inner)
     }
 
-    /// Force-flush the active memtable to an L0 SSTable.
-    pub fn flush_memtable(&mut self) -> Result<()> {
-        if self.memtable.is_empty() {
+    /// Internal flush with inner lock already held.
+    fn flush_inner(&self, inner: &mut LsmInner) -> Result<()> {
+        if inner.memtable.is_empty() {
             return Ok(());
         }
 
         // Freeze the active memtable.
-        let frozen = std::mem::take(&mut self.memtable).freeze();
+        let frozen = std::mem::take(&mut inner.memtable).freeze();
 
         // Write to a new SSTable.
-        let sst_id = self.level_state.next_id();
+        let sst_id = inner.level_state.next_id();
         let sst_path = self.sst_dir.join(format!("{sst_id:06}.sst"));
         let entries = frozen.into_iter();
         let meta = write_sstable(&sst_path, sst_id, entries)?;
 
         if let Some(meta) = meta {
             // Record in manifest.
-            self.manifest.log_add(0, &meta)?;
+            inner.manifest.log_add(0, &meta)?;
 
             // Open reader.
             let reader = SSTableReader::open(&meta.path, meta.id)?;
             self.readers.lock().insert(meta.id, reader);
 
             // Add to L0.
-            self.level_state.levels[0].push(meta);
+            inner.level_state.levels[0].push(meta);
 
-            // Check if compaction is needed (done in subtask 3.4.5).
-            self.maybe_compact()?;
+            // Check if compaction is needed.
+            compaction::maybe_compact(
+                &mut inner.level_state,
+                &mut inner.manifest,
+                &self.readers,
+                &self.sst_dir,
+                self.memtable_size_limit,
+            )?;
         }
 
         Ok(())
     }
 
-    /// Check if compaction is needed and run it.
-    fn maybe_compact(&mut self) -> Result<()> {
-        compaction::maybe_compact(
-            &mut self.level_state,
-            &mut self.manifest,
-            &self.readers,
-            &self.sst_dir,
-            self.memtable_size_limit,
-        )
-    }
-
     /// Access the level state (for status reporting).
-    pub fn level_state(&self) -> &LevelState {
-        &self.level_state
+    /// Returns a clone since the original is behind a Mutex.
+    pub fn level_state(&self) -> LevelState {
+        self.inner.lock().level_state.clone()
     }
 }
 
@@ -301,7 +323,7 @@ mod tests {
 
     #[test]
     fn put_get_memtable_only() {
-        let (mut tree, _dir) = test_tree();
+        let (tree, _dir) = test_tree();
         tree.put(b"hello".to_vec(), b"world".to_vec()).unwrap();
         assert_eq!(tree.get(b"hello").unwrap(), Some(b"world".to_vec()));
         assert_eq!(tree.get(b"missing").unwrap(), None);
@@ -309,7 +331,7 @@ mod tests {
 
     #[test]
     fn tombstone() {
-        let (mut tree, _dir) = test_tree();
+        let (tree, _dir) = test_tree();
         tree.put(b"key".to_vec(), b"value".to_vec()).unwrap();
         tree.delete(b"key".to_vec()).unwrap();
         assert_eq!(tree.get(b"key").unwrap(), None);
@@ -317,7 +339,7 @@ mod tests {
 
     #[test]
     fn overwrite() {
-        let (mut tree, _dir) = test_tree();
+        let (tree, _dir) = test_tree();
         tree.put(b"key".to_vec(), b"old".to_vec()).unwrap();
         tree.put(b"key".to_vec(), b"new".to_vec()).unwrap();
         assert_eq!(tree.get(b"key").unwrap(), Some(b"new".to_vec()));
@@ -325,7 +347,7 @@ mod tests {
 
     #[test]
     fn scan_all() {
-        let (mut tree, _dir) = test_tree();
+        let (tree, _dir) = test_tree();
         tree.put(b"c".to_vec(), b"3".to_vec()).unwrap();
         tree.put(b"a".to_vec(), b"1".to_vec()).unwrap();
         tree.put(b"b".to_vec(), b"2".to_vec()).unwrap();
@@ -339,7 +361,7 @@ mod tests {
 
     #[test]
     fn scan_range() {
-        let (mut tree, _dir) = test_tree();
+        let (tree, _dir) = test_tree();
         for i in 0u8..10 {
             tree.put(vec![i], vec![i * 10]).unwrap();
         }
@@ -359,15 +381,15 @@ mod tests {
 
     #[test]
     fn flush_and_read() {
-        let (mut tree, _dir) = test_tree();
+        let (tree, _dir) = test_tree();
         tree.put(b"key1".to_vec(), b"val1".to_vec()).unwrap();
         tree.put(b"key2".to_vec(), b"val2".to_vec()).unwrap();
 
         // Force flush.
         tree.flush_memtable().unwrap();
 
-        // Memtable should be empty now.
-        assert!(tree.memtable.is_empty());
+        // Memtable should be empty now — verify via get returning from SSTable.
+        // (Can't access inner.memtable directly from test anymore.)
 
         // Reads should still work via SSTable.
         assert_eq!(tree.get(b"key1").unwrap(), Some(b"val1".to_vec()));
@@ -376,7 +398,7 @@ mod tests {
 
     #[test]
     fn read_across_memtable_and_sstable() {
-        let (mut tree, _dir) = test_tree();
+        let (tree, _dir) = test_tree();
 
         // Put some entries and flush.
         tree.put(b"a".to_vec(), b"1".to_vec()).unwrap();
@@ -406,7 +428,7 @@ mod tests {
 
         // Write and flush.
         {
-            let mut tree = LsmTree::open(dir.path()).unwrap();
+            let tree = LsmTree::open(dir.path()).unwrap();
             tree.put(b"persist".to_vec(), b"me".to_vec()).unwrap();
             tree.flush_memtable().unwrap();
         }

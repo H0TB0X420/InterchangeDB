@@ -94,7 +94,7 @@ impl<T> ScanIterator for T where T: DoubleEndedIterator<Item = Result<(Vec<u8>, 
 /// ## Error Handling
 ///
 /// All operations return `Result<T>` to handle I/O errors, corruption, etc.
-pub trait StorageEngine: Send {
+pub trait StorageEngine: Send + Sync {
     /// Get the engine's name (e.g., "btree", "lsm").
     fn name(&self) -> &'static str;
 
@@ -107,13 +107,15 @@ pub trait StorageEngine: Send {
     /// Insert or update a key-value pair.
     ///
     /// If the key exists, its value is overwritten.
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
+    /// Takes `&self` — engines use interior mutability for thread safety.
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
 
     /// Delete a key.
     ///
     /// Typically writes a tombstone marker; actual removal happens
     /// during compaction. Deleting a non-existent key is a no-op.
-    fn delete(&mut self, key: &[u8]) -> Result<()>;
+    /// Takes `&self` — engines use interior mutability for thread safety.
+    fn delete(&self, key: &[u8]) -> Result<()>;
 
     /// Scan a range of keys.
     ///
@@ -138,7 +140,7 @@ pub trait StorageEngine: Send {
     ///
     /// For LSM: flushes memtable to SSTable.
     /// For B-tree: flushes dirty pages via buffer pool.
-    fn flush(&mut self) -> Result<()>;
+    fn flush(&self) -> Result<()>;
 
     /// Export engine state for warm transfer to another engine.
     ///
@@ -154,7 +156,7 @@ pub trait StorageEngine: Send {
     ///
     /// Clears existing data and imports all key-value pairs from the iterator.
     /// Used for runtime engine swapping.
-    fn import_data(&mut self, data: &mut dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>) -> Result<()> {
+    fn import_data(&self, data: &mut dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>) -> Result<()> {
         for item in data {
             let (key, value) = item?;
             self.put(&key, &value)?;

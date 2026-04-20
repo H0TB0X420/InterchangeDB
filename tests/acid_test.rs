@@ -39,7 +39,7 @@ fn atomicity_committed_all_present() {
     let dir = tempdir().unwrap();
 
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for i in 0..20 {
             let key = format!("atom_{:03}", i);
@@ -70,7 +70,7 @@ fn atomicity_uncommitted_none_present() {
     let dir = tempdir().unwrap();
 
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for i in 0..20 {
             let key = format!("ghost_{:03}", i);
@@ -102,7 +102,7 @@ fn atomicity_partial_never_visible() {
     // This multi-round test documents the edge case for future investigation.
     for round in 0..10u32 {
         {
-            let mut db = open_btree(dir.path());
+            let db = open_btree(dir.path());
             let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
             for k in 0..5 {
                 let key = format!("r{:03}_k{}", round, k);
@@ -148,7 +148,7 @@ fn consistency_transfer_invariant() {
     // 4 sequential "threads" each do 25 transfer transactions.
     // After all: invariant still holds.
     let dir = tempdir().unwrap();
-    let mut db = open_btree(dir.path());
+    let db = open_btree(dir.path());
 
     let num_accounts = 10;
     let initial_balance = 1000u64;
@@ -217,7 +217,7 @@ fn isolation_no_lost_updates() {
     // 4 sequential workers × 50 increment transactions on 5 shared counters.
     // Retry on deadlock/timeout. Final sum must equal 4 * 50 = 200.
     let dir = tempdir().unwrap();
-    let mut db = open_btree(dir.path());
+    let db = open_btree(dir.path());
 
     let num_counters = 5;
 
@@ -288,7 +288,7 @@ fn durability_100_crash_cycles() {
 
     for cycle in 0..100u32 {
         {
-            let mut db = open_btree(dir.path());
+            let db = open_btree(dir.path());
             let key = format!("dur_{:04}", cycle);
             db.put(key.as_bytes(), b"durable").unwrap();
         }

@@ -59,7 +59,7 @@ fn test_engine_initial_disk_size() {
 fn test_engine_many_keys_with_splits() {
     // Use small node sizes to force many splits — exercises BTree-specific
     // split/merge/redistribute logic that LSM doesn't have.
-    let (mut engine, _dir) = setup_engine_with_sizes(3, 3, 0);
+    let (engine, _dir) = setup_engine_with_sizes(3, 3, 0);
 
     // Insert 100 keys.
     for i in 0u16..100 {

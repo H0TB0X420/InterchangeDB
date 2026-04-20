@@ -33,7 +33,7 @@ fn setup_wal_lsm() -> (Database<LsmEngine>, tempfile::TempDir) {
 
 #[test]
 fn wal_put_get() {
-    let (mut db, _dir) = setup_wal_lsm();
+    let (db, _dir) = setup_wal_lsm();
     assert!(db.has_wal());
 
     db.put(b"hello", b"world").unwrap();
@@ -48,7 +48,7 @@ fn wal_put_get() {
 
 #[test]
 fn wal_delete() {
-    let (mut db, _dir) = setup_wal_lsm();
+    let (db, _dir) = setup_wal_lsm();
 
     db.put(b"a", b"1").unwrap();
     db.put(b"b", b"2").unwrap();
@@ -62,7 +62,7 @@ fn wal_delete() {
 
 #[test]
 fn wal_scan() {
-    let (mut db, _dir) = setup_wal_lsm();
+    let (db, _dir) = setup_wal_lsm();
 
     db.put(b"cherry", b"3").unwrap();
     db.put(b"apple", b"1").unwrap();
@@ -86,7 +86,7 @@ fn wal_files_on_disk() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let lsm_dir = data_dir.join("lsm");
     let engine = LsmEngine::new(&lsm_dir).unwrap();
-    let mut db = Database::open(&data_dir, engine).unwrap();
+    let db = Database::open(&data_dir, engine).unwrap();
 
     db.put(b"key", b"value").unwrap();
 
@@ -109,7 +109,7 @@ fn wal_records_verifiable() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let lsm_dir = data_dir.join("lsm");
     let engine = LsmEngine::new(&lsm_dir).unwrap();
-    let mut db = Database::open(&data_dir, engine).unwrap();
+    let db = Database::open(&data_dir, engine).unwrap();
 
     db.put(b"key1", b"val1").unwrap();
     db.put(b"key2", b"val2").unwrap();
@@ -166,7 +166,7 @@ fn crash_recovery() {
     // Phase 1: Write data through the WAL-enabled database.
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
         db.put(b"key1", b"val1").unwrap();
         db.put(b"key2", b"val2").unwrap();
         db.put(b"key3", b"val3").unwrap();
@@ -199,7 +199,7 @@ fn clean_shutdown_reopen() {
     // Phase 1: Write and flush.
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
         db.flush().unwrap();
@@ -229,7 +229,7 @@ fn idempotent_recovery() {
     // Phase 1: Write data.
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
         db.put(b"x", b"10").unwrap();
         db.put(b"y", b"20").unwrap();
     }
@@ -266,7 +266,7 @@ fn truncated_tail_recovery() {
     // Phase 1: Write data.
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
         db.put(b"c", b"3").unwrap();
@@ -305,7 +305,7 @@ fn multi_op_crash_recovery() {
     // Phase 1: Many operations.
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
 
         for i in 0u16..100 {
             db.put(&i.to_be_bytes(), &(i * 10).to_be_bytes()).unwrap();
@@ -350,7 +350,7 @@ fn checkpoint_and_crash_recovery() {
     // Phase 1: Write data, checkpoint, write more data.
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
 
         db.put(b"pre1", b"a").unwrap();
         db.put(b"pre2", b"b").unwrap();
@@ -386,7 +386,7 @@ fn checkpoint_deletes_old_segments() {
 
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
 
         // Write enough data to create multiple segments.
         // We'll write many records to ensure the WAL has content.
@@ -425,7 +425,7 @@ fn multiple_checkpoints() {
 
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
 
         db.put(b"k1", b"v1").unwrap();
         db.checkpoint().unwrap();
@@ -456,7 +456,7 @@ fn checkpoint_with_no_prior_ops() {
     let lsm_dir = data_dir.join("lsm");
 
     let engine = LsmEngine::new(&lsm_dir).unwrap();
-    let mut db = Database::open(&data_dir, engine).unwrap();
+    let db = Database::open(&data_dir, engine).unwrap();
 
     // Checkpoint on empty database — should not error.
     db.checkpoint().unwrap();
@@ -474,7 +474,7 @@ fn recovery_without_checkpoint_full_replay() {
     // Phase 1: Write without any checkpoint.
     {
         let engine = LsmEngine::new(&lsm_dir).unwrap();
-        let mut db = Database::open(&data_dir, engine).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
         db.put(b"a", b"1").unwrap();
         db.put(b"b", b"2").unwrap();
         db.put(b"c", b"3").unwrap();

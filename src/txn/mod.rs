@@ -30,6 +30,7 @@ use std::fmt;
 use crate::common::{Error, Result};
 use crate::wal::Lsn;
 pub use lock_manager::{LockManager, LockMode};
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -246,24 +247,22 @@ const MAX_ACTIVE_TRANSACTIONS: usize = 65536;
 
 /// Manages transaction lifecycle: begin, commit, abort.
 ///
-/// Assigns monotonically increasing IDs starting from 1 (0 is reserved
-/// for auto-commit). Tracks all active transactions and their WAL state.
+/// All methods take `&self`. Internal state uses Mutex/RwLock for concurrency.
+/// The lock manager and timestamp oracle are already thread-safe.
 pub struct TransactionManager {
     /// Next transaction ID to assign. Starts at 1 (0 = auto-commit).
-    next_txn_id: u64,
+    next_txn_id: AtomicU64,
     /// All currently active (uncommitted, non-aborted) transactions.
-    active_txns: HashMap<TxnId, Transaction>,
+    active_txns: Mutex<HashMap<TxnId, Transaction>>,
     /// Key-level lock manager for transaction isolation.
     lock_manager: LockManager,
     ts_oracle: TimestampOracle,
-    committed_txns: HashMap<TxnId, Timestamp>,
+    /// Committed txns map: txn_id -> commit_ts. Readers frequent, writers rare.
+    committed_txns: RwLock<HashMap<TxnId, Timestamp>>,
     /// Transactions known to be uncommitted (Begin but no Commit/Abort in WAL).
-    /// Used by visibility to prevent the checkpoint_ts fallback from making
-    /// their versions visible.
-    uncommitted_txns: HashSet<TxnId>,
-    /// Watermark: versions written before this timestamp are assumed committed
-    /// even if their Commit record was in a truncated WAL segment.
-    checkpoint_ts: Timestamp,
+    uncommitted_txns: RwLock<HashSet<TxnId>>,
+    /// Watermark: versions written before this timestamp are assumed committed.
+    checkpoint_ts: AtomicU64,
 }
 
 impl Default for TransactionManager {
@@ -276,13 +275,13 @@ impl TransactionManager {
     /// Create a new transaction manager.
     pub fn new() -> Self {
         Self {
-            next_txn_id: 1,
-            active_txns: HashMap::new(),
+            next_txn_id: AtomicU64::new(1),
+            active_txns: Mutex::new(HashMap::new()),
             lock_manager: LockManager::new(),
             ts_oracle: TimestampOracle::new(),
-            committed_txns: HashMap::new(),
-            uncommitted_txns: HashSet::new(),
-            checkpoint_ts: Timestamp::ZERO,
+            committed_txns: RwLock::new(HashMap::new()),
+            uncommitted_txns: RwLock::new(HashSet::new()),
+            checkpoint_ts: AtomicU64::new(Timestamp::ZERO.0),
         }
     }
 
@@ -292,135 +291,139 @@ impl TransactionManager {
     }
 
     /// Begin a new transaction, returning its assigned ID.
-    ///
-    /// The caller is responsible for appending the Begin WAL record and
-    /// passing the resulting LSN back via the `start_lsn` parameter.
-    /// This two-step approach keeps WAL ownership in `Database<E>`.
-    pub fn begin(&mut self, mode: TxnMode, start_lsn: Lsn) -> Result<TxnId> {
-        if self.active_txns.len() >= MAX_ACTIVE_TRANSACTIONS {
+    pub fn begin(&self, mode: TxnMode, start_lsn: Lsn) -> Result<TxnId> {
+        let mut active = self.active_txns.lock();
+        if active.len() >= MAX_ACTIVE_TRANSACTIONS {
             return Err(Error::TxnLimit(MAX_ACTIVE_TRANSACTIONS));
         }
 
-        let id = TxnId::new(self.next_txn_id);
-        self.next_txn_id += 1;
+        let id = TxnId::new(self.next_txn_id.fetch_add(1, Ordering::SeqCst));
 
         let begin_ts = self.ts_oracle.next();
         let snapshot = Snapshot {
             read_ts: begin_ts,
-            active_txns: self.active_txns.keys().copied().collect(),
+            active_txns: active.keys().copied().collect(),
         };
 
         let txn = Transaction::new(id, mode, start_lsn, begin_ts, snapshot);
-        self.active_txns.insert(id, txn);
+        active.insert(id, txn);
 
         Ok(id)
     }
 
     /// Mark a transaction as committed and remove from active set.
-    ///
-    /// The caller is responsible for writing the Commit WAL record and
-    /// syncing before calling this. This method only updates bookkeeping.
-    pub fn commit(&mut self, txn_id: TxnId) -> Result<()> {
-        let txn = self.get_active_mut(txn_id)?;
+    pub fn commit(&self, txn_id: TxnId) -> Result<()> {
+        let mut active = self.active_txns.lock();
+        let txn = active
+            .get_mut(&txn_id)
+            .ok_or(Error::TxnNotActive(txn_id.0))?;
         txn.state = TxnState::Committed;
-        self.active_txns.remove(&txn_id);
+        active.remove(&txn_id);
         Ok(())
     }
 
     /// Mark a transaction as aborted and remove from active set.
-    ///
-    /// The caller is responsible for undoing writes (via prev_lsn chain)
-    /// and writing the Abort WAL record before calling this.
-    pub fn abort(&mut self, txn_id: TxnId) -> Result<()> {
-        let txn = self.get_active_mut(txn_id)?;
+    pub fn abort(&self, txn_id: TxnId) -> Result<()> {
+        let mut active = self.active_txns.lock();
+        let txn = active
+            .get_mut(&txn_id)
+            .ok_or(Error::TxnNotActive(txn_id.0))?;
         txn.state = TxnState::Aborted;
-        self.active_txns.remove(&txn_id);
+        active.remove(&txn_id);
         Ok(())
     }
 
     /// Update the last LSN for a transaction after a WAL append.
-    ///
-    /// Called after each Put/Delete WAL record is appended, so the next
-    /// record in the chain has the correct `prev_lsn`.
-    pub fn update_last_lsn(&mut self, txn_id: TxnId, lsn: Lsn) -> Result<()> {
-        let txn = self.get_active_mut(txn_id)?;
+    pub fn update_last_lsn(&self, txn_id: TxnId, lsn: Lsn) -> Result<()> {
+        let mut active = self.active_txns.lock();
+        let txn = active
+            .get_mut(&txn_id)
+            .ok_or(Error::TxnNotActive(txn_id.0))?;
         txn.last_lsn = lsn;
         Ok(())
     }
 
     /// Get the last LSN for a transaction (for prev_lsn chain).
     pub fn last_lsn(&self, txn_id: TxnId) -> Result<Lsn> {
-        let txn = self.get_active(txn_id)?;
+        let active = self.active_txns.lock();
+        let txn = active
+            .get(&txn_id)
+            .ok_or(Error::TxnNotActive(txn_id.0))?;
         Ok(txn.last_lsn)
     }
 
     /// Get the mode of a transaction.
     pub fn mode(&self, txn_id: TxnId) -> Result<TxnMode> {
-        let txn = self.get_active(txn_id)?;
+        let active = self.active_txns.lock();
+        let txn = active
+            .get(&txn_id)
+            .ok_or(Error::TxnNotActive(txn_id.0))?;
         Ok(txn.mode)
     }
 
     /// Get all active transaction IDs — used by checkpoint.
     pub fn active_txn_ids(&self) -> Vec<u64> {
-        self.active_txns.keys().map(|id| id.0).collect()
+        self.active_txns.lock().keys().map(|id| id.0).collect()
     }
 
     /// Number of currently active transactions.
     pub fn active_count(&self) -> usize {
-        self.active_txns.len()
+        self.active_txns.lock().len()
     }
 
     /// Get all active snapshot read_ts values (for GC watermark computation).
     pub fn active_read_timestamps(&self) -> Vec<Timestamp> {
-        self.active_txns.values().map(|txn| txn.begin_ts).collect()
+        self.active_txns.lock().values().map(|txn| txn.begin_ts).collect()
     }
 
     /// Peek at the next transaction ID without consuming it.
-    /// Used by Database to write Begin WAL record before calling begin().                                                
     pub fn next_txn_id_peek(&self) -> u64 {
-        self.next_txn_id
+        self.next_txn_id.load(Ordering::SeqCst)
     }
 
-    /// Get a transaction's snapshot (for MVCC reads).
-    pub fn snapshot(&self, txn_id: TxnId) -> Result<&Snapshot> {
-        self.active_txns
+    /// Get a transaction's snapshot (for MVCC reads). Returns a clone.
+    pub fn snapshot(&self, txn_id: TxnId) -> Result<Snapshot> {
+        let active = self.active_txns.lock();
+        active
             .get(&txn_id)
-            .map(|txn| &txn.snapshot)
+            .map(|txn| txn.snapshot.clone())
             .ok_or(Error::TxnNotActive(txn_id.0))
     }
 
     /// Get a transaction's begin timestamp.
     pub fn begin_ts(&self, txn_id: TxnId) -> Result<Timestamp> {
-        self.active_txns
+        let active = self.active_txns.lock();
+        active
             .get(&txn_id)
             .map(|txn| txn.begin_ts)
             .ok_or(Error::TxnNotActive(txn_id.0))
     }
 
     /// Access the committed transactions map (for visibility checks).
-    pub fn committed_txns(&self) -> &HashMap<TxnId, Timestamp> {
-        &self.committed_txns
+    /// Returns a clone to avoid holding the RwLock across engine operations.
+    pub fn committed_txns(&self) -> HashMap<TxnId, Timestamp> {
+        self.committed_txns.read().clone()
     }
 
     /// Access the known-uncommitted transactions set (for visibility checks).
-    pub fn uncommitted_txns(&self) -> &HashSet<TxnId> {
-        &self.uncommitted_txns
+    pub fn uncommitted_txns(&self) -> HashSet<TxnId> {
+        self.uncommitted_txns.read().clone()
     }
 
     /// Load uncommitted txn_ids from recovery.
-    pub fn load_uncommitted_txns(&mut self, txns: HashSet<TxnId>) {
-        self.uncommitted_txns = txns;
+    pub fn load_uncommitted_txns(&self, txns: HashSet<TxnId>) {
+        *self.uncommitted_txns.write() = txns;
     }
 
     /// Assign a commit timestamp and record it. Called during commit.
-    pub fn assign_commit_ts(&mut self, txn_id: TxnId) -> Result<Timestamp> {
-        let txn = self
-            .active_txns
+    pub fn assign_commit_ts(&self, txn_id: TxnId) -> Result<Timestamp> {
+        let mut active = self.active_txns.lock();
+        let txn = active
             .get_mut(&txn_id)
             .ok_or(Error::TxnNotActive(txn_id.0))?;
         let commit_ts = self.ts_oracle.next();
         txn.commit_ts = Some(commit_ts);
-        self.committed_txns.insert(txn_id, commit_ts);
+        self.committed_txns.write().insert(txn_id, commit_ts);
         Ok(commit_ts)
     }
 
@@ -431,23 +434,23 @@ impl TransactionManager {
 
     /// Get the checkpoint watermark timestamp.
     pub fn checkpoint_ts(&self) -> Timestamp {
-        self.checkpoint_ts
+        Timestamp(self.checkpoint_ts.load(Ordering::Relaxed))
     }
 
     /// Update checkpoint watermark (called after successful checkpoint).
-    pub fn set_checkpoint_ts(&mut self, ts: Timestamp) {
-        self.checkpoint_ts = ts;
+    pub fn set_checkpoint_ts(&self, ts: Timestamp) {
+        self.checkpoint_ts.store(ts.0, Ordering::Relaxed);
     }
 
     /// Advance the oracle by one tick. Used during recovery to skip past
     /// persisted timestamps so new timestamps don't collide.
-    pub fn advance_oracle(&mut self) {
+    pub fn advance_oracle(&self) {
         self.ts_oracle.next();
     }
 
     /// Seed the committed_txns map from recovery.
     /// Also advances the oracle past recovered timestamps.
-    pub fn load_committed_txns(&mut self, recovered: HashMap<TxnId, Timestamp>) {
+    pub fn load_committed_txns(&self, recovered: HashMap<TxnId, Timestamp>) {
         let mut max_ts: u64 = 0;
         let mut max_txn_id: u64 = 0;
         for (&txn_id, &ts) in &recovered {
@@ -458,35 +461,16 @@ impl TransactionManager {
                 max_txn_id = txn_id.0;
             }
         }
-        self.committed_txns = recovered;
+        *self.committed_txns.write() = recovered;
         // Advance oracle past any recovered timestamp so new timestamps don't collide.
         while self.ts_oracle.peek().0 <= max_ts {
             self.ts_oracle.next();
         }
         // Advance txn_id counter past any recovered txn.
-        if max_txn_id >= self.next_txn_id {
-            self.next_txn_id = max_txn_id + 1;
-        }
+        // Use compare-and-swap to only raise it, never lower.
+        let _ = self.next_txn_id.fetch_max(max_txn_id + 1, Ordering::SeqCst);
         // Set checkpoint watermark so pre-recovery versions are visible.
-        self.checkpoint_ts = Timestamp(max_ts);
-    }
-
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
-
-    /// Get a reference to an active transaction, or error.
-    fn get_active(&self, txn_id: TxnId) -> Result<&Transaction> {
-        self.active_txns
-            .get(&txn_id)
-            .ok_or(Error::TxnNotActive(txn_id.0))
-    }
-
-    /// Get a mutable reference to an active transaction, or error.
-    fn get_active_mut(&mut self, txn_id: TxnId) -> Result<&mut Transaction> {
-        self.active_txns
-            .get_mut(&txn_id)
-            .ok_or(Error::TxnNotActive(txn_id.0))
+        self.checkpoint_ts.store(max_ts, Ordering::Relaxed);
     }
 }
 
@@ -542,7 +526,7 @@ mod tests {
 
     #[test]
     fn begin_assigns_unique_increasing_ids() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let id1 = mgr.begin(TxnMode::ReadWrite, Lsn::new(0)).unwrap();
         let id2 = mgr.begin(TxnMode::ReadWrite, Lsn::new(1)).unwrap();
@@ -557,7 +541,7 @@ mod tests {
 
     #[test]
     fn commit_removes_from_active_set() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let id = mgr.begin(TxnMode::ReadWrite, Lsn::new(0)).unwrap();
         assert_eq!(mgr.active_count(), 1);
@@ -568,7 +552,7 @@ mod tests {
 
     #[test]
     fn abort_removes_from_active_set() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let id = mgr.begin(TxnMode::ReadWrite, Lsn::new(0)).unwrap();
         assert_eq!(mgr.active_count(), 1);
@@ -579,7 +563,7 @@ mod tests {
 
     #[test]
     fn operations_after_commit_return_error() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let id = mgr.begin(TxnMode::ReadWrite, Lsn::new(0)).unwrap();
         mgr.commit(id).unwrap();
@@ -594,7 +578,7 @@ mod tests {
 
     #[test]
     fn operations_after_abort_return_error() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let id = mgr.begin(TxnMode::ReadWrite, Lsn::new(0)).unwrap();
         mgr.abort(id).unwrap();
@@ -606,7 +590,7 @@ mod tests {
 
     #[test]
     fn multiple_concurrent_transactions() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let id1 = mgr.begin(TxnMode::ReadWrite, Lsn::new(0)).unwrap();
         let id2 = mgr.begin(TxnMode::ReadOnly, Lsn::new(1)).unwrap();
@@ -628,7 +612,7 @@ mod tests {
 
     #[test]
     fn active_txn_ids_for_checkpoint() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let id1 = mgr.begin(TxnMode::ReadWrite, Lsn::new(0)).unwrap();
         let _id2 = mgr.begin(TxnMode::ReadOnly, Lsn::new(1)).unwrap();
@@ -647,7 +631,7 @@ mod tests {
 
     #[test]
     fn update_and_read_last_lsn() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let id = mgr.begin(TxnMode::ReadWrite, Lsn::new(10)).unwrap();
         assert_eq!(mgr.last_lsn(id).unwrap(), Lsn::new(10));
@@ -661,7 +645,7 @@ mod tests {
 
     #[test]
     fn begin_respects_mode() {
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
 
         let rw = mgr.begin(TxnMode::ReadWrite, Lsn::new(0)).unwrap();
         let ro = mgr.begin(TxnMode::ReadOnly, Lsn::new(1)).unwrap();

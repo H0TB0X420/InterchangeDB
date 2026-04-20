@@ -42,7 +42,7 @@ pub struct GcStats {
 /// `committed_txns` maps txn_id -> commit_ts for visibility determination.
 /// `checkpoint_ts` is the watermark for pre-recovery assumed-committed versions.
 pub fn gc_collect<E: StorageEngine>(
-    engine: &mut E,
+    engine: &E,
     low_water_mark: Timestamp,
     committed_txns: &HashMap<TxnId, Timestamp>,
     checkpoint_ts: Timestamp,

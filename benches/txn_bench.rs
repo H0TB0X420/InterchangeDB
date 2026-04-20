@@ -10,7 +10,7 @@
 //! - Latency (via criterion's built-in histogram)
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -40,7 +40,7 @@ fn open_db(dir: &Path) -> Database<BTreeEngine> {
 }
 
 /// Seed a database with N keys for read benchmarks.
-fn seed_db(db: &mut Database<BTreeEngine>, count: usize) {
+fn seed_db(db: &Database<BTreeEngine>, count: usize) {
     for i in 0..count {
         let key = format!("key_{:08}", i);
         let val = format!("val_{:08}", i);
@@ -59,7 +59,7 @@ fn bench_single_thread_txn(c: &mut Criterion) {
 
     group.bench_function("begin_put_commit", |b| {
         let dir = tempdir().unwrap();
-        let mut db = open_db(dir.path());
+        let db = open_db(dir.path());
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("key_{:08}", i);
@@ -73,7 +73,7 @@ fn bench_single_thread_txn(c: &mut Criterion) {
 
     group.bench_function("begin_3puts_commit", |b| {
         let dir = tempdir().unwrap();
-        let mut db = open_db(dir.path());
+        let db = open_db(dir.path());
         let mut i = 0u64;
         b.iter(|| {
             let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -88,8 +88,8 @@ fn bench_single_thread_txn(c: &mut Criterion) {
 
     group.bench_function("snapshot_read", |b| {
         let dir = tempdir().unwrap();
-        let mut db = open_db(dir.path());
-        seed_db(&mut db, 1000);
+        let db = open_db(dir.path());
+        seed_db(&db, 1000);
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("key_{:08}", i % 1000);
@@ -124,7 +124,7 @@ fn bench_multi_thread_txn(c: &mut Criterion) {
                     || {
                         let dir = tempdir().unwrap();
                         let db = open_db(dir.path());
-                        (Arc::new(Mutex::new(db)), dir)
+                        (Arc::new(db), dir)
                     },
                     |(db, _dir)| {
                         let barrier = Arc::new(Barrier::new(threads));
@@ -136,7 +136,6 @@ fn bench_multi_thread_txn(c: &mut Criterion) {
                                     barrier.wait();
                                     for i in 0..ops_per_thread {
                                         let key = format!("t{}_k{:04}", t, i);
-                                        let mut db = db.lock().unwrap();
                                         db.put(key.as_bytes(), b"bench_value").unwrap();
                                     }
                                 })
@@ -168,9 +167,9 @@ fn bench_read_heavy_concurrent(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let dir = tempdir().unwrap();
-                let mut db = open_db(dir.path());
-                seed_db(&mut db, 500);
-                (Arc::new(Mutex::new(db)), dir)
+                let db = open_db(dir.path());
+                seed_db(&db, 500);
+                (Arc::new(db), dir)
             },
             |(db, _dir)| {
                 let barrier = Arc::new(Barrier::new(8));
@@ -190,7 +189,6 @@ fn bench_read_heavy_concurrent(c: &mut Criterion) {
                         let mut i = 0u64;
                         while !stop.load(Ordering::Relaxed) {
                             let key = format!("key_{:08}", (r * 100 + i) % 500);
-                            let mut db = db.lock().unwrap();
                             let _ = db.get(key.as_bytes());
                             total_ops.fetch_add(1, Ordering::Relaxed);
                             i += 1;
@@ -210,7 +208,6 @@ fn bench_read_heavy_concurrent(c: &mut Criterion) {
                         let mut i = 0u64;
                         while !stop.load(Ordering::Relaxed) {
                             let key = format!("key_{:08}", (w * 250 + i) % 500);
-                            let mut db = db.lock().unwrap();
                             let _ = db.put(key.as_bytes(), b"updated_value");
                             total_ops.fetch_add(1, Ordering::Relaxed);
                             i += 1;
@@ -244,12 +241,12 @@ fn bench_write_contention(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let dir = tempdir().unwrap();
-                let mut db = open_db(dir.path());
+                let db = open_db(dir.path());
                 for i in 0..5 {
                     let key = format!("hot_{}", i);
                     db.put(key.as_bytes(), b"initial").unwrap();
                 }
-                (Arc::new(Mutex::new(db)), dir)
+                (Arc::new(db), dir)
             },
             |(db, _dir)| {
                 let barrier = Arc::new(Barrier::new(4));
@@ -267,7 +264,6 @@ fn bench_write_contention(c: &mut Criterion) {
                             for i in 0..20 {
                                 let key = format!("hot_{}", (t + i) % 5);
                                 let val = format!("v_{}_{}", t, i);
-                                let mut db = db.lock().unwrap();
                                 match db.put(key.as_bytes(), val.as_bytes()) {
                                     Ok(()) => { committed.fetch_add(1, Ordering::Relaxed); }
                                     Err(Error::Deadlock(_)) | Err(Error::LockTimeout) => {
@@ -300,7 +296,7 @@ fn bench_gc(c: &mut Criterion) {
 
     group.bench_function("gc_100_versions_10_keys", |b| {
         let dir = tempdir().unwrap();
-        let mut db = open_db(dir.path());
+        let db = open_db(dir.path());
 
         b.iter(|| {
             for i in 0..10 {
@@ -329,7 +325,7 @@ fn bench_recovery(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("replay", num_records), |b| {
             let dir = tempdir().unwrap();
             {
-                let mut db = open_db(dir.path());
+                let db = open_db(dir.path());
                 for i in 0..num_records {
                     let key = format!("rec_key_{:06}", i);
                     db.put(key.as_bytes(), b"recovery_benchmark_value").unwrap();

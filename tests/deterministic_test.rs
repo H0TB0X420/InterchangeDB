@@ -125,7 +125,7 @@ fn mvcc_write_then_read_sees_nothing() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     db.put(b"key", b"original").unwrap();
 
@@ -162,7 +162,7 @@ fn mvcc_concurrent_writes_one_wins() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     let t2 = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -191,7 +191,7 @@ fn mvcc_abort_then_read_sees_original() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     db.put(b"key", b"original").unwrap();
 
@@ -215,7 +215,7 @@ fn mvcc_own_write_visible_before_commit() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(t1, b"new_key", b"my_value").unwrap();
@@ -239,7 +239,7 @@ fn write_write_both_orderings() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     // Ordering 1: T1 writes first, T2 blocked.
     {

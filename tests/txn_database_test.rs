@@ -64,7 +64,7 @@ fn reopen_btree(dir: &Path) -> Database<BTreeEngine> {
 #[test]
 fn auto_commit_backward_compat() {
     // Database::new() with no WAL — put/get/delete work as before.
-    let (mut db, _dir) = setup_btree_no_wal();
+    let (db, _dir) = setup_btree_no_wal();
     db.put(b"key", b"value").unwrap();
     assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
     db.delete(b"key").unwrap();
@@ -74,7 +74,7 @@ fn auto_commit_backward_compat() {
 #[test]
 fn auto_commit_with_wal() {
     // Database::open() — auto-commit put/get/delete still work.
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     db.put(b"key", b"value").unwrap();
     assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
     db.delete(b"key").unwrap();
@@ -84,7 +84,7 @@ fn auto_commit_with_wal() {
 #[test]
 fn txn_not_supported_without_wal() {
     // Database::new() cannot begin transactions.
-    let (mut db, _dir) = setup_btree_no_wal();
+    let (db, _dir) = setup_btree_no_wal();
     let result = db.begin_txn(TxnMode::ReadWrite);
     assert!(matches!(result, Err(Error::TxnNotSupported)));
 }
@@ -95,7 +95,7 @@ fn txn_not_supported_without_wal() {
 
 #[test]
 fn begin_returns_valid_txn_id() {
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     let txn_id = db.begin_txn(TxnMode::ReadWrite).unwrap();
     assert!(txn_id.is_valid());
     assert!(txn_id.0 > 0); // 0 is reserved for AUTO_COMMIT.
@@ -105,7 +105,7 @@ fn begin_returns_valid_txn_id() {
 #[test]
 fn explicit_txn_lifecycle_btree() {
     // Full cycle: begin → put → get → commit → verify.
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(txn, b"name", b"alice").unwrap();
     let val = db.txn_get(txn, b"name").unwrap();
@@ -119,7 +119,7 @@ fn explicit_txn_lifecycle_btree() {
 #[test]
 fn explicit_txn_lifecycle_lsm() {
     // Same lifecycle on LSM engine — both engines work.
-    let (mut db, _dir) = setup_lsm_wal();
+    let (db, _dir) = setup_lsm_wal();
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(txn, b"name", b"bob").unwrap();
     let val = db.txn_get(txn, b"name").unwrap();
@@ -131,7 +131,7 @@ fn explicit_txn_lifecycle_lsm() {
 
 #[test]
 fn commit_makes_visible() {
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(txn, b"key", b"val").unwrap();
     db.commit_txn(txn).unwrap();
@@ -147,7 +147,7 @@ fn commit_makes_visible() {
 #[test]
 fn abort_makes_invisible() {
     // Put via txn, abort → key should not exist.
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(txn, b"key", b"val").unwrap();
     db.txn_abort(txn).unwrap();
@@ -158,7 +158,7 @@ fn abort_makes_invisible() {
 #[test]
 fn abort_undoes_all_writes() {
     // Txn writes 10 keys, aborts — none visible.
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     for i in 0..10u32 {
         let key = format!("key_{}", i);
@@ -176,7 +176,7 @@ fn abort_undoes_all_writes() {
 #[test]
 fn abort_restores_overwritten_value() {
     // Auto-commit put key=v1, txn puts key=v2, abort → key=v1 restored.
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     db.put(b"key", b"v1").unwrap();
 
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -190,7 +190,7 @@ fn abort_restores_overwritten_value() {
 #[test]
 fn abort_restores_deleted_value() {
     // Auto-commit put key=v1, txn deletes key, abort → key=v1 restored.
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     db.put(b"key", b"original").unwrap();
 
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -206,7 +206,7 @@ fn abort_restores_deleted_value() {
 
 #[test]
 fn multi_op_commit() {
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     // Pre-existing key to delete.
     db.put(b"c", b"to_delete").unwrap();
 
@@ -223,7 +223,7 @@ fn multi_op_commit() {
 
 #[test]
 fn multi_op_abort() {
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(txn, b"a", b"1").unwrap();
     db.txn_put(txn, b"b", b"2").unwrap();
@@ -239,7 +239,7 @@ fn multi_op_abort() {
 
 #[test]
 fn read_only_txn_allows_get() {
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     db.put(b"key", b"value").unwrap();
 
     let txn = db.begin_txn(TxnMode::ReadOnly).unwrap();
@@ -250,7 +250,7 @@ fn read_only_txn_allows_get() {
 
 #[test]
 fn read_only_txn_rejects_put() {
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     let txn = db.begin_txn(TxnMode::ReadOnly).unwrap();
     let result = db.txn_put(txn, b"key", b"val");
     assert!(matches!(result, Err(Error::TxnReadOnly(_))));
@@ -259,7 +259,7 @@ fn read_only_txn_rejects_put() {
 
 #[test]
 fn read_only_txn_rejects_delete() {
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
     let txn = db.begin_txn(TxnMode::ReadOnly).unwrap();
     let result = db.txn_delete(txn, b"key");
     assert!(matches!(result, Err(Error::TxnReadOnly(_))));
@@ -272,7 +272,7 @@ fn read_only_txn_rejects_delete() {
 
 #[test]
 fn auto_commit_mixed_with_explicit() {
-    let (mut db, _dir) = setup_btree_wal();
+    let (db, _dir) = setup_btree_wal();
 
     // Auto-commit write.
     db.put(b"auto_key", b"auto_val").unwrap();
@@ -304,7 +304,7 @@ fn recovery_committed_txn() {
         let dm = DiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let mut db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open(dir.path(), engine).unwrap();
 
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for i in 0..5u32 {
@@ -339,7 +339,7 @@ fn recovery_uncommitted_txn() {
         let dm = DiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let mut db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open(dir.path(), engine).unwrap();
 
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for i in 0..5u32 {
@@ -371,7 +371,7 @@ fn recovery_mixed_txns() {
         let dm = DiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let mut db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open(dir.path(), engine).unwrap();
 
         // T1: commit.
         let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -402,7 +402,7 @@ fn recovery_abort_before_crash() {
         let dm = DiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let mut db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open(dir.path(), engine).unwrap();
 
         db.put(b"survive", b"original").unwrap();
 

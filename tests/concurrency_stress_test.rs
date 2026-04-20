@@ -4,7 +4,7 @@
 //! deadlock detection, WAL, and GC all running simultaneously.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -17,14 +17,14 @@ use interchangedb::index::btree::BTreeEngine;
 use interchangedb::storage::DiskManager;
 use interchangedb::txn::TxnMode;
 
-fn setup_shared() -> (Arc<Mutex<Database<BTreeEngine>>>, tempfile::TempDir) {
+fn setup_shared() -> (Arc<Database<BTreeEngine>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
-    (Arc::new(Mutex::new(db)), dir)
+    (Arc::new(db), dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -40,13 +40,10 @@ fn read_heavy_8_threads() {
     let panicked = Arc::new(AtomicBool::new(false));
 
     // Seed some data.
-    {
-        let mut db = db.lock().unwrap();
-        for i in 0..20 {
-            let key = format!("rh_key_{:03}", i);
-            let val = format!("rh_val_{:03}", i);
-            db.put(key.as_bytes(), val.as_bytes()).unwrap();
-        }
+    for i in 0..20 {
+        let key = format!("rh_key_{:03}", i);
+        let val = format!("rh_val_{:03}", i);
+        db.put(key.as_bytes(), val.as_bytes()).unwrap();
     }
 
     let handles: Vec<_> = (0..8)
@@ -61,7 +58,6 @@ fn read_heavy_8_threads() {
                     let key_idx = (thread_idx * 11 + iter * 5) % 20;
                     let key = format!("rh_key_{:03}", key_idx);
 
-                    let mut db = db.lock().unwrap();
                     if is_write {
                         let val = format!("updated_{}_{}", thread_idx, iter);
                         if let Err(e) = db.put(key.as_bytes(), val.as_bytes()) {
@@ -117,7 +113,6 @@ fn write_heavy_8_threads() {
                     let key = format!("wh_t{}_{:04}", thread_idx, iter);
                     let val = format!("val_{}_{}", thread_idx, iter);
 
-                    let mut db = db.lock().unwrap();
                     match db.put(key.as_bytes(), val.as_bytes()) {
                         Ok(()) => { committed.fetch_add(1, Ordering::Relaxed); }
                         Err(_) => {} // Deadlock/timeout acceptable under contention.
@@ -135,7 +130,6 @@ fn write_heavy_8_threads() {
     assert!(total > 0, "At least some writes should commit");
 
     // Verify a sample of committed data.
-    let db = db.lock().unwrap();
     let sample_key = b"wh_t0_0000";
     let val = db.get(sample_key).unwrap();
     // This key should exist since thread 0 iter 0 runs early.
@@ -156,12 +150,9 @@ fn deadlock_storm_8_threads() {
     let deadlocks = Arc::new(AtomicU64::new(0));
 
     // Seed the keys.
-    {
-        let mut db = db.lock().unwrap();
-        for i in 0..8 {
-            let key = format!("dl_key_{}", i);
-            db.put(key.as_bytes(), b"initial").unwrap();
-        }
+    for i in 0..8 {
+        let key = format!("dl_key_{}", i);
+        db.put(key.as_bytes(), b"initial").unwrap();
     }
 
     let handles: Vec<_> = (0..8)
@@ -180,7 +171,6 @@ fn deadlock_storm_8_threads() {
                     let key1 = format!("dl_key_{}", k1);
                     let key2 = format!("dl_key_{}", k2);
 
-                    let mut db = db.lock().unwrap();
                     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
 
                     let r1 = db.txn_put(txn, key1.as_bytes(), b"locked");
@@ -247,7 +237,6 @@ fn gc_under_concurrent_writes() {
                 while !stop.load(Ordering::Relaxed) {
                     let key = format!("gc_t{}_{:06}", thread_idx, iter % 10);
                     let val = format!("v_{}", iter);
-                    let mut db = db.lock().unwrap();
                     let _ = db.put(key.as_bytes(), val.as_bytes());
                     iter += 1;
                 }
@@ -265,7 +254,6 @@ fn gc_under_concurrent_writes() {
             let mut total_removed = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(500));
-                let mut db = db.lock().unwrap();
                 match db.gc() {
                     Ok(stats) => { total_removed += stats.versions_removed; }
                     Err(_) => {}
@@ -284,7 +272,6 @@ fn gc_under_concurrent_writes() {
     }
 
     // Verify: all keys readable, GC didn't corrupt anything.
-    let db = db.lock().unwrap();
     for t in 0..4 {
         for k in 0..10 {
             let key = format!("gc_t{}_{:06}", t, k);
@@ -307,7 +294,7 @@ fn snapshot_consistency_under_writes() {
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let mut db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open(dir.path(), engine).unwrap();
 
     // Seed data.
     for i in 0..10 {

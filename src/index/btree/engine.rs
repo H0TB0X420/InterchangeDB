@@ -5,6 +5,7 @@
 //! struct problems since `BTree` borrows `&BPM`.
 
 use std::ops::RangeBounds;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::buffer::BufferPoolManager;
 use crate::common::config::PAGE_SIZE;
@@ -37,9 +38,9 @@ pub struct BTreeEngine {
     /// Maximum tombstones per leaf node.
     max_tombstones: usize,
     /// Number of live keys (maintained on put/delete).
-    key_count: u64,
+    key_count: AtomicU64,
     /// Logical data size in bytes (sum of key + value lengths).
-    data_size: u64,
+    data_size: AtomicU64,
 }
 
 impl BTreeEngine {
@@ -89,8 +90,8 @@ impl BTreeEngine {
                 leaf_max_size,
                 internal_max_size,
                 max_tombstones: 0,
-                key_count: 0,
-                data_size: 0,
+                key_count: AtomicU64::new(0),
+                data_size: AtomicU64::new(0),
             })
         } else {
             Self::build(bpm, leaf_max_size, internal_max_size, 0)
@@ -129,8 +130,8 @@ impl BTreeEngine {
             leaf_max_size,
             internal_max_size,
             max_tombstones,
-            key_count: 0,
-            data_size: 0,
+            key_count: AtomicU64::new(0),
+            data_size: AtomicU64::new(0),
         })
     }
 
@@ -164,14 +165,14 @@ impl StorageEngine for BTreeEngine {
         self.tree().get(key)
     }
 
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let tree = self.tree();
         let inserted = tree.insert(key, value)?;
 
         if inserted {
             // New key (or revived tombstone).
-            self.key_count += 1;
-            self.data_size += (key.len() + value.len()) as u64;
+            self.key_count.fetch_add(1, Ordering::Relaxed);
+            self.data_size.fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
         } else {
             // Key already exists — update by delete + re-insert.
             // Retrieve old value size for data_size tracking.
@@ -185,15 +186,14 @@ impl StorageEngine for BTreeEngine {
 
             // key_count unchanged (delete -1, insert +1 cancel out).
             // Adjust data_size for value size change.
-            self.data_size = self.data_size
-                .saturating_sub(old_value_size as u64)
-                + value.len() as u64;
+            self.data_size.fetch_sub(old_value_size as u64, Ordering::Relaxed);
+            self.data_size.fetch_add(value.len() as u64, Ordering::Relaxed);
         }
 
         Ok(())
     }
 
-    fn delete(&mut self, key: &[u8]) -> Result<()> {
+    fn delete(&self, key: &[u8]) -> Result<()> {
         let tree = self.tree();
 
         // Get value size before delete for data_size tracking.
@@ -204,8 +204,8 @@ impl StorageEngine for BTreeEngine {
         let deleted = tree.delete(key)?;
 
         if deleted {
-            self.key_count -= 1;
-            self.data_size = self.data_size.saturating_sub(entry_size);
+            self.key_count.fetch_sub(1, Ordering::Relaxed);
+            self.data_size.fetch_sub(entry_size, Ordering::Relaxed);
         }
 
         Ok(())
@@ -226,8 +226,8 @@ impl StorageEngine for BTreeEngine {
 
         StorageStatus {
             name: "btree",
-            keys: self.key_count,
-            size: self.data_size,
+            keys: self.key_count.load(Ordering::Relaxed),
+            size: self.data_size.load(Ordering::Relaxed),
             disk_size,
             // No garbage tracking yet — approximate as full disk usage.
             live_disk_size: disk_size,
@@ -235,7 +235,7 @@ impl StorageEngine for BTreeEngine {
         }
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&self) -> Result<()> {
         self.bpm.flush_all_pages()
     }
 }

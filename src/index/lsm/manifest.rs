@@ -38,6 +38,7 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
 }
 
 /// Tracks which SSTables belong to which levels.
+#[derive(Clone)]
 pub struct LevelState {
     /// levels[0] = L0 SSTables, levels[1] = L1, etc.
     /// L0 may have overlapping key ranges; L1+ are non-overlapping.

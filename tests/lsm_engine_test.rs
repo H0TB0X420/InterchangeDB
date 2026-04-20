@@ -37,7 +37,7 @@ fn test_engine_tombstone_tracking() {
     // compaction. BTree doesn't — its tombstones are internal leaf markers.
     let dir = tempdir().unwrap();
     let data_dir = dir.path().join("lsm_data");
-    let mut engine = LsmEngine::new(&data_dir).unwrap();
+    let engine = LsmEngine::new(&data_dir).unwrap();
 
     engine.put(b"a", b"1").unwrap();
     engine.put(b"b", b"2").unwrap();
@@ -56,7 +56,7 @@ fn test_engine_tombstone_tracking() {
 fn test_engine_compaction() {
     // Use small memtable to trigger flushes and compaction with fewer keys —
     // exercises LSM-specific SSTable creation, merge, and level management.
-    let (mut engine, _dir) = setup_engine_small_memtable();
+    let (engine, _dir) = setup_engine_small_memtable();
 
     for i in 0u32..100 {
         let key = format!("key_{i:04}").into_bytes();

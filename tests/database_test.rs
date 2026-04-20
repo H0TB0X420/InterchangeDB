@@ -29,7 +29,7 @@ macro_rules! database_tests {
 
             #[test]
             fn put_get() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 db.put(b"hello", b"world").unwrap();
                 db.put(b"foo", b"bar").unwrap();
@@ -45,7 +45,7 @@ macro_rules! database_tests {
 
             #[test]
             fn overwrite() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 db.put(b"key", b"value1").unwrap();
                 assert_eq!(db.get(b"key").unwrap(), Some(b"value1".to_vec()));
@@ -62,7 +62,7 @@ macro_rules! database_tests {
 
             #[test]
             fn delete() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 db.put(b"a", b"1").unwrap();
                 db.put(b"b", b"2").unwrap();
@@ -80,7 +80,7 @@ macro_rules! database_tests {
 
             #[test]
             fn delete_nonexistent() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 // Deleting a key that doesn't exist is a no-op.
                 db.delete(b"ghost").unwrap();
@@ -89,7 +89,7 @@ macro_rules! database_tests {
 
             #[test]
             fn scan_all() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 db.put(b"cherry", b"3").unwrap();
                 db.put(b"apple", b"1").unwrap();
@@ -105,7 +105,7 @@ macro_rules! database_tests {
 
             #[test]
             fn scan_range() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 for i in 0u8..10 {
                     db.put(&[i], &[i * 10]).unwrap();
@@ -138,7 +138,7 @@ macro_rules! database_tests {
 
             #[test]
             fn status_tracking() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 // Initial state.
                 let status = db.status();
@@ -166,7 +166,7 @@ macro_rules! database_tests {
 
             #[test]
             fn flush() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 db.put(b"persist", b"me").unwrap();
                 db.flush().unwrap();
@@ -177,7 +177,7 @@ macro_rules! database_tests {
 
             #[test]
             fn export_import() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 db.put(b"alpha", b"1").unwrap();
                 db.put(b"beta", b"2").unwrap();
@@ -188,7 +188,7 @@ macro_rules! database_tests {
                 assert_eq!(exported.len(), 3);
 
                 // Import into a fresh database of the same type.
-                let (mut db2, _dir2) = $setup();
+                let (db2, _dir2) = $setup();
                 let mut iter = exported.into_iter().map(Ok);
                 db2.import_data(&mut iter).unwrap();
 
@@ -200,7 +200,7 @@ macro_rules! database_tests {
 
             #[test]
             fn many_keys() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 // Insert 200 keys.
                 for i in 0u16..200 {
@@ -228,7 +228,7 @@ macro_rules! database_tests {
 
             #[test]
             fn flush_and_read() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 db.put(b"key1", b"val1").unwrap();
                 db.put(b"key2", b"val2").unwrap();
@@ -245,7 +245,7 @@ macro_rules! database_tests {
 
             #[test]
             fn mixed_operations() {
-                let (mut db, _dir) = $setup();
+                let (db, _dir) = $setup();
 
                 // Insert, overwrite, delete, then verify.
                 db.put(b"a", b"1").unwrap();
@@ -304,7 +304,7 @@ database_tests!(lsm, setup_lsm);
 #[test]
 fn cross_engine_btree_to_lsm() {
     // Populate a B-tree database.
-    let (mut btree_db, _dir1) = setup_btree();
+    let (btree_db, _dir1) = setup_btree();
     btree_db.put(b"alpha", b"1").unwrap();
     btree_db.put(b"beta", b"2").unwrap();
     btree_db.put(b"gamma", b"3").unwrap();
@@ -313,7 +313,7 @@ fn cross_engine_btree_to_lsm() {
     let exported: Vec<_> = btree_db.export_data().map(|r| r.unwrap()).collect();
 
     // Import into LSM.
-    let (mut lsm_db, _dir2) = setup_lsm();
+    let (lsm_db, _dir2) = setup_lsm();
     let mut iter = exported.into_iter().map(Ok);
     lsm_db.import_data(&mut iter).unwrap();
 
@@ -327,7 +327,7 @@ fn cross_engine_btree_to_lsm() {
 #[test]
 fn cross_engine_lsm_to_btree() {
     // Populate an LSM database.
-    let (mut lsm_db, _dir1) = setup_lsm();
+    let (lsm_db, _dir1) = setup_lsm();
     lsm_db.put(b"x", b"10").unwrap();
     lsm_db.put(b"y", b"20").unwrap();
     lsm_db.put(b"z", b"30").unwrap();
@@ -336,7 +336,7 @@ fn cross_engine_lsm_to_btree() {
     let exported: Vec<_> = lsm_db.export_data().map(|r| r.unwrap()).collect();
 
     // Import into B-tree.
-    let (mut btree_db, _dir2) = setup_btree();
+    let (btree_db, _dir2) = setup_btree();
     let mut iter = exported.into_iter().map(Ok);
     btree_db.import_data(&mut iter).unwrap();
 

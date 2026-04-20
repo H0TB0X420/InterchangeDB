@@ -57,7 +57,7 @@ struct LsmBenchState {
 
 fn setup_tree() -> LsmBenchState {
     let dir = tempdir().unwrap();
-    let mut tree = LsmTree::open(dir.path()).unwrap();
+    let tree = LsmTree::open(dir.path()).unwrap();
 
     // Bulk insert all keys.
     for key in 0..TOTAL_KEYS {
@@ -91,7 +91,7 @@ fn bench_lsm_insert(c: &mut Criterion) {
                     let tree = LsmTree::open(dir.path()).unwrap();
                     (tree, dir)
                 },
-                |(mut tree, _dir)| {
+                |(tree, _dir)| {
                     for key in 0..TOTAL_KEYS {
                         let k = encode_key(key as i64);
                         let v = encode_value(key as u64);
@@ -145,7 +145,7 @@ fn bench_lsm_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("lsm_write");
     group.throughput(Throughput::Elements(BATCH_SIZE as u64));
 
-    let mut state = setup_tree();
+    let state = setup_tree();
 
     let mut rng_state: u64 = 99;
     let mut do_insert = false;

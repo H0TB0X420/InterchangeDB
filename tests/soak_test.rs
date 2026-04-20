@@ -6,7 +6,7 @@
 //! Marked `#[ignore]` — run with `cargo test -- --ignored` or CI.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,14 +19,14 @@ use interchangedb::index::btree::BTreeEngine;
 use interchangedb::storage::DiskManager;
 use interchangedb::txn::TxnMode;
 
-fn setup_shared() -> (Arc<Mutex<Database<BTreeEngine>>>, tempfile::TempDir) {
+fn setup_shared() -> (Arc<Database<BTreeEngine>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
-    (Arc::new(Mutex::new(db)), dir)
+    (Arc::new(db), dir)
 }
 
 /// 30-second sustained mixed workload with periodic GC and checkpoint.
@@ -69,7 +69,6 @@ fn soak_30_seconds() {
                 let key_idx = (reader_idx * 17 + iter * 7) % 50;
                 let key = format!("soak_key_{:03}", key_idx);
 
-                let mut db = db.lock().unwrap();
                 let txn = match db.begin_txn(TxnMode::ReadOnly) {
                     Ok(t) => t,
                     Err(_) => { errors.fetch_add(1, Ordering::Relaxed); continue; }
@@ -108,7 +107,6 @@ fn soak_30_seconds() {
                 let val = format!("w{}_{}", writer_idx, iter);
                 let should_abort = iter % 5 == 0; // 20% abort rate
 
-                let mut db = db.lock().unwrap();
                 let txn = match db.begin_txn(TxnMode::ReadWrite) {
                     Ok(t) => t,
                     Err(_) => { errors.fetch_add(1, Ordering::Relaxed); continue; }
@@ -150,7 +148,6 @@ fn soak_30_seconds() {
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_secs(3));
 
-                let mut db = db.lock().unwrap();
                 // GC.
                 match db.gc() {
                     Ok(_stats) => { gc_runs.fetch_add(1, Ordering::Relaxed); }
@@ -191,7 +188,6 @@ fn soak_30_seconds() {
     assert_eq!(total_errors, 0, "Should have zero errors");
 
     // Final state check: read all keys, verify no corruption.
-    let db = db.lock().unwrap();
     for i in 0..50 {
         let key = format!("soak_key_{:03}", i);
         match db.get(key.as_bytes()) {

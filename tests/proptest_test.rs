@@ -137,7 +137,7 @@ proptest! {
         let dm = DiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let mut db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open(dir.path(), engine).unwrap();
 
         // Track expected state.
         let mut expected: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
@@ -173,7 +173,7 @@ proptest! {
         let dm = DiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let mut db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open(dir.path(), engine).unwrap();
 
         // Write multiple versions of each key.
         for k in 0..num_keys {
@@ -228,7 +228,7 @@ proptest! {
         let dm = DiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let mut db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open(dir.path(), engine).unwrap();
 
         // Committed transaction.
         let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();

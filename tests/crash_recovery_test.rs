@@ -38,7 +38,7 @@ fn crash_restart_loop_100() {
     for i in 0..100u32 {
         // Write and commit.
         {
-            let mut db = open_btree(dir.path());
+            let db = open_btree(dir.path());
             let key = format!("key_{:04}", i);
             let val = format!("val_{:04}", i);
             db.put(key.as_bytes(), val.as_bytes()).unwrap();
@@ -74,7 +74,7 @@ fn crash_mid_transaction_uncommitted_invisible() {
     let dir = tempdir().unwrap();
 
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for i in 0..5 {
             let key = format!("uncommitted_{}", i);
@@ -106,7 +106,7 @@ fn crash_after_commit_before_checkpoint() {
     let dir = tempdir().unwrap();
 
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         db.txn_put(txn, b"committed_key", b"committed_val").unwrap();
         db.commit_txn(txn).unwrap();
@@ -132,7 +132,7 @@ fn crash_mixed_transaction_states() {
     let dir = tempdir().unwrap();
 
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
 
         // T1: committed.
         let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -167,7 +167,7 @@ fn recovery_idempotent() {
     let dir = tempdir().unwrap();
 
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
         for i in 0..10 {
             let key = format!("idem_{}", i);
             db.put(key.as_bytes(), b"value").unwrap();
@@ -211,7 +211,7 @@ fn double_crash_recovery() {
     let dir = tempdir().unwrap();
 
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
         db.put(b"double_crash_key", b"double_crash_val").unwrap();
         // First crash.
     }
@@ -241,7 +241,7 @@ fn recovery_after_gc() {
     let dir = tempdir().unwrap();
 
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
 
         // Create multiple versions.
         for i in 0..5 {
@@ -280,7 +280,7 @@ fn atomicity_multi_key_transaction() {
 
     // Case 1: committed before crash — all present.
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for i in 0..10 {
             let key = format!("atomic_a_{}", i);
@@ -302,7 +302,7 @@ fn atomicity_multi_key_transaction() {
 
     // Case 2: NOT committed — none present.
     {
-        let mut db = open_btree(dir.path());
+        let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for i in 0..10 {
             let key = format!("atomic_b_{}", i);
@@ -333,7 +333,7 @@ fn durability_100_cycles() {
 
     for i in 0..100u32 {
         {
-            let mut db = open_btree(dir.path());
+            let db = open_btree(dir.path());
             let key = format!("durable_{:04}", i);
             let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
             db.txn_put(txn, key.as_bytes(), b"durable").unwrap();

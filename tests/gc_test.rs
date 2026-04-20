@@ -25,7 +25,7 @@ fn setup() -> (Database<BTreeEngine>, tempfile::TempDir) {
 #[test]
 fn gc_single_version_kept() {
     // One key, one committed version. GC keeps it (it's the newest below WM).
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
     db.put(b"key", b"value").unwrap();
 
     let stats = db.gc().unwrap();
@@ -38,7 +38,7 @@ fn gc_single_version_kept() {
 #[test]
 fn gc_removes_old_versions() {
     // Write same key 5 times. GC should keep only the newest version.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     for i in 0..5 {
         let val = format!("v{}", i);
@@ -61,7 +61,7 @@ fn gc_removes_old_versions() {
 fn gc_preserves_versions_above_watermark() {
     // Start a long-running read txn, then write new versions.
     // GC should not remove versions above the long-running txn's read_ts.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"v1").unwrap();
 
@@ -95,7 +95,7 @@ fn gc_preserves_versions_above_watermark() {
 #[test]
 fn gc_removes_aborted_versions() {
     // Write via txn and abort. GC should remove the aborted version.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(txn, b"ghost", b"aborted_data").unwrap();
@@ -117,7 +117,7 @@ fn gc_tombstone_cleanup() {
     // Second GC with no older versions... tombstone stays (conservative).
     // This documents current behavior: full tombstone cleanup needs two passes
     // or lookahead.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"value").unwrap();
     db.delete(b"key").unwrap();
@@ -136,7 +136,7 @@ fn gc_tombstone_cleanup() {
 #[test]
 fn gc_multiple_keys() {
     // Multiple keys, each with multiple versions. GC keeps newest per key.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     for i in 0..5 {
         for v in 0..3 {
@@ -162,7 +162,7 @@ fn gc_multiple_keys() {
 #[test]
 fn gc_idempotent() {
     // Run GC multiple times — second and subsequent runs are no-ops.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     for i in 0..10 {
         let val = format!("v{}", i);
@@ -182,7 +182,7 @@ fn gc_idempotent() {
 #[test]
 fn gc_does_not_corrupt_active_transaction() {
     // Begin a write txn, run GC, commit — data should be intact.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"existing", b"before").unwrap();
 
@@ -200,7 +200,7 @@ fn gc_does_not_corrupt_active_transaction() {
 
 #[test]
 fn gc_stats_accurate() {
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     // 3 keys, 4 versions each = 12 total versions.
     for k in 0..3 {

@@ -44,7 +44,7 @@ pub struct RecoveryStats {
 /// Returns recovery stats including the committed_txns map needed by MVCC.
 pub fn recover<E: StorageEngine>(
     reader: &WalReader,
-    engine: &mut E,
+    engine: &E,
     last_checkpoint_lsn: Lsn,
 ) -> Result<RecoveryStats> {
     let start = Instant::now();
@@ -120,7 +120,7 @@ fn analyze_transactions(records: &[LogRecord]) -> (HashMap<u64, u64>, HashSet<u6
 
 /// Phase 2: Replay committed transaction writes and auto-commit operations.
 fn redo_committed<E: StorageEngine>(
-    engine: &mut E,
+    engine: &E,
     records: &[LogRecord],
     committed: &HashSet<u64>,
 ) -> Result<u64> {

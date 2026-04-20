@@ -36,7 +36,7 @@ fn setup() -> (Database<BTreeEngine>, tempfile::TempDir) {
 fn no_dirty_reads() {
     // T1 writes a key. T2 starts after T1 but before T1 commits.
     // T2 should NOT see T1's uncommitted write.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     // Pre-existing value.
     db.put(b"key", b"original").unwrap();
@@ -59,7 +59,7 @@ fn no_dirty_reads() {
 #[test]
 fn no_dirty_reads_new_key() {
     // T1 inserts a brand-new key. T2 should not see it until T1 commits.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(t1, b"new_key", b"new_val").unwrap();
@@ -79,7 +79,7 @@ fn no_dirty_reads_new_key() {
 #[test]
 fn no_non_repeatable_reads() {
     // T1 reads a key. T2 writes + commits. T1 reads again — same value.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"v1").unwrap();
 
@@ -107,7 +107,7 @@ fn no_non_repeatable_reads() {
 #[test]
 fn no_phantom_reads() {
     // T1 scans a range. T2 inserts into that range + commits. T1 scans again — same results.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"a", b"1").unwrap();
     db.put(b"c", b"3").unwrap();
@@ -141,7 +141,7 @@ fn no_phantom_reads() {
 #[test]
 fn own_writes_visible() {
     // A transaction can see its own uncommitted writes.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(t1, b"key", b"my_value").unwrap();
@@ -155,7 +155,7 @@ fn own_writes_visible() {
 #[test]
 fn own_writes_overwrite_visible() {
     // Write twice to the same key within one txn — sees the latest write.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"original").unwrap();
 
@@ -176,7 +176,7 @@ fn own_writes_overwrite_visible() {
 #[test]
 fn aborted_writes_invisible() {
     // T1 writes and aborts. T2 cannot see the write.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(t1, b"secret", b"aborted_data").unwrap();
@@ -191,7 +191,7 @@ fn aborted_writes_invisible() {
 #[test]
 fn aborted_overwrite_preserves_original() {
     // Pre-existing value. T1 overwrites and aborts. Original still visible.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"original").unwrap();
 
@@ -210,7 +210,7 @@ fn aborted_overwrite_preserves_original() {
 #[test]
 fn tombstone_makes_key_invisible() {
     // T1 writes key, commits. T2 deletes key, commits. T3 reads — gets None.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"value").unwrap();
 
@@ -225,7 +225,7 @@ fn tombstone_makes_key_invisible() {
 #[test]
 fn tombstone_not_visible_to_earlier_snapshot() {
     // T1 takes snapshot. T2 deletes key + commits. T1 still sees the key.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"value").unwrap();
 
@@ -252,7 +252,7 @@ fn tombstone_not_visible_to_earlier_snapshot() {
 #[test]
 fn readers_dont_block_writers() {
     // A read-only transaction does NOT acquire locks. A writer can proceed.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"v1").unwrap();
 
@@ -282,7 +282,7 @@ fn readers_dont_block_writers() {
 #[test]
 fn write_write_conflict_detected() {
     // Two write transactions on the same key — second gets deadlock or timeout.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(t1, b"contested", b"t1_value").unwrap();
@@ -315,7 +315,7 @@ fn write_skew_possible_under_snapshot_isolation() {
     //
     // This test documents that write skew IS possible — it's expected behavior,
     // not a bug. Full serializability would require SSI (Phase 8+).
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"A", b"1").unwrap();
     db.put(b"B", b"1").unwrap();
@@ -352,7 +352,7 @@ fn write_skew_possible_under_snapshot_isolation() {
 #[test]
 fn multiple_versions_newest_wins() {
     // Write a key 5 times via separate transactions. Get returns the latest.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     for i in 0..5 {
         let val = format!("v{}", i);
@@ -365,7 +365,7 @@ fn multiple_versions_newest_wins() {
 #[test]
 fn older_snapshot_sees_older_version() {
     // T1 takes snapshot after v1. Write v2. T1 still sees v1.
-    let (mut db, _dir) = setup();
+    let (db, _dir) = setup();
 
     db.put(b"key", b"v1").unwrap();
 

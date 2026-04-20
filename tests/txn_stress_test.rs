@@ -5,7 +5,7 @@
 //! sustained contention.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,14 +18,14 @@ use interchangedb::index::btree::BTreeEngine;
 use interchangedb::storage::DiskManager;
 use interchangedb::txn::TxnMode;
 
-fn setup_shared_db() -> (Arc<Mutex<Database<BTreeEngine>>>, tempfile::TempDir) {
+fn setup_shared_db() -> (Arc<Database<BTreeEngine>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dm = DiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
-    (Arc::new(Mutex::new(db)), dir)
+    (Arc::new(db), dir)
 }
 
 #[test]
@@ -50,7 +50,6 @@ fn concurrent_txn_commits() {
                     let key2 = format!("t{}_i{}_k2", thread_idx, iter);
                     let val = format!("v_{}_{}", thread_idx, iter);
 
-                    let mut db = db.lock().unwrap();
                     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
 
                     let r1 = db.txn_put(txn, key1.as_bytes(), val.as_bytes());
@@ -115,7 +114,6 @@ fn concurrent_txn_mixed() {
                     let val = format!("val_{}_{}", thread_idx, iter);
                     let should_abort = (thread_idx + iter) % 3 == 0; // ~33% abort
 
-                    let mut db = db.lock().unwrap();
                     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
 
                     let result = db.txn_put(txn, key.as_bytes(), val.as_bytes());
@@ -170,7 +168,6 @@ fn rapid_begin_abort_churn() {
             thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..100 {
-                    let mut db = db.lock().unwrap();
                     let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
                     db.txn_abort(txn).unwrap();
                     cycles.fetch_add(1, Ordering::Relaxed);
