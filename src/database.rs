@@ -98,6 +98,13 @@ impl<E: StorageEngine> Database<E> {
             .collect();
         txn_mgr.load_uncommitted_txns(uncommitted);
 
+        // Advance the txn-id counter past every id the engine could still
+        // hold MVCC versions for. Without this, a fresh transaction could
+        // be assigned an id that collides with a leftover uncommitted txn
+        // from a prior crash; a later commit on that reused id would
+        // retroactively make the leftover versions visible.
+        txn_mgr.advance_next_txn_id_past(stats.max_txn_id);
+
         // Restore oracle timestamp from checkpoint.
         if stats.checkpoint_oracle_ts > 0 {
             let ckpt_ts = crate::txn::Timestamp(stats.checkpoint_oracle_ts);
@@ -277,7 +284,12 @@ impl<E: StorageEngine> Database<E> {
             .as_ref()
             .map(|mgr| mgr.ts_oracle_peek().0)
             .unwrap_or(0);
-        let mut record = LogRecord::checkpoint(active_txn_ids, oracle_ts);
+        let next_txn_id = self
+            .txn_manager
+            .as_ref()
+            .map(|mgr| mgr.next_txn_id_peek())
+            .unwrap_or(1);
+        let mut record = LogRecord::checkpoint(active_txn_ids, oracle_ts, next_txn_id);
         let checkpoint_lsn = wal.append(&mut record)?;
 
         // Step 3: Sync WAL.

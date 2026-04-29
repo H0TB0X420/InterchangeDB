@@ -91,15 +91,11 @@ fn atomicity_uncommitted_none_present() {
 
 #[test]
 fn atomicity_partial_never_visible() {
-    // Run 50 transactions, each writing 5 keys. Crash at random points.
-    // After each recovery: for each txn, either ALL 5 keys present or NONE.
+    // Multi-round crash loop with alternating commit / uncommitted writes.
+    // After each recovery: for each prior round, all 5 keys present (committed
+    // round) or none (uncommitted round) — strict all-or-nothing.
     let dir = tempdir().unwrap();
 
-    // NOTE: Multi-round crash loops with alternating commit/uncommitted expose
-    // a subtle interaction between BTreeEngine::open_existing and MVCC visibility
-    // across multiple crash-restart cycles. The simple single-crash cases pass
-    // (atomicity_committed_all_present, atomicity_uncommitted_none_present).
-    // This multi-round test documents the edge case for future investigation.
     for round in 0..10u32 {
         {
             let db = open_btree(dir.path());
@@ -115,12 +111,6 @@ fn atomicity_partial_never_visible() {
             // Crash.
         }
 
-        // Verify atomicity: all-or-nothing per transaction.
-        // BUG FOUND (Phase 8): The checkpoint_ts watermark fallback in is_visible()
-        // incorrectly assumes ALL versions below the watermark are committed.
-        // Uncommitted versions with version_ts <= checkpoint_ts are wrongly visible.
-        // This needs fixing: the fallback should exclude txn_ids that appear in
-        // WAL records without a corresponding Commit record.
         let db = open_btree(dir.path());
         for r in 0..=round {
             let count: usize = (0..5)
@@ -135,6 +125,72 @@ fn atomicity_partial_never_visible() {
                 assert_eq!(count, 0, "Round {} (uncommitted): no keys should be present", r);
             }
         }
+    }
+}
+
+#[test]
+fn atomicity_no_txn_id_reuse_after_uncommitted() {
+    // Tight regression for the txn-id reuse bug:
+    //   round 0: commit  (txn id 1)
+    //   round 1: crash with no commit (txn id 2 leaves MVCC versions in engine)
+    //   round 2: commit  — must NOT be assigned id 2, or round 1's leftover
+    //                       versions retroactively become visible.
+    //
+    // Pre-fix: round 2's begin reused id 2 because next_txn_id was only
+    //          advanced past max committed id (1). Round 2's commit then
+    //          made round 1's writes visible.
+    // Post-fix: recovery advances next_txn_id past every id seen in the WAL.
+    let dir = tempdir().unwrap();
+
+    // Round 0 — commit.
+    {
+        let db = open_btree(dir.path());
+        let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
+        for k in 0..5 {
+            db.txn_put(txn, format!("r000_k{}", k).as_bytes(), b"committed").unwrap();
+        }
+        db.commit_txn(txn).unwrap();
+    }
+    // Round 1 — crash uncommitted.
+    {
+        let db = open_btree(dir.path());
+        let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
+        for k in 0..5 {
+            db.txn_put(txn, format!("r001_k{}", k).as_bytes(), b"phantom").unwrap();
+        }
+        // NO commit.
+    }
+    // Round 2 — commit a different set of keys.
+    {
+        let db = open_btree(dir.path());
+        let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
+        for k in 0..5 {
+            db.txn_put(txn, format!("r002_k{}", k).as_bytes(), b"committed").unwrap();
+        }
+        db.commit_txn(txn).unwrap();
+    }
+
+    // Verify: round 0 and round 2 visible; round 1 invisible.
+    let db = open_btree(dir.path());
+    for k in 0..5 {
+        assert_eq!(
+            db.get(format!("r000_k{}", k).as_bytes()).unwrap().as_deref(),
+            Some(&b"committed"[..]),
+            "round 0 key {} must be present",
+            k
+        );
+        assert_eq!(
+            db.get(format!("r001_k{}", k).as_bytes()).unwrap(),
+            None,
+            "round 1 key {} (uncommitted) must NOT be visible — txn-id reuse bug",
+            k
+        );
+        assert_eq!(
+            db.get(format!("r002_k{}", k).as_bytes()).unwrap().as_deref(),
+            Some(&b"committed"[..]),
+            "round 2 key {} must be present",
+            k
+        );
     }
 }
 

@@ -37,6 +37,12 @@ pub struct RecoveryStats {
     /// Transactions that have WAL records but no Commit or Abort record.
     /// These are genuinely uncommitted — their versions must be invisible.
     pub uncommitted_txns: HashSet<u64>,
+    /// Highest txn_id observed during recovery — across all post-checkpoint
+    /// records and the persisted `next_txn_id` from the last Checkpoint.
+    /// The transaction manager must advance its counter past this value so
+    /// new transactions never reuse an id that could collide with an
+    /// existing MVCC version (committed, aborted, or uncommitted).
+    pub max_txn_id: u64,
 }
 
 /// Replay WAL records into the engine, starting from `last_checkpoint_lsn`.
@@ -61,8 +67,10 @@ pub fn recover<E: StorageEngine>(
 
     let records_scanned = records.len() as u64;
 
-    // Phase 1: Analysis — who committed, who aborted, last checkpoint oracle_ts.
-    let (committed_map, aborted, checkpoint_oracle_ts) = analyze_transactions(&records);
+    // Phase 1: Analysis — who committed, who aborted, last checkpoint
+    // oracle_ts, and the txn-id high-water mark recorded at that checkpoint.
+    let (committed_map, aborted, checkpoint_oracle_ts, checkpoint_max_txn_id) =
+        analyze_transactions(&records);
 
     // Phase 2: Redo — replay committed operations.
     let committed_set: HashSet<u64> = committed_map.keys().copied().collect();
@@ -70,10 +78,16 @@ pub fn recover<E: StorageEngine>(
 
     // Phase 3: Identify uncommitted transactions (Begin but no Commit/Abort).
     // Their versions are in the engine but must be invisible.
+    // Also track the highest txn_id seen so the txn manager can advance
+    // past it on reopen (prevents id reuse → wrong-visibility bugs).
     let mut seen_txns: HashSet<u64> = HashSet::new();
+    let mut max_txn_id_records: u64 = 0;
     for record in &records {
         if record.txn_id != 0 {
             seen_txns.insert(record.txn_id);
+            if record.txn_id > max_txn_id_records {
+                max_txn_id_records = record.txn_id;
+            }
         }
     }
     let uncommitted_txns: HashSet<u64> = seen_txns
@@ -81,6 +95,8 @@ pub fn recover<E: StorageEngine>(
         .filter(|id| !committed_set.contains(id))
         .filter(|id| !aborted.contains(id))
         .collect();
+
+    let max_txn_id = max_txn_id_records.max(checkpoint_max_txn_id);
 
     Ok(RecoveryStats {
         records_scanned,
@@ -90,15 +106,24 @@ pub fn recover<E: StorageEngine>(
         committed_txns: committed_map,
         checkpoint_oracle_ts,
         uncommitted_txns,
+        max_txn_id,
     })
 }
 
 /// Phase 1: Forward scan to classify transactions.
-/// Returns (committed: txn_id -> commit_ts, aborted: set, last checkpoint oracle_ts).
-fn analyze_transactions(records: &[LogRecord]) -> (HashMap<u64, u64>, HashSet<u64>, u64) {
+/// Returns:
+/// - committed: txn_id -> commit_ts
+/// - aborted: set of aborted txn_ids
+/// - last checkpoint's oracle_ts (0 if no checkpoint)
+/// - txn-id high-water mark seeded by the last Checkpoint record
+///   (covers ids whose original records were truncated by that checkpoint)
+fn analyze_transactions(
+    records: &[LogRecord],
+) -> (HashMap<u64, u64>, HashSet<u64>, u64, u64) {
     let mut committed = HashMap::new();
     let mut aborted = HashSet::new();
     let mut checkpoint_oracle_ts: u64 = 0;
+    let mut checkpoint_max_txn_id: u64 = 0;
 
     for record in records {
         match &record.payload {
@@ -108,14 +133,24 @@ fn analyze_transactions(records: &[LogRecord]) -> (HashMap<u64, u64>, HashSet<u6
             LogPayload::Abort => {
                 aborted.insert(record.txn_id);
             }
-            LogPayload::Checkpoint { oracle_ts, .. } => {
+            LogPayload::Checkpoint { oracle_ts, next_txn_id, active_txn_ids } => {
                 checkpoint_oracle_ts = *oracle_ts;
+                // The persisted next_txn_id is the authoritative high-water
+                // mark; active_txn_ids is included as a defensive fallback
+                // for older checkpoint records that lack next_txn_id (read
+                // back as 0 via backward-compat decode).
+                let from_active = active_txn_ids.iter().copied().max().unwrap_or(0);
+                let from_next = next_txn_id.saturating_sub(1);
+                let candidate = from_active.max(from_next);
+                if candidate > checkpoint_max_txn_id {
+                    checkpoint_max_txn_id = candidate;
+                }
             }
             _ => {}
         }
     }
 
-    (committed, aborted, checkpoint_oracle_ts)
+    (committed, aborted, checkpoint_oracle_ts, checkpoint_max_txn_id)
 }
 
 /// Phase 2: Replay committed transaction writes and auto-commit operations.

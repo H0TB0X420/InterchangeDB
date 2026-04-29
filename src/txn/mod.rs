@@ -415,6 +415,16 @@ impl TransactionManager {
         *self.uncommitted_txns.write() = txns;
     }
 
+    /// Advance the txn-id counter past `max_seen` so future `begin()` calls
+    /// can never reuse an id that already appears in the engine. Recovery
+    /// calls this with the highest txn_id seen across committed, aborted,
+    /// and uncommitted transactions (and the persisted checkpoint mark).
+    /// Reusing an id would let a fresh commit retroactively make leftover
+    /// MVCC versions from a prior crash visible.
+    pub fn advance_next_txn_id_past(&self, max_seen: u64) {
+        let _ = self.next_txn_id.fetch_max(max_seen + 1, Ordering::SeqCst);
+    }
+
     /// Assign a commit timestamp and record it. Called during commit.
     pub fn assign_commit_ts(&self, txn_id: TxnId) -> Result<Timestamp> {
         let mut active = self.active_txns.lock();
