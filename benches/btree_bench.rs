@@ -6,6 +6,17 @@
 //! BusTub runs 4 read + 2 write threads for 30s with in-memory disk.
 //! We run single-threaded with real disk I/O. Concurrent version will
 //! be added when latch crabbing is implemented.
+//!
+//! ## Fairness contract (must match `lsm_bench.rs`)
+//! - Same key/value sizes (8 / 8 bytes), same key count, same RNG seed.
+//! - Same predicates (key_will_vanish, key_will_change).
+//! - Engine-direct: no `Database` wrapper, no WAL.
+//! - Cache budget: BPM = 1024 frames * 4 KB ≈ 4 MB. LSM matches via
+//!   `LsmTree::open_with_memtable_size(_, 4 * 1024 * 1024)`.
+//! - Durability at iter end: insert iter calls `bpm.flush_all_pages()`
+//!   to match LSM's explicit `flush_memtable()`.
+//! - End-of-bench prints `bpm.stats().snapshot()` for cache hit rate
+//!   and pages-read/written observability.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use interchangedb::buffer::BufferPoolManager;
@@ -123,6 +134,11 @@ fn bench_btree_insert(c: &mut Criterion) {
                         let v = encode_value(key as u64);
                         tree.insert(&k, &v).unwrap();
                     }
+                    // Match LSM's explicit `flush_memtable()`: force all dirty
+                    // pages to disk inside the timed region. Without this, the
+                    // B+Tree's "insert" measurement excludes the durability cost
+                    // that the LSM bench is paying.
+                    bpm.flush_all_pages().unwrap();
                 },
             );
         },
@@ -140,6 +156,10 @@ fn bench_btree_read(c: &mut Criterion) {
 
     // Simple LCG for deterministic random keys.
     let mut rng_state: u64 = 42;
+
+    // Reset BPM stats so the read snapshot reflects only this benchmark
+    // (setup_tree already did the inserts and warmed the cache).
+    state.bpm.stats().reset();
 
     group.bench_function(
         BenchmarkId::new("random_lookup", format!("{}keys", TOTAL_KEYS)),
@@ -163,6 +183,7 @@ fn bench_btree_read(c: &mut Criterion) {
     );
 
     group.finish();
+    eprintln!("[btree_read] {}", state.bpm.stats().snapshot());
 }
 
 fn bench_btree_write(c: &mut Criterion) {
@@ -174,6 +195,8 @@ fn bench_btree_write(c: &mut Criterion) {
 
     let mut rng_state: u64 = 99;
     let mut do_insert = false;
+
+    state.bpm.stats().reset();
 
     group.bench_function(
         BenchmarkId::new("mixed_delete_insert", format!("{}keys", TOTAL_KEYS)),
@@ -215,6 +238,7 @@ fn bench_btree_write(c: &mut Criterion) {
     );
 
     group.finish();
+    eprintln!("[btree_write] {}", state.bpm.stats().snapshot());
 }
 
 criterion_group!(benches, bench_btree_insert, bench_btree_read, bench_btree_write);

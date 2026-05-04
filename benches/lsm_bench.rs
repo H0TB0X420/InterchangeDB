@@ -8,6 +8,16 @@
 //! - LSM reads check memtable → immutable memtables → L0 SSTables → L1+.
 //! - The "insert" benchmark measures memtable + flush throughput.
 //! - The "read" benchmark reads from flushed SSTables (not memtable-hot).
+//!
+//! ## Fairness contract (must match `btree_bench.rs`)
+//! - Same key/value sizes (8 / 8 bytes), same key count, same RNG seed.
+//! - Same predicates (key_will_vanish, key_will_change).
+//! - Engine-direct: no `Database` wrapper, no WAL.
+//! - Cache budget: memtable = 4 MB, matching the B+Tree's 1024-frame BPM.
+//! - Durability at iter end: insert iter calls `flush_memtable()`, matching
+//!   the B+Tree's `bpm.flush_all_pages()`.
+//! - End-of-bench prints `level_state()` for level distribution and
+//!   on-disk size observability.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use interchangedb::index::lsm::LsmTree;
@@ -18,6 +28,10 @@ const TOTAL_KEYS: usize = 10_000;
 
 /// Number of keys to read/write per benchmark iteration. Matches btree_bench.
 const BATCH_SIZE: usize = 100;
+
+/// Memtable byte budget. Matches the B+Tree's BPM budget
+/// (1024 frames * 4 KB = 4 MB) so both engines get the same RAM.
+const MEMTABLE_SIZE: usize = 4 * 1024 * 1024;
 
 // ============================================================================
 // Key encoding (identical to btree_bench)
@@ -57,7 +71,7 @@ struct LsmBenchState {
 
 fn setup_tree() -> LsmBenchState {
     let dir = tempdir().unwrap();
-    let tree = LsmTree::open(dir.path()).unwrap();
+    let tree = LsmTree::open_with_memtable_size(dir.path(), MEMTABLE_SIZE).unwrap();
 
     // Bulk insert all keys.
     for key in 0..TOTAL_KEYS {
@@ -88,7 +102,7 @@ fn bench_lsm_insert(c: &mut Criterion) {
                 || {
                     // Fresh tree for each iteration.
                     let dir = tempdir().unwrap();
-                    let tree = LsmTree::open(dir.path()).unwrap();
+                    let tree = LsmTree::open_with_memtable_size(dir.path(), MEMTABLE_SIZE).unwrap();
                     (tree, dir)
                 },
                 |(tree, _dir)| {
@@ -139,6 +153,12 @@ fn bench_lsm_read(c: &mut Criterion) {
     );
 
     group.finish();
+    let ls = state.tree.level_state();
+    eprintln!(
+        "[lsm_read] disk_size_bytes={} levels={}",
+        ls.total_disk_size(),
+        format_levels(&ls)
+    );
 }
 
 fn bench_lsm_write(c: &mut Criterion) {
@@ -190,6 +210,25 @@ fn bench_lsm_write(c: &mut Criterion) {
     );
 
     group.finish();
+    let ls = state.tree.level_state();
+    eprintln!(
+        "[lsm_write] disk_size_bytes={} levels={}",
+        ls.total_disk_size(),
+        format_levels(&ls)
+    );
+}
+
+/// Format level table count per level as `L0=2,L1=4,...`.
+/// `LevelState::level_size(i)` returns bytes per level; we report it directly.
+fn format_levels(ls: &interchangedb::index::lsm::manifest::LevelState) -> String {
+    let mut parts = Vec::new();
+    for i in 0..7 {
+        let bytes = ls.level_size(i);
+        if bytes > 0 {
+            parts.push(format!("L{}={}B", i, bytes));
+        }
+    }
+    if parts.is_empty() { "empty".into() } else { parts.join(",") }
 }
 
 criterion_group!(benches, bench_lsm_insert, bench_lsm_read, bench_lsm_write);

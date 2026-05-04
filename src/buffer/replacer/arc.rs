@@ -187,11 +187,15 @@ impl ArcReplacer {
         };
 
         if evict_from_t1 {
-            // Evict LRU from T1, add to B1
-            self.evict_from_t1()
+            // Evict LRU from T1, add to B1.
+            // Fall back to T2 if every T1 frame is currently pinned: the BPM
+            // contract is "find an evictable frame if one exists" — refusing
+            // to evict because of policy preference would raise NoFreeFrames
+            // even though T2 has unpinned frames available.
+            self.evict_from_t1().or_else(|| self.evict_from_t2())
         } else {
-            // Evict LRU from T2, add to B2
-            self.evict_from_t2()
+            // Evict LRU from T2, add to B2. Symmetric fallback to T1.
+            self.evict_from_t2().or_else(|| self.evict_from_t1())
         }
     }
 
@@ -756,5 +760,97 @@ mod tests {
         let b2_page = *replacer.b2.front().unwrap();
         replacer.record_access(FrameId::new(20), b2_page);
         assert!(replacer.p < p_before_b2_hit);
+    }
+
+    /// Regression test for the "preferred list fully pinned" bug.
+    ///
+    /// The bug: `replace()` picks T1 or T2 by length-vs-p, then bails if the
+    /// chosen list has no evictable frame — even when the *other* list does.
+    /// FIFO/LRU/LRU-K don't have this shape (single search structure); 2Q
+    /// already falls back. ARC alone needed the fallback.
+    ///
+    /// Surfaced under range_scan benchmarking with cache=64 frames. T1 holds
+    /// freshly-fetched scan leaves; T2 holds hot internal nodes. p stays at 0
+    /// (no B1 ghost hits in a forward scan), so `replace` always picks T1.
+    /// When the iterator's descent transiently pins enough T1 frames to leave
+    /// no evictable T1 candidate, the BPM raised `NoFreeFrames` even though
+    /// T2 had unpinned internal-node frames available.
+    #[test]
+    fn test_arc_falls_back_when_chosen_list_pinned() {
+        let mut replacer = ArcReplacer::new(4);
+
+        // T1: two pinned frames (frames 0, 1 holding fresh pages).
+        replacer.record_access(FrameId::new(0), PageId::new(100));
+        replacer.record_access(FrameId::new(1), PageId::new(101));
+        replacer.set_evictable(FrameId::new(0), false);
+        replacer.set_evictable(FrameId::new(1), false);
+
+        // T2: two evictable frames (double-access promotes T1 → T2).
+        replacer.record_access(FrameId::new(2), PageId::new(102));
+        replacer.record_access(FrameId::new(2), PageId::new(102));
+        replacer.record_access(FrameId::new(3), PageId::new(103));
+        replacer.record_access(FrameId::new(3), PageId::new(103));
+        replacer.set_evictable(FrameId::new(2), true);
+        replacer.set_evictable(FrameId::new(3), true);
+
+        // Confirm the test setup: T1 has 2 entries (both pinned), T2 has 2
+        // (both evictable), p = 0.
+        assert_eq!(replacer.t1.len(), 2);
+        assert_eq!(replacer.t2.len(), 2);
+        assert_eq!(replacer.p, 0);
+        assert_eq!(replacer.size(), 2); // only T2 frames are evictable
+
+        // With p=0 and t1_len(2) > p(0), `replace` picks T1. T1 has no
+        // evictable frame. Without the fallback, this returns None and the
+        // BPM panics with NoFreeFrames. With the fallback, it must return
+        // an evictable frame from T2.
+        let victim = replacer.evict();
+        assert!(
+            victim.is_some(),
+            "ARC must fall back to T2 when its preferred list (T1) has no \
+             evictable frame, even though T2 has evictable candidates"
+        );
+        let victim_id = victim.unwrap();
+        assert!(
+            victim_id == FrameId::new(2) || victim_id == FrameId::new(3),
+            "fallback victim must come from T2 (frames 2 or 3), got {victim_id:?}"
+        );
+    }
+
+    /// Symmetric case: when `replace` picks T2 (e.g., t1_len <= p) but every
+    /// T2 frame is pinned, it must fall back to T1.
+    #[test]
+    fn test_arc_falls_back_t2_to_t1_when_t2_pinned() {
+        let mut replacer = ArcReplacer::new(4);
+
+        // T1: two evictable frames.
+        replacer.record_access(FrameId::new(0), PageId::new(100));
+        replacer.record_access(FrameId::new(1), PageId::new(101));
+        replacer.set_evictable(FrameId::new(0), true);
+        replacer.set_evictable(FrameId::new(1), true);
+
+        // T2: two pinned frames.
+        replacer.record_access(FrameId::new(2), PageId::new(102));
+        replacer.record_access(FrameId::new(2), PageId::new(102));
+        replacer.record_access(FrameId::new(3), PageId::new(103));
+        replacer.record_access(FrameId::new(3), PageId::new(103));
+        replacer.set_evictable(FrameId::new(2), false);
+        replacer.set_evictable(FrameId::new(3), false);
+
+        // Force `replace` to pick T2 by setting p large enough that
+        // t1_len(2) <= p.
+        replacer.p = 4;
+
+        let victim = replacer.evict();
+        assert!(
+            victim.is_some(),
+            "ARC must fall back to T1 when its preferred list (T2) has no \
+             evictable frame"
+        );
+        let victim_id = victim.unwrap();
+        assert!(
+            victim_id == FrameId::new(0) || victim_id == FrameId::new(1),
+            "fallback victim must come from T1 (frames 0 or 1), got {victim_id:?}"
+        );
     }
 }
