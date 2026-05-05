@@ -68,17 +68,18 @@ pub mod concurrency;
 pub mod execution;
 pub mod index;
 pub mod txn;
+pub mod types;
 pub mod wal;
 
 // Re-export commonly used items at crate root for convenience
 pub use common::config::PAGE_SIZE;
 pub use common::{Error, FrameId, PageId, Result};
 
-pub use buffer::{BufferPoolStats, Frame, StatsSnapshot, BufferPoolManager};
+pub use buffer::{BufferPoolManager, BufferPoolStats, Frame, StatsSnapshot};
+pub use database::{BTreeDatabase, Database, LsmDatabase};
+pub use index::btree::BTreeEngine;
+pub use index::lsm::LsmEngine;
 pub use storage::page::{Page, PageHeader, PageType};
 pub use storage::DiskManager;
 pub use storage::{ScanIterator, StorageEngine, StorageStatus};
-pub use index::btree::BTreeEngine;
-pub use index::lsm::LsmEngine;
-pub use database::{Database, BTreeDatabase, LsmDatabase};
-pub use txn::{TxnId, TxnMode, TxnState, TransactionManager, LockManager, LockMode};
+pub use txn::{LockManager, LockMode, TransactionManager, TxnId, TxnMode, TxnState};
