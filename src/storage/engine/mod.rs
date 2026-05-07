@@ -98,6 +98,19 @@ pub trait StorageEngine: Send + Sync {
     /// Get the engine's name (e.g., "btree", "lsm").
     fn name(&self) -> &'static str;
 
+    /// Acquire write intent on `key`. Subsequent get/put on `key` from this
+    /// engine handle is atomic w.r.t. other writers of the same key.
+    ///
+    /// Default: no-op. Single-threaded engines (Phase 9 raw `BTreeEngine`,
+    /// `LsmEngine`) have nothing to do here.
+    ///
+    /// Phase 10's `TxnEngine<E>` wrapper overrides this to acquire an X-lock
+    /// from the LockManager, closing the get-then-put TOCTOU race in
+    /// `Table::insert` / `update_*`.
+    fn lock_for_write(&self, _key: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
     /// Retrieve a value by key.
     ///
     /// Returns `Ok(Some(value))` if found, `Ok(None)` if not found,

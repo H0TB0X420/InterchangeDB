@@ -61,6 +61,7 @@
 pub mod buffer;
 pub mod catalog;
 pub mod common;
+pub mod layout;
 pub mod database;
 pub mod storage;
 
@@ -68,6 +69,7 @@ pub mod storage;
 pub mod concurrency;
 pub mod execution;
 pub mod index;
+pub mod table;
 pub mod txn;
 pub mod types;
 pub mod wal;
