@@ -21,7 +21,7 @@
 //!     Varchar(n) / Bytes(n):                 byte-stuffed escape with terminator                    
 
 use crate::common::{Error, Result};
-use crate::types::{ColumnType, Value};
+use crate::types::{ColumnType, Decimal, Value};
 
 /// Sentinel byte for a NULL component. Sorts before any present value.                               
 const NULL_SENTINEL: u8 = 0x00;
@@ -100,12 +100,12 @@ fn encode_one(value: &Value, ty: &ColumnType, out: &mut Vec<u8>) -> Result<()> {
             encode_int64(*t, out);
             Ok(())
         }
-        (Value::Decimal { mantissa, .. }, ColumnType::Decimal { .. }) => {
+        (Value::Decimal(d), ColumnType::Decimal { .. }) => {
             // Cross-scale ordering is undefined; all Decimal values in a single
             // column must share the column's scale (constraint layer enforces).
             // The encoded bytes are just the mantissa as Int64.
             out.push(PRESENT_SENTINEL);
-            encode_int64(*mantissa, out);
+            encode_int64(d.mantissa(), out);
             Ok(())
         }
         (Value::Char(s), ColumnType::Char(n)) => {
@@ -164,7 +164,10 @@ fn decode_one(bytes: &[u8], ty: &ColumnType) -> Result<(Value, usize)> {
         }
         ColumnType::Decimal { scale, .. } => {
             let (mantissa, consumed) = decode_int64(body)?;
-            Ok((Value::Decimal { mantissa, scale: *scale }, 1 + consumed))
+            Ok((
+                Value::Decimal(Decimal::from_i64_with_scale(mantissa, *scale)),
+                1 + consumed,
+            ))
         }
         ColumnType::Char(n) => {
             let (s, consumed) = decode_char(body, *n)?;
@@ -580,11 +583,11 @@ mod tests {
     fn decimal_roundtrip_preserves_scale_from_column() {
         let col = ColumnType::Decimal { precision: 12, scale: 2 };
         let cases = [
-            Value::Decimal { mantissa: 0, scale: 2 },
-            Value::Decimal { mantissa: 12345, scale: 2 },     // 123.45
-            Value::Decimal { mantissa: -12345, scale: 2 },    // -123.45
-            Value::Decimal { mantissa: i64::MAX, scale: 2 },
-            Value::Decimal { mantissa: i64::MIN, scale: 2 },
+            Value::Decimal(Decimal::from_i64_with_scale(0, 2)),
+            Value::Decimal(Decimal::from_i64_with_scale(12345, 2)),    // 123.45
+            Value::Decimal(Decimal::from_i64_with_scale(-12345, 2)),   // -123.45
+            Value::Decimal(Decimal::from_i64_with_scale(i64::MAX, 2)),
+            Value::Decimal(Decimal::from_i64_with_scale(i64::MIN, 2)),
         ];
         for v in &cases {
             let bytes = encode_key_components(&[v], std::slice::from_ref(&col)).unwrap();
@@ -603,7 +606,7 @@ mod tests {
             .iter()
             .map(|m| {
                 encode_key_components(
-                    &[&Value::Decimal { mantissa: *m, scale: 4 }],
+                    &[&Value::Decimal(Decimal::from_i64_with_scale(*m, 4))],
                     std::slice::from_ref(&col),
                 )
                 .unwrap()

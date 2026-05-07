@@ -10,6 +10,10 @@
 //! - Task 9.1 (later): methods, decimal arithmetic, serde, full constructors.
 //! - Task 9.2 (later): tuple encoding for row-store storage values.
 
+pub mod decimal;
 pub mod keyenc;
+pub mod tuple;
 pub mod value;
+
+pub use decimal::Decimal;
 pub use value::{ColumnType, Value};

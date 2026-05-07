@@ -59,6 +59,7 @@
 
 // Core modules
 pub mod buffer;
+pub mod catalog;
 pub mod common;
 pub mod database;
 pub mod storage;

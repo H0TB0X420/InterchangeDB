@@ -80,6 +80,14 @@ pub enum Error {
 
     /// Txn ops require WAL (use Database::open)
     TxnNotSupported,
+
+    // =========================================================================
+    // Type System Errors (Phase 9)
+    // =========================================================================
+
+    /// Decimal arithmetic failure — overflow, scale mismatch, division by zero.
+    /// Message describes which rule was violated.
+    DecimalArithmetic(String),
 }
 
 impl fmt::Display for Error {
@@ -101,6 +109,7 @@ impl fmt::Display for Error {
             Error::LockTimeout => write!(f, "Lock acquisition timed out"),
             Error::TxnReadOnly(txn_id) => write!(f, "Transaction {} is read-only", txn_id),
             Error::TxnNotSupported => write!(f, "Transactions require WAL (use Database::open)"),
+            Error::DecimalArithmetic(msg) => write!(f, "Decimal arithmetic error: {}", msg),
         }
 
     }
