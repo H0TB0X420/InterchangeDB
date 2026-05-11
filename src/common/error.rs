@@ -79,6 +79,12 @@ pub enum Error {
     /// Txn ops require WAL (use Database::open)
     TxnNotSupported,
 
+    /// Snapshot-isolation write-write conflict: another transaction committed
+    /// a version of the same key after this transaction's begin_ts. The
+    /// committing writer's id is reported so callers can log or trace the
+    /// conflict source. Callers should abort and retry with a fresh snapshot.
+    WriteConflict { writer: u64 },
+
     // =========================================================================
     // Type System Errors (Phase 9)
     // =========================================================================
@@ -200,6 +206,9 @@ impl fmt::Display for Error {
             Error::LockTimeout => write!(f, "Lock acquisition timed out"),
             Error::TxnReadOnly(txn_id) => write!(f, "Transaction {} is read-only", txn_id),
             Error::TxnNotSupported => write!(f, "Transactions require WAL (use Database::open)"),
+            Error::WriteConflict { writer } => {
+                write!(f, "write-write conflict: transaction {} committed a newer version", writer)
+            }
             Error::DecimalArithmetic(msg) => write!(f, "Decimal arithmetic error: {}", msg),
             Error::RowNotFound { table } => write!(f, "row not found in {}", table),
             Error::CatalogDrift(msg) => write!(f, "catalog drift: {}", msg),

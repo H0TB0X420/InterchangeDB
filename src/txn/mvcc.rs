@@ -156,19 +156,20 @@ pub fn decode_mvcc_value(encoded: &[u8]) -> Result<MvccValue> {
 
 /// Determine if a version is visible to a transaction's snapshot.
 ///
+/// Standard SI: a version is visible iff the writer committed at-or-before
+/// our snapshot's read_ts. The `active_txns` field on the snapshot is not
+/// consulted — `committed_txns` is authoritative, and a writer's presence
+/// there with `commit_ts <= read_ts` is sufficient and necessary.
+///
 /// Rules (evaluated in order):
 /// 1. Own writes are always visible.
 /// 2. Pre-checkpoint versions are assumed committed (their Commit record
 ///    may have been in a truncated WAL segment).
-/// 3. If the writer never committed (not in committed_txns), invisible.
+/// 3. If the writer never committed (not in committed_txns, post-checkpoint
+///    or known-uncommitted), invisible.
 /// 4. If the writer committed after our snapshot, invisible.
-/// 5. If the writer was active when our snapshot was taken, invisible.
-/// 6. Otherwise, visible.
-///
-/// `checkpoint_ts` is the timestamp watermark: any version written by a txn
-/// not found in committed_txns whose begin_ts <= checkpoint_ts is assumed
-/// committed pre-checkpoint. Pass Timestamp::ZERO if no checkpoint exists.
-// Visibility requires all 8 parameters for correctness — no clean way to reduce.
+/// 5. Otherwise, visible.
+// Visibility requires all 7 parameters for correctness — no clean way to reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn is_visible(
     version_txn_id: TxnId,
@@ -179,17 +180,13 @@ pub fn is_visible(
     checkpoint_ts: Timestamp,
     known_uncommitted: &HashSet<TxnId>,
 ) -> bool {
-    // Rule 1: own writes.
     if version_txn_id == my_txn_id {
         return true;
     }
 
-    // Rule 2 & 3: determine commit_ts.
     let commit_ts = match committed_txns.get(&version_txn_id) {
         Some(ts) => *ts,
         None => {
-            // Not in committed_txns. If version was written before checkpoint
-            // AND not known to be uncommitted, assume committed pre-checkpoint.
             if version_ts <= checkpoint_ts
                 && !known_uncommitted.contains(&version_txn_id)
             {
@@ -200,18 +197,7 @@ pub fn is_visible(
         }
     };
 
-    // Rule 4: committed after our snapshot.
-    if commit_ts > snapshot.read_ts {
-        return false;
-    }
-
-    // Rule 5: was in-flight when we took our snapshot.
-    if snapshot.active_txns.contains(&version_txn_id) {
-        return false;
-    }
-
-    // Rule 6: visible.
-    true
+    commit_ts <= snapshot.read_ts
 }
 
 // ---------------------------------------------------------------------------

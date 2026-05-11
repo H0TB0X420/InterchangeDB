@@ -13,7 +13,7 @@
 //!    - Remove everything else below the watermark.
 //! 4. Batch-delete removed versions after scan completes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::common::Result;
 use crate::storage::StorageEngine;
@@ -46,6 +46,7 @@ pub fn gc_collect<E: StorageEngine>(
     low_water_mark: Timestamp,
     committed_txns: &HashMap<TxnId, Timestamp>,
     checkpoint_ts: Timestamp,
+    non_committed: &HashSet<TxnId>,
 ) -> Result<GcStats> {
     let mut stats = GcStats::default();
     let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
@@ -92,8 +93,11 @@ pub fn gc_collect<E: StorageEngine>(
             MvccValue::Tombstone { txn_id } => *txn_id,
         };
 
-        let is_committed = committed_txns.contains_key(&version_txn_id)
-            || version_ts <= checkpoint_ts;
+        // Pre-checkpoint heuristic ("assume committed") is overridden by
+        // definitive evidence the writer aborted or never committed.
+        let is_committed = !non_committed.contains(&version_txn_id)
+            && (committed_txns.contains_key(&version_txn_id)
+                || version_ts <= checkpoint_ts);
 
         // Uncommitted/aborted version below watermark — always remove.
         if !is_committed {

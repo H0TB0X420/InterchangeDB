@@ -113,15 +113,13 @@ impl TimestampOracle {
 
 /// Captures what a transaction can see at the moment it begins.
 ///
-/// A version is visible if its writer committed before `read_ts` AND
-/// was not in `active_txns` when the snapshot was taken.
+/// A version is visible iff its writer is in `committed_txns` with a
+/// `commit_ts <= read_ts` (or assumed-committed via the pre-checkpoint
+/// heuristic). Standard SI: `committed_txns` is authoritative.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Versions committed at or before this timestamp are candidates for visibility.
     pub read_ts: Timestamp,
-    /// Transactions that were active (uncommitted) when this snapshot was taken.
-    /// Their writes are invisible even if they commit with commit_ts <= read_ts.
-    pub active_txns: HashSet<TxnId>,
 }
 // ---------------------------------------------------------------------------
 // TxnId — newtype over u64, follows PageId/Lsn pattern
@@ -261,6 +259,12 @@ pub struct TransactionManager {
     committed_txns: RwLock<HashMap<TxnId, Timestamp>>,
     /// Transactions known to be uncommitted (Begin but no Commit/Abort in WAL).
     uncommitted_txns: RwLock<HashSet<TxnId>>,
+    /// Transactions known to have aborted in-memory. Distinct from
+    /// `uncommitted_txns` (which is recovery-loaded "begun but unresolved").
+    /// Without this, a recently-aborted txn whose `begin_ts <= checkpoint_ts`
+    /// falls into the "assumed committed pre-checkpoint" branch of visibility
+    /// → ghost commit.
+    aborted_txns: RwLock<HashSet<TxnId>>,
     /// Watermark: versions written before this timestamp are assumed committed.
     checkpoint_ts: AtomicU64,
 }
@@ -281,6 +285,7 @@ impl TransactionManager {
             ts_oracle: TimestampOracle::new(),
             committed_txns: RwLock::new(HashMap::new()),
             uncommitted_txns: RwLock::new(HashSet::new()),
+            aborted_txns: RwLock::new(HashSet::new()),
             checkpoint_ts: AtomicU64::new(Timestamp::ZERO.0),
         }
     }
@@ -300,10 +305,7 @@ impl TransactionManager {
         let id = TxnId::new(self.next_txn_id.fetch_add(1, Ordering::SeqCst));
 
         let begin_ts = self.ts_oracle.next();
-        let snapshot = Snapshot {
-            read_ts: begin_ts,
-            active_txns: active.keys().copied().collect(),
-        };
+        let snapshot = Snapshot { read_ts: begin_ts };
 
         let txn = Transaction::new(id, mode, start_lsn, begin_ts, snapshot);
         active.insert(id, txn);
@@ -323,12 +325,18 @@ impl TransactionManager {
     }
 
     /// Mark a transaction as aborted and remove from active set.
+    ///
+    /// Inserts into `aborted_txns` while still holding the active-set lock so
+    /// no concurrent `begin()` can produce a snapshot that sees this txn as
+    /// "neither active nor aborted" (a window that would re-open the ghost
+    /// commit race).
     pub fn abort(&self, txn_id: TxnId) -> Result<()> {
         let mut active = self.active_txns.lock();
         let txn = active
             .get_mut(&txn_id)
             .ok_or(Error::TxnNotActive(txn_id.0))?;
         txn.state = TxnState::Aborted;
+        self.aborted_txns.write().insert(txn_id);
         active.remove(&txn_id);
         Ok(())
     }
@@ -408,6 +416,30 @@ impl TransactionManager {
     /// Access the known-uncommitted transactions set (for visibility checks).
     pub fn uncommitted_txns(&self) -> HashSet<TxnId> {
         self.uncommitted_txns.read().clone()
+    }
+
+    /// Access the in-memory aborted-txn set (for visibility and GC).
+    pub fn aborted_txns(&self) -> HashSet<TxnId> {
+        self.aborted_txns.read().clone()
+    }
+
+    /// Union of recovery-loaded uncommitted and in-memory aborted txn ids —
+    /// the set of all writers known *not* to have committed. Used by MVCC
+    /// visibility to override the "pre-checkpoint = assumed committed"
+    /// heuristic when we have definitive evidence the writer didn't commit.
+    pub fn known_not_committed(&self) -> HashSet<TxnId> {
+        let mut set = self.uncommitted_txns.read().clone();
+        set.extend(self.aborted_txns.read().iter());
+        set
+    }
+
+    /// Remove fully-cleaned aborted txn ids from the in-memory set. Caller
+    /// is responsible for proving no versions remain in the engine (e.g., GC).
+    pub fn remove_aborted_txns(&self, ids: &HashSet<TxnId>) {
+        let mut set = self.aborted_txns.write();
+        for id in ids {
+            set.remove(id);
+        }
     }
 
     /// Load uncommitted txn_ids from recovery.

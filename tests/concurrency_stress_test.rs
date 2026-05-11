@@ -60,9 +60,16 @@ fn read_heavy_8_threads() {
 
                     if is_write {
                         let val = format!("updated_{}_{}", thread_idx, iter);
-                        if let Err(e) = db.put(key.as_bytes(), val.as_bytes()) {
-                            eprintln!("Write error: {}", e);
-                            panicked.store(true, Ordering::Relaxed);
+                        // WriteConflict/Deadlock/LockTimeout are expected under contention.
+                        match db.put(key.as_bytes(), val.as_bytes()) {
+                            Ok(()) => {}
+                            Err(Error::WriteConflict { .. })
+                            | Err(Error::Deadlock(_))
+                            | Err(Error::LockTimeout) => {}
+                            Err(e) => {
+                                eprintln!("Unexpected write error: {}", e);
+                                panicked.store(true, Ordering::Relaxed);
+                            }
                         }
                     } else {
                         match db.get(key.as_bytes()) {
@@ -176,7 +183,9 @@ fn deadlock_storm_8_threads() {
                     let r1 = db.txn_put(txn, key1.as_bytes(), b"locked");
                     match r1 {
                         Ok(()) => {}
-                        Err(Error::Deadlock(_)) | Err(Error::LockTimeout) => {
+                        Err(Error::Deadlock(_))
+                        | Err(Error::LockTimeout)
+                        | Err(Error::WriteConflict { .. }) => {
                             deadlocks.fetch_add(1, Ordering::Relaxed);
                             db.txn_abort(txn).unwrap();
                             completed.fetch_add(1, Ordering::Relaxed);
@@ -190,7 +199,9 @@ fn deadlock_storm_8_threads() {
                         Ok(()) => {
                             db.commit_txn(txn).unwrap();
                         }
-                        Err(Error::Deadlock(_)) | Err(Error::LockTimeout) => {
+                        Err(Error::Deadlock(_))
+                        | Err(Error::LockTimeout)
+                        | Err(Error::WriteConflict { .. }) => {
                             deadlocks.fetch_add(1, Ordering::Relaxed);
                             db.txn_abort(txn).unwrap();
                         }
@@ -209,8 +220,10 @@ fn deadlock_storm_8_threads() {
     let total_completed = completed.load(Ordering::Relaxed);
     let total_deadlocks = deadlocks.load(Ordering::Relaxed);
     assert_eq!(total_completed, 400, "All 8×50 iterations must complete");
-    // Some deadlocks expected — but not too many.
-    assert!(total_deadlocks < 200, "Too many deadlocks: {}", total_deadlocks);
+    // Contention errors bundle Deadlock + LockTimeout + WriteConflict.
+    // SI first-committer-wins makes WriteConflict more frequent than raw
+    // deadlocks alone — bound loosened accordingly.
+    assert!(total_deadlocks < 350, "Too many contention errors: {}", total_deadlocks);
 }
 
 // ---------------------------------------------------------------------------

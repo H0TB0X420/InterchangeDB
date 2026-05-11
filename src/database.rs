@@ -31,7 +31,7 @@ use crate::storage::{ScanIterator, StorageEngine, StorageStatus};
 use crate::txn::gc::{self, GcStats};
 use crate::txn::lock_manager::LockMode;
 use crate::txn::mvcc::{self, MvccValue};
-use crate::txn::{Snapshot, TransactionManager, TxnId, TxnMode};
+use crate::txn::{Snapshot, Timestamp, TransactionManager, TxnId, TxnMode};
 use crate::wal::{LogRecord, Wal};
 
 /// A database instance parameterized by storage engine.
@@ -137,13 +137,10 @@ impl<E: StorageEngine> Database<E> {
             let oracle_ts = txn_mgr.ts_oracle_peek();
             let ckpt_ts = txn_mgr.checkpoint_ts();
             let read_ts = if ckpt_ts > oracle_ts { ckpt_ts } else { oracle_ts };
-            let snapshot = Snapshot {
-                read_ts,
-                active_txns: std::collections::HashSet::new(),
-            };
+            let snapshot = Snapshot { read_ts };
             let committed = txn_mgr.committed_txns();
-            let uncommitted = txn_mgr.uncommitted_txns();
-            mvcc::mvcc_get(&self.engine, key, TxnId::AUTO_COMMIT, &snapshot, &committed, ckpt_ts, &uncommitted)
+            let non_committed = txn_mgr.known_not_committed();
+            mvcc::mvcc_get(&self.engine, key, TxnId::AUTO_COMMIT, &snapshot, &committed, ckpt_ts, &non_committed)
         } else {
             self.engine.get(key)
         }
@@ -192,10 +189,7 @@ impl<E: StorageEngine> Database<E> {
         let oracle_ts = txn_mgr.ts_oracle_peek();
         let ckpt_ts = txn_mgr.checkpoint_ts();
         let read_ts = if ckpt_ts > oracle_ts { ckpt_ts } else { oracle_ts };
-        let snapshot = Snapshot {
-            read_ts,
-            active_txns: std::collections::HashSet::new(),
-        };
+        let snapshot = Snapshot { read_ts };
         let committed = txn_mgr.committed_txns();
 
         let start = match range.start_bound() {
@@ -212,10 +206,10 @@ impl<E: StorageEngine> Database<E> {
             std::ops::Bound::Unbounded => vec![0xFF; 32],
         };
 
-        let uncommitted = txn_mgr.uncommitted_txns();
+        let non_committed = txn_mgr.known_not_committed();
         let results = mvcc::mvcc_scan(
             &self.engine, &start, &end,
-            TxnId::AUTO_COMMIT, &snapshot, &committed, txn_mgr.checkpoint_ts(), &uncommitted,
+            TxnId::AUTO_COMMIT, &snapshot, &committed, txn_mgr.checkpoint_ts(), &non_committed,
         );
 
         match results {
@@ -319,8 +313,43 @@ impl<E: StorageEngine> Database<E> {
 
         let committed = txn_mgr.committed_txns();
         let checkpoint_ts = txn_mgr.checkpoint_ts();
+        let aborted_snapshot = txn_mgr.aborted_txns();
+        let non_committed = txn_mgr.known_not_committed();
 
-        gc::gc_collect(&self.engine, low_water_mark, &committed, checkpoint_ts)
+        let stats = gc::gc_collect(
+            &self.engine, low_water_mark, &committed, checkpoint_ts, &non_committed,
+        )?;
+
+        // Step 2.D: forget any snapshotted aborted txn whose versions are
+        // fully gone. We re-scan the engine and intersect against the
+        // snapshot; anything not seen is safe to remove from the in-memory
+        // set. Aborts that occurred during gc_collect aren't in the snapshot,
+        // so they stay tracked.
+        let mut still_present: std::collections::HashSet<TxnId> =
+            std::collections::HashSet::new();
+        for result in self.engine.scan(..) {
+            let (encoded_key, encoded_value) = result?;
+            if mvcc::decode_mvcc_key(&encoded_key).is_err() {
+                continue;
+            }
+            let Ok(val) = mvcc::decode_mvcc_value(&encoded_value) else {
+                continue;
+            };
+            let writer = match val {
+                MvccValue::Value { txn_id, .. } => txn_id,
+                MvccValue::Tombstone { txn_id } => txn_id,
+            };
+            if aborted_snapshot.contains(&writer) {
+                still_present.insert(writer);
+            }
+        }
+        let safe_to_forget: std::collections::HashSet<TxnId> = aborted_snapshot
+            .difference(&still_present)
+            .copied()
+            .collect();
+        txn_mgr.remove_aborted_txns(&safe_to_forget);
+
+        Ok(stats)
     }
 
     pub fn begin_txn(&self, mode: TxnMode) -> Result<TxnId> {
@@ -370,8 +399,47 @@ impl<E: StorageEngine> Database<E> {
         let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
         let snapshot = txn_mgr.snapshot(txn_id)?;
         let committed = txn_mgr.committed_txns();
-        let uncommitted = txn_mgr.uncommitted_txns();
-        mvcc::mvcc_get(&self.engine, key, txn_id, &snapshot, &committed, txn_mgr.checkpoint_ts(), &uncommitted)
+        let non_committed = txn_mgr.known_not_committed();
+        mvcc::mvcc_get(&self.engine, key, txn_id, &snapshot, &committed, txn_mgr.checkpoint_ts(), &non_committed)
+    }
+
+    /// Find a committed version of `user_key` whose writer committed after
+    /// `my_begin_ts`. Returns the writer's id if found, None otherwise.
+    ///
+    /// Implements snapshot isolation's first-committer-wins check: an X-lock
+    /// alone is insufficient because it is released at commit, so a later
+    /// txn can write the same key without ever observing the earlier commit.
+    /// Caller holds the X-lock on `user_key`, so no concurrent writer can
+    /// race this scan.
+    fn find_conflicting_committed_version(
+        &self,
+        user_key: &[u8],
+        my_begin_ts: Timestamp,
+    ) -> Result<Option<TxnId>> {
+        let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
+        let committed = txn_mgr.committed_txns();
+
+        let start = mvcc::encode_mvcc_key_start(user_key);
+        let end = mvcc::encode_mvcc_key_end(user_key);
+
+        for result in self.engine.scan(start..=end) {
+            let (encoded_key, encoded_value) = result?;
+            let (found_key, _version_ts) = mvcc::decode_mvcc_key(&encoded_key)?;
+            if found_key != user_key {
+                break;
+            }
+            let mvcc_val = mvcc::decode_mvcc_value(&encoded_value)?;
+            let version_txn_id = match &mvcc_val {
+                MvccValue::Value { txn_id, .. } => *txn_id,
+                MvccValue::Tombstone { txn_id } => *txn_id,
+            };
+            if let Some(commit_ts) = committed.get(&version_txn_id) {
+                if *commit_ts > my_begin_ts {
+                    return Ok(Some(version_txn_id));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Put a key-value pair within a transaction. Creates a new MVCC version.
@@ -383,6 +451,12 @@ impl<E: StorageEngine> Database<E> {
         txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Exclusive)?;
 
         let begin_ts = txn_mgr.begin_ts(txn_id)?;
+        // SI first-committer-wins check. X-lock alone doesn't prevent
+        // lost updates (lock released at commit, so a later txn writes the
+        // same key without ever observing the earlier commit).
+        if let Some(writer) = self.find_conflicting_committed_version(key, begin_ts)? {
+            return Err(Error::WriteConflict { writer: writer.0 });
+        }
         let mvcc_key = mvcc::encode_mvcc_key(key, begin_ts);
         let mvcc_val = mvcc::encode_mvcc_value(&MvccValue::Value {
             txn_id,
@@ -410,6 +484,9 @@ impl<E: StorageEngine> Database<E> {
         txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Exclusive)?;
 
         let begin_ts = txn_mgr.begin_ts(txn_id)?;
+        if let Some(writer) = self.find_conflicting_committed_version(key, begin_ts)? {
+            return Err(Error::WriteConflict { writer: writer.0 });
+        }
         let mvcc_key = mvcc::encode_mvcc_key(key, begin_ts);
         let mvcc_val = mvcc::encode_mvcc_value(&MvccValue::Tombstone { txn_id });
 
