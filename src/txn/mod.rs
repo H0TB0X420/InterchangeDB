@@ -20,6 +20,7 @@
 //! Begin(txn=1, prev=INVALID) → Put(txn=1, prev=lsn0) → Put(txn=1, prev=lsn1) → Commit(txn=1, prev=lsn2)
 //! ```
 
+pub mod engine;
 pub mod gc;
 pub mod lock_manager;
 pub mod mvcc;

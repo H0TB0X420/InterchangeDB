@@ -262,6 +262,12 @@ pub fn mvcc_get<E: StorageEngine>(
 /// Iterates over MVCC-encoded keys in the engine, groups by user key,
 /// and emits only the first (newest) visible version per user key.
 /// Tombstoned keys are excluded from results.
+///
+/// NOTE (perf): buffers all visible versions into a `Vec` before returning.
+/// Fine for OLTP table sizes (TPC-C warehouse/district/customer) but a
+/// memory issue for large analytical scans (TPC-H `lineitem`, large
+/// `order_line` at scale > 10). Phase-11 perf work: refactor to a
+/// streaming `Iterator` that filters lazily across MVCC-encoded keys.
 pub fn mvcc_scan<E: StorageEngine>(
     engine: &E,
     start_key: &[u8],

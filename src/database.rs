@@ -21,6 +21,7 @@
 
 use std::ops::RangeBounds;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::buffer::BufferPoolManager;
 use crate::common::Error;
@@ -28,10 +29,10 @@ use crate::common::Result;
 use crate::index::btree::BTreeEngine;
 use crate::index::lsm::LsmEngine;
 use crate::storage::{ScanIterator, StorageEngine, StorageStatus};
+use crate::txn::engine::TxnEngine;
 use crate::txn::gc::{self, GcStats};
-use crate::txn::lock_manager::LockMode;
 use crate::txn::mvcc::{self, MvccValue};
-use crate::txn::{Snapshot, Timestamp, TransactionManager, TxnId, TxnMode};
+use crate::txn::{TransactionManager, TxnId, TxnMode};
 use crate::wal::{LogRecord, Wal};
 
 /// A database instance parameterized by storage engine.
@@ -39,10 +40,15 @@ use crate::wal::{LogRecord, Wal};
 /// When `wal` is `Some`, every mutation is logged before being applied
 /// to the engine (write-ahead discipline). When `None`, the database
 /// operates without durability guarantees (backward compatible).
+///
+/// Fields are `Arc` so transaction-scoped `TxnEngine<E>` handles can be
+/// constructed cheaply (one atomic ref-count bump per shared piece) without
+/// borrowing from `&self`. This keeps the shim through `TxnEngine` free
+/// of lifetime gymnastics.
 pub struct Database<E: StorageEngine> {
-    engine: E,
-    wal: Option<Wal>,
-    txn_manager: Option<TransactionManager>,
+    engine: Arc<E>,
+    wal: Option<Arc<Wal>>,
+    txn_manager: Option<Arc<TransactionManager>>,
 }
 
 /// B-tree backed database (point-lookup optimized).
@@ -62,7 +68,7 @@ impl<E: StorageEngine> Database<E> {
     /// to work unchanged.
     pub fn new(engine: E) -> Self {
         Self {
-            engine,
+            engine: Arc::new(engine),
             wal: None,
             txn_manager: None,
         }
@@ -117,9 +123,9 @@ impl<E: StorageEngine> Database<E> {
         }
 
         Ok(Self {
-            engine,
-            wal: Some(wal),
-            txn_manager: Some(txn_mgr),
+            engine: Arc::new(engine),
+            wal: Some(Arc::new(wal)),
+            txn_manager: Some(Arc::new(txn_mgr)),
         })
     }
 
@@ -130,17 +136,13 @@ impl<E: StorageEngine> Database<E> {
 
     /// Retrieve a value by key.
     ///
-    /// If MVCC is enabled (WAL mode), creates a temporary snapshot at the
-    /// latest timestamp and reads through the MVCC layer. Otherwise: direct.
+    /// If MVCC is enabled (WAL mode), reads through a `TxnEngine` handle
+    /// bound to `AUTO_COMMIT` so the visibility/snapshot logic lives in one
+    /// place. Otherwise: direct engine get.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if let Some(ref txn_mgr) = self.txn_manager {
-            let oracle_ts = txn_mgr.ts_oracle_peek();
-            let ckpt_ts = txn_mgr.checkpoint_ts();
-            let read_ts = if ckpt_ts > oracle_ts { ckpt_ts } else { oracle_ts };
-            let snapshot = Snapshot { read_ts };
-            let committed = txn_mgr.committed_txns();
-            let non_committed = txn_mgr.known_not_committed();
-            mvcc::mvcc_get(&self.engine, key, TxnId::AUTO_COMMIT, &snapshot, &committed, ckpt_ts, &non_committed)
+        if self.txn_manager.is_some() {
+            let handle = self.txn_engine_handle(TxnId::AUTO_COMMIT)?;
+            handle.get(key)
         } else {
             self.engine.get(key)
         }
@@ -178,42 +180,24 @@ impl<E: StorageEngine> Database<E> {
 
     /// Scan a range of keys in sorted order.
     ///
-    /// Under MVCC, returns the newest visible version of each user key.
-    /// Without MVCC (no WAL), delegates directly to the engine.
+    /// Under MVCC, returns the newest visible version of each user key
+    /// via a fresh `TxnEngine` handle bound to `AUTO_COMMIT`. The handle's
+    /// streaming iterator is collected into an owned `Vec` here so the
+    /// returned iterator outlives the local handle. Cost: one extra Vec on
+    /// this specific path. Operators bypass `Database::scan` entirely —
+    /// they call `TxnEngine::scan` directly through their own handle, so
+    /// they pay the single-Vec cost from `mvcc_scan` only.
     pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Box<dyn ScanIterator + '_> {
         if self.txn_manager.is_none() {
             return self.engine.scan(range);
         }
-
-        let txn_mgr = self.txn_manager.as_ref().unwrap();
-        let oracle_ts = txn_mgr.ts_oracle_peek();
-        let ckpt_ts = txn_mgr.checkpoint_ts();
-        let read_ts = if ckpt_ts > oracle_ts { ckpt_ts } else { oracle_ts };
-        let snapshot = Snapshot { read_ts };
-        let committed = txn_mgr.committed_txns();
-
-        let start = match range.start_bound() {
-            std::ops::Bound::Included(k) => k.clone(),
-            std::ops::Bound::Excluded(k) => {
-                let mut next = k.clone();
-                next.push(0);
-                next
-            }
-            std::ops::Bound::Unbounded => vec![],
+        let handle = match self.txn_engine_handle(TxnId::AUTO_COMMIT) {
+            Ok(h) => h,
+            Err(e) => return Box::new(std::iter::once(Err(e))),
         };
-        let end = match range.end_bound() {
-            std::ops::Bound::Included(k) | std::ops::Bound::Excluded(k) => k.clone(),
-            std::ops::Bound::Unbounded => vec![0xFF; 32],
-        };
-
-        let non_committed = txn_mgr.known_not_committed();
-        let results = mvcc::mvcc_scan(
-            &self.engine, &start, &end,
-            TxnId::AUTO_COMMIT, &snapshot, &committed, txn_mgr.checkpoint_ts(), &non_committed,
-        );
-
-        match results {
-            Ok(pairs) => Box::new(pairs.into_iter().map(Ok)),
+        let collected: Result<Vec<_>> = handle.scan(range).collect();
+        match collected {
+            Ok(v) => Box::new(v.into_iter().map(Ok)),
             Err(e) => Box::new(std::iter::once(Err(e))),
         }
     }
@@ -317,7 +301,7 @@ impl<E: StorageEngine> Database<E> {
         let non_committed = txn_mgr.known_not_committed();
 
         let stats = gc::gc_collect(
-            &self.engine, low_water_mark, &committed, checkpoint_ts, &non_committed,
+            &*self.engine, low_water_mark, &committed, checkpoint_ts, &non_committed,
         )?;
 
         // Step 2.D: forget any snapshotted aborted txn whose versions are
@@ -325,6 +309,11 @@ impl<E: StorageEngine> Database<E> {
         // snapshot; anything not seen is safe to remove from the in-memory
         // set. Aborts that occurred during gc_collect aren't in the snapshot,
         // so they stay tracked.
+        //
+        // NOTE (perf): this is a second full engine scan after gc_collect's
+        // own pass. Could be folded into gc_collect to halve scan work —
+        // gc_collect would return the safely-forgettable set alongside its
+        // stats. Phase-13 maintenance cleanup.
         let mut still_present: std::collections::HashSet<TxnId> =
             std::collections::HashSet::new();
         for result in self.engine.scan(..) {
@@ -371,6 +360,17 @@ impl<E: StorageEngine> Database<E> {
     }
 
     /// Commit a transaction — assign commit_ts, make writes visible.
+    ///
+    /// NOTE (correctness, narrow window): `assign_commit_ts` atomically bumps
+    /// the oracle, inserts into `committed_txns`, and removes the txn from
+    /// `active_txns`. Between that point and `wal.sync_to(commit_lsn)` below,
+    /// in-process readers can already see this txn as committed. On a crash
+    /// in that window, the WAL doesn't have the Commit record so recovery
+    /// marks the txn uncommitted — any reader that acted on the in-memory
+    /// "ghost commit" gets a post-recovery inconsistency. In practice the
+    /// window is microseconds and a real WAL-sync failure usually aborts the
+    /// process anyway. Phase-13 fix: two-phase commit-marking that holds
+    /// txns in a "preparing" state until WAL sync returns.
     pub fn commit_txn(&self, txn_id: TxnId) -> Result<()> {
         let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
         let prev_lsn = txn_mgr.last_lsn(txn_id)?;
@@ -394,112 +394,38 @@ impl<E: StorageEngine> Database<E> {
         Ok(())
     }
 
-    /// Read a value within a transaction using snapshot isolation (no locks).
-    pub fn txn_get(&self, txn_id: TxnId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Construct a per-call `TxnEngine` handle bound to `txn_id`. Cheap —
+    /// three `Arc` clones + the `TxnId`. All MVCC/locking ops route through
+    /// this handle so the visibility/conflict logic lives in one place.
+    fn txn_engine_handle(&self, txn_id: TxnId) -> Result<TxnEngine<E>> {
         let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
-        let snapshot = txn_mgr.snapshot(txn_id)?;
-        let committed = txn_mgr.committed_txns();
-        let non_committed = txn_mgr.known_not_committed();
-        mvcc::mvcc_get(&self.engine, key, txn_id, &snapshot, &committed, txn_mgr.checkpoint_ts(), &non_committed)
+        let wal = self.wal.as_ref().ok_or(Error::TxnNotSupported)?;
+        Ok(TxnEngine::new(
+            self.engine.clone(),
+            txn_mgr.clone(),
+            wal.clone(),
+            txn_id,
+        ))
     }
 
-    /// Find a committed version of `user_key` whose writer committed after
-    /// `my_begin_ts`. Returns the writer's id if found, None otherwise.
-    ///
-    /// Implements snapshot isolation's first-committer-wins check: an X-lock
-    /// alone is insufficient because it is released at commit, so a later
-    /// txn can write the same key without ever observing the earlier commit.
-    /// Caller holds the X-lock on `user_key`, so no concurrent writer can
-    /// race this scan.
-    fn find_conflicting_committed_version(
-        &self,
-        user_key: &[u8],
-        my_begin_ts: Timestamp,
-    ) -> Result<Option<TxnId>> {
-        let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
-        let committed = txn_mgr.committed_txns();
-
-        let start = mvcc::encode_mvcc_key_start(user_key);
-        let end = mvcc::encode_mvcc_key_end(user_key);
-
-        for result in self.engine.scan(start..=end) {
-            let (encoded_key, encoded_value) = result?;
-            let (found_key, _version_ts) = mvcc::decode_mvcc_key(&encoded_key)?;
-            if found_key != user_key {
-                break;
-            }
-            let mvcc_val = mvcc::decode_mvcc_value(&encoded_value)?;
-            let version_txn_id = match &mvcc_val {
-                MvccValue::Value { txn_id, .. } => *txn_id,
-                MvccValue::Tombstone { txn_id } => *txn_id,
-            };
-            if let Some(commit_ts) = committed.get(&version_txn_id) {
-                if *commit_ts > my_begin_ts {
-                    return Ok(Some(version_txn_id));
-                }
-            }
-        }
-        Ok(None)
+    /// Read a value within a transaction using snapshot isolation (no locks).
+    pub fn txn_get(&self, txn_id: TxnId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let handle = self.txn_engine_handle(txn_id)?;
+        handle.get(key)
     }
 
     /// Put a key-value pair within a transaction. Creates a new MVCC version.
     pub fn txn_put(&self, txn_id: TxnId, key: &[u8], value: &[u8]) -> Result<()> {
-        let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
-        if txn_mgr.mode(txn_id)? == TxnMode::ReadOnly {
-            return Err(Error::TxnReadOnly(txn_id.0));
-        }
-        txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Exclusive)?;
-
-        let begin_ts = txn_mgr.begin_ts(txn_id)?;
-        // SI first-committer-wins check. X-lock alone doesn't prevent
-        // lost updates (lock released at commit, so a later txn writes the
-        // same key without ever observing the earlier commit).
-        if let Some(writer) = self.find_conflicting_committed_version(key, begin_ts)? {
-            return Err(Error::WriteConflict { writer: writer.0 });
-        }
-        let mvcc_key = mvcc::encode_mvcc_key(key, begin_ts);
-        let mvcc_val = mvcc::encode_mvcc_value(&MvccValue::Value {
-            txn_id,
-            data: value.to_vec(),
-        });
-
-        let prev_lsn = txn_mgr.last_lsn(txn_id)?;
-        let wal = self.wal.as_ref().ok_or(Error::TxnNotSupported)?;
-        let mut record = LogRecord::txn_put(
-            txn_id.0, prev_lsn, mvcc_key.clone(), mvcc_val.clone(), None,
-        );
-        let lsn = wal.append(&mut record)?;
-        // No sync here — deferred to commit for batching.
-
-        txn_mgr.update_last_lsn(txn_id, lsn)?;
-        self.engine.put(&mvcc_key, &mvcc_val)
+        let handle = self.txn_engine_handle(txn_id)?;
+        handle.lock_for_write(key)?;
+        handle.put(key, value)
     }
 
     /// Delete a key within a transaction. Writes a tombstone MVCC version.
     pub fn txn_delete(&self, txn_id: TxnId, key: &[u8]) -> Result<()> {
-        let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
-        if txn_mgr.mode(txn_id)? == TxnMode::ReadOnly {
-            return Err(Error::TxnReadOnly(txn_id.0));
-        }
-        txn_mgr.lock_manager().acquire(txn_id, key, LockMode::Exclusive)?;
-
-        let begin_ts = txn_mgr.begin_ts(txn_id)?;
-        if let Some(writer) = self.find_conflicting_committed_version(key, begin_ts)? {
-            return Err(Error::WriteConflict { writer: writer.0 });
-        }
-        let mvcc_key = mvcc::encode_mvcc_key(key, begin_ts);
-        let mvcc_val = mvcc::encode_mvcc_value(&MvccValue::Tombstone { txn_id });
-
-        let prev_lsn = txn_mgr.last_lsn(txn_id)?;
-        let wal = self.wal.as_ref().ok_or(Error::TxnNotSupported)?;
-        let mut record = LogRecord::txn_put(
-            txn_id.0, prev_lsn, mvcc_key.clone(), mvcc_val.clone(), None,
-        );
-        let lsn = wal.append(&mut record)?;
-        // No sync here — deferred to commit for batching.
-
-        txn_mgr.update_last_lsn(txn_id, lsn)?;
-        self.engine.put(&mvcc_key, &mvcc_val)
+        let handle = self.txn_engine_handle(txn_id)?;
+        handle.lock_for_write(key)?;
+        handle.delete(key)
     }
 
     /// Abort a transaction — no undo needed under MVCC.
