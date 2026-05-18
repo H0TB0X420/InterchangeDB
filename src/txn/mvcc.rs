@@ -257,17 +257,97 @@ pub fn mvcc_get<E: StorageEngine>(
     Ok(None)
 }
 
+/// Smallest user_key of length `l` that is >= `start`.
+///
+/// Returns `None` when no such key exists (e.g., `start` is all-`0xFF` and
+/// `l < start.len()`).
+fn min_user_key_at_length_ge(start: &[u8], l: usize) -> Option<Vec<u8>> {
+    if l >= start.len() {
+        // Pad with zeros: result equals `start` for the first start.len()
+        // bytes, then has extra zeros, making it strictly greater than
+        // `start` (longer with matching prefix wins lex).
+        let mut uk = Vec::with_capacity(l);
+        uk.extend_from_slice(start);
+        uk.resize(l, 0);
+        Some(uk)
+    } else {
+        // Need uk[0..l] > start[0..l] lex (strictly, because uk shorter than
+        // start with uk == start[0..l] makes uk < start). Smallest such is
+        // lex-increment of start[0..l].
+        let mut uk = start[..l].to_vec();
+        let mut carry = true;
+        for byte in uk.iter_mut().rev() {
+            if !carry {
+                break;
+            }
+            if *byte == 0xFF {
+                *byte = 0;
+            } else {
+                *byte += 1;
+                carry = false;
+            }
+        }
+        if carry {
+            None
+        } else {
+            Some(uk)
+        }
+    }
+}
+
+/// Largest user_key of length `l` that is <= `end`.
+///
+/// Returns `None` when no such key exists (e.g., `end` is all-zero and
+/// `l > end.len()`).
+fn max_user_key_at_length_le(end: &[u8], l: usize) -> Option<Vec<u8>> {
+    if l <= end.len() {
+        // Take the first l bytes of `end`. Result is <= end either via
+        // shorter-with-prefix-match (l < end.len) or equal (l == end.len).
+        Some(end[..l].to_vec())
+    } else {
+        // l > end.len: any length-l uk has uk[0..end.len] vs end. Same
+        // prefix means uk > end (longer wins). So we need uk[0..end.len]
+        // strictly < end. Largest such is lex-decrement of end, then pad
+        // with 0xFF up to length l.
+        let mut prefix = end.to_vec();
+        let mut borrow = true;
+        for byte in prefix.iter_mut().rev() {
+            if !borrow {
+                break;
+            }
+            if *byte == 0 {
+                *byte = 0xFF;
+            } else {
+                *byte -= 1;
+                borrow = false;
+            }
+        }
+        if borrow {
+            None
+        } else {
+            prefix.resize(l, 0xFF);
+            Some(prefix)
+        }
+    }
+}
+
 /// Scan a range of user keys, returning the newest visible version of each.
 ///
-/// Iterates over MVCC-encoded keys in the engine, groups by user key,
-/// and emits only the first (newest) visible version per user key.
-/// Tombstoned keys are excluded from results.
+/// Iterates length-buckets of the MVCC keyspace using probe-then-scan: each
+/// `engine.scan(probe..).next()` is an O(log n) seek that returns the next
+/// occupied bucket's first entry. From its length-prefix we compute the
+/// sub-range of that bucket that intersects `[start_key, end_key]` and scan
+/// it directly. After processing, advance the probe past the bucket.
 ///
-/// NOTE (perf): buffers all visible versions into a `Vec` before returning.
-/// Fine for OLTP table sizes (TPC-C warehouse/district/customer) but a
-/// memory issue for large analytical scans (TPC-H `lineitem`, large
-/// `order_line` at scale > 10). Phase-11 perf work: refactor to a
-/// streaming `Iterator` that filters lazily across MVCC-encoded keys.
+/// For fixed-length-PK tables (TPC-C warehouse/district/customer) this is
+/// one seek + one targeted scan. For variable-length PKs it's K seeks where
+/// K = number of distinct row-key lengths actually present in the engine.
+///
+/// `start_key` and `end_key` define an INCLUSIVE user-key range.
+///
+/// NOTE (perf): still buffers into a `Vec` rather than streaming. The Vec
+/// is the next bottleneck for analytical workloads — Phase 11 streaming
+/// refactor.
 pub fn mvcc_scan<E: StorageEngine>(
     engine: &E,
     start_key: &[u8],
@@ -278,48 +358,206 @@ pub fn mvcc_scan<E: StorageEngine>(
     checkpoint_ts: Timestamp,
     known_uncommitted: &HashSet<TxnId>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let scan_start = encode_mvcc_key_start(start_key);
-    let scan_end = encode_mvcc_key_end(end_key);
-
-    let iter = engine.scan(scan_start..=scan_end);
-
     let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut current_user_key: Option<Vec<u8>> = None;
-    let mut found_visible_for_current = false;
 
-    for result in iter {
-        let (encoded_key, encoded_value) = result?;
-        let (user_key, version_ts) = decode_mvcc_key(&encoded_key)?;
+    // Probe starts at the lowest possible MVCC key: length-prefix 0,
+    // empty user_key, ts=u64::MAX (inverted to 0). Equivalent to
+    // `[0,0,0,0, 0*8]`.
+    let mut probe_pos: Vec<u8> = vec![0; 4 + 8];
 
-        // Moved to a new user key — reset tracking.
-        if current_user_key.as_ref() != Some(&user_key) {
-            current_user_key = Some(user_key.clone());
-            found_visible_for_current = false;
-        }
-
-        // Already found the newest visible version for this key — skip older versions.
-        if found_visible_for_current {
-            continue;
-        }
-
-        let mvcc_val = decode_mvcc_value(&encoded_value)?;
-        let version_txn_id = match &mvcc_val {
-            MvccValue::Value { txn_id, .. } => *txn_id,
-            MvccValue::Tombstone { txn_id } => *txn_id,
+    loop {
+        let probe_key = {
+            let mut iter = engine.scan(probe_pos.clone()..);
+            match iter.next() {
+                None => break,
+                Some(Err(e)) => return Err(e),
+                Some(Ok((k, _))) => k,
+            }
         };
 
-        if !is_visible(version_txn_id, version_ts, my_txn_id, snapshot, committed_txns, checkpoint_ts, known_uncommitted) {
-            continue;
+        // The first 4 bytes of any well-formed MVCC key are the user_key
+        // length prefix. Anything shorter is a non-MVCC engine entry —
+        // shouldn't happen in practice, but guard against it.
+        if probe_key.len() < 4 {
+            break;
+        }
+        let bucket_len = u32::from_be_bytes([
+            probe_key[0],
+            probe_key[1],
+            probe_key[2],
+            probe_key[3],
+        ]) as usize;
+
+        // Compute the bucket's intersection with [start_key, end_key].
+        let bucket_min = min_user_key_at_length_ge(start_key, bucket_len);
+        let bucket_max = max_user_key_at_length_le(end_key, bucket_len);
+        if let (Some(min_uk), Some(max_uk)) = (bucket_min, bucket_max) {
+            if min_uk <= max_uk {
+                let scan_start = encode_mvcc_key_start(&min_uk);
+                let scan_end = encode_mvcc_key_end(&max_uk);
+
+                let mut current_user_key: Option<Vec<u8>> = None;
+                let mut found_visible_for_current = false;
+
+                for result in engine.scan(scan_start..=scan_end) {
+                    let (encoded_key, encoded_value) = result?;
+                    let (user_key, version_ts) = decode_mvcc_key(&encoded_key)?;
+
+                    if current_user_key.as_ref() != Some(&user_key) {
+                        current_user_key = Some(user_key.clone());
+                        found_visible_for_current = false;
+                    }
+
+                    if found_visible_for_current {
+                        continue;
+                    }
+
+                    let mvcc_val = decode_mvcc_value(&encoded_value)?;
+                    let version_txn_id = match &mvcc_val {
+                        MvccValue::Value { txn_id, .. } => *txn_id,
+                        MvccValue::Tombstone { txn_id } => *txn_id,
+                    };
+
+                    if !is_visible(
+                        version_txn_id,
+                        version_ts,
+                        my_txn_id,
+                        snapshot,
+                        committed_txns,
+                        checkpoint_ts,
+                        known_uncommitted,
+                    ) {
+                        continue;
+                    }
+
+                    found_visible_for_current = true;
+                    if let MvccValue::Value { data, .. } = mvcc_val {
+                        results.push((user_key, data));
+                    }
+                }
+            }
         }
 
-        // First visible version for this user key.
-        found_visible_for_current = true;
-        if let MvccValue::Value { data, .. } = mvcc_val {
-            results.push((user_key, data));
-        }
-        // If tombstone: key is deleted, don't emit. But mark found so we skip older versions.
+        // Advance probe past bucket `bucket_len`: seek to start of the
+        // next length bucket. If `bucket_len + 1` overflows u32, we've
+        // covered every possible bucket — terminate.
+        let next_len = match (bucket_len as u32).checked_add(1) {
+            Some(n) => n,
+            None => break,
+        };
+        probe_pos = next_len.to_be_bytes().to_vec();
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- min_user_key_at_length_ge ----
+
+    #[test]
+    fn min_uk_equal_length_returns_start_padded_to_self() {
+        // L == len(start): result is start itself (pad-with-zero of zero bytes).
+        assert_eq!(
+            min_user_key_at_length_ge(&[0, 0, 0, 1], 4),
+            Some(vec![0, 0, 0, 1])
+        );
+    }
+
+    #[test]
+    fn min_uk_longer_pads_with_zeros() {
+        // L > len(start): pad with zeros; result > start (longer with matching prefix).
+        assert_eq!(
+            min_user_key_at_length_ge(&[0, 0, 0, 1], 6),
+            Some(vec![0, 0, 0, 1, 0, 0])
+        );
+    }
+
+    #[test]
+    fn min_uk_shorter_lex_increments_prefix() {
+        // L < len(start): smallest length-L uk > start[..L] = start[..L] incremented.
+        assert_eq!(
+            min_user_key_at_length_ge(&[0, 0, 0, 1], 3),
+            Some(vec![0, 0, 1])
+        );
+        assert_eq!(
+            min_user_key_at_length_ge(&[0, 0, 0, 1], 2),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn min_uk_shorter_with_carry() {
+        // Lex-inc with carry across multiple bytes.
+        assert_eq!(
+            min_user_key_at_length_ge(&[0, 0xFF, 0xFF, 1], 3),
+            Some(vec![1, 0, 0])
+        );
+    }
+
+    #[test]
+    fn min_uk_returns_none_when_overflow() {
+        // start prefix is all 0xFF at shorter length: no length-L uk can exceed it.
+        assert_eq!(min_user_key_at_length_ge(&[0xFF, 0xFF, 0xFF, 0xFF], 3), None);
+    }
+
+    // ---- max_user_key_at_length_le ----
+
+    #[test]
+    fn max_uk_equal_length_returns_end_itself() {
+        assert_eq!(
+            max_user_key_at_length_le(&[0, 0, 0, 2], 4),
+            Some(vec![0, 0, 0, 2])
+        );
+    }
+
+    #[test]
+    fn max_uk_shorter_takes_prefix_of_end() {
+        // L < len(end): the first L bytes of end. result <= end via
+        // shorter-with-matching-prefix.
+        assert_eq!(
+            max_user_key_at_length_le(&[0, 0, 0, 2], 3),
+            Some(vec![0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn max_uk_longer_decrements_end_then_pads_max() {
+        // L > len(end): need uk[..end.len] < end. Lex-dec end, pad with 0xFF.
+        assert_eq!(
+            max_user_key_at_length_le(&[0, 0, 0, 2], 6),
+            Some(vec![0, 0, 0, 1, 0xFF, 0xFF])
+        );
+    }
+
+    #[test]
+    fn max_uk_longer_with_borrow() {
+        // Lex-dec across borrow.
+        assert_eq!(
+            max_user_key_at_length_le(&[0, 0, 1, 0], 6),
+            Some(vec![0, 0, 0, 0xFF, 0xFF, 0xFF])
+        );
+    }
+
+    #[test]
+    fn max_uk_returns_none_when_underflow() {
+        // end is all-zero at its length and we need a strictly smaller prefix.
+        assert_eq!(max_user_key_at_length_le(&[0, 0, 0, 0], 6), None);
+    }
+
+    // ---- intersection viability ----
+
+    #[test]
+    fn bucket_at_table_id_length_overlaps_range() {
+        // The case from the operator_tree e2e bug: start=[0,0,0,1], end=[0,0,0,2],
+        // table rows live in length-9 bucket (4-byte table_id + 5-byte int32 PK).
+        let min = min_user_key_at_length_ge(&[0, 0, 0, 1], 9).unwrap();
+        let max = max_user_key_at_length_le(&[0, 0, 0, 2], 9).unwrap();
+        assert_eq!(min, vec![0, 0, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(max, vec![0, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(min <= max, "bucket should be non-empty for this range");
+    }
 }
 
