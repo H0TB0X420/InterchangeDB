@@ -388,6 +388,20 @@ pub fn mvcc_scan<E: StorageEngine>(
             probe_key[3],
         ]) as usize;
 
+        // Validate that this probe key is actually MVCC-encoded. When the
+        // engine is shared between TxnEngine (MVCC entries) and Catalog
+        // (raw entries like system tables), the first non-MVCC entry's
+        // first 4 bytes are arbitrary bytes — interpreting them as a
+        // length yields huge values that would trigger giant allocations
+        // in the bucket math. MVCC entries always satisfy
+        // `total_len == 4 + bucket_len + 8`. Use u64 to avoid usize
+        // overflow when `bucket_len` is huge.
+        let expected_total = 4u64 + bucket_len as u64 + 8u64;
+        if probe_key.len() as u64 != expected_total {
+            // Crossed into a non-MVCC region of the keyspace — done.
+            break;
+        }
+
         // Compute the bucket's intersection with [start_key, end_key].
         let bucket_min = min_user_key_at_length_ge(start_key, bucket_len);
         let bucket_max = max_user_key_at_length_le(end_key, bucket_len);

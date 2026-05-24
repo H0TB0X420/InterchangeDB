@@ -25,6 +25,16 @@ impl Filter {
             predicate: Box::new(predicate),
         }
     }
+
+    /// Construct from an already-boxed predicate. Used by the planner when
+    /// binding compiled `Predicate` closures — avoids the double-Box that
+    /// `Filter::new(child, |t| f(t))` would produce.
+    pub fn from_boxed(
+        child: Box<dyn Executor>,
+        predicate: Box<dyn Fn(&Tuple) -> bool + Send>,
+    ) -> Self {
+        Self { child, predicate }
+    }
 }
 
 impl Executor for Filter {

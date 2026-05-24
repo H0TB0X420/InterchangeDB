@@ -394,10 +394,17 @@ impl<E: StorageEngine> Database<E> {
         Ok(())
     }
 
+    /// Borrow the underlying engine `Arc` (used by callers that need to
+    /// hand the same engine to a peer like `Catalog`). Cheap — caller
+    /// clones the Arc.
+    pub fn engine_arc(&self) -> &Arc<E> {
+        &self.engine
+    }
+
     /// Construct a per-call `TxnEngine` handle bound to `txn_id`. Cheap —
     /// three `Arc` clones + the `TxnId`. All MVCC/locking ops route through
     /// this handle so the visibility/conflict logic lives in one place.
-    fn txn_engine_handle(&self, txn_id: TxnId) -> Result<TxnEngine<E>> {
+    pub fn txn_engine_handle(&self, txn_id: TxnId) -> Result<TxnEngine<E>> {
         let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
         let wal = self.wal.as_ref().ok_or(Error::TxnNotSupported)?;
         Ok(TxnEngine::new(

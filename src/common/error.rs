@@ -125,6 +125,12 @@ pub enum Error {
 
     /// Index name lookup failed.
     IndexNotFound { name: String },
+
+    // =========================================================================
+    // SQL Errors (Phase 11)
+    // =========================================================================
+    /// SQL parse failure. Message carries sqlparser's diagnostic verbatim.
+    SqlParse(String),
 }
 
 /// Specific constraint rule violated, used inside `Error::ConstraintViolation`.
@@ -220,6 +226,7 @@ impl fmt::Display for Error {
             Error::TableNotFound { name } => write!(f, "table '{}' not found", name),
             Error::IndexAlreadyExists { name } => write!(f, "index '{}' already exists", name),
             Error::IndexNotFound { name } => write!(f, "index '{}' not found", name),
+            Error::SqlParse(msg) => write!(f, "SQL parse error: {}", msg),
         }
     }
 }

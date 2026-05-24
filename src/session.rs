@@ -1,0 +1,529 @@
+//! `Session<E>` — user-facing SQL entry point.
+//!
+//! Owns a `Database<E>` (for txn lifecycle) and a `Catalog<E>` (for schema
+//! lookup). One `Session` per connection. `execute(sql)` does the full
+//! parse → bind → plan → run pipeline and returns a `QueryResult`.
+//!
+//! ## Transaction lifecycle
+//!
+//! - `BEGIN` / `COMMIT` / `ROLLBACK` toggle `current_txn`.
+//! - Writes (INSERT/UPDATE/DELETE) outside an explicit txn are wrapped in
+//!   an implicit single-statement transaction — auto-begin on entry,
+//!   auto-commit on Ok, auto-abort on Err.
+//! - Reads (SELECT) outside an explicit txn use the `AUTO_COMMIT` TxnEngine
+//!   handle — cheap, no WAL begin/commit pair.
+//!
+//! ## What's NOT here (yet)
+//!
+//! - Multi-statement `execute("a; b")` — single statement per call.
+//!   Callers wanting batches loop.
+//! - Workload log — Step 8.
+//! - Prepared statements — Phase 13.
+
+use std::sync::Arc;
+
+use crate::catalog::{Catalog, ColumnDef, Schema};
+use crate::common::{Error, Result};
+use crate::database::Database;
+use crate::execution::Tuple;
+use crate::sql::binder::Binder;
+use crate::sql::frontend::parse;
+use crate::sql::logical::LogicalPlan;
+use crate::sql::planner::{plan, PhysicalPlan};
+use crate::sql::workload_log::WorkloadLog;
+use crate::storage::StorageEngine;
+use crate::txn::{TxnId, TxnMode};
+use crate::types::Value;
+
+/// Outcome of a single `Session::execute` call.
+#[derive(Debug)]
+pub enum QueryResult {
+    /// SELECT result. `schema` describes the columns of `rows`.
+    Rows {
+        schema: Schema,
+        rows: Vec<Tuple>,
+    },
+    /// Row count from INSERT / UPDATE / DELETE.
+    Affected(u64),
+    /// DDL or transaction-control acknowledgment.
+    Ack,
+    /// EXPLAIN plan as a rendered tree.
+    Explain(String),
+}
+
+pub struct Session<E: StorageEngine + 'static> {
+    database: Arc<Database<E>>,
+    catalog: Arc<Catalog<E>>,
+    binder: Binder<E>,
+    current_txn: Option<TxnId>,
+    log: Option<Arc<WorkloadLog>>,
+}
+
+impl<E: StorageEngine + 'static> Session<E> {
+    pub fn new(database: Arc<Database<E>>, catalog: Arc<Catalog<E>>) -> Self {
+        let binder = Binder::new(catalog.clone());
+        Self {
+            database,
+            catalog,
+            binder,
+            current_txn: None,
+            log: None,
+        }
+    }
+
+    /// Attach a workload log. Each subsequent `execute` call appends one
+    /// entry before parsing — captures intent including malformed SQL.
+    pub fn with_log(mut self, log: Arc<WorkloadLog>) -> Self {
+        self.log = Some(log);
+        self
+    }
+
+    /// Run a single SQL statement.
+    pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
+        if let Some(ref log) = self.log {
+            if let Err(e) = log.append(sql) {
+                // Best-effort logging. Disk-full / IO errors shouldn't
+                // crash a working session; surface to stderr and move on.
+                eprintln!("workload log append failed: {}", e);
+            }
+        }
+        let stmts = parse(sql)?;
+        if stmts.is_empty() {
+            return Ok(QueryResult::Ack);
+        }
+        if stmts.len() > 1 {
+            return Err(Error::SqlParse(
+                "session: multiple statements per execute() not supported".into(),
+            ));
+        }
+        let stmt = stmts.into_iter().next().unwrap();
+        let logical = self.binder.bind(stmt)?;
+        self.execute_logical(logical)
+    }
+
+    /// Whether the session currently has an explicit transaction open.
+    pub fn in_transaction(&self) -> bool {
+        self.current_txn.is_some()
+    }
+
+    // -----------------------------------------------------------------------
+    // Logical dispatch
+    // -----------------------------------------------------------------------
+
+    fn execute_logical(&mut self, logical: LogicalPlan) -> Result<QueryResult> {
+        match logical {
+            LogicalPlan::BeginTxn => self.handle_begin(),
+            LogicalPlan::CommitTxn => self.handle_commit(),
+            LogicalPlan::AbortTxn => self.handle_abort(),
+            LogicalPlan::CreateTable {
+                name,
+                columns,
+                primary_key,
+            } => self.handle_create_table(name, columns, primary_key),
+            // Everything else (Select/Insert/Update/Delete/Explain) needs
+            // an engine handle and possibly an implicit txn.
+            other => self.execute_engine_bound(other),
+        }
+    }
+
+    fn execute_engine_bound(&mut self, logical: LogicalPlan) -> Result<QueryResult> {
+        let is_select_shape = matches!(&logical, LogicalPlan::Select { .. });
+        let needs_write = is_write(&logical);
+
+        // Determine the txn the engine handle is bound to.
+        let (txn_id, implicit) = match self.current_txn {
+            Some(t) => (t, false),
+            None if needs_write => {
+                let t = self.database.begin_txn(TxnMode::ReadWrite)?;
+                (t, true)
+            }
+            None => (TxnId::AUTO_COMMIT, false),
+        };
+
+        let engine_handle = match self.database.txn_engine_handle(txn_id) {
+            Ok(h) => Arc::new(h),
+            Err(e) => {
+                if implicit {
+                    let _ = self.database.txn_abort(txn_id);
+                }
+                return Err(e);
+            }
+        };
+
+        let physical = match plan(logical, engine_handle, &self.catalog) {
+            Ok(p) => p,
+            Err(e) => {
+                if implicit {
+                    let _ = self.database.txn_abort(txn_id);
+                }
+                return Err(e);
+            }
+        };
+
+        let result = self.run_physical(physical, is_select_shape);
+
+        if implicit {
+            match &result {
+                Ok(_) => self.database.commit_txn(txn_id)?,
+                Err(_) => {
+                    let _ = self.database.txn_abort(txn_id);
+                }
+            }
+        }
+        result
+    }
+
+    fn run_physical(
+        &self,
+        physical: PhysicalPlan,
+        is_select_shape: bool,
+    ) -> Result<QueryResult> {
+        match physical {
+            PhysicalPlan::Executor(mut exec) => {
+                let schema = exec.schema().clone();
+                let mut rows: Vec<Tuple> = Vec::new();
+                while let Some(t) = exec.next()? {
+                    rows.push(t);
+                }
+                if is_select_shape {
+                    Ok(QueryResult::Rows { schema, rows })
+                } else {
+                    // DML — yields exactly one [Int64(count)] tuple.
+                    let count = extract_count(rows)?;
+                    Ok(QueryResult::Affected(count))
+                }
+            }
+            PhysicalPlan::Explain(text) => Ok(QueryResult::Explain(text)),
+            // DDL / TC variants are handled in execute_logical before plan()
+            // is even called — they shouldn't reach here.
+            other => Err(Error::SqlParse(format!(
+                "session: unexpected physical plan in run_physical: {:?}",
+                kind_name(&other)
+            ))),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Transaction control
+    // -----------------------------------------------------------------------
+
+    fn handle_begin(&mut self) -> Result<QueryResult> {
+        if self.current_txn.is_some() {
+            return Err(Error::SqlParse(
+                "session: nested transactions not supported".into(),
+            ));
+        }
+        let t = self.database.begin_txn(TxnMode::ReadWrite)?;
+        self.current_txn = Some(t);
+        Ok(QueryResult::Ack)
+    }
+
+    fn handle_commit(&mut self) -> Result<QueryResult> {
+        let t = self
+            .current_txn
+            .ok_or_else(|| Error::SqlParse("session: COMMIT with no active txn".into()))?;
+        self.database.commit_txn(t)?;
+        self.current_txn = None;
+        Ok(QueryResult::Ack)
+    }
+
+    fn handle_abort(&mut self) -> Result<QueryResult> {
+        let t = self
+            .current_txn
+            .ok_or_else(|| Error::SqlParse("session: ROLLBACK with no active txn".into()))?;
+        self.database.txn_abort(t)?;
+        self.current_txn = None;
+        Ok(QueryResult::Ack)
+    }
+
+    // -----------------------------------------------------------------------
+    // DDL
+    // -----------------------------------------------------------------------
+
+    fn handle_create_table(
+        &self,
+        name: String,
+        columns: Vec<ColumnDef>,
+        primary_key: Vec<usize>,
+    ) -> Result<QueryResult> {
+        // Catalog assigns the real `table_id` — we pass 0 as a placeholder.
+        let schema = Schema {
+            name: name.clone(),
+            table_id: crate::catalog::TableId(0),
+            columns,
+            primary_key,
+        };
+        self.catalog.create_table(name, schema)?;
+        Ok(QueryResult::Ack)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+fn is_write(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Insert { .. }
+        | LogicalPlan::Update { .. }
+        | LogicalPlan::Delete { .. } => true,
+        // EXPLAIN is read-only at the storage level; it just builds the
+        // executor tree for description. Even EXPLAIN INSERT doesn't insert.
+        LogicalPlan::Explain(_) => false,
+        _ => false,
+    }
+}
+
+fn extract_count(rows: Vec<Tuple>) -> Result<u64> {
+    let first = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::SqlParse("session: DML produced no count tuple".into()))?;
+    let v = first
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::SqlParse("session: DML count tuple is empty".into()))?;
+    match v {
+        Value::Int64(n) if n >= 0 => Ok(n as u64),
+        other => Err(Error::SqlParse(format!(
+            "session: DML count not Int64: {:?}",
+            other
+        ))),
+    }
+}
+
+fn kind_name(p: &PhysicalPlan) -> &'static str {
+    match p {
+        PhysicalPlan::Executor(_) => "Executor",
+        PhysicalPlan::CreateTable { .. } => "CreateTable",
+        PhysicalPlan::BeginTxn => "BeginTxn",
+        PhysicalPlan::CommitTxn => "CommitTxn",
+        PhysicalPlan::AbortTxn => "AbortTxn",
+        PhysicalPlan::Explain(_) => "Explain",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::BufferPoolManager;
+    use crate::index::btree::BTreeEngine;
+    use crate::storage::DiskManager;
+    use tempfile::TempDir;
+
+    struct TestSession {
+        session: Session<BTreeEngine>,
+        _dir: TempDir,
+    }
+
+    fn setup() -> TestSession {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let dm = DiskManager::create(&db_path).unwrap();
+        let bpm = BufferPoolManager::new(512, dm);
+        let engine = BTreeEngine::new(bpm).unwrap();
+        let database = Arc::new(Database::open(dir.path(), engine).unwrap());
+        let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
+        let session = Session::new(database, catalog);
+        TestSession { session, _dir: dir }
+    }
+
+    fn count_rows(result: QueryResult) -> usize {
+        match result {
+            QueryResult::Rows { rows, .. } => rows.len(),
+            other => panic!("expected Rows, got {:?}", other),
+        }
+    }
+
+    // ---- DDL ----
+
+    #[test]
+    fn session_create_table_then_describe_via_select() {
+        let mut s = setup();
+        let ack = s
+            .session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))")
+            .unwrap();
+        assert!(matches!(ack, QueryResult::Ack));
+
+        // SELECT against empty table works.
+        let r = s.session.execute("SELECT * FROM t").unwrap();
+        assert_eq!(count_rows(r), 0);
+    }
+
+    // ---- Auto-commit INSERT + SELECT ----
+
+    #[test]
+    fn session_implicit_txn_for_insert_is_visible_after() {
+        let mut s = setup();
+        s.session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, n BIGINT NOT NULL)")
+            .unwrap();
+        let r = s
+            .session
+            .execute("INSERT INTO t VALUES (1, 100), (2, 200)")
+            .unwrap();
+        match r {
+            QueryResult::Affected(n) => assert_eq!(n, 2),
+            other => panic!("expected Affected(2), got {:?}", other),
+        }
+
+        // SELECT confirms the insert is visible.
+        let sel = s.session.execute("SELECT * FROM t").unwrap();
+        assert_eq!(count_rows(sel), 2);
+    }
+
+    // ---- Explicit BEGIN/COMMIT ----
+
+    #[test]
+    fn session_explicit_txn_commit_persists() {
+        let mut s = setup();
+        s.session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, n BIGINT NOT NULL)")
+            .unwrap();
+
+        s.session.execute("BEGIN").unwrap();
+        assert!(s.session.in_transaction());
+        s.session.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+        s.session.execute("COMMIT").unwrap();
+        assert!(!s.session.in_transaction());
+
+        let sel = s.session.execute("SELECT * FROM t").unwrap();
+        assert_eq!(count_rows(sel), 1);
+    }
+
+    #[test]
+    fn session_rollback_discards_writes() {
+        let mut s = setup();
+        s.session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, n BIGINT NOT NULL)")
+            .unwrap();
+
+        s.session.execute("BEGIN").unwrap();
+        s.session.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+        s.session.execute("ROLLBACK").unwrap();
+        assert!(!s.session.in_transaction());
+
+        let sel = s.session.execute("SELECT * FROM t").unwrap();
+        assert_eq!(count_rows(sel), 0, "ROLLBACK must discard the insert");
+    }
+
+    // ---- TPC-C-shaped UPDATE end-to-end ----
+
+    #[test]
+    fn session_payment_style_update_persists() {
+        let mut s = setup();
+        s.session
+            .execute(
+                "CREATE TABLE warehouse (w_id INT NOT NULL, w_ytd BIGINT NOT NULL, PRIMARY KEY (w_id))",
+            )
+            .unwrap();
+        s.session
+            .execute("INSERT INTO warehouse VALUES (1, 1000), (2, 2000)")
+            .unwrap();
+
+        let r = s
+            .session
+            .execute("UPDATE warehouse SET w_ytd = w_ytd + 100 WHERE w_id = 1")
+            .unwrap();
+        match r {
+            QueryResult::Affected(n) => assert_eq!(n, 1),
+            other => panic!("expected Affected(1), got {:?}", other),
+        }
+
+        let sel = s
+            .session
+            .execute("SELECT w_ytd FROM warehouse WHERE w_id = 1")
+            .unwrap();
+        match sel {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Int64(1100));
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        // The non-matching row is untouched.
+        let sel2 = s
+            .session
+            .execute("SELECT w_ytd FROM warehouse WHERE w_id = 2")
+            .unwrap();
+        match sel2 {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int64(2000));
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ---- DELETE ----
+
+    #[test]
+    fn session_delete_removes_filtered_rows() {
+        let mut s = setup();
+        s.session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, n BIGINT NOT NULL)")
+            .unwrap();
+        s.session
+            .execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+
+        let r = s.session.execute("DELETE FROM t WHERE id = 2").unwrap();
+        assert!(matches!(r, QueryResult::Affected(1)));
+
+        let sel = s.session.execute("SELECT * FROM t").unwrap();
+        assert_eq!(count_rows(sel), 2);
+    }
+
+    // ---- EXPLAIN ----
+
+    #[test]
+    fn session_explain_returns_plan_string() {
+        let mut s = setup();
+        s.session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY)")
+            .unwrap();
+        let r = s
+            .session
+            .execute("EXPLAIN SELECT * FROM t WHERE id = 1")
+            .unwrap();
+        match r {
+            QueryResult::Explain(text) => {
+                assert!(text.contains("SeqScan(t)"));
+                assert!(text.contains("Filter"));
+            }
+            other => panic!("expected Explain, got {:?}", other),
+        }
+    }
+
+    // ---- Error paths ----
+
+    #[test]
+    fn session_commit_without_begin_errors() {
+        let mut s = setup();
+        let err = s.session.execute("COMMIT").unwrap_err();
+        assert!(matches!(err, Error::SqlParse(ref m) if m.contains("no active")));
+    }
+
+    #[test]
+    fn session_nested_begin_errors() {
+        let mut s = setup();
+        s.session.execute("BEGIN").unwrap();
+        let err = s.session.execute("BEGIN").unwrap_err();
+        assert!(matches!(err, Error::SqlParse(ref m) if m.contains("nested")));
+    }
+
+    #[test]
+    fn session_multiple_statements_per_execute_rejected() {
+        let mut s = setup();
+        let err = s.session.execute("SELECT 1; SELECT 2").unwrap_err();
+        assert!(matches!(err, Error::SqlParse(ref m) if m.contains("multiple")));
+    }
+
+    #[test]
+    fn session_empty_input_returns_ack() {
+        let mut s = setup();
+        let r = s.session.execute("").unwrap();
+        assert!(matches!(r, QueryResult::Ack));
+    }
+}

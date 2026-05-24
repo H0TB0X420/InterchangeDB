@@ -69,6 +69,8 @@ pub mod storage;
 pub mod concurrency;
 pub mod execution;
 pub mod index;
+pub mod session;
+pub mod sql;
 pub mod table;
 pub mod txn;
 pub mod types;
