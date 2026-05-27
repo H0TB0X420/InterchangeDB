@@ -341,6 +341,26 @@ impl<E: StorageEngine> Database<E> {
         Ok(stats)
     }
 
+    /// Snapshot current GC state without running a collection. Cheap —
+    /// no engine scan; just reads `TransactionManager` fields. Returns
+    /// `Error::TxnNotSupported` for databases opened without a txn manager
+    /// (i.e. `Database::new()` rather than `Database::open()`).
+    pub fn gc_status(&self) -> Result<gc::GcStatus> {
+        let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
+        let active = txn_mgr.active_read_timestamps();
+        let oldest_active_read_ts = active.iter().min().copied();
+        let current_timestamp = txn_mgr.ts_oracle_peek();
+        let low_water_mark = oldest_active_read_ts.unwrap_or(current_timestamp);
+        Ok(gc::GcStatus {
+            low_water_mark,
+            oldest_active_read_ts,
+            active_snapshot_count: active.len(),
+            committed_txns_tracked: txn_mgr.committed_txns().len(),
+            aborted_txns_tracked: txn_mgr.aborted_txns().len(),
+            current_timestamp,
+        })
+    }
+
     pub fn begin_txn(&self, mode: TxnMode) -> Result<TxnId> {
         let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
 

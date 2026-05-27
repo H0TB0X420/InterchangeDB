@@ -33,6 +33,34 @@ pub struct GcStats {
     pub keys_processed: u64,
 }
 
+/// Observability snapshot of current GC state, without running a collection.
+///
+/// All fields are read from the `TransactionManager` at one instant — there
+/// is no engine scan, so the call is cheap (O(active txns) + a couple of
+/// hashmap sizes). Useful for monitoring and the Phase 16 perf harness.
+#[derive(Debug, Clone)]
+pub struct GcStatus {
+    /// Current watermark — the timestamp below which versions can be
+    /// reclaimed. Equal to the oldest active snapshot's read_ts, or to
+    /// the latest issued timestamp if no transactions are active.
+    pub low_water_mark: Timestamp,
+    /// Oldest active snapshot's read_ts (pinning the watermark).
+    /// `None` when no active transactions exist.
+    pub oldest_active_read_ts: Option<Timestamp>,
+    /// Number of currently active transactions. Each active snapshot
+    /// blocks GC of versions below its read_ts.
+    pub active_snapshot_count: usize,
+    /// Number of committed-txn metadata entries currently retained for
+    /// visibility checks.
+    pub committed_txns_tracked: usize,
+    /// Number of aborted-txn ids currently retained for skip-on-read.
+    /// Entries are forgotten once their versions are fully GC'd.
+    pub aborted_txns_tracked: usize,
+    /// Latest timestamp issued by the oracle. The watermark would
+    /// advance to this if every active transaction committed or aborted.
+    pub current_timestamp: Timestamp,
+}
+
 /// Run garbage collection on the engine.
 ///
 /// Removes MVCC versions that are no longer visible to any active or future

@@ -216,3 +216,107 @@ fn gc_stats_accurate() {
     assert_eq!(stats.versions_removed, 9); // 3 keys × 3 old versions
     assert_eq!(stats.versions_scanned, 12); // 3 keys × 4 versions total
 }
+
+// ---- Q-26: gc_status() observability hook ----
+
+#[test]
+fn gc_status_no_active_txns_advances_to_current_ts() {
+    let (db, _dir) = setup();
+    db.put(b"k", b"v").unwrap();
+    let s = db.gc_status().unwrap();
+    assert!(s.oldest_active_read_ts.is_none());
+    assert_eq!(s.active_snapshot_count, 0);
+    // With no active txns, the watermark is the latest issued timestamp.
+    assert_eq!(s.low_water_mark, s.current_timestamp);
+}
+
+#[test]
+fn gc_status_active_snapshot_pins_watermark() {
+    let (db, _dir) = setup();
+    db.put(b"k", b"v1").unwrap();
+    let t = db.begin_txn(TxnMode::ReadOnly).unwrap();
+    db.put(b"k", b"v2").unwrap(); // bumps current_timestamp past T's read_ts
+
+    let s = db.gc_status().unwrap();
+    assert_eq!(s.active_snapshot_count, 1);
+    let read_ts = s.oldest_active_read_ts.expect("active snapshot present");
+    assert_eq!(s.low_water_mark, read_ts);
+    assert!(
+        s.current_timestamp > read_ts,
+        "current_timestamp ({:?}) should be past the pinned read_ts ({:?}) — proves the watermark is held DOWN, not just bumped",
+        s.current_timestamp,
+        read_ts
+    );
+
+    db.commit_txn(t).unwrap();
+
+    // After commit, no active txns; watermark catches up to current_timestamp.
+    let s2 = db.gc_status().unwrap();
+    assert_eq!(s2.active_snapshot_count, 0);
+    assert_eq!(s2.low_water_mark, s2.current_timestamp);
+}
+
+#[test]
+fn gc_status_multiple_snapshots_watermark_is_oldest() {
+    let (db, _dir) = setup();
+    db.put(b"k", b"v").unwrap();
+    let t1 = db.begin_txn(TxnMode::ReadOnly).unwrap();
+    db.put(b"k", b"v2").unwrap();
+    let t2 = db.begin_txn(TxnMode::ReadOnly).unwrap();
+    db.put(b"k", b"v3").unwrap();
+
+    let s = db.gc_status().unwrap();
+    assert_eq!(s.active_snapshot_count, 2);
+    // The oldest active read_ts pins the watermark, not the newest.
+    let pinned = s.oldest_active_read_ts.unwrap();
+    assert_eq!(s.low_water_mark, pinned);
+
+    // Committing the younger snapshot doesn't advance the watermark.
+    db.commit_txn(t2).unwrap();
+    let s_after_t2 = db.gc_status().unwrap();
+    assert_eq!(s_after_t2.active_snapshot_count, 1);
+    assert_eq!(s_after_t2.low_water_mark, pinned, "older snapshot still pinning");
+
+    // Committing the older snapshot lets the watermark advance.
+    db.commit_txn(t1).unwrap();
+    let s_after_t1 = db.gc_status().unwrap();
+    assert_eq!(s_after_t1.active_snapshot_count, 0);
+    assert!(s_after_t1.low_water_mark > pinned);
+}
+
+#[test]
+fn gc_status_tracks_committed_metadata_size() {
+    let (db, _dir) = setup();
+    let initial = db.gc_status().unwrap().committed_txns_tracked;
+
+    for _ in 0..5 {
+        let t = db.begin_txn(TxnMode::ReadWrite).unwrap();
+        db.txn_put(t, b"k", b"v").unwrap();
+        db.commit_txn(t).unwrap();
+    }
+
+    let after = db.gc_status().unwrap().committed_txns_tracked;
+    assert!(
+        after > initial,
+        "committed_txns_tracked should grow with committed txns (initial={}, after={})",
+        initial,
+        after
+    );
+}
+
+#[test]
+fn gc_status_without_txn_manager_returns_error() {
+    use interchangedb::buffer::BufferPoolManager;
+    use interchangedb::index::btree::BTreeEngine;
+    use interchangedb::storage::FileDiskManager;
+    let dir = tempdir().unwrap();
+    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
+    let bpm = BufferPoolManager::new(64, dm);
+    let engine = BTreeEngine::new(bpm).unwrap();
+    // Database::new — no txn manager.
+    let db = Database::new(engine);
+    assert!(matches!(
+        db.gc_status(),
+        Err(interchangedb::Error::TxnNotSupported)
+    ));
+}

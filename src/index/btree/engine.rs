@@ -166,6 +166,20 @@ impl StorageEngine for BTreeEngine {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        // Q-16: reject single entries that won't fit in a leaf page.
+        // Leaf budget = PAGE_SIZE − LEAF_HEADER_SIZE (33) − tombstone area
+        // (MAX_TOMBSTONES × 2 = 16) − per-entry length prefixes (key_len:u16
+        // + val_len:u16 = 4). The encoder previously panicked deep in
+        // `encode_leaf_node` for over-budget entries — now it's a clean
+        // `ValueTooLarge`. Key-side is separately guarded with a smaller
+        // per-key cap (a long key forces an internal-node entry too).
+        const LEAF_BUDGET: usize = crate::common::config::PAGE_SIZE
+            - crate::index::btree::node::LEAF_HEADER_SIZE
+            - crate::index::btree::node::MAX_TOMBSTONES * 2
+            - 4;
+        if key.len() + value.len() > LEAF_BUDGET {
+            return Err(crate::common::Error::ValueTooLarge(value.len()));
+        }
         let tree = self.tree();
         let inserted = tree.insert(key, value)?;
 
