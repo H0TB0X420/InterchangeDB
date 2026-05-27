@@ -4,7 +4,7 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use std::sync::Arc;
 use std::thread;
 use tempfile::tempdir;
@@ -12,7 +12,7 @@ use tempfile::tempdir;
 fn create_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     (BufferPoolManager::new(pool_size, dm), dir)
 }
 
@@ -49,7 +49,7 @@ fn test_flush_and_reload() {
 
     // First session: create and write
     {
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = FileDiskManager::create(&path).unwrap();
         let bpm = BufferPoolManager::new(10, dm);
 
         let mut guard = bpm.new_page().unwrap();
@@ -62,7 +62,7 @@ fn test_flush_and_reload() {
 
     // Second session: verify data
     {
-        let dm = DiskManager::open(&path).unwrap();
+        let dm = FileDiskManager::open(&path).unwrap();
         let bpm = BufferPoolManager::new(10, dm);
 
         let guard = bpm.fetch_page_read(pid).unwrap();

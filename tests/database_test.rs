@@ -11,7 +11,7 @@ use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::index::lsm::LsmEngine;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use tempfile::{tempdir, TempDir};
 
 // =============================================================================
@@ -277,7 +277,7 @@ macro_rules! database_tests {
 fn setup_btree() -> (Database<BTreeEngine>, TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(128, dm);
     let db = Database::btree(bpm).unwrap();
     (db, dir)

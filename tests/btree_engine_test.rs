@@ -6,7 +6,7 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::index::btree::BTreeEngine;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use interchangedb::storage::engine::StorageEngine;
 use tempfile::tempdir;
 
@@ -17,7 +17,7 @@ use tempfile::tempdir;
 fn setup_engine() -> (BTreeEngine, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(128, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     (engine, dir)
@@ -30,7 +30,7 @@ fn setup_engine_with_sizes(
 ) -> (BTreeEngine, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(256, dm);
     let engine = BTreeEngine::with_sizes(bpm, leaf_max, internal_max, max_tombstones).unwrap();
     (engine, dir)

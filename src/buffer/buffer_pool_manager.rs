@@ -57,8 +57,10 @@ pub struct BufferPoolManager {
     /// Uses trait object for runtime policy swapping.
     replacer: Mutex<Box<dyn EvictionPolicy>>,
 
-    /// Handles all disk I/O.
-    disk_manager: Mutex<DiskManager>,
+    /// Handles all disk I/O. `Box<dyn DiskManager>` allows runtime
+    /// substitution of file-backed, in-memory, or fault-injection backends.
+    /// Vtable dispatch cost is negligible next to the I/O it gates.
+    disk_manager: Mutex<Box<dyn DiskManager>>,
 
     /// Performance statistics.
     stats: BufferPoolStats,
@@ -76,7 +78,7 @@ impl BufferPoolManager {
     ///
     /// # Panics
     /// Panics if `pool_size` is 0.
-    pub fn new(pool_size: usize, disk_manager: DiskManager) -> Self {
+    pub fn new<D: DiskManager + 'static>(pool_size: usize, disk_manager: D) -> Self {
         assert!(pool_size > 0, "pool_size must be > 0");
 
         let frames: Vec<Frame> = (0..pool_size).map(|_| Frame::new()).collect();
@@ -87,7 +89,7 @@ impl BufferPoolManager {
             page_table: RwLock::new(HashMap::new()),
             free_list: Mutex::new(free_list),
             replacer: Mutex::new(Box::new(FifoReplacer::new())),
-            disk_manager: Mutex::new(disk_manager),
+            disk_manager: Mutex::new(Box::new(disk_manager)),
             stats: BufferPoolStats::new(),
             pool_size,
         }
@@ -346,13 +348,18 @@ impl BufferPoolManager {
     /// - **Warm**: Transfers "hot page" scores so the new policy knows which pages
     ///   are frequently accessed. Avoids a burst of poor eviction decisions.
     pub fn swap_policy(&self, new_policy: Box<dyn EvictionPolicy>, mode: SwapMode) -> SwapResult {
-        // Snapshot frame-to-page mappings (released before locking replacer)
-        let frame_mappings: Vec<(FrameId, PageId)> = {
-            let pt = self.page_table.read();
-            pt.iter().map(|(&pid, &fid)| (fid, pid)).collect()
-        };
-
+        // Q-27: hold pt.write across the entire swap (snapshot + replace +
+        // re-register). evict_page also holds pt.write across its
+        // evict_for_page → pt.remove sequence. With both paths gated on
+        // pt.write, swap_policy cannot run while a victim is mid-eviction
+        // (between evict_for_page and pt.remove) — preventing the new
+        // replacer from re-marking that victim evictable and letting a
+        // second concurrent eviction pick it.
         let start = Instant::now();
+        let pt = self.page_table.write();
+        let frame_mappings: Vec<(FrameId, PageId)> =
+            pt.iter().map(|(&pid, &fid)| (fid, pid)).collect();
+
         let mut replacer = self.replacer.lock();
 
         let old_name = replacer.name();
@@ -373,7 +380,7 @@ impl BufferPoolManager {
 
         let new_name = replacer.name();
 
-        // Re-register all in-pool frames with the new policy
+        // Re-register all in-pool frames with the new policy.
         for &(frame_id, page_id) in &frame_mappings {
             replacer.record_access(frame_id, page_id);
 
@@ -383,6 +390,7 @@ impl BufferPoolManager {
 
         let swap_duration = start.elapsed();
         drop(replacer);
+        drop(pt);
 
         self.stats.policy_swaps.fetch_add(1, Ordering::Relaxed);
 
@@ -497,31 +505,76 @@ impl BufferPoolManager {
     }
 
     fn evict_page(&self, incoming_page: PageId) -> Result<FrameId> {
-        let frame_id = {
-            let mut replacer = self.replacer.lock();
-            replacer.evict_for_page(incoming_page).ok_or(Error::NoFreeFrames)?
-        };
-
-        self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-
-        let frame = &self.frames[frame_id.0];
-        let old_page_id = frame.page_id();
-
-        if frame.is_dirty() {
-            if let Some(pid) = old_page_id {
-                self.flush_frame(frame_id, pid)?;
+        // Q-27: `evict_for_page` only consults the replacer's evictable
+        // set, which is updated by `set_evictable` calls *after* a
+        // cache-hit thread pins a frame. There is a window where a frame
+        // is still in the evictable set but a concurrent cache-hit has
+        // selected it and is about to pin. Without the pin-count check
+        // below, we'd flush + overwrite a frame that another thread
+        // holds — surfacing as "byte 0 of page X is page Y's data" reads.
+        //
+        // The check has to happen *under* `pt.write`: cache-hit threads
+        // hold `pt.read` for the entirety of `handle_cache_hit`, which is
+        // exclusive with `pt.write`. So while we hold `pt.write`, no
+        // cache-hit can complete its pin, and `pin_count` is the final
+        // value, not a moving target.
+        //
+        // If the victim is pinned at check time, we abandon it (don't
+        // re-add to the evictable set; the pinning thread's eventual
+        // `unpin_page_internal` will set_evictable(true)) and try again.
+        // Bounded by frame count to avoid pathological retry loops.
+        // Q-27 also addresses a swap_policy race: swap_policy iterates the
+        // page table and re-registers each frame's evictability in the new
+        // replacer. If swap_policy runs after our `evict_for_page` (which
+        // removed our victim from the old policy's evictable set) but
+        // before our `pt.remove`, the victim is still in pt and the new
+        // replacer marks it evictable again — a second concurrent
+        // eviction can then select the same frame, and we end up with
+        // two threads "owning" it. Holding pt.write across evict_for_page
+        // prevents the window: swap_policy must also acquire pt.write,
+        // so it serializes with our entire selection-and-removal.
+        const MAX_EVICT_RETRIES: usize = 64;
+        for _ in 0..MAX_EVICT_RETRIES {
+            let frame_id;
+            let old_page_id;
+            let was_dirty;
+            {
+                let mut pt = self.page_table.write();
+                frame_id = {
+                    let mut replacer = self.replacer.lock();
+                    match replacer.evict_for_page(incoming_page) {
+                        Some(fid) => fid,
+                        None => return Err(Error::NoFreeFrames),
+                    }
+                };
+                let frame = &self.frames[frame_id.0];
+                if frame.pin_count() > 0 {
+                    // Cache-hit raced ahead. Abandon this victim; the
+                    // unpinning thread will set_evictable(true) and add
+                    // the frame back to the evictable set.
+                    drop(pt);
+                    continue;
+                }
+                old_page_id = frame.page_id();
+                was_dirty = frame.is_dirty();
+                if let Some(pid) = old_page_id {
+                    pt.remove(&pid);
+                }
+                frame.set_page_id(None);
             }
+
+            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+
+            if was_dirty {
+                if let Some(pid) = old_page_id {
+                    self.flush_frame(frame_id, pid)?;
+                }
+            }
+            let frame = &self.frames[frame_id.0];
+            frame.clear_dirty();
+            return Ok(frame_id);
         }
-
-        if let Some(pid) = old_page_id {
-            let mut pt = self.page_table.write();
-            pt.remove(&pid);
-        }
-
-        frame.clear_dirty();
-        frame.set_page_id(None);
-
-        Ok(frame_id)
+        Err(Error::NoFreeFrames)
     }
 
     fn flush_frame(&self, frame_id: FrameId, page_id: PageId) -> Result<()> {
@@ -554,7 +607,7 @@ mod tests {
     fn create_test_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = crate::storage::FileDiskManager::create(&path).unwrap();
         (BufferPoolManager::new(pool_size, dm), dir)
     }
 

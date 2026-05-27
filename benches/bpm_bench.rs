@@ -10,7 +10,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;
 
 const PAGE_COUNT: usize = 640;
@@ -59,7 +59,7 @@ struct BpmBenchState {
 fn setup_bench(pool_size: usize, page_count: usize) -> BpmBenchState {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bench.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(pool_size, dm);
 
     let mut page_ids = Vec::with_capacity(page_count);

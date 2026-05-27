@@ -1,13 +1,15 @@
 //! Storage layer - disk I/O, page formats, and storage engines.
 //!
 //! This module handles persistent storage:
-//! - [`DiskManager`] - Low-level file I/O
-//! - [`page`] - Page types and layouts
-//! - [`engine`] - Storage engine trait and implementations
+//! - [`DiskManager`] (trait) - the disk backend contract used by the BPM.
+//! - [`FileDiskManager`] - production file-backed backend.
+//! - [`MemoryDiskManager`] - in-memory backend for fast tests + Q-07 wrapping.
+//! - [`page`] - Page types and layouts.
+//! - [`engine`] - Storage engine trait and implementations.
 
 mod disk_manager;
 pub mod engine;
 pub mod page;
 
-pub use disk_manager::DiskManager;
+pub use disk_manager::{DiskManager, FileDiskManager, MemoryDiskManager};
 pub use engine::{ScanIterator, StorageEngine, StorageStatus};

@@ -173,7 +173,13 @@ pub fn write_sstable(
     id: u64,
     entries: impl Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
 ) -> Result<Option<SSTableMeta>> {
-    let file = File::create(path)?;
+    // Write to a sibling .sst.tmp path, fsync, then atomically rename to
+    // `path`. Guarantees on crash: either `path` exists as a complete,
+    // fsync'd SSTable or it doesn't exist at all. Recovery never sees a
+    // half-written final file. Orphan `.sst.tmp` files left by a crash are
+    // swept by `Manifest::open` on the next startup.
+    let tmp_path = path.with_extension("sst.tmp");
+    let file = File::create(&tmp_path)?;
     let mut writer = BufWriter::new(file);
 
     let mut block_buf: Vec<u8> = Vec::with_capacity(BLOCK_SIZE);
@@ -239,10 +245,10 @@ pub fn write_sstable(
         total_entry_count += 1;
     }
 
-    // If no entries were written, remove the empty file and return None.
+    // If no entries were written, remove the empty tmp file and return None.
     if total_entry_count == 0 {
         drop(writer);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&tmp_path);
         return Ok(None);
     }
 
@@ -300,6 +306,22 @@ pub fn write_sstable(
     writer.flush()?;
 
     let file_size = writer.stream_position()?;
+
+    // Recover the File from BufWriter so we can fsync. Drop before rename
+    // so no handle survives the rename on platforms that care.
+    let file = writer.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp_path, path)?;
+
+    // Best-effort: fsync the parent directory so the rename itself is
+    // durable on POSIX. Failure here doesn't roll back — the file is
+    // already at its final path with valid, fsync'd contents.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 
     Ok(Some(SSTableMeta {
         id,

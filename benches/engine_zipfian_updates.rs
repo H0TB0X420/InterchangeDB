@@ -33,7 +33,7 @@ use interchangedb::buffer::replacer::ArcReplacer;
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::index::btree::{BTree, BTreeHeaderPage};
 use interchangedb::index::lsm::LsmTree;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -198,7 +198,7 @@ fn emit_row(
 fn run_btree(dist: Distribution, bpm_frames: usize) -> CellResult {
     let dir = tempdir().unwrap();
     let path = dir.path().join("zipf.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(bpm_frames, dm);
     let _ = bpm.swap_policy(Box::new(ArcReplacer::new(bpm_frames)), SwapMode::Cold);
 

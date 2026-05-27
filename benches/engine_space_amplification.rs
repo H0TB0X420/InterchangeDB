@@ -27,7 +27,7 @@ use interchangedb::buffer::replacer::ArcReplacer;
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::index::btree::{BTree, BTreeHeaderPage};
 use interchangedb::index::lsm::LsmTree;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;
 
 #[path = "common/mod.rs"]
@@ -172,7 +172,7 @@ fn push_table_row(
 fn run_btree(bpm_frames: usize) -> (PhaseResult, PhaseResult) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("space.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(bpm_frames, dm);
     let _ = bpm.swap_policy(Box::new(ArcReplacer::new(bpm_frames)), SwapMode::Cold);
 
@@ -193,7 +193,7 @@ fn run_btree(bpm_frames: usize) -> (PhaseResult, PhaseResult) {
     bpm.flush_all_pages().unwrap();
 
     // `disk_page_count()` returns total pages allocated to the file, which
-    // matches what's on disk for the BPM's DiskManager.
+    // matches what's on disk for the BPM's FileDiskManager.
     let post_insert_disk = bpm.disk_page_count() as u64 * PAGE_SIZE as u64;
     let post_insert_user = (INSERT_KEYS * RECORD_BYTES) as u64;
     let post_insert = PhaseResult {

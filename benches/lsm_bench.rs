@@ -112,7 +112,7 @@ fn bench_lsm_insert(c: &mut Criterion) {
                         tree.put(k, v).unwrap();
                     }
                     // Flush to ensure all data hits disk, matching B+Tree
-                    // which writes through the BPM to DiskManager.
+                    // which writes through the BPM to FileDiskManager.
                     tree.flush_memtable().unwrap();
                 },
             );

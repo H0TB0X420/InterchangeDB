@@ -189,7 +189,12 @@ fn render_explain(plan: &PhysicalPlan) -> String {
         PhysicalPlan::BeginTxn => "BeginTxn\n".to_string(),
         PhysicalPlan::CommitTxn => "CommitTxn\n".to_string(),
         PhysicalPlan::AbortTxn => "AbortTxn\n".to_string(),
-        PhysicalPlan::Explain(_) => "Explain[nested]\n".to_string(),
+        PhysicalPlan::Explain(text) => {
+            // Inner Explain already carries a rendered, newline-terminated string.
+            // Indent each line so the nesting is visible in the output.
+            let indented: String = text.lines().map(|l| format!("  {}\n", l)).collect();
+            format!("Explain\n{}", indented)
+        }
     }
 }
 
@@ -202,7 +207,7 @@ mod tests {
     use crate::index::btree::BTreeEngine;
     use crate::sql::binder::Binder;
     use crate::sql::frontend::parse;
-    use crate::storage::DiskManager;
+    use crate::storage::FileDiskManager;
     use crate::types::{ColumnType, Value};
     use tempfile::TempDir;
 
@@ -216,7 +221,7 @@ mod tests {
     fn setup() -> TestEnv {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = FileDiskManager::create(&path).unwrap();
         let bpm = BufferPoolManager::new(512, dm);
         let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
         let catalog = Arc::new(Catalog::open(engine.clone()).unwrap());
@@ -405,6 +410,35 @@ Limit(3)
         match p {
             PhysicalPlan::Explain(text) => {
                 assert!(text.starts_with("CreateTable(t)"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    // Regression: `render_explain` used to emit the stub "Explain[nested]\n"
+    // when the inner plan was itself a `PhysicalPlan::Explain`, dropping the
+    // inner text. The SQL surface forbids nested EXPLAIN at the parser layer
+    // ("Explain must be root of the plan"), so we hand-build the nested
+    // LogicalPlan to exercise the planner branch directly. The fix remains
+    // load-bearing for any internal caller that constructs nested plans (e.g.
+    // future optimizer rewrites or hand-built test plans).
+    #[test]
+    fn plans_nested_explain_preserves_inner_render() {
+        let env = setup();
+        create_warehouse(&env);
+        let stmts = parse("EXPLAIN SELECT w_id FROM warehouse WHERE w_id = 1").unwrap();
+        let inner_logical = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
+        let nested = LogicalPlan::Explain(Box::new(inner_logical));
+        let p = plan(nested, env.engine.clone(), &env.catalog).unwrap();
+        match p {
+            PhysicalPlan::Explain(text) => {
+                assert!(text.starts_with("Explain\n"), "got: {}", text);
+                assert!(!text.contains("Explain[nested]"), "old stub leaked: {}", text);
+                assert!(text.contains("  Projection"), "got: {}", text);
+                assert!(text.contains("SeqScan(warehouse)"), "got: {}", text);
+                for line in text.lines().skip(1).filter(|l| !l.is_empty()) {
+                    assert!(line.starts_with("  "), "unindented inner line: {:?}", line);
+                }
             }
             _ => panic!(),
         }

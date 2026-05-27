@@ -31,7 +31,7 @@
 //! │                              ↓                                  │
 //! │  ┌─────────────────────────────────────────────────────────┐   │
 //! │  │           Storage Layer (storage/)                       │   │
-//! │  │     DiskManager + Page + PageHeader + recovery/WAL       │   │
+//! │  │     FileDiskManager + Page + PageHeader + recovery/WAL       │   │
 //! │  └─────────────────────────────────────────────────────────┘   │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
@@ -47,11 +47,11 @@
 //!
 //! # Quick Start
 //! ```no_run
-//! use interchangedb::storage::DiskManager;
+//! use interchangedb::storage::FileDiskManager;
 //! use interchangedb::common::PageId;
 //!
 //! // Create a new database file
-//! let mut dm = DiskManager::create("my_database.db").unwrap();
+//! let mut dm = FileDiskManager::create("my_database.db").unwrap();
 //!
 //! // Allocate and write a page
 //! let page_id = dm.allocate_page().unwrap();
@@ -85,6 +85,6 @@ pub use database::{BTreeDatabase, Database, LsmDatabase};
 pub use index::btree::BTreeEngine;
 pub use index::lsm::LsmEngine;
 pub use storage::page::{Page, PageHeader, PageType};
-pub use storage::DiskManager;
+pub use storage::{DiskManager, FileDiskManager, MemoryDiskManager};
 pub use storage::{ScanIterator, StorageEngine, StorageStatus};
 pub use txn::{LockManager, LockMode, TransactionManager, TxnId, TxnMode, TxnState};

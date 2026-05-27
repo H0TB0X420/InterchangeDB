@@ -247,14 +247,14 @@ mod tests {
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{ColumnDef, Schema};
     use crate::index::btree::BTreeEngine;
-    use crate::storage::DiskManager;
+    use crate::storage::FileDiskManager;
     use crate::types::ColumnType;
     use tempfile::TempDir;
 
     fn fresh_catalog() -> (Catalog<BTreeEngine>, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = FileDiskManager::create(&path).unwrap();
         let bpm = BufferPoolManager::new(256, dm);
         let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
         let catalog = Catalog::open(engine).unwrap();
@@ -427,7 +427,7 @@ mod tests {
         let path = dir.path().join("test.db");
         let id1;
         {
-            let dm = DiskManager::create(&path).unwrap();
+            let dm = FileDiskManager::create(&path).unwrap();
             let bpm = BufferPoolManager::new(256, dm);
             let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
             let catalog = Catalog::open(engine).unwrap();
@@ -442,7 +442,7 @@ mod tests {
             catalog.engine().flush().unwrap();
         }
         // Reopen — fresh engine instance, same path.
-        let dm = DiskManager::open(&path).unwrap();
+        let dm = FileDiskManager::open(&path).unwrap();
         let bpm = BufferPoolManager::new(256, dm);
         let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
         let catalog = Catalog::open(engine).unwrap();

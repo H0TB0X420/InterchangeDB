@@ -16,13 +16,13 @@ use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::Error;
 use interchangedb::database::Database;
 use interchangedb::index::btree::BTreeEngine;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use interchangedb::txn::TxnMode;
 
 fn setup_shared() -> (Arc<Database<BTreeEngine>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();

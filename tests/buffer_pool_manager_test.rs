@@ -5,7 +5,7 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -14,7 +14,7 @@ const FRAMES: usize = 10;
 fn create_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     (BufferPoolManager::new(pool_size, dm), dir)
 }
 

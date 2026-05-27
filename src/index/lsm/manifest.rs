@@ -110,6 +110,19 @@ impl Manifest {
             }
         }
 
+        // Sweep orphan `.sst.tmp` files left by a crash mid-flush. They have
+        // no manifest entries, so they're unreferenced bytes. Best-effort —
+        // a tmp we can't delete (permissions, locked file) is not fatal:
+        // recovery correctness doesn't depend on these being gone.
+        if sst_dir.exists() {
+            for entry in std::fs::read_dir(sst_dir)?.flatten() {
+                let entry_path = entry.path();
+                if entry_path.extension().and_then(|s| s.to_str()) == Some("tmp") {
+                    let _ = std::fs::remove_file(&entry_path);
+                }
+            }
+        }
+
         // Open for append.
         let file = OpenOptions::new()
             .create(true)
@@ -129,6 +142,10 @@ impl Manifest {
         );
         self.file.write_all(line.as_bytes())?;
         self.file.flush()?;
+        // fsync so the entry is durable. The manifest is the source of truth
+        // for which SSTables exist on disk; losing an entry orphans an
+        // SSTable file invisible to recovery (silent data loss).
+        self.file.sync_all()?;
         Ok(())
     }
 
@@ -137,6 +154,7 @@ impl Manifest {
         let line = format!("DEL {}\n", sst_id);
         self.file.write_all(line.as_bytes())?;
         self.file.flush()?;
+        self.file.sync_all()?;
         Ok(())
     }
 

@@ -97,6 +97,35 @@ impl<'a> BTreeScanIterator<'a> {
         let leaf = decode_leaf_node(data);
         let next_page_id = leaf.next_page_id;
 
+        // Validate decoded leaf invariants before trusting it. A corrupt
+        // page on disk could land here with mismatched arrays or a bogus
+        // sibling pointer; without these checks we'd silently yield garbage
+        // or follow next_page_id off the end of the BPM.
+        if leaf.keys.len() != leaf.values.len() {
+            self.done = true;
+            return Err(Error::StorageCorrupted(format!(
+                "Leaf {} keys.len()={} != values.len()={}",
+                self.current_page_id.0, leaf.keys.len(), leaf.values.len()
+            )));
+        }
+        for &idx in &leaf.tombstones {
+            if (idx as usize) >= leaf.keys.len() {
+                self.done = true;
+                return Err(Error::StorageCorrupted(format!(
+                    "Leaf {} tombstone index {} out of range (keys.len()={})",
+                    self.current_page_id.0, idx, leaf.keys.len()
+                )));
+            }
+        }
+        let page_count = self.bpm.disk_page_count();
+        if next_page_id != PageId::INVALID && next_page_id.0 >= page_count {
+            self.done = true;
+            return Err(Error::StorageCorrupted(format!(
+                "Leaf {} next_page_id={} out of range (page_count={})",
+                self.current_page_id.0, next_page_id.0, page_count
+            )));
+        }
+
         // Collect live entries, filtering by bounds.
         let mut entries = Vec::new();
         let mut hit_end_bound = false;

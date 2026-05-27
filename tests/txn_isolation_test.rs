@@ -14,7 +14,7 @@ use tempfile::tempdir;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
 use interchangedb::index::btree::BTreeEngine;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use interchangedb::txn::TxnMode;
 
 // ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ use interchangedb::txn::TxnMode;
 fn setup_shared_db() -> (Arc<Database<BTreeEngine>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -77,7 +77,7 @@ fn dirty_read_prevention() {
     // Under MVCC: T2's snapshot excludes T1 (T1 is in active_txns at snapshot time).
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -117,7 +117,7 @@ fn lost_update_prevention() {
     // Under 2PL, they are serialized — the second sees the first's write.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -150,7 +150,7 @@ fn deadlock_resolution_through_database() {
     // This tests the lock manager's deadlock detection through the Database API.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -200,7 +200,7 @@ fn serialization_counter_increment() {
     // Final sum = initial_sum + (4 * 50).
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();

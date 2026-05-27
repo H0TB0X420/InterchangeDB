@@ -1421,14 +1421,14 @@ impl<'a> BTree<'a> {
 mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
-    use crate::storage::DiskManager;
+    use crate::storage::FileDiskManager;
     use super::super::page_layout::encode_internal_node;
     use tempfile::tempdir;
 
     fn setup_bpm() -> (BufferPoolManager, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = FileDiskManager::create(&path).unwrap();
         let bpm = BufferPoolManager::new(10, dm);
         (bpm, dir)
     }

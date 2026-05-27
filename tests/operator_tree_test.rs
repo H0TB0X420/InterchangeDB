@@ -1,6 +1,6 @@
 //! Phase 10 end-to-end: TPC-C-shaped operator trees over the full stack.
 //!
-//!   DiskManager → BPM → BTreeEngine → TxnEngine → Table → Executor tree
+//!   FileDiskManager → BPM → BTreeEngine → TxnEngine → Table → Executor tree
 //!
 //! Each test exercises a complete transaction lifecycle: begin → build
 //! operator tree → drive `next()` → commit (or abort) → verify with a
@@ -19,7 +19,7 @@ use interchangedb::execution::{
 };
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::layout::RowLayout;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use interchangedb::table::Table;
 use interchangedb::txn::engine::TxnEngine;
 use interchangedb::txn::{TransactionManager, TxnId, TxnMode};
@@ -39,7 +39,7 @@ struct Env {
 
 fn setup() -> Env {
     let dir = tempdir().unwrap();
-    let dm = DiskManager::create(&dir.path().join("test.db")).unwrap();
+    let dm = FileDiskManager::create(&dir.path().join("test.db")).unwrap();
     let bpm = BufferPoolManager::new(512, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());

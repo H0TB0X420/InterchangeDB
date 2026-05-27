@@ -22,7 +22,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
 use interchangedb::index::btree::{BTree, BTreeHeaderPage};
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;
 
 /// Total keys to insert. BusTub uses 100K; we use 10K to keep bench
@@ -83,7 +83,7 @@ struct BTreeBenchState {
 fn setup_tree() -> BTreeBenchState {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bench.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(BPM_SIZE, dm);
 
     let header_page = bpm.new_page().unwrap();
@@ -120,7 +120,7 @@ fn bench_btree_insert(c: &mut Criterion) {
                     // Fresh tree for each iteration.
                     let dir = tempdir().unwrap();
                     let path = dir.path().join("bench.db");
-                    let dm = DiskManager::create(&path).unwrap();
+                    let dm = FileDiskManager::create(&path).unwrap();
                     let bpm = BufferPoolManager::new(BPM_SIZE, dm);
                     let header_page = bpm.new_page().unwrap();
                     let hid = header_page.page_id();

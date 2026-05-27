@@ -7,7 +7,7 @@
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
 use interchangedb::index::btree::{BTree, BTreeHeaderPage};
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;
 
 // =============================================================================
@@ -17,7 +17,7 @@ use tempfile::tempdir;
 fn setup_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     (BufferPoolManager::new(pool_size, dm), dir)
 }
 

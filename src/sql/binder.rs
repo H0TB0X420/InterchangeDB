@@ -799,13 +799,13 @@ mod tests {
     use crate::buffer::BufferPoolManager;
     use crate::index::btree::BTreeEngine;
     use crate::sql::frontend::parse;
-    use crate::storage::DiskManager;
+    use crate::storage::FileDiskManager;
     use tempfile::TempDir;
 
     fn fresh_catalog() -> (Binder<BTreeEngine>, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = FileDiskManager::create(&path).unwrap();
         let bpm = BufferPoolManager::new(256, dm);
         let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
         let catalog = Arc::new(Catalog::open(engine).unwrap());

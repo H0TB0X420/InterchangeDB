@@ -308,7 +308,7 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::index::btree::BTreeEngine;
-    use crate::storage::DiskManager;
+    use crate::storage::FileDiskManager;
     use tempfile::TempDir;
 
     struct TestSession {
@@ -319,7 +319,7 @@ mod tests {
     fn setup() -> TestSession {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let dm = DiskManager::create(&db_path).unwrap();
+        let dm = FileDiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(512, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
         let database = Arc::new(Database::open(dir.path(), engine).unwrap());

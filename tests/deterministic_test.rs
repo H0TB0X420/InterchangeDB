@@ -16,7 +16,7 @@ use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::Error;
 use interchangedb::database::Database;
 use interchangedb::index::btree::BTreeEngine;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use interchangedb::txn::{TxnId, TxnMode};
 use interchangedb::txn::lock_manager::{LockManager, LockMode};
 
@@ -122,7 +122,7 @@ fn mvcc_write_then_read_sees_nothing() {
     // T2 must NOT see T1's write.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -159,7 +159,7 @@ fn mvcc_concurrent_writes_one_wins() {
     // One succeeds (gets X lock first), the other gets blocked/deadlock/timeout.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -188,7 +188,7 @@ fn mvcc_abort_then_read_sees_original() {
     // T1 writes + aborts. T2 reads — must see original (not T1's aborted write).
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -212,7 +212,7 @@ fn mvcc_own_write_visible_before_commit() {
     // T1 writes a key, then reads it — must see own write even before commit.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -236,7 +236,7 @@ fn write_write_both_orderings() {
     // Test both possible orderings: T1 first vs T2 first.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();

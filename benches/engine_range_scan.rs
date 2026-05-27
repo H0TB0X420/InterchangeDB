@@ -30,7 +30,7 @@ use interchangedb::buffer::replacer::ArcReplacer;
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::index::btree::{BTree, BTreeHeaderPage};
 use interchangedb::index::lsm::LsmTree;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -104,7 +104,7 @@ fn main() {
     // --- Pre-fill engines once; all sweep cells share the same dataset. ---
     let btree_dir = tempdir().unwrap();
     let btree_path = btree_dir.path().join("range.db");
-    let dm = DiskManager::create(&btree_path).unwrap();
+    let dm = FileDiskManager::create(&btree_path).unwrap();
     let bpm = BufferPoolManager::new(bpm_frames, dm);
     let _ = bpm.swap_policy(Box::new(ArcReplacer::new(bpm_frames)), SwapMode::Cold);
     let header_page = bpm.new_page().unwrap();

@@ -14,7 +14,7 @@ use interchangedb::index::btree::BTreeEngine;
 use interchangedb::index::lsm::LsmEngine;
 use interchangedb::txn::TxnMode;
 use interchangedb::buffer::BufferPoolManager;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -23,7 +23,7 @@ use interchangedb::storage::DiskManager;
 fn setup_btree_wal() -> (Database<BTreeEngine>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let db = Database::open(dir.path(), engine).unwrap();
@@ -42,7 +42,7 @@ fn setup_lsm_wal() -> (Database<LsmEngine>, tempfile::TempDir) {
 fn setup_btree_no_wal() -> (Database<BTreeEngine>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     (Database::new(engine), dir)
@@ -51,7 +51,7 @@ fn setup_btree_no_wal() -> (Database<BTreeEngine>, tempfile::TempDir) {
 /// Reopen a WAL-enabled BTree database from the same directory.
 fn reopen_btree(dir: &Path) -> Database<BTreeEngine> {
     let db_path = dir.join("test.db");
-    let dm = DiskManager::open(&db_path).unwrap();
+    let dm = FileDiskManager::open(&db_path).unwrap();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     Database::open(dir, engine).unwrap()
@@ -301,7 +301,7 @@ fn recovery_committed_txn() {
     let dir = tempdir().unwrap();
     {
         let db_path = dir.path().join("test.db");
-        let dm = DiskManager::create(&db_path).unwrap();
+        let dm = FileDiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
         let db = Database::open(dir.path(), engine).unwrap();
@@ -336,7 +336,7 @@ fn recovery_uncommitted_txn() {
     let dir = tempdir().unwrap();
     {
         let db_path = dir.path().join("test.db");
-        let dm = DiskManager::create(&db_path).unwrap();
+        let dm = FileDiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
         let db = Database::open(dir.path(), engine).unwrap();
@@ -368,7 +368,7 @@ fn recovery_mixed_txns() {
     let dir = tempdir().unwrap();
     {
         let db_path = dir.path().join("test.db");
-        let dm = DiskManager::create(&db_path).unwrap();
+        let dm = FileDiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
         let db = Database::open(dir.path(), engine).unwrap();
@@ -399,7 +399,7 @@ fn recovery_abort_before_crash() {
     let dir = tempdir().unwrap();
     {
         let db_path = dir.path().join("test.db");
-        let dm = DiskManager::create(&db_path).unwrap();
+        let dm = FileDiskManager::create(&db_path).unwrap();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
         let db = Database::open(dir.path(), engine).unwrap();

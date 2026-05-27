@@ -19,7 +19,7 @@ use interchangedb::common::Error;
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::index::lsm::LsmEngine;
 use interchangedb::layout::RowLayout;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use interchangedb::storage::StorageEngine;
 use interchangedb::table::Table;
 use interchangedb::types::{ColumnType, Decimal, Value};
@@ -29,7 +29,7 @@ use interchangedb::types::{ColumnType, Decimal, Value};
 fn fresh_btree() -> (Arc<BTreeEngine>, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(256, dm);
     (Arc::new(BTreeEngine::new(bpm).unwrap()), dir)
 }
@@ -298,7 +298,7 @@ fn btree_reopen_recovers_user_tables() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
     {
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = FileDiskManager::create(&path).unwrap();
         let bpm = BufferPoolManager::new(256, dm);
         let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
         let catalog = Catalog::open(engine.clone()).unwrap();
@@ -310,7 +310,7 @@ fn btree_reopen_recovers_user_tables() {
         table.insert(&warehouse_row(42, "DC42")).unwrap();
         engine.flush().unwrap();
     }
-    let dm = DiskManager::open(&path).unwrap();
+    let dm = FileDiskManager::open(&path).unwrap();
     let bpm = BufferPoolManager::new(256, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let catalog = Catalog::open(engine.clone()).unwrap();

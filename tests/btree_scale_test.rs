@@ -6,7 +6,7 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::index::btree::{BTree, BTreeHeaderPage};
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;
 
 // =============================================================================
@@ -16,7 +16,7 @@ use tempfile::tempdir;
 fn setup_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     (BufferPoolManager::new(pool_size, dm), dir)
 }
 
@@ -59,7 +59,7 @@ fn decode_value(bytes: &[u8]) -> i64 {
 ///      forcing thousands of splits and a deep tree.
 ///
 /// Note: BusTub uses pool_size=30 with in-memory disk. We use a larger pool
-/// since our DiskManager writes to real files. Correctness is identical.
+/// since our FileDiskManager writes to real files. Correctness is identical.
 #[test]
 fn test_basic_scale() {
     let (bpm, _dir) = setup_bpm(10000);

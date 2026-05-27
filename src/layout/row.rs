@@ -203,7 +203,7 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::index::btree::BTreeEngine;
-    use crate::storage::DiskManager;
+    use crate::storage::FileDiskManager;
     use crate::types::{keyenc, ColumnType};
     use tempfile::TempDir;
 
@@ -212,7 +212,7 @@ mod tests {
     fn fresh_engine() -> (BTreeEngine, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = FileDiskManager::create(&path).unwrap();
         let bpm = BufferPoolManager::new(256, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
         (engine, dir)

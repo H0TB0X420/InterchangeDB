@@ -16,7 +16,7 @@ use interchangedb::buffer::replacer::{
 use interchangedb::buffer::swap::SwapMode;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 
 // Auto-discover all scripts in tests/goldenscripts/buffer_pool/.
 test_each_path! { in "tests/goldenscripts/buffer_pool" as buffer_pool => test_goldenscript }
@@ -37,7 +37,7 @@ impl BpmRunner {
     fn new(pool_size: usize) -> Self {
         let dir = TempDir::new().expect("failed to create temp dir");
         let path = dir.path().join("test.db");
-        let dm = DiskManager::create(&path).expect("failed to create disk manager");
+        let dm = FileDiskManager::create(&path).expect("failed to create disk manager");
         let bpm = BufferPoolManager::new(pool_size, dm);
         Self { bpm, dir, pool_size }
     }
@@ -49,9 +49,9 @@ impl BpmRunner {
 
         // Open the existing DB file instead of creating a new one.
         let dm = if path.exists() {
-            DiskManager::open(&path).expect("failed to open disk manager")
+            FileDiskManager::open(&path).expect("failed to open disk manager")
         } else {
-            DiskManager::create(&path).expect("failed to create disk manager")
+            FileDiskManager::create(&path).expect("failed to create disk manager")
         };
 
         self.bpm = BufferPoolManager::new(pool_size, dm);

@@ -3,7 +3,7 @@
 //! Drives the full stack through `Session::execute`:
 //!
 //!   SQL string → parse → bind → plan → operator tree → TxnEngine →
-//!   Table → BTreeEngine → BPM → DiskManager
+//!   Table → BTreeEngine → BPM → FileDiskManager
 //!
 //! Each test rehearses a TPC-C-shaped flow with real SQL syntax.
 //! Workload log is enabled where relevant so we also verify the
@@ -21,7 +21,7 @@ use interchangedb::database::Database;
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::sql::workload_log::WorkloadLog;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use interchangedb::types::Value;
 
 // ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ struct Env {
 fn setup() -> Env {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let dm = DiskManager::create(&db_path).unwrap();
+    let dm = FileDiskManager::create(&db_path).unwrap();
     let bpm = BufferPoolManager::new(512, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     let database = Arc::new(Database::open(dir.path(), engine).unwrap());

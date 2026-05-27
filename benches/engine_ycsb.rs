@@ -39,7 +39,7 @@ use interchangedb::buffer::replacer::ArcReplacer;
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::index::btree::{BTree, BTreeHeaderPage};
 use interchangedb::index::lsm::LsmTree;
-use interchangedb::storage::DiskManager;
+use interchangedb::storage::FileDiskManager;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -225,7 +225,7 @@ fn pick_latest(rng: &mut Lcg64, max_id: usize) -> usize {
 fn run_btree(workload: Ycsb, bpm_frames: usize) -> CellResult {
     let dir = tempdir().unwrap();
     let path = dir.path().join("ycsb.db");
-    let dm = DiskManager::create(&path).unwrap();
+    let dm = FileDiskManager::create(&path).unwrap();
     let bpm = BufferPoolManager::new(bpm_frames, dm);
     let _ = bpm.swap_policy(Box::new(ArcReplacer::new(bpm_frames)), SwapMode::Cold);
 

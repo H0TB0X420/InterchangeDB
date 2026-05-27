@@ -69,14 +69,14 @@ mod tests {
     use crate::catalog::{ColumnDef, TableId};
     use crate::index::btree::BTreeEngine;
     use crate::layout::RowLayout;
-    use crate::storage::DiskManager;
+    use crate::storage::FileDiskManager;
     use crate::types::ColumnType;
     use tempfile::TempDir;
 
     fn fresh_table() -> (Table<BTreeEngine, RowLayout>, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let dm = DiskManager::create(&path).unwrap();
+        let dm = FileDiskManager::create(&path).unwrap();
         let bpm = BufferPoolManager::new(256, dm);
         let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
         let schema = Arc::new(Schema {
