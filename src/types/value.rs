@@ -28,7 +28,7 @@ pub enum ColumnType {
 /// A runtime value, tagged with its type. `Null` is its own variant rather
 /// than wrapping every other variant in `Option` — keeps `Vec<Value>` flat
 /// (one layer of nullability) instead of `Vec<Option<Value>>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Value {
     Int32(i32),
     Int64(i64),

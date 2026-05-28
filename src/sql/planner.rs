@@ -21,7 +21,8 @@ use std::sync::Arc;
 use crate::catalog::{Catalog, ColumnDef};
 use crate::common::Result;
 use crate::execution::{
-    Delete, Executor, Filter, IndexScan, Insert, Limit, Projection, SeqScan, SetExpr, Update,
+    Delete, Executor, Filter, IndexNestedLoopJoin, IndexScan, Insert, Limit, NestedLoopJoin,
+    Projection, SeqScan, SetExpr, Update,
 };
 use crate::layout::RowLayout;
 use crate::sql::expr::Predicate;
@@ -71,8 +72,10 @@ where
             let inner_phys = plan(*inner, engine, catalog)?;
             Ok(PhysicalPlan::Explain(render_explain(&inner_phys)))
         }
-        LogicalPlan::Select { table, projection, filter, limit } => {
-            let exec = plan_select(table, projection, filter, limit, engine, catalog)?;
+        LogicalPlan::Select { table, joins, projection, aggregates, filter, order_by, limit } => {
+            let exec = plan_select(
+                table, joins, projection, aggregates, filter, order_by, limit, engine, catalog,
+            )?;
             Ok(PhysicalPlan::Executor(exec))
         }
         LogicalPlan::Insert { table, rows } => {
@@ -92,8 +95,11 @@ where
 
 fn plan_select<TblE, CatE>(
     table_name: String,
+    joins: Vec<crate::sql::logical::JoinClause>,
     projection: Vec<usize>,
+    aggregates: Vec<crate::sql::logical::AggregateSpec>,
     filter: Option<Predicate>,
+    order_by: Vec<(usize, crate::sql::logical::OrderDir)>,
     limit: Option<usize>,
     engine: Arc<TblE>,
     catalog: &Catalog<CatE>,
@@ -102,41 +108,193 @@ where
     TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
-    let schema = catalog.get_table(&table_name)?;
-    let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
-    let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes.clone()));
+    let left_schema = catalog.get_table(&table_name)?;
+    let left_indexes =
+        catalog.indexes_for_table(left_schema.table_id, &left_schema)?;
+    let left_table = Arc::new(Table::with_indexes(
+        engine.clone(),
+        left_schema,
+        RowLayout,
+        left_indexes.clone(),
+    ));
 
-    // P12.6: try to lower the filter into an IndexScan. Recognized shape:
-    // `col_i = literal` where col_i is the only indexed column of some
-    // attached single-column index. On match, drop the predicate and emit
-    // IndexScan; otherwise fall back to SeqScan + Filter.
+    // Build the leaf scan for the left side. We only attempt IndexScan
+    // lowering on the LEFT side when there are NO joins — once joins
+    // enter, predicate scoping spans multiple tables and column indices
+    // shift, so the lowering rule (column index == table column index)
+    // no longer holds. Index-driven joins use IndexNestedLoopJoin below.
     let mut current: Box<dyn Executor>;
     let mut residual_filter: Option<Predicate> = filter;
-    if let Some(pred) = residual_filter {
-        match try_lower_index_predicate(pred, &indexes) {
-            IndexLowering::Matched { handle, prefix } => {
-                current = Box::new(IndexScan::new(&*table, &handle, &prefix)?);
-                residual_filter = None;
+    if joins.is_empty() {
+        if let Some(pred) = residual_filter {
+            match try_lower_index_predicate(pred, &left_indexes) {
+                IndexLowering::Matched { handle, prefix } => {
+                    current = Box::new(IndexScan::new(&*left_table, &handle, &prefix)?);
+                    residual_filter = None;
+                }
+                IndexLowering::Unmatched(pred) => {
+                    current = Box::new(SeqScan::new(&*left_table)?);
+                    residual_filter = Some(pred);
+                }
             }
-            IndexLowering::Unmatched(pred) => {
-                current = Box::new(SeqScan::new(&*table)?);
-                residual_filter = Some(pred);
-            }
+        } else {
+            current = Box::new(SeqScan::new(&*left_table)?);
         }
     } else {
-        current = Box::new(SeqScan::new(&*table)?);
+        current = Box::new(SeqScan::new(&*left_table)?);
+    }
+
+    // P13.1: chain joins onto the left side. For each join, pick
+    // IndexNestedLoopJoin when the ON predicate is `left.col = right.idx_col`
+    // and the right side has a matching single-column index; fall back to
+    // NestedLoopJoin with the compiled ON predicate (or trivially-true for
+    // cross joins).
+    let mut outer_offset = current.schema().columns.len();
+    for join in joins {
+        let right_schema = catalog.get_table(&join.right_table)?;
+        let right_indexes =
+            catalog.indexes_for_table(right_schema.table_id, &right_schema)?;
+        let right_table = Arc::new(Table::with_indexes(
+            engine.clone(),
+            right_schema.clone(),
+            RowLayout,
+            right_indexes.clone(),
+        ));
+
+        // Attempt INLJ lowering first.
+        let inlj_choice = join.on.as_ref().and_then(|pred| {
+            try_match_inlj(pred, outer_offset, &right_indexes)
+        });
+        let next: Box<dyn Executor> = if let Some((outer_col, handle)) = inlj_choice {
+            // INLJ consumes the ON predicate (no Filter needed).
+            Box::new(IndexNestedLoopJoin::new(
+                current,
+                right_table,
+                handle,
+                vec![outer_col],
+            )?)
+        } else {
+            // NLJ: compile the ON predicate (or fall back to constant-true
+            // for cross joins and implicit cross products).
+            let pred_fn: crate::execution::JoinPredicate = match join.on {
+                Some(p) => {
+                    let f = p.compile();
+                    Box::new(move |outer, inner| {
+                        // Compose a temporary joined tuple just for predicate
+                        // evaluation. The predicate's column indices are
+                        // tuple-global (set up by the binder).
+                        let mut combined = outer.clone();
+                        combined.extend_from_slice(inner);
+                        f(&combined)
+                    })
+                }
+                None => Box::new(|_, _| true),
+            };
+            let right_seq = Box::new(SeqScan::new(&*right_table)?);
+            Box::new(NestedLoopJoin::new(current, right_seq, pred_fn)?)
+        };
+        outer_offset += right_schema.columns.len();
+        current = next;
     }
 
     if let Some(pred) = residual_filter {
         current = Box::new(Filter::from_boxed(current, pred.compile()));
     }
-    if !projection.is_empty() {
+    if !aggregates.is_empty() {
+        // P13.4: HashAggregate before Projection (aggregates ARE the
+        // output; binder enforces projection empty alongside aggregates).
+        let agg_fns: Vec<crate::execution::AggregateFn> = aggregates
+            .into_iter()
+            .map(translate_aggregate_spec)
+            .collect();
+        current = Box::new(crate::execution::HashAggregate::new(current, agg_fns)?);
+    }
+    // P13.6: Sort BEFORE Projection so sort keys can reference columns
+    // even if they're not in the projection (TPC-C Payment does this).
+    // Binder resolves ORDER BY indices against the pre-projection scope.
+    if !order_by.is_empty() {
+        let keys: Vec<(usize, crate::execution::SortDir)> = order_by
+            .into_iter()
+            .map(|(c, d)| {
+                let dir = match d {
+                    crate::sql::logical::OrderDir::Asc => crate::execution::SortDir::Asc,
+                    crate::sql::logical::OrderDir::Desc => crate::execution::SortDir::Desc,
+                };
+                (c, dir)
+            })
+            .collect();
+        current = Box::new(crate::execution::Sort::new(current, keys)?);
+    }
+    if aggregates_was_empty_marker(&projection) && !projection.is_empty() {
         current = Box::new(Projection::new(current, projection)?);
     }
     if let Some(n) = limit {
         current = Box::new(Limit::new(current, n));
     }
     Ok(current)
+}
+
+/// Always true unless we want to suppress Projection for aggregate plans.
+/// The aggregate path replaces the input schema entirely, so a trailing
+/// Projection would re-index into the aggregate's output tuple, not the
+/// pre-aggregate scope. Binder enforces projection is empty when
+/// aggregates are non-empty, so this guard is conservative: only run
+/// Projection if there's something to project.
+fn aggregates_was_empty_marker(projection: &[usize]) -> bool {
+    let _ = projection;
+    true
+}
+
+fn translate_aggregate_spec(
+    spec: crate::sql::logical::AggregateSpec,
+) -> crate::execution::AggregateFn {
+    use crate::execution::AggregateFn;
+    use crate::sql::logical::AggregateSpec;
+    match spec {
+        AggregateSpec::CountStar => AggregateFn::CountStar,
+        AggregateSpec::Count { col, distinct: false } => AggregateFn::Count(col),
+        AggregateSpec::Count { col, distinct: true } => AggregateFn::CountDistinct(col),
+        AggregateSpec::Sum(col) => AggregateFn::Sum(col),
+        AggregateSpec::Min(col) => AggregateFn::Min(col),
+        AggregateSpec::Max(col) => AggregateFn::Max(col),
+        AggregateSpec::Avg(col) => AggregateFn::Avg(col),
+    }
+}
+
+/// Try to lower a join ON predicate into IndexNestedLoopJoin. Recognized
+/// shape: `Column(outer) = Column(inner_col)` where `inner_col` is local
+/// to the right table (i.e. inner_col_tuple - outer_offset == 0 for a
+/// single-column index on the right's first indexed column).
+///
+/// Returns `(outer_col_idx_in_outer_tuple, IndexHandle)` on match.
+fn try_match_inlj(
+    pred: &Predicate,
+    outer_offset: usize,
+    right_indexes: &[crate::table::IndexHandle],
+) -> Option<(usize, crate::table::IndexHandle)> {
+    let (l, r) = match pred {
+        Predicate::Compare {
+            op: crate::sql::expr::CompareOp::Eq,
+            left: crate::sql::expr::Expression::Column(l),
+            right: crate::sql::expr::Expression::Column(r),
+        } => (*l, *r),
+        _ => return None,
+    };
+    // Identify which side is outer (< outer_offset) and which is inner.
+    let (outer_col, inner_col_global) = if l < outer_offset && r >= outer_offset {
+        (l, r)
+    } else if r < outer_offset && l >= outer_offset {
+        (r, l)
+    } else {
+        return None;
+    };
+    let inner_col_local = inner_col_global - outer_offset;
+    for ix in right_indexes {
+        if ix.def.columns == [inner_col_local] {
+            return Some((outer_col, ix.clone()));
+        }
+    }
+    None
 }
 
 /// Result of attempting to lower a `WHERE` clause into an IndexScan.
@@ -194,7 +352,7 @@ fn try_lower_index_predicate(
 
 fn plan_insert<TblE, CatE>(
     table_name: String,
-    rows: Vec<Vec<crate::types::Value>>,
+    rows: Vec<Vec<crate::sql::expr::Expression>>,
     engine: Arc<TblE>,
     catalog: &Catalog<CatE>,
 ) -> Result<Box<dyn Executor>>
@@ -202,6 +360,19 @@ where
     TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
+    // Evaluate each expression against an empty tuple — INSERT VALUES
+    // exprs are literals or pre-substituted parameters, never column
+    // refs. (Parameter substitution happens upstream in
+    // PreparedStatement::execute; any unsubstituted parameters here are
+    // a bug — `Expression::compile` debug-asserts.)
+    let rows: Vec<Vec<crate::types::Value>> = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|e| e.compile()(&Vec::new()))
+                .collect()
+        })
+        .collect();
     let schema = catalog.get_table(&table_name)?;
     let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
     let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes));
@@ -564,8 +735,11 @@ Limit(3)
         let env = setup();
         let logical = LogicalPlan::Select {
             table: "nonexistent".to_string(),
+            joins: vec![],
             projection: vec![],
+            aggregates: vec![],
             filter: None,
+            order_by: vec![],
             limit: None,
         };
         match plan(logical, env.engine.clone(), &env.catalog) {

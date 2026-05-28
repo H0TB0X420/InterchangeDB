@@ -24,12 +24,17 @@ use crate::execution::Tuple;
 use crate::types::{Decimal, Value};
 
 /// An expression that evaluates to a `Value` against an input tuple.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expression {
     /// A constant value embedded in the plan (e.g., `42`, `'alice'`).
     Literal(Value),
     /// Index into the input tuple (column position in the child's schema).
     Column(usize),
+    /// A parameter placeholder — `?` in SQL. The `usize` is the
+    /// positional index (0-based) into the parameter array passed to
+    /// `PreparedStatement::execute`. Must be substituted with a
+    /// `Literal` before `compile()` is called.
+    Parameter(usize),
     /// Binary arithmetic on two sub-expressions.
     BinaryOp {
         op: BinaryOp,
@@ -48,7 +53,7 @@ pub enum BinaryOp {
 }
 
 /// A boolean predicate that evaluates against an input tuple.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Predicate {
     /// Comparison between two expressions.
     Compare {
@@ -87,11 +92,69 @@ impl Expression {
         match self {
             Expression::Literal(v) => Box::new(move |_t| v.clone()),
             Expression::Column(i) => Box::new(move |t| t[i].clone()),
+            Expression::Parameter(i) => {
+                // Should have been substituted by PreparedStatement::execute
+                // before reaching compile. Treat as NULL at runtime — keeps
+                // closures total — but emit a debug_assert to surface the
+                // bug during development.
+                debug_assert!(false, "unsubstituted Parameter({}) reached compile()", i);
+                Box::new(move |_t| Value::Null)
+            }
             Expression::BinaryOp { op, left, right } => {
                 let l = left.compile();
                 let r = right.compile();
                 Box::new(move |t| eval_binary_op(op, l(t), r(t)))
             }
+        }
+    }
+
+    /// Recursively substitute `Parameter(i)` with `Literal(params[i])`.
+    /// Used by `PreparedStatement::execute` to bind parameters before
+    /// the plan is compiled. Returns an error if any parameter index is
+    /// out of bounds.
+    pub fn substitute_params(self, params: &[Value]) -> crate::common::Result<Expression> {
+        match self {
+            Expression::Parameter(i) => {
+                params
+                    .get(i)
+                    .cloned()
+                    .map(Expression::Literal)
+                    .ok_or_else(|| {
+                        crate::common::Error::SqlParse(format!(
+                            "prepared statement: parameter ${} not bound (only {} provided)",
+                            i + 1,
+                            params.len()
+                        ))
+                    })
+            }
+            Expression::Literal(_) | Expression::Column(_) => Ok(self),
+            Expression::BinaryOp { op, left, right } => Ok(Expression::BinaryOp {
+                op,
+                left: Box::new(left.substitute_params(params)?),
+                right: Box::new(right.substitute_params(params)?),
+            }),
+        }
+    }
+}
+
+impl Predicate {
+    /// Recursively substitute parameters in nested expressions.
+    pub fn substitute_params(self, params: &[Value]) -> crate::common::Result<Predicate> {
+        match self {
+            Predicate::Compare { op, left, right } => Ok(Predicate::Compare {
+                op,
+                left: left.substitute_params(params)?,
+                right: right.substitute_params(params)?,
+            }),
+            Predicate::And(a, b) => Ok(Predicate::And(
+                Box::new(a.substitute_params(params)?),
+                Box::new(b.substitute_params(params)?),
+            )),
+            Predicate::Or(a, b) => Ok(Predicate::Or(
+                Box::new(a.substitute_params(params)?),
+                Box::new(b.substitute_params(params)?),
+            )),
+            Predicate::Not(p) => Ok(Predicate::Not(Box::new(p.substitute_params(params)?))),
         }
     }
 }

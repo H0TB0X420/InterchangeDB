@@ -23,6 +23,7 @@
 
 pub mod delete;
 pub mod filter;
+pub mod hash_aggregate;
 pub mod index_scan;
 pub mod insert;
 pub mod join;
@@ -30,6 +31,7 @@ pub mod limit;
 pub mod pk_lookup;
 pub mod projection;
 pub mod seq_scan;
+pub mod sort;
 pub mod update;
 
 #[cfg(test)]
@@ -37,6 +39,7 @@ pub(crate) mod test_util;
 
 pub use delete::Delete;
 pub use filter::Filter;
+pub use hash_aggregate::{AggregateFn, HashAggregate};
 pub use index_scan::IndexScan;
 pub use insert::Insert;
 pub use join::{IndexNestedLoopJoin, JoinPredicate, JoinStrategy, NestedLoopJoin};
@@ -44,6 +47,7 @@ pub use limit::Limit;
 pub use pk_lookup::PkLookup;
 pub use projection::Projection;
 pub use seq_scan::SeqScan;
+pub use sort::{Sort, SortDir};
 pub use update::{SetExpr, Update};
 
 use crate::catalog::{ColumnDef, Schema, TableId};

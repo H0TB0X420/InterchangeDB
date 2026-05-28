@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::{Error, Result};
 
 /// A fixed-scale decimal value: `mantissa * 10^(-scale)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Decimal {
     mantissa: i64,
     scale: u8,

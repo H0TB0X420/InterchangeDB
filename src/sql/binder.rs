@@ -23,7 +23,7 @@ use sqlparser::ast::{
 use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::{Error, Result};
 use crate::sql::expr::{BinaryOp, CompareOp, Expression, Predicate};
-use crate::sql::logical::LogicalPlan;
+use crate::sql::logical::{AggregateSpec, LogicalPlan, OrderDir};
 use crate::storage::StorageEngine;
 use crate::types::{ColumnType, Decimal, Value};
 
@@ -32,11 +32,53 @@ pub struct Binder<E: StorageEngine> {
     catalog: Arc<Catalog<E>>,
 }
 
-/// The single-table scope a statement's expressions resolve against.
-/// Phase 12 will generalize this to a join tree.
+/// A scope a statement's expressions resolve against. May span multiple
+/// tables (joins). Column references resolve to *tuple-global* indices —
+/// each table contributes a contiguous run of columns starting at its
+/// `column_offset`.
+///
+/// Single-table queries have `tables.len() == 1`; column indices then
+/// match the schema's column order directly (`column_offset == 0`).
 struct Scope {
+    tables: Vec<ScopedTable>,
+}
+
+struct ScopedTable {
+    /// Original catalog table name (used for qualified refs like `t.col`
+    /// when no alias is given).
     table_name: String,
+    /// FROM-clause alias, if any. Qualified refs prefer alias over name.
+    alias: Option<String>,
     schema: Arc<Schema>,
+    /// Start index of this table's columns in the joined tuple.
+    column_offset: usize,
+}
+
+impl Scope {
+    /// Single-table scope. Identical resolution to pre-P13.1 binder.
+    fn single(table_name: String, schema: Arc<Schema>) -> Self {
+        Self {
+            tables: vec![ScopedTable {
+                table_name,
+                alias: None,
+                schema,
+                column_offset: 0,
+            }],
+        }
+    }
+
+    /// Append another table to the scope. The new table's
+    /// `column_offset` is the sum of all prior tables' column counts.
+    fn push(&mut self, table_name: String, alias: Option<String>, schema: Arc<Schema>) {
+        let column_offset: usize = self.tables.iter().map(|t| t.schema.columns.len()).sum();
+        self.tables.push(ScopedTable {
+            table_name,
+            alias,
+            schema,
+            column_offset,
+        });
+    }
+
 }
 
 impl<E: StorageEngine> Binder<E> {
@@ -196,35 +238,80 @@ impl<E: StorageEngine> Binder<E> {
             }
         };
 
-        // FROM clause — exactly one table.
-        if select.from.len() != 1 {
-            return Err(Error::SqlParse(
-                "binder: SELECT requires exactly one FROM table (joins are Phase 12)".into(),
-            ));
+        if select.from.is_empty() {
+            return Err(Error::SqlParse("binder: SELECT needs a FROM clause".into()));
         }
-        let twj = &select.from[0];
-        if !twj.joins.is_empty() {
-            return Err(Error::SqlParse(
-                "binder: JOINs are not yet supported (Phase 12)".into(),
-            ));
-        }
-        let table_name = match &twj.relation {
-            TableFactor::Table { name, .. } => object_name_to_string(name),
-            other => {
-                return Err(Error::SqlParse(format!(
-                    "binder: only named tables in FROM, got {:?}",
-                    other
-                )))
-            }
-        };
-        let schema = self.catalog.get_table(&table_name)?;
-        let scope = Scope {
-            table_name: table_name.clone(),
-            schema: schema.clone(),
-        };
 
-        // Projection: empty Vec = SELECT *.
-        let projection = bind_projection(&scope, &select.projection)?;
+        // FROM clause. Two forms produce multi-table queries:
+        //   - Implicit cross join: `FROM a, b, c` → from.len() > 1, joins empty.
+        //   - Explicit join: `FROM a JOIN b ON …` → from.len() == 1, joins
+        //     attached to that entry.
+        // We support both, plus mixtures (`FROM a, b JOIN c ON …`).
+        //
+        // Build a scope incrementally + a parallel `JoinClause` list. The
+        // first table becomes `LogicalPlan::Select::table`; the rest become
+        // entries in `joins`.
+        let mut scope = Scope { tables: Vec::new() };
+        let mut joined_tables: Vec<(String, Option<String>, Option<AstExpr>)> = Vec::new();
+
+        for (twj_idx, twj) in select.from.into_iter().enumerate() {
+            // The "head" relation of this TableWithJoins.
+            let (head_name, head_alias) = extract_table_and_alias(&twj.relation)?;
+            let head_schema = self.catalog.get_table(&head_name)?;
+            if twj_idx == 0 {
+                scope.push(head_name.clone(), head_alias.clone(), head_schema);
+            } else {
+                // Implicit cross join with the running scope.
+                scope.push(head_name.clone(), head_alias.clone(), head_schema);
+                joined_tables.push((head_name, head_alias, None));
+            }
+
+            // Explicit joins attached to this entry.
+            for j in twj.joins {
+                let (right_name, right_alias) = extract_table_and_alias(&j.relation)?;
+                let right_schema = self.catalog.get_table(&right_name)?;
+                // The ON predicate (when present) must bind against a scope
+                // that already includes the right side, so push first.
+                scope.push(right_name.clone(), right_alias.clone(), right_schema);
+
+                let on_expr = match j.join_operator {
+                    ast::JoinOperator::Inner(ast::JoinConstraint::On(e)) => Some(e),
+                    ast::JoinOperator::Inner(ast::JoinConstraint::None) => None,
+                    ast::JoinOperator::CrossJoin => None,
+                    other => {
+                        return Err(Error::SqlParse(format!(
+                            "binder: only INNER JOIN and CROSS JOIN supported, got {:?}",
+                            other
+                        )))
+                    }
+                };
+                joined_tables.push((right_name, right_alias, on_expr));
+            }
+        }
+
+        // The first scoped table becomes the LogicalPlan's `table`.
+        let table_name = scope.tables[0].table_name.clone();
+
+        // Bind each join's ON predicate against the scope built up to
+        // that join's position. Easiest: bind against the *final* scope
+        // — predicates over earlier tables still work, and over later
+        // tables that haven't been joined yet would be a forward
+        // reference (unusual, the binder rejects via column-not-found).
+        let mut joins: Vec<crate::sql::logical::JoinClause> = Vec::with_capacity(joined_tables.len());
+        for (right_table, right_alias, on_expr) in joined_tables {
+            let on = match on_expr {
+                Some(e) => Some(bind_predicate(&scope, e)?),
+                None => None,
+            };
+            joins.push(crate::sql::logical::JoinClause {
+                right_table,
+                right_alias,
+                on,
+            });
+        }
+
+        // Projection + aggregates: empty Vec / empty Vec = SELECT *.
+        let (projection, aggregates) = bind_select_items(&scope, &select.projection)?;
 
         // WHERE clause.
         let filter = match select.selection {
@@ -232,10 +319,32 @@ impl<E: StorageEngine> Binder<E> {
             None => None,
         };
 
+        // P13.6: ORDER BY. sqlparser exposes `Option<OrderBy>` on Query;
+        // each `OrderByExpr` has the expression + an optional ASC/DESC
+        // flag (None defaults to ASC).
+        let order_by = match q.order_by {
+            Some(ob) => {
+                let mut keys: Vec<(usize, OrderDir)> = Vec::with_capacity(ob.exprs.len());
+                for obe in ob.exprs {
+                    let col = resolve_column_expr(&scope, &obe.expr)?;
+                    let dir = match obe.asc {
+                        Some(false) => OrderDir::Desc,
+                        _ => OrderDir::Asc,  // None defaults to ASC per SQL spec
+                    };
+                    keys.push((col, dir));
+                }
+                keys
+            }
+            None => Vec::new(),
+        };
+
         Ok(LogicalPlan::Select {
             table: table_name,
+            joins,
             projection,
+            aggregates,
             filter,
+            order_by,
             limit,
         })
     }
@@ -283,7 +392,7 @@ impl<E: StorageEngine> Binder<E> {
                 .collect::<Result<Vec<_>>>()?
         };
 
-        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(values.len());
+        let mut rows: Vec<Vec<Expression>> = Vec::with_capacity(values.len());
         for row in values {
             if row.len() != col_indices.len() {
                 return Err(Error::SqlParse(format!(
@@ -292,12 +401,13 @@ impl<E: StorageEngine> Binder<E> {
                     col_indices.len()
                 )));
             }
-            // Build a full-width row in schema order; fill specified columns,
-            // leave others as NULL (column list semantics).
-            let mut full = vec![Value::Null; schema.columns.len()];
+            // Build a full-width row of Expressions; fill specified columns,
+            // leave others as Literal(Null) (column list semantics).
+            let mut full: Vec<Expression> =
+                (0..schema.columns.len()).map(|_| Expression::Literal(Value::Null)).collect();
             for (src_pos, expr) in row.into_iter().enumerate() {
                 let dst = col_indices[src_pos];
-                full[dst] = literal_from_expr(expr, &schema.columns[dst].ty)?;
+                full[dst] = insert_value_expr(expr, &schema.columns[dst].ty)?;
             }
             rows.push(full);
         }
@@ -333,10 +443,7 @@ impl<E: StorageEngine> Binder<E> {
             }
         };
         let schema = self.catalog.get_table(&table_name)?;
-        let scope = Scope {
-            table_name: table_name.clone(),
-            schema: schema.clone(),
-        };
+        let scope = Scope::single(table_name.clone(), schema.clone());
 
         let mut set_clauses: Vec<(usize, Expression)> = Vec::with_capacity(assignments.len());
         for a in assignments {
@@ -359,7 +466,8 @@ impl<E: StorageEngine> Binder<E> {
                 }
             };
             let idx = column_index(&scope, &col_name)?;
-            let target_ty = scope.schema.columns[idx].ty.clone();
+            // Single-table scope in UPDATE — table[0] is the target.
+            let target_ty = scope.tables[0].schema.columns[idx].ty.clone();
             let expr = bind_expression(&scope, a.value)?;
             // The SET result must match the target column's type — Table's
             // update_columns rejects type mismatch outright. Narrow Int64
@@ -412,10 +520,7 @@ impl<E: StorageEngine> Binder<E> {
             }
         };
         let schema = self.catalog.get_table(&table_name)?;
-        let scope = Scope {
-            table_name: table_name.clone(),
-            schema,
-        };
+        let scope = Scope::single(table_name.clone(), schema);
 
         let filter = match del.selection {
             Some(e) => Some(bind_predicate(&scope, e)?),
@@ -440,47 +545,280 @@ fn object_name_to_string(n: &ObjectName) -> String {
         .join(".")
 }
 
-fn column_index(scope: &Scope, name: &str) -> Result<usize> {
-    scope
-        .schema
-        .columns
-        .iter()
-        .position(|c| c.name == name)
-        .ok_or_else(|| {
-            Error::SqlParse(format!(
-                "column '{}' not found in table '{}'",
-                name, scope.table_name
-            ))
-        })
+/// Extract the table name and optional alias from a `TableFactor`. Used
+/// when walking a `TableWithJoins`. Errors on derived tables, subqueries,
+/// table functions — those land in later phases.
+fn extract_table_and_alias(tf: &TableFactor) -> Result<(String, Option<String>)> {
+    match tf {
+        TableFactor::Table { name, alias, .. } => {
+            let table_name = object_name_to_string(name);
+            let alias = alias.as_ref().map(|a| a.name.value.clone());
+            Ok((table_name, alias))
+        }
+        other => Err(Error::SqlParse(format!(
+            "binder: FROM/JOIN must be a named table, got {:?}",
+            other
+        ))),
+    }
 }
 
-/// SELECT projection: empty Vec encodes `SELECT *`.
-fn bind_projection(scope: &Scope, items: &[ast::SelectItem]) -> Result<Vec<usize>> {
+/// Resolve an unqualified column name to a tuple-global index. Errors
+/// on "not found" and "ambiguous" (column present in multiple scoped
+/// tables — caller must use the qualified `t.col` form to disambiguate).
+fn column_index(scope: &Scope, name: &str) -> Result<usize> {
+    let mut hits: Vec<usize> = Vec::new();
+    for t in &scope.tables {
+        if let Some(local) = t.schema.columns.iter().position(|c| c.name == name) {
+            hits.push(t.column_offset + local);
+        }
+    }
+    match hits.len() {
+        0 => {
+            let names: Vec<String> = scope.tables.iter().map(|t| t.table_name.clone()).collect();
+            Err(Error::SqlParse(format!(
+                "column '{}' not found in scope (tables: {:?})",
+                name, names
+            )))
+        }
+        1 => Ok(hits[0]),
+        _ => Err(Error::SqlParse(format!(
+            "column '{}' is ambiguous across joined tables — qualify it (e.g. `t.{}`)",
+            name, name
+        ))),
+    }
+}
+
+/// Resolve a qualified column reference (`table_or_alias.col`) to a
+/// tuple-global index. Alias matches take precedence over table-name
+/// matches (matches SQL's standard scoping rule).
+fn column_index_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<usize> {
+    for t in &scope.tables {
+        let matches_qualifier = t.alias.as_deref() == Some(qualifier) || t.table_name == qualifier;
+        if matches_qualifier {
+            let local = t
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == name)
+                .ok_or_else(|| {
+                    Error::SqlParse(format!(
+                        "column '{}' not found in table '{}'",
+                        name, qualifier
+                    ))
+                })?;
+            return Ok(t.column_offset + local);
+        }
+    }
+    Err(Error::SqlParse(format!(
+        "table or alias '{}' not in FROM scope",
+        qualifier
+    )))
+}
+
+/// Bind SELECT items into projection columns + aggregate specs.
+///
+/// Returns `(projection, aggregates)`:
+/// - Both empty: `SELECT *`.
+/// - Only projection non-empty: column projection (`SELECT a, b.c FROM …`).
+/// - Only aggregates non-empty: whole-table aggregation
+///   (`SELECT COUNT(*), SUM(x) FROM …`).
+/// - Both non-empty: GROUP BY semantics, which Phase 13 doesn't support
+///   (rejected here; lands in Phase 14).
+fn bind_select_items(
+    scope: &Scope,
+    items: &[ast::SelectItem],
+) -> Result<(Vec<usize>, Vec<AggregateSpec>)> {
     // Single Wildcard → SELECT *.
     if items.len() == 1 && matches!(items[0], ast::SelectItem::Wildcard(_)) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
-    let mut out = Vec::with_capacity(items.len());
+
+    let mut projection: Vec<usize> = Vec::new();
+    let mut aggregates: Vec<AggregateSpec> = Vec::new();
     for it in items {
-        match it {
-            ast::SelectItem::UnnamedExpr(AstExpr::Identifier(ident)) => {
-                out.push(column_index(scope, &ident.value)?);
-            }
-            ast::SelectItem::ExprWithAlias {
-                expr: AstExpr::Identifier(ident),
-                ..
-            } => {
-                out.push(column_index(scope, &ident.value)?);
-            }
+        let expr = match it {
+            ast::SelectItem::UnnamedExpr(e) => e,
+            ast::SelectItem::ExprWithAlias { expr, .. } => expr,
             other => {
                 return Err(Error::SqlParse(format!(
                     "binder: projection item shape unsupported: {:?}",
                     other
                 )))
             }
+        };
+        match expr {
+            AstExpr::Identifier(ident) => {
+                projection.push(column_index(scope, &ident.value)?);
+            }
+            AstExpr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                projection
+                    .push(column_index_qualified(scope, &parts[0].value, &parts[1].value)?);
+            }
+            AstExpr::Function(func) => {
+                aggregates.push(bind_aggregate_function(scope, func)?);
+            }
+            other => {
+                return Err(Error::SqlParse(format!(
+                    "binder: projection expression shape unsupported: {:?}",
+                    other
+                )))
+            }
         }
     }
-    Ok(out)
+
+    if !projection.is_empty() && !aggregates.is_empty() {
+        return Err(Error::SqlParse(
+            "binder: mixed column-and-aggregate projection requires GROUP BY (Phase 14)".into(),
+        ));
+    }
+    Ok((projection, aggregates))
+}
+
+/// Translate a sqlparser `Function` AST node into our `AggregateSpec`.
+/// Supported: `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`,
+/// `SUM(col)`, `MIN(col)`, `MAX(col)`, `AVG(col)`. Anything else is a
+/// non-aggregate function call — we error rather than silently treating
+/// it as a row-level expression (no scalar-function support yet).
+fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<AggregateSpec> {
+    let name = object_name_to_string(&func.name).to_uppercase();
+    let (args, distinct) = match &func.args {
+        ast::FunctionArguments::List(list) => {
+            let distinct = matches!(
+                list.duplicate_treatment,
+                Some(ast::DuplicateTreatment::Distinct)
+            );
+            (&list.args, distinct)
+        }
+        ast::FunctionArguments::None => {
+            return Err(Error::SqlParse(format!(
+                "binder: function '{}' with no argument list not supported",
+                name
+            )));
+        }
+        ast::FunctionArguments::Subquery(_) => {
+            return Err(Error::SqlParse(format!(
+                "binder: function '{}' with subquery argument not supported",
+                name
+            )));
+        }
+    };
+
+    // Reject window-function modifiers (OVER), FILTER, WITHIN GROUP, etc.
+    if func.over.is_some() {
+        return Err(Error::SqlParse(format!(
+            "binder: window functions ('{}' OVER ...) not supported",
+            name
+        )));
+    }
+    if func.filter.is_some() {
+        return Err(Error::SqlParse(format!(
+            "binder: FILTER clauses on '{}' not supported",
+            name
+        )));
+    }
+
+    match name.as_str() {
+        "COUNT" => {
+            if args.len() != 1 {
+                return Err(Error::SqlParse(
+                    "COUNT takes exactly one argument (* or a column)".into(),
+                ));
+            }
+            match &args[0] {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => {
+                    if distinct {
+                        return Err(Error::SqlParse(
+                            "COUNT(DISTINCT *) is not valid SQL".into(),
+                        ));
+                    }
+                    Ok(AggregateSpec::CountStar)
+                }
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                    let col = resolve_column_expr(scope, e)?;
+                    Ok(AggregateSpec::Count { col, distinct })
+                }
+                other => Err(Error::SqlParse(format!(
+                    "binder: unsupported COUNT argument shape: {:?}",
+                    other
+                ))),
+            }
+        }
+        "SUM" | "MIN" | "MAX" | "AVG" => {
+            if distinct {
+                return Err(Error::SqlParse(format!(
+                    "{}(DISTINCT …) not supported (Phase 13 only handles COUNT(DISTINCT))",
+                    name
+                )));
+            }
+            if args.len() != 1 {
+                return Err(Error::SqlParse(format!(
+                    "{} takes exactly one column argument",
+                    name
+                )));
+            }
+            let col = match &args[0] {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                    resolve_column_expr(scope, e)?
+                }
+                other => {
+                    return Err(Error::SqlParse(format!(
+                        "binder: unsupported {} argument shape: {:?}",
+                        name, other
+                    )));
+                }
+            };
+            Ok(match name.as_str() {
+                "SUM" => AggregateSpec::Sum(col),
+                "MIN" => AggregateSpec::Min(col),
+                "MAX" => AggregateSpec::Max(col),
+                "AVG" => AggregateSpec::Avg(col),
+                _ => unreachable!(),
+            })
+        }
+        other => Err(Error::SqlParse(format!(
+            "binder: unsupported function '{}'",
+            other
+        ))),
+    }
+}
+
+/// Aggregates only accept a column reference as the argument expression
+/// — not arbitrary expressions (yet). This helper centralizes that
+/// resolution and the corresponding error message.
+fn resolve_column_expr(scope: &Scope, e: &AstExpr) -> Result<usize> {
+    match e {
+        AstExpr::Identifier(ident) => column_index(scope, &ident.value),
+        AstExpr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            column_index_qualified(scope, &parts[0].value, &parts[1].value)
+        }
+        other => Err(Error::SqlParse(format!(
+            "binder: aggregate argument must be a column reference, got {:?}",
+            other
+        ))),
+    }
+}
+
+/// Convert an INSERT VALUES expression into an `Expression`. Most cases
+/// are literals (typed against the target column); placeholders become
+/// `Expression::Parameter(i)` for prepared statements (P13.7).
+fn insert_value_expr(e: AstExpr, target_ty: &ColumnType) -> Result<Expression> {
+    if let AstExpr::Value(AstValue::Placeholder(s)) = &e {
+        if let Some(rest) = s.strip_prefix('$') {
+            let n: usize = rest
+                .parse()
+                .map_err(|err| Error::SqlParse(format!("invalid placeholder '{}': {}", s, err)))?;
+            if n == 0 {
+                return Err(Error::SqlParse(
+                    "parameter placeholders are 1-based ($1, $2, …)".into(),
+                ));
+            }
+            return Ok(Expression::Parameter(n - 1));
+        }
+        return Err(Error::SqlParse(
+            "use $1, $2, … for parameter placeholders in INSERT VALUES".into(),
+        ));
+    }
+    literal_from_expr(e, target_ty).map(Expression::Literal)
 }
 
 /// Convert an AST expression that must be a literal (used by INSERT VALUES).
@@ -570,6 +908,47 @@ fn decimal_from_str(s: &str, scale: u8) -> Result<Decimal> {
 
 fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
     match e {
+        AstExpr::Value(AstValue::Placeholder(s)) => {
+            // P13.7: SQL parameter placeholder. Accept both `?` (anonymous,
+            // index-by-occurrence) and `$N` (PostgreSQL-style positional).
+            // For `?`, we use the running placeholder count tracked by the
+            // binder's recursion order; here the simplest correct approach
+            // is to require `$N` syntax for explicit indexing.
+            //
+            // sqlparser passes the source token verbatim, so `?` arrives as
+            // "?". For Phase 13 we support both styles:
+            // - "?": treated as $1 if it's the only one, else require $N.
+            //   To keep things simple we assign indices in the order they
+            //   appear via a counter on the binder. But Binder is &self
+            //   here, not &mut self — so we use atomic interior mutability
+            //   later. For now, accept only $N to keep this stateless.
+            if let Some(rest) = s.strip_prefix('$') {
+                let n: usize = rest.parse().map_err(|e| {
+                    Error::SqlParse(format!(
+                        "invalid parameter placeholder '{}': {}",
+                        s, e
+                    ))
+                })?;
+                if n == 0 {
+                    return Err(Error::SqlParse(
+                        "parameter placeholders are 1-based ($1, $2, …)".into(),
+                    ));
+                }
+                Ok(Expression::Parameter(n - 1))
+            } else if s == "?" {
+                // For "?" without explicit numbering, we'd need to track
+                // occurrence order in the binder. Defer to a Phase 14
+                // refactor; for now require explicit `$N`.
+                Err(Error::SqlParse(
+                    "use $1, $2, … for parameter placeholders (anonymous `?` not supported yet)".into(),
+                ))
+            } else {
+                Err(Error::SqlParse(format!(
+                    "unrecognized placeholder syntax: '{}'",
+                    s
+                )))
+            }
+        }
         AstExpr::Value(v) => {
             // Literals in expression position get an inferred type from
             // their syntactic shape — narrowing happens at compile time
@@ -601,13 +980,23 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
             Ok(Expression::Column(idx))
         }
         AstExpr::CompoundIdentifier(parts) => {
-            // For Phase 11 single-table scope, ignore table qualifier;
-            // resolve the column part only.
-            let col = parts
-                .last()
-                .ok_or_else(|| Error::SqlParse("empty compound identifier".into()))?;
-            let idx = column_index(scope, &col.value)?;
-            Ok(Expression::Column(idx))
+            // `qualifier.column` — qualifier is a table name or alias.
+            // Two parts: standard SQL. Three+: schema-qualified (we don't
+            // support a notion of SQL schemas yet — error).
+            match parts.len() {
+                1 => {
+                    let idx = column_index(scope, &parts[0].value)?;
+                    Ok(Expression::Column(idx))
+                }
+                2 => {
+                    let idx = column_index_qualified(scope, &parts[0].value, &parts[1].value)?;
+                    Ok(Expression::Column(idx))
+                }
+                _ => Err(Error::SqlParse(format!(
+                    "binder: compound identifier with {} parts not supported",
+                    parts.len()
+                ))),
+            }
         }
         AstExpr::BinaryOp { left, op, right } => {
             let arith_op = map_arith_op(&op)?;
@@ -910,12 +1299,15 @@ mod tests {
             LogicalPlan::Insert { table, rows } => {
                 assert_eq!(table, "warehouse");
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0][0], Value::Int32(1));
-                assert_eq!(
-                    rows[0][1],
-                    Value::Decimal(Decimal::from_i64_with_scale(100000, 2))
-                );
-                assert_eq!(rows[0][2], Value::Varchar("north".into()));
+                assert!(matches!(&rows[0][0], Expression::Literal(Value::Int32(1))));
+                assert!(matches!(
+                    &rows[0][1],
+                    Expression::Literal(Value::Decimal(d)) if d.mantissa() == 100000 && d.scale() == 2
+                ));
+                assert!(matches!(
+                    &rows[0][2],
+                    Expression::Literal(Value::Varchar(s)) if s == "north"
+                ));
             }
             _ => panic!(),
         }
@@ -931,8 +1323,11 @@ mod tests {
         match plan {
             LogicalPlan::Insert { rows, .. } => {
                 // Always materialized in schema order [w_id, w_ytd, w_name].
-                assert_eq!(rows[0][0], Value::Int32(2));
-                assert_eq!(rows[0][2], Value::Varchar("south".into()));
+                assert!(matches!(&rows[0][0], Expression::Literal(Value::Int32(2))));
+                assert!(matches!(
+                    &rows[0][2],
+                    Expression::Literal(Value::Varchar(s)) if s == "south"
+                ));
             }
             _ => panic!(),
         }
@@ -945,8 +1340,11 @@ mod tests {
         let (binder, _dir) = binder_with_warehouse();
         let plan = bind_first(&binder, "SELECT * FROM warehouse");
         match plan {
-            LogicalPlan::Select { table, projection, filter, limit } => {
+            LogicalPlan::Select { table, joins, projection, aggregates, filter, order_by, limit } => {
                 assert_eq!(table, "warehouse");
+                assert!(joins.is_empty());
+                assert!(aggregates.is_empty());
+                assert!(order_by.is_empty());
                 assert!(projection.is_empty(), "SELECT * → empty projection");
                 assert!(filter.is_none());
                 assert!(limit.is_none());
@@ -1068,11 +1466,40 @@ mod tests {
     // ---- Unsupported shapes ----
 
     #[test]
-    fn join_in_select_rejected() {
+    fn self_join_binds_with_alias_and_qualified_predicate() {
+        // Replaces the legacy "JOINs reject" test — P13.1 adds the JOIN
+        // surface. Self-join with aliases is the strictest qualification
+        // test: same table on both sides, so resolution must rely on
+        // aliases (`w` vs `w2`) to disambiguate columns.
         let (binder, _dir) = binder_with_warehouse();
         let stmts =
             parse("SELECT * FROM warehouse w JOIN warehouse w2 ON w.w_id = w2.w_id").unwrap();
-        let err = binder.bind(stmts.into_iter().next().unwrap()).unwrap_err();
-        assert!(matches!(err, Error::SqlParse(ref m) if m.contains("JOIN")));
+        let plan = binder.bind(stmts.into_iter().next().unwrap()).unwrap();
+        match plan {
+            LogicalPlan::Select { table, joins, .. } => {
+                assert_eq!(table, "warehouse");
+                assert_eq!(joins.len(), 1);
+                assert_eq!(joins[0].right_table, "warehouse");
+                assert_eq!(joins[0].right_alias.as_deref(), Some("w2"));
+                let on = joins[0].on.as_ref().expect("ON predicate");
+                match on {
+                    Predicate::Compare { op: crate::sql::expr::CompareOp::Eq, left, right } => {
+                        // Left is `w.w_id` (column 0 of warehouse; tuple
+                        // offset 0). Right is `w2.w_id` (column 0 of the
+                        // second `warehouse`; tuple offset 3 — warehouse
+                        // has 3 columns).
+                        match (left, right) {
+                            (Expression::Column(l), Expression::Column(r)) => {
+                                assert_eq!(*l, 0);
+                                assert_eq!(*r, 3);
+                            }
+                            _ => panic!("expected Column-Column ON"),
+                        }
+                    }
+                    _ => panic!("expected Eq ON predicate"),
+                }
+            }
+            _ => panic!(),
+        }
     }
 }

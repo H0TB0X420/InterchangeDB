@@ -21,7 +21,7 @@ use crate::sql::expr::{Expression, Predicate};
 use crate::types::Value;
 
 /// One catalog-resolved SQL statement.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LogicalPlan {
     // --- DDL (catalog-only; not executed by operator tree) -----------------
     CreateTable {
@@ -32,20 +32,43 @@ pub enum LogicalPlan {
     },
 
     // --- DML (run through executor tree) ----------------------------------
-    /// `SELECT [projection] FROM table [WHERE filter] [LIMIT limit]`.
+    /// `SELECT [projection|aggregates] FROM table [JOIN …]* [WHERE filter] [LIMIT limit]`.
+    ///
+    /// `joins` is empty for a single-table SELECT (today's common case).
+    /// Column indices in `projection` and `filter` are tuple-global: they
+    /// index into the concatenated `table || joins[0] || joins[1] || …`
+    /// row produced by the operator tree.
+    ///
+    /// Exactly one of `projection` and `aggregates` is non-empty:
+    /// - `projection` non-empty, `aggregates` empty: column-projection (or
+    ///   `SELECT *` when both are empty).
+    /// - `aggregates` non-empty, `projection` empty: whole-table
+    ///   aggregation (no GROUP BY).
+    /// - Both non-empty: GROUP BY semantics (rejected by the binder for
+    ///   now — lands in Phase 14 alongside `HashAggregate`'s grouped path).
     Select {
         table: String,
-        /// Column indices in the requested output order. Empty = `SELECT *`.
+        joins: Vec<JoinClause>,
+        /// Column indices in the requested output order. Empty = `SELECT *`
+        /// (when aggregates is also empty) or whole-table aggregation (when
+        /// aggregates is non-empty).
         projection: Vec<usize>,
+        /// Aggregate functions to compute over the rows. Empty means no
+        /// aggregation.
+        aggregates: Vec<AggregateSpec>,
         filter: Option<Predicate>,
+        /// `ORDER BY (col, dir)+`. Column indices are tuple-global (same
+        /// scope as `projection` / `filter`). Empty means unsorted.
+        order_by: Vec<(usize, OrderDir)>,
         limit: Option<usize>,
     },
 
     /// `INSERT INTO table VALUES (row1), (row2), …`.
     ///
-    /// Each row is a vector of literal values in schema order. Computed
-    /// inserts (`INSERT … SELECT`) are Phase 12.
-    Insert { table: String, rows: Vec<Vec<Value>> },
+    /// Each row is a vector of *expressions* in schema order. Most are
+    /// literals; `Expression::Parameter(i)` slots support prepared
+    /// statements. Computed inserts (`INSERT … SELECT`) are Phase 14.
+    Insert { table: String, rows: Vec<Vec<Expression>> },
 
     /// `UPDATE table SET col = expr, … [WHERE filter]`.
     Update {
@@ -68,4 +91,124 @@ pub enum LogicalPlan {
     /// `EXPLAIN <stmt>` — wraps any other plan; planner returns the
     /// child's executor-tree explain string instead of executing it.
     Explain(Box<LogicalPlan>),
+}
+
+/// One JOIN clause attached to a SELECT. The right side is always a
+/// single table at this stage (3+-way joins compose by repeating). The
+/// `on` predicate is `None` for implicit `FROM a, b` (cross product) and
+/// `Some(p)` for explicit `JOIN b ON p`. WHERE filters are kept separate
+/// — Phase 14's cost-based planner will revisit predicate pushdown.
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub right_table: String,
+    pub right_alias: Option<String>,
+    pub on: Option<Predicate>,
+}
+
+/// SQL-level aggregate function spec. The planner translates each
+/// variant into the corresponding `execution::AggregateFn`. Column
+/// references are tuple-global indices (same convention as
+/// `Predicate`).
+#[derive(Debug, Clone)]
+pub enum AggregateSpec {
+    CountStar,
+    Count { col: usize, distinct: bool },
+    Sum(usize),
+    Min(usize),
+    Max(usize),
+    Avg(usize),
+}
+
+/// SQL-level sort direction. Separate from `execution::SortDir` so the
+/// SQL IR has no executor dependency; the planner translates between
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDir {
+    Asc,
+    Desc,
+}
+
+impl LogicalPlan {
+    /// Walk the plan tree and substitute every `Expression::Parameter(i)`
+    /// with `Expression::Literal(params[i])`. Used by
+    /// `PreparedStatement::execute` to bind parameters before planning.
+    pub fn substitute_params(self, params: &[Value]) -> crate::common::Result<LogicalPlan> {
+        match self {
+            LogicalPlan::Select {
+                table,
+                joins,
+                projection,
+                aggregates,
+                filter,
+                order_by,
+                limit,
+            } => {
+                let joins = joins
+                    .into_iter()
+                    .map(|j| {
+                        Ok::<JoinClause, crate::common::Error>(JoinClause {
+                            right_table: j.right_table,
+                            right_alias: j.right_alias,
+                            on: match j.on {
+                                Some(p) => Some(p.substitute_params(params)?),
+                                None => None,
+                            },
+                        })
+                    })
+                    .collect::<crate::common::Result<Vec<_>>>()?;
+                let filter = match filter {
+                    Some(p) => Some(p.substitute_params(params)?),
+                    None => None,
+                };
+                Ok(LogicalPlan::Select {
+                    table,
+                    joins,
+                    projection,
+                    aggregates,
+                    filter,
+                    order_by,
+                    limit,
+                })
+            }
+            LogicalPlan::Insert { table, rows } => {
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|e| e.substitute_params(params))
+                            .collect::<crate::common::Result<Vec<_>>>()
+                    })
+                    .collect::<crate::common::Result<Vec<_>>>()?;
+                Ok(LogicalPlan::Insert { table, rows })
+            }
+            LogicalPlan::Update {
+                table,
+                set_clauses,
+                filter,
+            } => {
+                let set_clauses = set_clauses
+                    .into_iter()
+                    .map(|(idx, expr)| Ok::<_, crate::common::Error>((idx, expr.substitute_params(params)?)))
+                    .collect::<crate::common::Result<Vec<_>>>()?;
+                let filter = match filter {
+                    Some(p) => Some(p.substitute_params(params)?),
+                    None => None,
+                };
+                Ok(LogicalPlan::Update {
+                    table,
+                    set_clauses,
+                    filter,
+                })
+            }
+            LogicalPlan::Delete { table, filter } => {
+                let filter = match filter {
+                    Some(p) => Some(p.substitute_params(params)?),
+                    None => None,
+                };
+                Ok(LogicalPlan::Delete { table, filter })
+            }
+            // No parameters in DDL or TC.
+            other => Ok(other),
+        }
+    }
 }

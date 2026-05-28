@@ -18,7 +18,17 @@
 //! - Multi-statement `execute("a; b")` — single statement per call.
 //!   Callers wanting batches loop.
 //! - Workload log — Step 8.
-//! - Prepared statements — Phase 13.
+//!
+//! ## Prepared statements (P13.7)
+//!
+//! `Session::prepare(sql)` parses + binds once, returning a
+//! `PreparedStatement` that holds the resulting `LogicalPlan`. Every
+//! call to `Session::execute_prepared(ps, params)` substitutes the
+//! parameter values, re-plans (cheap — no parsing/binding), and runs.
+//!
+//! Parameter placeholders use `$1`, `$2`, … syntax (1-based). The
+//! anonymous `?` form requires occurrence-order tracking in the binder
+//! and is deferred — Phase 14 territory.
 
 use std::sync::Arc;
 
@@ -34,6 +44,13 @@ use crate::sql::workload_log::WorkloadLog;
 use crate::storage::StorageEngine;
 use crate::txn::{TxnId, TxnMode};
 use crate::types::Value;
+
+/// A parsed + bound SQL statement, ready for repeated execution with
+/// different parameter bindings. Returned by `Session::prepare`.
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    pub logical: LogicalPlan,
+}
 
 /// Outcome of a single `Session::execute` call.
 #[derive(Debug)]
@@ -104,6 +121,37 @@ impl<E: StorageEngine + 'static> Session<E> {
     /// Whether the session currently has an explicit transaction open.
     pub fn in_transaction(&self) -> bool {
         self.current_txn.is_some()
+    }
+
+    /// P13.7: Parse + bind a SQL statement, returning a
+    /// `PreparedStatement` that can be executed many times with
+    /// different parameter values. Parsing and binding are paid
+    /// once; each `execute_prepared` call substitutes parameters and
+    /// re-plans against the current catalog state.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        let stmts = parse(sql)?;
+        if stmts.is_empty() {
+            return Err(Error::SqlParse("prepare: empty SQL".into()));
+        }
+        if stmts.len() > 1 {
+            return Err(Error::SqlParse(
+                "prepare: multiple statements per prepare() not supported".into(),
+            ));
+        }
+        let stmt = stmts.into_iter().next().unwrap();
+        let logical = self.binder.bind(stmt)?;
+        Ok(PreparedStatement { logical })
+    }
+
+    /// Execute a previously-prepared statement with bound parameters.
+    /// `params[i]` substitutes for `$(i+1)` placeholders in the SQL.
+    pub fn execute_prepared(
+        &mut self,
+        ps: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let logical = ps.logical.clone().substitute_params(params)?;
+        self.execute_logical(logical)
     }
 
     // -----------------------------------------------------------------------
