@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use crate::catalog::{Catalog, ColumnDef};
 use crate::common::Result;
-use crate::execution::{Delete, Executor, Filter, Insert, Limit, Projection, SeqScan, SetExpr, Update};
+use crate::execution::{
+    Delete, Executor, Filter, IndexScan, Insert, Limit, Projection, SeqScan, SetExpr, Update,
+};
 use crate::layout::RowLayout;
 use crate::sql::expr::Predicate;
 use crate::sql::logical::LogicalPlan;
@@ -101,11 +103,31 @@ where
     CatE: StorageEngine,
 {
     let schema = catalog.get_table(&table_name)?;
-    let table = Arc::new(Table::new(engine, schema, RowLayout));
+    let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
+    let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes.clone()));
 
-    let mut current: Box<dyn Executor> = Box::new(SeqScan::new(&*table)?);
+    // P12.6: try to lower the filter into an IndexScan. Recognized shape:
+    // `col_i = literal` where col_i is the only indexed column of some
+    // attached single-column index. On match, drop the predicate and emit
+    // IndexScan; otherwise fall back to SeqScan + Filter.
+    let mut current: Box<dyn Executor>;
+    let mut residual_filter: Option<Predicate> = filter;
+    if let Some(pred) = residual_filter {
+        match try_lower_index_predicate(pred, &indexes) {
+            IndexLowering::Matched { handle, prefix } => {
+                current = Box::new(IndexScan::new(&*table, &handle, &prefix)?);
+                residual_filter = None;
+            }
+            IndexLowering::Unmatched(pred) => {
+                current = Box::new(SeqScan::new(&*table)?);
+                residual_filter = Some(pred);
+            }
+        }
+    } else {
+        current = Box::new(SeqScan::new(&*table)?);
+    }
 
-    if let Some(pred) = filter {
+    if let Some(pred) = residual_filter {
         current = Box::new(Filter::from_boxed(current, pred.compile()));
     }
     if !projection.is_empty() {
@@ -115,6 +137,59 @@ where
         current = Box::new(Limit::new(current, n));
     }
     Ok(current)
+}
+
+/// Result of attempting to lower a `WHERE` clause into an IndexScan.
+enum IndexLowering {
+    /// A single-column equality predicate matched a single-column index.
+    /// `handle` is the index; `prefix` is the literal value to scan for.
+    /// The original predicate is consumed and dropped — IndexScan
+    /// guarantees no false positives for this shape.
+    Matched {
+        handle: crate::table::IndexHandle,
+        prefix: Vec<crate::types::Value>,
+    },
+    /// No index matched. Original predicate returned unchanged so the
+    /// caller can drop it onto a `Filter` on top of `SeqScan`.
+    Unmatched(Predicate),
+}
+
+/// Try to lower `pred` into an IndexScan against any of `indexes`. First
+/// cut handles only the simplest indexable shape: a single equality
+/// between one indexed column and a literal. Composite indexes, range
+/// predicates, and AND-decomposition land in later phases.
+fn try_lower_index_predicate(
+    pred: Predicate,
+    indexes: &[crate::table::IndexHandle],
+) -> IndexLowering {
+    // Extract `(col_idx, value)` from `Compare(Eq, Column(i), Literal(v))`
+    // and the mirror `Compare(Eq, Literal(v), Column(i))`.
+    let extracted = match &pred {
+        Predicate::Compare {
+            op: crate::sql::expr::CompareOp::Eq,
+            left: crate::sql::expr::Expression::Column(i),
+            right: crate::sql::expr::Expression::Literal(v),
+        } => Some((*i, v.clone())),
+        Predicate::Compare {
+            op: crate::sql::expr::CompareOp::Eq,
+            left: crate::sql::expr::Expression::Literal(v),
+            right: crate::sql::expr::Expression::Column(i),
+        } => Some((*i, v.clone())),
+        _ => None,
+    };
+
+    if let Some((col_idx, lit)) = extracted {
+        for ix in indexes {
+            // Only single-column indexes match this simple shape.
+            if ix.def.columns == [col_idx] {
+                return IndexLowering::Matched {
+                    handle: ix.clone(),
+                    prefix: vec![lit],
+                };
+            }
+        }
+    }
+    IndexLowering::Unmatched(pred)
 }
 
 fn plan_insert<TblE, CatE>(
@@ -128,7 +203,8 @@ where
     CatE: StorageEngine,
 {
     let schema = catalog.get_table(&table_name)?;
-    let table = Arc::new(Table::new(engine, schema, RowLayout));
+    let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
+    let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes));
     Ok(Box::new(Insert::new(table, rows)))
 }
 
@@ -144,10 +220,28 @@ where
     CatE: StorageEngine,
 {
     let schema = catalog.get_table(&table_name)?;
-    let table = Arc::new(Table::new(engine, schema, RowLayout));
+    let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
+    let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes.clone()));
 
-    let mut child: Box<dyn Executor> = Box::new(SeqScan::new(&*table)?);
-    if let Some(pred) = filter {
+    // Same IndexScan lowering as plan_select. Index-driven updates are
+    // common in OLTP: `UPDATE customer SET … WHERE c_id = ?`.
+    let mut child: Box<dyn Executor>;
+    let mut residual_filter: Option<Predicate> = filter;
+    if let Some(pred) = residual_filter {
+        match try_lower_index_predicate(pred, &indexes) {
+            IndexLowering::Matched { handle, prefix } => {
+                child = Box::new(IndexScan::new(&*table, &handle, &prefix)?);
+                residual_filter = None;
+            }
+            IndexLowering::Unmatched(pred) => {
+                child = Box::new(SeqScan::new(&*table)?);
+                residual_filter = Some(pred);
+            }
+        }
+    } else {
+        child = Box::new(SeqScan::new(&*table)?);
+    }
+    if let Some(pred) = residual_filter {
         child = Box::new(Filter::from_boxed(child, pred.compile()));
     }
 
@@ -170,10 +264,26 @@ where
     CatE: StorageEngine,
 {
     let schema = catalog.get_table(&table_name)?;
-    let table = Arc::new(Table::new(engine, schema, RowLayout));
+    let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
+    let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes.clone()));
 
-    let mut child: Box<dyn Executor> = Box::new(SeqScan::new(&*table)?);
-    if let Some(pred) = filter {
+    let mut child: Box<dyn Executor>;
+    let mut residual_filter: Option<Predicate> = filter;
+    if let Some(pred) = residual_filter {
+        match try_lower_index_predicate(pred, &indexes) {
+            IndexLowering::Matched { handle, prefix } => {
+                child = Box::new(IndexScan::new(&*table, &handle, &prefix)?);
+                residual_filter = None;
+            }
+            IndexLowering::Unmatched(pred) => {
+                child = Box::new(SeqScan::new(&*table)?);
+                residual_filter = Some(pred);
+            }
+        }
+    } else {
+        child = Box::new(SeqScan::new(&*table)?);
+    }
+    if let Some(pred) = residual_filter {
         child = Box::new(Filter::from_boxed(child, pred.compile()));
     }
     Ok(Box::new(Delete::new(table, child)))

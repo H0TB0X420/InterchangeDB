@@ -375,6 +375,35 @@ pub fn byte_increment(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Exclusive upper bound for a prefix scan: returns the
+/// lexicographically smallest byte string strictly greater than every
+/// extension of `bytes`. Used by `IndexScan` to bound a "starts-with
+/// prefix" scan in the underlying engine.
+///
+/// Algorithm: increment the last byte that isn't 0xFF (truncating
+/// trailing 0xFF bytes that wrap). Returns `None` if every byte is 0xFF
+/// — meaning the prefix has no finite upper bound and the caller should
+/// use `Bound::Unbounded`.
+///
+/// Why this differs from `byte_increment`: `byte_increment` appends 0x00,
+/// which works as the next valid *full PK* encoding (full PKs end at
+/// fixed offsets so they can't have a suffix shorter than appending
+/// 0x00). For *prefix* scans, the suffix is arbitrary (it includes
+/// downstream PK bytes that may start with 0x01+), so appending 0x00 is
+/// less than some valid full keys — the half-open range would miss
+/// entries with PK encodings whose first byte exceeds 0x00.
+pub fn prefix_increment(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = bytes.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(out);
+        }
+        out.pop();
+    }
+    None
+}
+
 // ---- tests ---------------------------------------------------------------
 
 #[cfg(test)]

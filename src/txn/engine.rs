@@ -14,7 +14,6 @@
 //!   1.D  thread snapshot/txn through ops
 //!   2.*  relocate MVCC bodies in from `Database`
 
-use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use crate::common::{Error, Result};
@@ -185,11 +184,15 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
         self.engine.put(&mvcc_key, &mvcc_val)
     }
 
-    /// MVCC scan: newest visible version per user-key across `range`.
-    /// Buffers via `mvcc_scan`'s `Vec` return and re-emits as a streaming
-    /// iterator. Streaming-native refactor is a Phase-11 perf todo — for
-    /// TPC-C table sizes the buffer is fine.
-    fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Box<dyn ScanIterator + '_> {
+    /// MVCC scan: newest visible version per user-key across the given
+    /// bound pair. Buffers via `mvcc_scan`'s `Vec` return and re-emits as
+    /// a streaming iterator. Streaming-native refactor is a Phase-11 perf
+    /// todo — for TPC-C table sizes the buffer is fine.
+    fn scan_range(
+        &self,
+        start_bound: std::ops::Bound<Vec<u8>>,
+        end_bound: std::ops::Bound<Vec<u8>>,
+    ) -> Box<dyn ScanIterator + '_> {
         let snapshot = match self.snapshot_for_read() {
             Ok(s) => s,
             Err(e) => return Box::new(std::iter::once(Err(e))),
@@ -197,7 +200,7 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
         let committed = self.txn_mgr.committed_txns();
         let non_committed = self.txn_mgr.known_not_committed();
 
-        let start = match range.start_bound() {
+        let start = match &start_bound {
             std::ops::Bound::Included(k) => k.clone(),
             std::ops::Bound::Excluded(k) => {
                 let mut next = k.clone();
@@ -206,7 +209,7 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
             }
             std::ops::Bound::Unbounded => vec![],
         };
-        let end = match range.end_bound() {
+        let end = match &end_bound {
             std::ops::Bound::Included(k) | std::ops::Bound::Excluded(k) => k.clone(),
             std::ops::Bound::Unbounded => vec![0xFF; 32],
         };

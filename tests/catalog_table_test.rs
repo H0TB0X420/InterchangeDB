@@ -237,6 +237,7 @@ fn scenario_index_metadata_persists<E: StorageEngine + 'static>(engine: Arc<E>) 
             table_id,
             columns: vec![1],
             unique: false,
+            backend: interchangedb::catalog::IndexBackend::BTree,
         })
         .unwrap();
     assert_eq!(id.0, 1);
@@ -248,6 +249,7 @@ fn scenario_index_metadata_persists<E: StorageEngine + 'static>(engine: Arc<E>) 
             table_id,
             columns: vec![2],
             unique: false,
+            backend: interchangedb::catalog::IndexBackend::BTree,
         })
         .unwrap_err();
     assert!(matches!(err, Error::IndexAlreadyExists { .. }));

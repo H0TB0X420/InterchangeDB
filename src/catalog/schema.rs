@@ -37,13 +37,55 @@ pub struct Schema {
     pub primary_key: Vec<usize>,
 }
 
-/// Index declaration: name, target table, indexed columns, and uniqueness.
+/// Per-index storage backend choice. Persisted in `__sys_indexes` so
+/// reopens can instantiate the right engine. Phase 12 introduces this so
+/// one table can have indexes split across multiple backends — e.g. a
+/// hot lookup index on `BTreeEngine` and a write-heavy log index on
+/// `LsmEngine`.
+///
+/// New variants are added by extending this enum + bumping the
+/// `__sys_indexes` discriminator mapping in
+/// `system_tables::write_index_row` / `read_index_row`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexBackend {
+    BTree,
+    Lsm,
+}
+
+impl IndexBackend {
+    /// Stable discriminator used in `__sys_indexes`. Don't renumber; only
+    /// append new variants with new ids.
+    pub fn as_i32(self) -> i32 {
+        match self {
+            IndexBackend::BTree => 0,
+            IndexBackend::Lsm => 1,
+        }
+    }
+
+    pub fn from_i32(v: i32) -> Result<Self> {
+        match v {
+            0 => Ok(IndexBackend::BTree),
+            1 => Ok(IndexBackend::Lsm),
+            other => Err(Error::StorageCorrupted(format!(
+                "unknown IndexBackend discriminator in __sys_indexes: {}",
+                other
+            ))),
+        }
+    }
+}
+
+/// Index declaration: name, target table, indexed columns, uniqueness,
+/// and the per-index storage backend.
 ///
 /// `columns` are positions in the target table's `Schema::columns`. The
 /// same column may appear in arbitrarily many secondary indexes; the PK
-/// is *not* represented as an `IndexDef` (it's implicit in `Schema::primary_key`,
-/// though Phase 12 may materialize a unique PK index — the `Schema` remains
-/// the source of truth for "what is the PK").
+/// is *not* represented as an `IndexDef` (it's implicit in
+/// `Schema::primary_key`, though Phase 12 may materialize a unique PK
+/// index — the `Schema` remains the source of truth for "what is the PK").
+///
+/// `backend` selects which storage engine type holds this index. Each
+/// index gets its own engine instance allocated at create time and
+/// re-instantiated on reopen. See `IndexBackend`.
 ///
 /// No `id` field — `IndexId` is assigned by `Catalog::create_index` and
 /// stored alongside this blob in `__sys_indexes`.
@@ -53,6 +95,7 @@ pub struct IndexDef {
     pub table_id: TableId,
     pub columns: Vec<usize>,
     pub unique: bool,
+    pub backend: IndexBackend,
 }
 
 impl Schema {
@@ -223,6 +266,7 @@ mod tests {
             table_id: TableId(3),
             columns: vec![5, 1], // composite (c_last, c_w_id)
             unique: false,
+            backend: IndexBackend::BTree,
         };
         let bytes = bincode::serialize(&def).unwrap();
         let back: IndexDef = bincode::deserialize(&bytes).unwrap();

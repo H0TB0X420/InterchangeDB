@@ -152,6 +152,12 @@ pub fn sys_indexes_schema() -> Schema {
                 nullable: false,
                 default: None,
             },
+            ColumnDef {
+                name: "backend".to_string(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -350,8 +356,79 @@ pub fn write_index_row<E: StorageEngine>(
         Value::Varchar(def.name.clone()),
         Value::Bytes(columns_blob),
         Value::Boolean(def.unique),
+        Value::Int32(def.backend.as_i32()),
     ];
     RowLayout.put_row(engine, ctx, &pk, &values)
+}
+
+/// Scan all `__sys_indexes` rows back into `(IndexId, IndexDef)` pairs.
+/// Used by `Catalog::open` (P12.3) to re-instantiate index engines on
+/// reopen, and by tests that need to round-trip the persistence path.
+pub fn read_all_index_rows<E: StorageEngine>(
+    engine: &E,
+) -> Result<Vec<(crate::catalog::IndexId, crate::catalog::IndexDef)>> {
+    let sys_indexes = sys_indexes_schema();
+    let column_types = sys_indexes.column_types();
+    let ctx = LayoutCtx {
+        column_types: &column_types,
+        table_id: SYS_INDEXES_ID,
+    };
+    let mut out = Vec::new();
+    for row_result in RowLayout.scan_table(engine, ctx) {
+        let (_, values) = row_result?;
+        let index_id = match &values[0] {
+            Value::Int64(v) => crate::catalog::IndexId(*v as u32),
+            _ => return Err(Error::StorageCorrupted(
+                "__sys_indexes.index_id: expected Int64".into(),
+            )),
+        };
+        let table_id = match &values[1] {
+            Value::Int64(v) => crate::catalog::TableId(*v as u32),
+            _ => return Err(Error::StorageCorrupted(
+                "__sys_indexes.table_id: expected Int64".into(),
+            )),
+        };
+        let name = match &values[2] {
+            Value::Varchar(s) => s.clone(),
+            _ => return Err(Error::StorageCorrupted(
+                "__sys_indexes.name: expected Varchar".into(),
+            )),
+        };
+        let columns: Vec<usize> = match &values[3] {
+            Value::Bytes(b) => bincode::deserialize(b).map_err(|e| {
+                Error::StorageCorrupted(format!(
+                    "__sys_indexes.columns_blob: bincode decode: {}",
+                    e
+                ))
+            })?,
+            _ => return Err(Error::StorageCorrupted(
+                "__sys_indexes.columns_blob: expected Bytes".into(),
+            )),
+        };
+        let unique = match &values[4] {
+            Value::Boolean(b) => *b,
+            _ => return Err(Error::StorageCorrupted(
+                "__sys_indexes.unique: expected Boolean".into(),
+            )),
+        };
+        let backend = match &values[5] {
+            Value::Int32(v) => crate::catalog::IndexBackend::from_i32(*v)?,
+            _ => return Err(Error::StorageCorrupted(
+                "__sys_indexes.backend: expected Int32".into(),
+            )),
+        };
+        out.push((
+            index_id,
+            crate::catalog::IndexDef {
+                name,
+                table_id,
+                columns,
+                unique,
+                backend,
+            },
+        ));
+    }
+    Ok(out)
 }
 
 /// Insert / overwrite all `__sys_columns` rows describing `table`'s columns.
@@ -425,7 +502,11 @@ mod tests {
         assert_eq!(s.name, "__sys_indexes");
         assert_eq!(s.table_id, SYS_INDEXES_ID);
         assert_eq!(s.primary_key, vec![0]);
-        assert_eq!(s.columns.len(), 5);
+        // 6 columns: index_id, table_id, name, columns_blob, unique, backend.
+        // The trailing `backend` was added by P12.2 to persist the per-index
+        // storage choice across reopens.
+        assert_eq!(s.columns.len(), 6);
+        assert_eq!(s.columns[5].name, "backend");
     }
 
     /// Hardcoded schemas must each round-trip through their own

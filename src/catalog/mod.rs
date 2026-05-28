@@ -15,4 +15,4 @@ pub mod system_tables;
 
 pub use ids::{ColumnId, IndexId, TableId, FIRST_SYSTEM_TABLE_ID, FIRST_USER_TABLE_ID};
 pub use manager::Catalog;
-pub use schema::{ColumnDef, IndexDef, Schema};
+pub use schema::{ColumnDef, IndexBackend, IndexDef, Schema};

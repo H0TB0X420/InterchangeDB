@@ -3,7 +3,6 @@
 //! `LsmEngine` tracks key counts, data size, and tombstone counts via
 //! the same get-before-mutate pattern as `BTreeEngine`.
 
-use std::ops::RangeBounds;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -108,8 +107,12 @@ impl StorageEngine for LsmEngine {
         self.tree.delete(key.to_vec())
     }
 
-    fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Box<dyn ScanIterator + '_> {
-        match self.tree.scan(range) {
+    fn scan_range(
+        &self,
+        start: std::ops::Bound<Vec<u8>>,
+        end: std::ops::Bound<Vec<u8>>,
+    ) -> Box<dyn ScanIterator + '_> {
+        match self.tree.scan((start, end)) {
             Ok(entries) => {
                 let results: Vec<Result<(Vec<u8>, Vec<u8>)>> =
                     entries.into_iter().map(Ok).collect();

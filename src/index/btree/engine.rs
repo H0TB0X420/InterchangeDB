@@ -4,7 +4,6 @@
 //! demand (cheap — just a reference + config). This avoids self-referential
 //! struct problems since `BTree` borrows `&BPM`.
 
-use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::buffer::BufferPoolManager;
@@ -225,10 +224,14 @@ impl StorageEngine for BTreeEngine {
         Ok(())
     }
 
-    fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Box<dyn ScanIterator + '_> {
+    fn scan_range(
+        &self,
+        start: std::ops::Bound<Vec<u8>>,
+        end: std::ops::Bound<Vec<u8>>,
+    ) -> Box<dyn ScanIterator + '_> {
         // Collect into Vec to satisfy DoubleEndedIterator requirement.
         // A true reverse iterator would need prev_page_id traversal (deferred).
-        let results: Vec<Result<(Vec<u8>, Vec<u8>)>> = match self.tree().scan(range) {
+        let results: Vec<Result<(Vec<u8>, Vec<u8>)>> = match self.tree().scan((start, end)) {
             Ok(iter) => iter.collect(),
             Err(e) => vec![Err(e)],
         };

@@ -25,17 +25,36 @@ use crate::catalog::constraints::{
     apply_defaults, check_arity, check_nullability, check_pk_not_null, check_type_compat,
     check_type_compat_one, check_value_bounds, check_value_bounds_one,
 };
-use crate::catalog::Schema;
+use crate::catalog::{IndexDef, IndexId, Schema};
 use crate::common::{Error, Result};
 use crate::layout::{DataLayout, LayoutCtx};
 use crate::storage::StorageEngine;
 use crate::types::{keyenc, ColumnType, Value};
+
+/// One index attached to a `Table`. Carries everything needed to write
+/// index entries on every mutation: the column positions to project,
+/// the precomputed `(secondary_cols ++ pk_cols)` type list for key
+/// encoding, and the engine handle that holds the index data.
+///
+/// Constructed by `Catalog` (P12.3) and handed to `Table::with_indexes`.
+#[derive(Clone)]
+pub struct IndexHandle {
+    pub id: IndexId,
+    pub def: IndexDef,
+    pub engine: Arc<dyn StorageEngine>,
+    /// Concatenation of indexed column types + PK column types. Used by
+    /// `encode_key_components` when building each entry's secondary key.
+    pub key_types: Vec<ColumnType>,
+}
 
 /// Typed row-level access to a single table backed by `engine` with layout `L`.
 pub struct Table<E: StorageEngine, L: DataLayout> {
     engine: Arc<E>,
     schema: Arc<Schema>,
     layout: L,
+    /// Secondary indexes maintained on every mutation. Empty for tables
+    /// constructed without explicit index handles (legacy / test paths).
+    indexes: Vec<IndexHandle>,
 }
 
 impl<E: StorageEngine, L: DataLayout> Table<E, L> {
@@ -44,7 +63,62 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
             engine,
             schema,
             layout,
+            indexes: Vec::new(),
         }
+    }
+
+    /// Same as `new`, but with the table's secondary indexes attached.
+    /// Each mutation will maintain entries in every listed index.
+    pub fn with_indexes(
+        engine: Arc<E>,
+        schema: Arc<Schema>,
+        layout: L,
+        indexes: Vec<IndexHandle>,
+    ) -> Self {
+        Self {
+            engine,
+            schema,
+            layout,
+            indexes,
+        }
+    }
+
+    /// Build a secondary index key from `row_values`. Format:
+    /// `encode_key_components([indexed cols] ++ [pk cols])`. The PK
+    /// suffix lets non-unique indexes hold multiple entries per
+    /// secondary key value (distinguished by the pk-tiebreak suffix).
+    fn build_index_key(&self, ix: &IndexHandle, row_values: &[Value]) -> Result<Vec<u8>> {
+        let mut components: Vec<&Value> = ix
+            .def
+            .columns
+            .iter()
+            .map(|&i| &row_values[i])
+            .collect();
+        for &pk_col in &self.schema.primary_key {
+            components.push(&row_values[pk_col]);
+        }
+        keyenc::encode_key_components(&components, &ix.key_types)
+    }
+
+    /// Write secondary entries for `row_values` into every attached index.
+    fn put_index_entries(&self, row_values: &[Value]) -> Result<()> {
+        for ix in &self.indexes {
+            let key = self.build_index_key(ix, row_values)?;
+            // Value is empty: the PK is recoverable from the key's suffix
+            // (see `build_index_key`). Phase 12's IndexScan operator
+            // decodes the suffix back into PK components.
+            ix.engine.put(&key, &[])?;
+        }
+        Ok(())
+    }
+
+    /// Delete secondary entries for `row_values` from every attached index.
+    fn delete_index_entries(&self, row_values: &[Value]) -> Result<()> {
+        for ix in &self.indexes {
+            let key = self.build_index_key(ix, row_values)?;
+            ix.engine.delete(&key)?;
+        }
+        Ok(())
     }
 
     /// Strict insert. Errors with `DuplicateKey` if the PK already exists.
@@ -64,7 +138,15 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
             });
         }
         self.layout
-            .put_row(&*self.engine, ctx, &pk_encoded, &values)
+            .put_row(&*self.engine, ctx, &pk_encoded, &values)?;
+        // P12.4: maintain secondary indexes. Done after the PK write so a
+        // failed PK write doesn't leak index entries. Index writes
+        // themselves can in principle fail mid-loop — that leaves a
+        // partial state requiring transactional rollback to clean up.
+        // For Phase 12 raw use this is documented; `TxnEngine`-wrapped
+        // use gets atomicity via the surrounding txn.
+        self.put_index_entries(&values)?;
+        Ok(())
     }
 
     /// Upsert. Last writer wins on PK collision.
@@ -77,8 +159,17 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
             column_types: &column_types,
             table_id: self.schema.table_id,
         };
+        // If there's a prior row at this PK, remove its old index entries
+        // first (they may have different indexed-column values).
+        if !self.indexes.is_empty() {
+            if let Some(prev) = self.layout.get_row(&*self.engine, ctx, &pk_encoded)? {
+                self.delete_index_entries(&prev)?;
+            }
+        }
         self.layout
-            .put_row(&*self.engine, ctx, &pk_encoded, &values)
+            .put_row(&*self.engine, ctx, &pk_encoded, &values)?;
+        self.put_index_entries(&values)?;
+        Ok(())
     }
 
     /// Replace the entire row at the given PK. Errors with `RowNotFound`
@@ -92,8 +183,19 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
             column_types: &column_types,
             table_id: self.schema.table_id,
         };
+        // Capture old row for index maintenance before mutating.
+        let prev = if !self.indexes.is_empty() {
+            self.layout.get_row(&*self.engine, ctx, &pk_encoded)?
+        } else {
+            None
+        };
         self.layout
-            .update_row(&*self.engine, ctx, &pk_encoded, &new_values)
+            .update_row(&*self.engine, ctx, &pk_encoded, &new_values)?;
+        if let Some(prev) = prev {
+            self.delete_index_entries(&prev)?;
+        }
+        self.put_index_entries(&new_values)?;
+        Ok(())
     }
 
     /// Update specific columns at the given PK. Per-column type/bounds
@@ -115,8 +217,25 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
             column_types: &column_types,
             table_id: self.schema.table_id,
         };
+        // For index maintenance: pre-fetch the row, apply the column
+        // changes locally to materialize what the new row will look like,
+        // and use both to rewrite index entries.
+        let prev = if !self.indexes.is_empty() {
+            self.layout.get_row(&*self.engine, ctx, &pk_encoded)?
+        } else {
+            None
+        };
         self.layout
-            .update_columns(&*self.engine, ctx, &pk_encoded, changes)
+            .update_columns(&*self.engine, ctx, &pk_encoded, changes)?;
+        if let Some(prev) = prev {
+            self.delete_index_entries(&prev)?;
+            let mut new_row = prev.clone();
+            for (col_idx, new_val) in changes {
+                new_row[*col_idx] = new_val.clone();
+            }
+            self.put_index_entries(&new_row)?;
+        }
+        Ok(())
     }
 
     /// Read the row at the given PK. Returns `None` if absent.
@@ -139,7 +258,19 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
             column_types: &column_types,
             table_id: self.schema.table_id,
         };
-        self.layout.delete_row(&*self.engine, ctx, &pk_encoded)
+        // Index maintenance: capture row before the delete so we have the
+        // indexed-column values to look up. After delete succeeds, remove
+        // the corresponding index entries.
+        let prev = if !self.indexes.is_empty() {
+            self.layout.get_row(&*self.engine, ctx, &pk_encoded)?
+        } else {
+            None
+        };
+        self.layout.delete_row(&*self.engine, ctx, &pk_encoded)?;
+        if let Some(prev) = prev {
+            self.delete_index_entries(&prev)?;
+        }
+        Ok(())
     }
 
     /// Full-table scan in PK order. Returns rows as `Vec<Value>` (PK bytes

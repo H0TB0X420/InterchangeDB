@@ -23,20 +23,30 @@
 //! Phase 11+ may revisit if this becomes a real concern.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::buffer::BufferPoolManager;
 use crate::catalog::ids::{FIRST_SYSTEM_TABLE_ID, FIRST_USER_TABLE_ID, SYS_INDEXES_ID};
 use crate::catalog::system_tables::{
-    initialize_system_tables, is_initialized, load_system_tables, sys_indexes_schema,
+    initialize_system_tables, is_initialized, load_system_tables, read_all_index_rows,
+    sys_indexes_schema,
 };
-use crate::catalog::{IndexDef, IndexId, Schema, TableId};
+use crate::catalog::{IndexBackend, IndexDef, IndexId, Schema, TableId};
 use crate::common::{ConstraintRule, Error, Result};
+use crate::index::btree::BTreeEngine;
+use crate::index::lsm::LsmEngine;
 use crate::layout::{DataLayout, LayoutCtx, RowLayout};
-use crate::storage::StorageEngine;
+use crate::storage::{FileDiskManager, StorageEngine};
 use crate::types::Value;
+
+/// Per-index BPM pool size for file-backed BTree indexes. 128 frames is
+/// ~512 KiB per index — enough to keep traversal pages hot without
+/// dominating memory in tables with many indexes.
+const INDEX_BTREE_POOL_SIZE: usize = 128;
 
 /// Public-facing catalog handle.
 pub struct Catalog<E: StorageEngine> {
@@ -51,18 +61,51 @@ pub struct Catalog<E: StorageEngine> {
     next_user_table_id: AtomicU32,
     /// Next index id. Pre-incremented past existing ids on `open`.
     next_index_id: AtomicU32,
+    /// Per-index storage engine handles, keyed by IndexId. Each index can
+    /// use a different backend (BTreeEngine, LsmEngine, future impls)
+    /// independently of the table's PK engine.
+    ///
+    /// `Arc<dyn StorageEngine>`: Arc lets ops share the handle; dyn erases
+    /// the backend type so two indexes on one table can be different
+    /// engines; `StorageEngine: Send + Sync` already, so the trait object
+    /// is too.
+    ///
+    /// `RwLock` because index creation (DDL) writes; lookups during scans
+    /// and inserts read.
+    index_engines: RwLock<HashMap<IndexId, Arc<dyn StorageEngine>>>,
+    /// Root directory for per-index storage. `Some(dir)` enables
+    /// auto-allocation: `create_index` builds the chosen backend under
+    /// `<dir>/idx_<id>` and registers it. `None` means tests must
+    /// register engines manually via `register_index_engine`.
+    index_data_dir: Option<PathBuf>,
 }
 
 impl<E: StorageEngine> Catalog<E> {
     /// Open the catalog backed by `engine`. Initializes system tables on a
     /// fresh data dir; loads them otherwise. Performs drift detection.
+    ///
+    /// Index engines are NOT auto-allocated by this constructor — useful
+    /// for tests that want full control via `register_index_engine`. For
+    /// production use, `open_persistent` re-instantiates index engines
+    /// from `__sys_indexes` on reopen.
     pub fn open(engine: Arc<E>) -> Result<Self> {
+        Self::open_inner(engine, None)
+    }
+
+    /// Same as `open`, but with auto-allocation of per-index storage
+    /// engines rooted at `index_data_dir`. On reopen, every index in
+    /// `__sys_indexes` is rebuilt against `<index_data_dir>/idx_<id>`
+    /// using its persisted `backend` choice.
+    pub fn open_persistent(engine: Arc<E>, index_data_dir: PathBuf) -> Result<Self> {
+        Self::open_inner(engine, Some(index_data_dir))
+    }
+
+    fn open_inner(engine: Arc<E>, index_data_dir: Option<PathBuf>) -> Result<Self> {
         if !is_initialized(&*engine)? {
             initialize_system_tables(&*engine)?;
         }
         let tables = load_system_tables(&*engine)?;
 
-        // Find the largest user table id so the counter starts past it on reopen.
         let max_user_id = tables
             .values()
             .filter(|s| !s.table_id.is_system())
@@ -72,12 +115,25 @@ impl<E: StorageEngine> Catalog<E> {
 
         let max_index_id = read_max_index_id(&*engine)?;
 
+        // P12.3: repopulate per-index engines if we have a data dir.
+        // Without a dir, tests will register manually.
+        let mut index_engines: HashMap<IndexId, Arc<dyn StorageEngine>> = HashMap::new();
+        if let Some(dir) = &index_data_dir {
+            std::fs::create_dir_all(dir)?;
+            for (id, def) in read_all_index_rows(&*engine)? {
+                let idx_engine = build_index_engine(def.backend, id, dir)?;
+                index_engines.insert(id, idx_engine);
+            }
+        }
+
         Ok(Self {
             engine,
             ddl_mutex: Mutex::new(()),
             tables: RwLock::new(tables),
             next_user_table_id: AtomicU32::new(max_user_id + 1),
             next_index_id: AtomicU32::new(max_index_id + 1),
+            index_engines: RwLock::new(index_engines),
+            index_data_dir,
         })
     }
 
@@ -174,8 +230,15 @@ impl<E: StorageEngine> Catalog<E> {
     }
 
     /// Register an index in the catalog. Returns its assigned `IndexId`.
-    /// Maintenance (writing index entries on insert/update/delete) lands
-    /// in Phase 12.
+    ///
+    /// If the catalog was opened with `open_persistent(dir)`, this also
+    /// allocates the per-index storage engine at `<dir>/idx_<id>` using
+    /// the backend named in `def.backend`, and registers the resulting
+    /// `Arc<dyn StorageEngine>` for future lookups.
+    ///
+    /// If the catalog was opened with `open()` (no dir), the metadata is
+    /// written to `__sys_indexes` but no engine is allocated — tests are
+    /// expected to call `register_index_engine` themselves.
     pub fn create_index(&self, def: IndexDef) -> Result<IndexId> {
         let _guard = self.ddl_mutex.lock();
 
@@ -188,6 +251,12 @@ impl<E: StorageEngine> Catalog<E> {
         let id = self.next_index_id.fetch_add(1, Ordering::SeqCst);
         let index_id = IndexId(id);
         crate::catalog::system_tables::write_index_row(&*self.engine, index_id, &def)?;
+
+        if let Some(dir) = &self.index_data_dir {
+            let idx_engine = build_index_engine(def.backend, index_id, dir)?;
+            self.index_engines.write().insert(index_id, idx_engine);
+        }
+
         Ok(index_id)
     }
 
@@ -200,9 +269,95 @@ impl<E: StorageEngine> Catalog<E> {
     pub fn engine(&self) -> &Arc<E> {
         &self.engine
     }
+
+    /// Register a freshly-allocated index's storage engine. P12.3 will call
+    /// this from `create_index` after the engine factory builds the chosen
+    /// backend.
+    pub fn register_index_engine(&self, id: IndexId, engine: Arc<dyn StorageEngine>) {
+        self.index_engines.write().insert(id, engine);
+    }
+
+    /// Storage engine handle for `id`, or `None` if the index isn't loaded.
+    /// Callers use the trait methods (`put`/`get`/`scan`); the concrete
+    /// backend is opaque — that's the whole point of per-index choice.
+    pub fn index_engine(&self, id: IndexId) -> Option<Arc<dyn StorageEngine>> {
+        self.index_engines.read().get(&id).cloned()
+    }
+
+    /// Build the list of `IndexHandle`s for `table_id`, ready to hand to
+    /// `Table::with_indexes`. Walks `__sys_indexes`, filters by table,
+    /// resolves each index's engine handle, and precomputes the
+    /// `(indexed_cols ++ pk_cols)` type list each handle needs for
+    /// secondary-key encoding.
+    pub fn indexes_for_table(
+        &self,
+        table_id: TableId,
+        table_schema: &Schema,
+    ) -> Result<Vec<crate::table::IndexHandle>> {
+        let rows = read_all_index_rows(&*self.engine)?;
+        let mut out = Vec::new();
+        let pk_types: Vec<crate::types::ColumnType> = table_schema
+            .primary_key
+            .iter()
+            .map(|&i| table_schema.columns[i].ty)
+            .collect();
+        for (id, def) in rows {
+            if def.table_id != table_id {
+                continue;
+            }
+            let engine = self.index_engines.read().get(&id).cloned().ok_or_else(|| {
+                Error::StorageCorrupted(format!(
+                    "index {:?} present in __sys_indexes but no engine registered",
+                    id
+                ))
+            })?;
+            let mut key_types: Vec<crate::types::ColumnType> = def
+                .columns
+                .iter()
+                .map(|&i| table_schema.columns[i].ty)
+                .collect();
+            key_types.extend(pk_types.iter().copied());
+            out.push(crate::table::IndexHandle {
+                id,
+                def,
+                engine,
+                key_types,
+            });
+        }
+        Ok(out)
+    }
 }
 
 // ---- internal helpers -----------------------------------------------------
+
+/// Build a fresh `StorageEngine` for an index. The choice of `backend`
+/// decides which concrete type. Each index gets its own subdirectory
+/// under `parent_dir` keyed by `IndexId` so files don't collide.
+fn build_index_engine(
+    backend: IndexBackend,
+    id: IndexId,
+    parent_dir: &Path,
+) -> Result<Arc<dyn StorageEngine>> {
+    match backend {
+        IndexBackend::BTree => {
+            // BTree uses a single file backed by a small BPM. Subdir
+            // structure: <parent_dir>/idx_<id>/btree.db.
+            let dir = parent_dir.join(format!("idx_{:08}", id.0));
+            std::fs::create_dir_all(&dir)?;
+            let dm = FileDiskManager::open_or_create(dir.join("btree.db"))?;
+            let bpm = BufferPoolManager::new(INDEX_BTREE_POOL_SIZE, dm);
+            let engine = BTreeEngine::new(bpm)?;
+            Ok(Arc::new(engine))
+        }
+        IndexBackend::Lsm => {
+            // LSM uses its own directory (manifest + SSTables live there).
+            let dir = parent_dir.join(format!("idx_{:08}", id.0));
+            std::fs::create_dir_all(&dir)?;
+            let engine = LsmEngine::new(&dir)?;
+            Ok(Arc::new(engine))
+        }
+    }
+}
 
 fn read_max_index_id<E: StorageEngine>(engine: &E) -> Result<u32> {
     let sys_indexes = sys_indexes_schema();
@@ -389,6 +544,7 @@ mod tests {
                 table_id,
                 columns: vec![1],
                 unique: false,
+                backend: crate::catalog::IndexBackend::BTree,
             })
             .unwrap();
         assert_eq!(id, IndexId(1));
@@ -406,6 +562,7 @@ mod tests {
                 table_id,
                 columns: vec![0],
                 unique: false,
+                backend: crate::catalog::IndexBackend::BTree,
             })
             .unwrap();
         let err = catalog
@@ -414,6 +571,7 @@ mod tests {
                 table_id,
                 columns: vec![1],
                 unique: false,
+                backend: crate::catalog::IndexBackend::BTree,
             })
             .unwrap_err();
         assert!(matches!(err, Error::IndexAlreadyExists { .. }));

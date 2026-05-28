@@ -126,6 +126,15 @@ pub enum Error {
     /// Index name lookup failed.
     IndexNotFound { name: String },
 
+    /// `IndexScan` received a key prefix with more components than the
+    /// index has indexed columns. `expected` is the index's column count;
+    /// `actual` is what the caller passed.
+    IndexLookupArity {
+        index: String,
+        expected: usize,
+        actual: usize,
+    },
+
     // =========================================================================
     // SQL Errors (Phase 11)
     // =========================================================================
@@ -226,6 +235,11 @@ impl fmt::Display for Error {
             Error::TableNotFound { name } => write!(f, "table '{}' not found", name),
             Error::IndexAlreadyExists { name } => write!(f, "index '{}' already exists", name),
             Error::IndexNotFound { name } => write!(f, "index '{}' not found", name),
+            Error::IndexLookupArity { index, expected, actual } => write!(
+                f,
+                "index '{}' lookup arity mismatch: index has {} indexed columns, got {} prefix components",
+                index, expected, actual
+            ),
             Error::SqlParse(msg) => write!(f, "SQL parse error: {}", msg),
         }
     }

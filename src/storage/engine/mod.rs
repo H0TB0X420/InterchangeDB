@@ -130,21 +130,39 @@ pub trait StorageEngine: Send + Sync {
     /// Takes `&self` — engines use interior mutability for thread safety.
     fn delete(&self, key: &[u8]) -> Result<()>;
 
-    /// Scan a range of keys.
-    ///
-    /// Returns an iterator over `(key, value)` pairs in sorted order.
-    /// The range bounds follow Rust's `RangeBounds` trait:
+    /// Scan a key range, taking concrete `Bound` values. Dyn-compatible
+    /// (no generics). Engines implement this; the ergonomic `scan` below
+    /// delegates here.
+    fn scan_range(
+        &self,
+        start: std::ops::Bound<Vec<u8>>,
+        end: std::ops::Bound<Vec<u8>>,
+    ) -> Box<dyn ScanIterator + '_>;
+
+    /// Ergonomic scan accepting any `RangeBounds<Vec<u8>>`:
     /// - `..` — all keys
     /// - `start..end` — keys in [start, end)
     /// - `start..=end` — keys in [start, end]
     /// - `start..` — keys >= start
     /// - `..end` — keys < end
     ///
+    /// Only available on concrete `StorageEngine` (not via `dyn`) — the
+    /// `Self: Sized` bound excludes this method from the vtable so the
+    /// trait itself stays dyn-compatible. Dyn callers use `scan_range`
+    /// directly with explicit bounds.
+    ///
     /// ## Lifetime
     ///
-    /// The returned iterator borrows from the engine. For `Box<dyn StorageEngine>`,
-    /// this means the iterator cannot outlive the boxed engine.
-    fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Box<dyn ScanIterator + '_>;
+    /// The returned iterator borrows from the engine. For
+    /// `Arc<dyn StorageEngine>`, the iterator cannot outlive the handle.
+    fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Box<dyn ScanIterator + '_>
+    where
+        Self: Sized,
+    {
+        let start = range.start_bound().cloned();
+        let end = range.end_bound().cloned();
+        self.scan_range(start, end)
+    }
 
     /// Get engine statistics.
     fn status(&self) -> StorageStatus;
@@ -160,9 +178,10 @@ pub trait StorageEngine: Send + Sync {
     /// Returns an iterator over all key-value pairs. Used when
     /// swapping engines at runtime to preserve data.
     ///
-    /// Default implementation scans all keys.
+    /// Default implementation scans all keys via `scan_range` (the
+    /// dyn-compatible primitive).
     fn export_data(&self) -> Box<dyn ScanIterator + '_> {
-        self.scan(..)
+        self.scan_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
     }
 
     /// Import data from another engine's export.

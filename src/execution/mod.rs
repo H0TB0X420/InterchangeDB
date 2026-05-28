@@ -23,7 +23,9 @@
 
 pub mod delete;
 pub mod filter;
+pub mod index_scan;
 pub mod insert;
+pub mod join;
 pub mod limit;
 pub mod pk_lookup;
 pub mod projection;
@@ -35,7 +37,9 @@ pub(crate) mod test_util;
 
 pub use delete::Delete;
 pub use filter::Filter;
+pub use index_scan::IndexScan;
 pub use insert::Insert;
+pub use join::{IndexNestedLoopJoin, JoinPredicate, JoinStrategy, NestedLoopJoin};
 pub use limit::Limit;
 pub use pk_lookup::PkLookup;
 pub use projection::Projection;
