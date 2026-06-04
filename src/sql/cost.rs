@@ -117,6 +117,12 @@ pub trait CostModel: Send + Sync {
     /// Hash join: build hash table from `build_rows`, probe with
     /// `probe_rows`. Build side traditionally the smaller relation.
     fn cost_hash_join(&self, build_rows: f64, probe_rows: f64) -> Cost;
+
+    /// Collapse a `Cost` to a single comparable scalar under this model's
+    /// own weighting; lower is better. Kept on the model (rather than
+    /// making callers hold a `CostWeights` and call `Cost::total`) so the
+    /// DP core can rank two plans knowing only `&dyn CostModel`.
+    fn scalar(&self, cost: Cost) -> f64;
 }
 
 /// Default cost model. Textbook formulas with fixed weights. Treats
@@ -240,6 +246,10 @@ impl CostModel for DefaultCostModel {
             io_units: 0.0,
             cpu_units: build_rows + probe_rows,
         }
+    }
+
+    fn scalar(&self, cost: Cost) -> f64 {
+        cost.total(&self.weights)
     }
 }
 
