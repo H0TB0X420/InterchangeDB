@@ -139,12 +139,32 @@ fn select_with_aggregate_matches() {
 }
 
 #[test]
-fn select_with_join_matches() {
+fn selinger_picks_hash_join_where_rule_based_picks_nested_loop() {
+    // P14.13a: the two planners legitimately diverge on join *algorithm*.
+    // The join is on `d_w_id`, which has no index, so the rule-based
+    // planner falls back to NestedLoopJoin; the Selinger planner costs the
+    // alternatives and picks HashJoin (linear vs quadratic). Same textual
+    // order, same column layout, same Projection — only the join operator
+    // differs. This is the contract P14.8 used to assert as "identical";
+    // it is now intentionally a divergence.
     let env = setup();
-    assert_match(
+    let (rule_tree, selinger_tree) = plans_match(
         &env,
         "SELECT w_id, d_id FROM warehouse JOIN district ON w_id = d_w_id",
     );
+    assert!(
+        rule_tree.contains("NestedLoopJoin"),
+        "rule-based should use NestedLoopJoin, got:\n{}",
+        rule_tree
+    );
+    assert!(
+        selinger_tree.contains("HashJoin"),
+        "Selinger should use HashJoin, got:\n{}",
+        selinger_tree
+    );
+    // Layout is unchanged: both wrap the join in the same Projection.
+    assert!(rule_tree.starts_with("Projection([0, 2])"));
+    assert!(selinger_tree.starts_with("Projection([0, 2])"));
 }
 
 #[test]

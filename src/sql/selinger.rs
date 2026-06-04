@@ -27,11 +27,12 @@
 
 use std::sync::Arc;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, TableId};
 use crate::common::Result;
 use crate::sql::cost::{CostModel, DefaultCostModel};
 use crate::sql::logical::LogicalPlan;
-use crate::sql::planner::{plan as plan_rule_based, PhysicalPlan, PlannerStrategy};
+use crate::sql::planner::{plan_inner, JoinSelection, PhysicalPlan, PlannerStrategy};
+use crate::sql::stats::{CatalogStatsProvider, QueryStats};
 use crate::storage::StorageEngine;
 
 /// Cost-based planner. Carries the `CostModel` and a `time_budget_ms`
@@ -66,19 +67,57 @@ impl<C: CostModel> PlannerStrategy for SelingerPlanner<C> {
         TblE: StorageEngine + 'static,
         CatE: StorageEngine,
     {
-        // Scaffolding: delegate. The dispatch site for cost-driven
-        // leaf-scan and join-algorithm choices lives here once
-        // table-relative predicates land. Until then, the rule-based
-        // planner's tree is also the cost-optimal tree under the
-        // identity ordering.
-        let _ = &self.cost_model;
+        // P14.13a: cost-based join-*algorithm* selection in textual order.
+        // Snapshot the query's stats once, then plan with a `CostBased`
+        // join selection. Join *reordering* (and the layout refactor it
+        // needs) is P14.12 / P14.13b; `time_budget_ms` starts mattering
+        // there, once the search space actually branches.
         let _ = self.time_budget_ms;
-        plan_rule_based(logical, engine, catalog)
+        let stats = gather_query_stats(&logical, catalog)?;
+        let selection = JoinSelection::CostBased { cost_model: &self.cost_model, stats: &stats };
+        plan_inner(logical, engine, catalog, &selection)
     }
 
     fn name(&self) -> &'static str {
         "selinger"
     }
+}
+
+/// Table names referenced by a query, for stats gathering: a `SELECT`'s
+/// base table plus every join's right table (`EXPLAIN` unwraps to its
+/// inner plan). Non-`SELECT` statements have no joins, so they need no
+/// snapshot and return empty.
+fn collect_select_tables(logical: &LogicalPlan) -> Vec<String> {
+    match logical {
+        LogicalPlan::Select { table, joins, .. } => {
+            let mut names = vec![table.clone()];
+            for j in joins {
+                names.push(j.right_table.clone());
+            }
+            names
+        }
+        LogicalPlan::Explain(inner) => collect_select_tables(inner),
+        _ => Vec::new(),
+    }
+}
+
+/// Snapshot stats for every table a query touches (all columns of each),
+/// through a `CatalogStatsProvider`. One pass; the cost-based join loop
+/// then reads the owned `QueryStats`.
+fn gather_query_stats<CatE: StorageEngine>(
+    logical: &LogicalPlan,
+    catalog: &Catalog<CatE>,
+) -> Result<QueryStats> {
+    let provider = CatalogStatsProvider::new(catalog);
+    let mut requests_owned: Vec<(TableId, Vec<u32>)> = Vec::new();
+    for name in collect_select_tables(logical) {
+        let schema = catalog.get_table(&name)?;
+        let column_count = schema.columns.len() as u32;
+        requests_owned.push((schema.table_id, (0..column_count).collect()));
+    }
+    let requests: Vec<(TableId, &[u32])> =
+        requests_owned.iter().map(|(t, c)| (*t, c.as_slice())).collect();
+    QueryStats::gather(&provider, &requests)
 }
 
 #[cfg(test)]

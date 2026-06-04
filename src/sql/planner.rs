@@ -21,14 +21,35 @@ use std::sync::Arc;
 use crate::catalog::{Catalog, ColumnDef};
 use crate::common::Result;
 use crate::execution::{
-    Delete, Executor, Filter, IndexNestedLoopJoin, IndexScan, Insert, Limit, NestedLoopJoin,
-    Projection, SeqScan, SetExpr, Update,
+    Delete, Executor, Filter, HashJoin, IndexNestedLoopJoin, IndexScan, Insert, Limit,
+    NestedLoopJoin, Projection, SeqScan, SetExpr, Update,
 };
 use crate::layout::RowLayout;
+use crate::sql::cost::{CostModel, DefaultCostModel};
 use crate::sql::expr::Predicate;
+use crate::sql::join_order::JoinAlgorithm;
 use crate::sql::logical::LogicalPlan;
+use crate::sql::selectivity::join_selectivity;
+use crate::sql::selinger::SelingerPlanner;
+use crate::sql::stats::QueryStats;
 use crate::storage::StorageEngine;
 use crate::table::Table;
+
+/// How a `SELECT`'s joins pick their algorithm. The difference between
+/// the rule-based and Selinger planners is *only* this choice — both
+/// build the same textual-order, same-layout tree (P14.13a).
+pub(crate) enum JoinSelection<'a> {
+    /// Phase 11 rule-based: `IndexNestedLoopJoin` when the inner side is
+    /// indexed on the join column, else `NestedLoopJoin`. Never `HashJoin`.
+    Heuristic,
+    /// P14.13a cost-based: the cheapest of NLJ / Hash / INLJ under the
+    /// model, with join order left textual (no layout change). `stats` is
+    /// the query's `QueryStats` snapshot.
+    CostBased {
+        cost_model: &'a dyn CostModel,
+        stats: &'a QueryStats,
+    },
+}
 
 /// Output of the planner: either an executable operator tree, a
 /// descriptor for a side-effect-only plan, or an EXPLAIN string.
@@ -98,6 +119,54 @@ impl PlannerStrategy for RuleBasedPlanner {
     }
 }
 
+/// Runtime-selectable planner held by a `Session` (P14.14).
+///
+/// Enum dispatch rather than `Box<dyn PlannerStrategy>` because
+/// `PlannerStrategy::plan` is generic over the engine types, so the trait
+/// isn't object-safe. The planner set is closed and known (rule-based,
+/// Selinger now; Volcano, Cascades later), so an enum is the right
+/// pragmatic swap. See plan.md P14.14 for the Option-C refactor (rework
+/// the trait to be object-safe) if an *open* set is ever needed.
+pub enum Planner {
+    RuleBased(RuleBasedPlanner),
+    Selinger(SelingerPlanner<DefaultCostModel>),
+}
+
+impl Default for Planner {
+    fn default() -> Self {
+        // Rule-based stays the default — Selinger is opt-in until the
+        // Phase 16 harness validates it (see the P14.13a watch item).
+        Planner::RuleBased(RuleBasedPlanner)
+    }
+}
+
+impl Planner {
+    /// Plan one statement with the selected strategy.
+    pub fn plan<TblE, CatE>(
+        &self,
+        logical: LogicalPlan,
+        engine: Arc<TblE>,
+        catalog: &Catalog<CatE>,
+    ) -> Result<PhysicalPlan>
+    where
+        TblE: StorageEngine + 'static,
+        CatE: StorageEngine,
+    {
+        match self {
+            Planner::RuleBased(p) => p.plan(logical, engine, catalog),
+            Planner::Selinger(p) => p.plan(logical, engine, catalog),
+        }
+    }
+
+    /// Identifier of the active strategy, for logging / introspection.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Planner::RuleBased(p) => p.name(),
+            Planner::Selinger(p) => p.name(),
+        }
+    }
+}
+
 /// Plan a single logical statement.
 ///
 /// `engine` is the storage handle DML operators read/write through —
@@ -114,6 +183,23 @@ where
     TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
+    plan_inner(logical, engine, catalog, &JoinSelection::Heuristic)
+}
+
+/// Plan with an explicit join-selection strategy. `plan()` is the
+/// rule-based entry (`Heuristic`); `SelingerPlanner` (P14.13a) calls this
+/// with `CostBased`. Only `SELECT` join lowering reads `selection`; every
+/// other arm is identical across planners.
+pub(crate) fn plan_inner<TblE, CatE>(
+    logical: LogicalPlan,
+    engine: Arc<TblE>,
+    catalog: &Catalog<CatE>,
+    selection: &JoinSelection,
+) -> Result<PhysicalPlan>
+where
+    TblE: StorageEngine + 'static,
+    CatE: StorageEngine,
+{
     match logical {
         LogicalPlan::CreateTable { name, columns, primary_key } => {
             Ok(PhysicalPlan::CreateTable { name, columns, primary_key })
@@ -123,12 +209,13 @@ where
         LogicalPlan::CommitTxn => Ok(PhysicalPlan::CommitTxn),
         LogicalPlan::AbortTxn => Ok(PhysicalPlan::AbortTxn),
         LogicalPlan::Explain(inner) => {
-            let inner_phys = plan(*inner, engine, catalog)?;
+            let inner_phys = plan_inner(*inner, engine, catalog, selection)?;
             Ok(PhysicalPlan::Explain(render_explain(&inner_phys)))
         }
         LogicalPlan::Select { table, joins, projection, aggregates, filter, order_by, limit } => {
             let exec = plan_select(
                 table, joins, projection, aggregates, filter, order_by, limit, engine, catalog,
+                selection,
             )?;
             Ok(PhysicalPlan::Executor(exec))
         }
@@ -157,12 +244,14 @@ fn plan_select<TblE, CatE>(
     limit: Option<usize>,
     engine: Arc<TblE>,
     catalog: &Catalog<CatE>,
+    selection: &JoinSelection,
 ) -> Result<Box<dyn Executor>>
 where
     TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
     let left_schema = catalog.get_table(&table_name)?;
+    let left_table_id = left_schema.table_id;
     let left_indexes =
         catalog.indexes_for_table(left_schema.table_id, &left_schema)?;
     let left_table = Arc::new(Table::with_indexes(
@@ -204,6 +293,16 @@ where
     // NestedLoopJoin with the compiled ON predicate (or trivially-true for
     // cross joins).
     let mut outer_offset = current.schema().columns.len();
+    // Running output-cardinality estimate — used only in cost mode to pick
+    // join algorithms. Seeded from the left table's base row count. NOTE
+    // (P14.13a): this ignores any narrowing from the left's index scan /
+    // local filter; an over-estimate of the outer only biases toward Hash,
+    // which is the safe direction. The exact figure arrives with the
+    // P14.12 table-relative refactor.
+    let mut outer_card: f64 = match selection {
+        JoinSelection::CostBased { stats, .. } => stats.row_count(left_table_id),
+        JoinSelection::Heuristic => 0.0,
+    };
     for join in joins {
         let right_schema = catalog.get_table(&join.right_table)?;
         let right_indexes =
@@ -214,40 +313,72 @@ where
             RowLayout,
             right_indexes.clone(),
         ));
+        let right_cols = right_schema.columns.len();
 
-        // Attempt INLJ lowering first.
-        let inlj_choice = join.on.as_ref().and_then(|pred| {
-            try_match_inlj(pred, outer_offset, &right_indexes)
-        });
-        let next: Box<dyn Executor> = if let Some((outer_col, handle)) = inlj_choice {
-            // INLJ consumes the ON predicate (no Filter needed).
-            Box::new(IndexNestedLoopJoin::new(
-                current,
-                right_table,
-                handle,
-                vec![outer_col],
-            )?)
-        } else {
-            // NLJ: compile the ON predicate (or fall back to constant-true
-            // for cross joins and implicit cross products).
-            let pred_fn: crate::execution::JoinPredicate = match join.on {
-                Some(p) => {
-                    let f = p.compile();
-                    Box::new(move |outer, inner| {
-                        // Compose a temporary joined tuple just for predicate
-                        // evaluation. The predicate's column indices are
-                        // tuple-global (set up by the binder).
-                        let mut combined = outer.clone();
-                        combined.extend_from_slice(inner);
-                        f(&combined)
-                    })
+        let next: Box<dyn Executor> = match selection {
+            // Phase 11 heuristic: INLJ when the inner is indexed, else NLJ.
+            JoinSelection::Heuristic => {
+                let inlj_choice = join
+                    .on
+                    .as_ref()
+                    .and_then(|pred| try_match_inlj(pred, outer_offset, &right_indexes));
+                if let Some((outer_col, handle)) = inlj_choice {
+                    Box::new(IndexNestedLoopJoin::new(current, right_table, handle, vec![outer_col])?)
+                } else {
+                    build_nested_loop_join(current, right_table, join.on)?
                 }
-                None => Box::new(|_, _| true),
-            };
-            let right_seq = Box::new(SeqScan::new(&*right_table)?);
-            Box::new(NestedLoopJoin::new(current, right_seq, pred_fn)?)
+            }
+            // P14.13a cost-based: cheapest of NLJ / Hash / INLJ, textual
+            // order preserved (so column layout is unchanged).
+            JoinSelection::CostBased { cost_model, stats } => {
+                let keys = join
+                    .on
+                    .as_ref()
+                    .and_then(|p| extract_equi_join_keys(p, outer_offset));
+                let inlj = join
+                    .on
+                    .as_ref()
+                    .and_then(|p| try_match_inlj(p, outer_offset, &right_indexes));
+                let inner_card = stats.row_count(right_schema.table_id);
+                // NOTE (P14.13a): the outer join key can't be mapped back to
+                // a (table, col) for its NDV until P14.12, so selectivity
+                // uses the inner key's NDV only. Adequate for algorithm
+                // choice (Hash-vs-NLJ is cardinality-driven).
+                let inner_ndv = keys
+                    .map(|(_, ic)| stats.ndv(right_schema.table_id, ic as u32))
+                    .unwrap_or(0);
+                let edge_sel = if keys.is_some() {
+                    join_selectivity(0, inner_ndv)
+                } else {
+                    1.0
+                };
+                let algorithm = choose_join_algorithm(
+                    *cost_model,
+                    outer_card,
+                    inner_card,
+                    edge_sel,
+                    keys.is_some(),
+                    inlj.is_some(),
+                );
+                outer_card = (outer_card * inner_card * edge_sel).max(1.0);
+                match algorithm {
+                    JoinAlgorithm::IndexNestedLoop => {
+                        let (outer_col, handle) = inlj.expect("INLJ chosen only when available");
+                        Box::new(IndexNestedLoopJoin::new(current, right_table, handle, vec![outer_col])?)
+                    }
+                    JoinAlgorithm::Hash => {
+                        let (outer_col, inner_col) =
+                            keys.expect("Hash chosen only when equi-keys exist");
+                        let right_seq = Box::new(SeqScan::new(&*right_table)?);
+                        Box::new(HashJoin::new(current, right_seq, outer_col, inner_col)?)
+                    }
+                    JoinAlgorithm::NestedLoop => {
+                        build_nested_loop_join(current, right_table, join.on)?
+                    }
+                }
+            }
         };
-        outer_offset += right_schema.columns.len();
+        outer_offset += right_cols;
         current = next;
     }
 
@@ -313,6 +444,93 @@ fn translate_aggregate_spec(
         AggregateSpec::Max(col) => AggregateFn::Max(col),
         AggregateSpec::Avg(col) => AggregateFn::Avg(col),
     }
+}
+
+/// Build a `NestedLoopJoin` of `outer` with a fresh scan of `right_table`,
+/// compiling the ON predicate (or constant-true for a cross product). The
+/// predicate's column indices are tuple-global over `outer || inner`,
+/// which holds because joins are lowered in textual order.
+fn build_nested_loop_join<TblE>(
+    outer: Box<dyn Executor>,
+    right_table: Arc<Table<TblE, RowLayout>>,
+    on: Option<Predicate>,
+) -> Result<Box<dyn Executor>>
+where
+    TblE: StorageEngine + 'static,
+{
+    let pred_fn: crate::execution::JoinPredicate = match on {
+        Some(p) => {
+            let f = p.compile();
+            Box::new(move |outer, inner| {
+                let mut combined = outer.clone();
+                combined.extend_from_slice(inner);
+                f(&combined)
+            })
+        }
+        None => Box::new(|_, _| true),
+    };
+    let right_seq = Box::new(SeqScan::new(&*right_table)?);
+    Ok(Box::new(NestedLoopJoin::new(outer, right_seq, pred_fn)?))
+}
+
+/// Extract `(outer_col_global, inner_col_local)` from an equi-join ON
+/// predicate `outer.col = inner.col`. Mirrors `try_match_inlj` but needs
+/// no index — it drives `HashJoin`. `None` for non-equi or composite
+/// predicates (those stay on `NestedLoopJoin`).
+fn extract_equi_join_keys(pred: &Predicate, outer_offset: usize) -> Option<(usize, usize)> {
+    let (l, r) = match pred {
+        Predicate::Compare {
+            op: crate::sql::expr::CompareOp::Eq,
+            left: crate::sql::expr::Expression::Column(l),
+            right: crate::sql::expr::Expression::Column(r),
+        } => (*l, *r),
+        _ => return None,
+    };
+    let (outer_col, inner_col_global) = if l < outer_offset && r >= outer_offset {
+        (l, r)
+    } else if r < outer_offset && l >= outer_offset {
+        (r, l)
+    } else {
+        return None;
+    };
+    Some((outer_col, inner_col_global - outer_offset))
+}
+
+/// Pick the cheapest join algorithm under `cost_model` for one
+/// textual-order join. `Hash` is considered only when equi-join keys
+/// exist; `IndexNestedLoop` only when the inner side is indexed on the
+/// join column. The caller builds the executor for the returned choice.
+fn choose_join_algorithm(
+    cost_model: &dyn CostModel,
+    outer_card: f64,
+    inner_card: f64,
+    edge_sel: f64,
+    hash_available: bool,
+    inlj_available: bool,
+) -> JoinAlgorithm {
+    let mut best_algorithm = JoinAlgorithm::NestedLoop;
+    let mut best_cost = cost_model.scalar(cost_model.cost_nested_loop_join(outer_card, inner_card));
+
+    if hash_available {
+        let (build, probe) = if outer_card <= inner_card {
+            (outer_card, inner_card)
+        } else {
+            (inner_card, outer_card)
+        };
+        let hash_cost = cost_model.scalar(cost_model.cost_hash_join(build, probe));
+        if hash_cost < best_cost {
+            best_cost = hash_cost;
+            best_algorithm = JoinAlgorithm::Hash;
+        }
+    }
+    if inlj_available {
+        let avg_matches = (inner_card * edge_sel).max(0.0);
+        let inlj_cost = cost_model.scalar(cost_model.cost_index_nested_loop_join(outer_card, avg_matches));
+        if inlj_cost < best_cost {
+            best_algorithm = JoinAlgorithm::IndexNestedLoop;
+        }
+    }
+    best_algorithm
 }
 
 /// Try to lower a join ON predicate into IndexNestedLoopJoin. Recognized
