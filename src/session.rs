@@ -39,7 +39,7 @@ use crate::execution::Tuple;
 use crate::sql::binder::Binder;
 use crate::sql::frontend::parse;
 use crate::sql::logical::LogicalPlan;
-use crate::sql::planner::{plan, PhysicalPlan};
+use crate::sql::planner::{PhysicalPlan, Planner};
 use crate::sql::workload_log::WorkloadLog;
 use crate::storage::StorageEngine;
 use crate::txn::{TxnId, TxnMode};
@@ -74,6 +74,7 @@ pub struct Session<E: StorageEngine + 'static> {
     binder: Binder<E>,
     current_txn: Option<TxnId>,
     log: Option<Arc<WorkloadLog>>,
+    planner: Planner,
 }
 
 impl<E: StorageEngine + 'static> Session<E> {
@@ -85,7 +86,21 @@ impl<E: StorageEngine + 'static> Session<E> {
             binder,
             current_txn: None,
             log: None,
+            planner: Planner::default(),
         }
+    }
+
+    /// Swap the planner strategy for subsequent statements. Defaults to
+    /// rule-based; the Phase 16/18 harness uses this to run the same
+    /// workload through each `PlannerStrategy`. (Future: a `SET planner`
+    /// pragma drives this.)
+    pub fn set_planner(&mut self, planner: Planner) {
+        self.planner = planner;
+    }
+
+    /// Name of the active planner strategy.
+    pub fn planner_name(&self) -> &'static str {
+        self.planner.name()
     }
 
     /// Attach a workload log. Each subsequent `execute` call appends one
@@ -199,7 +214,7 @@ impl<E: StorageEngine + 'static> Session<E> {
             }
         };
 
-        let physical = match plan(logical, engine_handle, &self.catalog) {
+        let physical = match self.planner.plan(logical, engine_handle, &self.catalog) {
             Ok(p) => p,
             Err(e) => {
                 if implicit {
