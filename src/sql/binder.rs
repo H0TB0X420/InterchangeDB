@@ -105,6 +105,18 @@ impl<E: StorageEngine> Binder<E> {
                 let inner = self.bind(*statement)?;
                 Ok(LogicalPlan::Explain(Box::new(inner)))
             }
+            Statement::Analyze { table_name, .. } => {
+                // We only care about the table name; partitions / for_columns
+                // / cache_metadata / noscan / compute_statistics options
+                // are silently accepted (Phase 14 always does full table-scan
+                // + all-columns analysis).
+                let name = object_name_to_string(&table_name);
+                // Validate the table exists at bind time so the SQL surface
+                // returns a clean error rather than dispatching an executor
+                // that immediately fails.
+                self.catalog.get_table(&name)?;
+                Ok(LogicalPlan::Analyze { table: name })
+            }
             other => Err(Error::SqlParse(format!(
                 "binder: unsupported statement: {}",
                 other

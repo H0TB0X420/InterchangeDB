@@ -42,7 +42,7 @@ pub use filter::Filter;
 pub use hash_aggregate::{AggregateFn, HashAggregate};
 pub use index_scan::IndexScan;
 pub use insert::Insert;
-pub use join::{IndexNestedLoopJoin, JoinPredicate, JoinStrategy, NestedLoopJoin};
+pub use join::{HashJoin, IndexNestedLoopJoin, JoinPredicate, JoinStrategy, NestedLoopJoin};
 pub use limit::Limit;
 pub use pk_lookup::PkLookup;
 pub use projection::Projection;

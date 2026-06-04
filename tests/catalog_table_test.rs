@@ -125,8 +125,15 @@ fn warehouse_row(id: i32, name: &str) -> Vec<Value> {
 fn scenario_bootstrap_empty_engine<E: StorageEngine + 'static>(engine: Arc<E>) {
     let catalog = Catalog::open(engine).unwrap();
     let names = catalog.list_tables();
-    assert_eq!(names.len(), 3, "fresh catalog should have 3 system tables");
-    for sys in ["__sys_tables", "__sys_columns", "__sys_indexes"] {
+    // P14.1 added __sys_table_stats and __sys_column_stats → 5 total.
+    assert_eq!(names.len(), 5, "fresh catalog should have 5 system tables");
+    for sys in [
+        "__sys_tables",
+        "__sys_columns",
+        "__sys_indexes",
+        "__sys_table_stats",
+        "__sys_column_stats",
+    ] {
         assert!(names.contains(&sys.to_string()), "missing {}", sys);
     }
 }

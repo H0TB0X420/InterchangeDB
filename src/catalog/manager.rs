@@ -284,6 +284,52 @@ impl<E: StorageEngine> Catalog<E> {
         self.index_engines.read().get(&id).cloned()
     }
 
+    // ---- P14.1: stats access ---------------------------------------------
+
+    /// Persist a table-level statistics row for `table_id`. Called by
+    /// `ANALYZE TABLE` (P14.2).
+    pub fn put_table_stats(
+        &self,
+        table_id: TableId,
+        stats: &crate::catalog::system_tables::TableStats,
+    ) -> Result<()> {
+        crate::catalog::system_tables::write_table_stats(&*self.engine, table_id, stats)
+    }
+
+    /// Persist a column-level statistics row for `(table_id, column_id)`.
+    pub fn put_column_stats(
+        &self,
+        table_id: TableId,
+        column_id: u32,
+        stats: &crate::catalog::system_tables::ColumnStats,
+    ) -> Result<()> {
+        crate::catalog::system_tables::write_column_stats(
+            &*self.engine,
+            table_id,
+            column_id,
+            stats,
+        )
+    }
+
+    /// Look up the table-level statistics row for `table_id`. `None` if
+    /// `ANALYZE` has never run for it. The planner (P14.7) treats
+    /// missing stats as "unknown" and falls back to magic-number defaults.
+    pub fn get_table_stats(
+        &self,
+        table_id: TableId,
+    ) -> Result<Option<crate::catalog::system_tables::TableStats>> {
+        crate::catalog::system_tables::read_table_stats(&*self.engine, table_id)
+    }
+
+    /// Look up the column-level statistics row for `(table_id, column_id)`.
+    pub fn get_column_stats(
+        &self,
+        table_id: TableId,
+        column_id: u32,
+    ) -> Result<Option<crate::catalog::system_tables::ColumnStats>> {
+        crate::catalog::system_tables::read_column_stats(&*self.engine, table_id, column_id)
+    }
+
     /// Build the list of `IndexHandle`s for `table_id`, ready to hand to
     /// `Table::with_indexes`. Walks `__sys_indexes`, filters by table,
     /// resolves each index's engine handle, and precomputes the
@@ -442,10 +488,14 @@ mod tests {
     fn open_initializes_fresh_engine() {
         let (catalog, _dir) = fresh_catalog();
         let names = catalog.list_tables();
-        assert_eq!(names.len(), 3);
+        // Five system tables after P14.1: tables, columns, indexes,
+        // table_stats, column_stats.
+        assert_eq!(names.len(), 5);
         assert!(names.contains(&"__sys_tables".to_string()));
         assert!(names.contains(&"__sys_columns".to_string()));
         assert!(names.contains(&"__sys_indexes".to_string()));
+        assert!(names.contains(&"__sys_table_stats".to_string()));
+        assert!(names.contains(&"__sys_column_stats".to_string()));
     }
 
     #[test]

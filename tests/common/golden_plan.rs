@@ -17,6 +17,7 @@ pub fn pretty_plan(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::Executor(exec) => exec.explain(0),
         PhysicalPlan::CreateTable { name, .. } => format!("CreateTable({})\n", name),
+        PhysicalPlan::Analyze { table } => format!("Analyze({})\n", table),
         PhysicalPlan::BeginTxn => "BeginTxn\n".to_string(),
         PhysicalPlan::CommitTxn => "CommitTxn\n".to_string(),
         PhysicalPlan::AbortTxn => "AbortTxn\n".to_string(),

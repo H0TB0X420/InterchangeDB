@@ -23,6 +23,13 @@ pub const SYS_TABLES_ID: TableId = TableId(0xFFFF_0001);
 pub const SYS_COLUMNS_ID: TableId = TableId(0xFFFF_0002);
 /// Hardcoded id of the `__sys_indexes` system table.
 pub const SYS_INDEXES_ID: TableId = TableId(0xFFFF_0003);
+/// Hardcoded id of the `__sys_table_stats` system table (P14.1).
+/// One row per user table, carrying its current row count.
+pub const SYS_TABLE_STATS_ID: TableId = TableId(0xFFFF_0004);
+/// Hardcoded id of the `__sys_column_stats` system table (P14.1).
+/// One row per (table_id, column_id), carrying per-column NDV +
+/// histogram blob.
+pub const SYS_COLUMN_STATS_ID: TableId = TableId(0xFFFF_0005);
 
 /// Identifier for a table — user or system. Persisted in `__sys_tables` and
 /// embedded as the prefix of every storage key for that table's rows.

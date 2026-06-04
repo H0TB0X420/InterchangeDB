@@ -28,7 +28,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::catalog::ids::{SYS_COLUMNS_ID, SYS_INDEXES_ID, SYS_TABLES_ID};
+use crate::catalog::ids::{
+    SYS_COLUMNS_ID, SYS_COLUMN_STATS_ID, SYS_INDEXES_ID, SYS_TABLES_ID, SYS_TABLE_STATS_ID,
+};
 use crate::catalog::{ColumnDef, Schema};
 use crate::common::{Error, Result};
 use crate::layout::{DataLayout, LayoutCtx, RowLayout};
@@ -163,12 +165,97 @@ pub fn sys_indexes_schema() -> Schema {
     }
 }
 
-/// All three system schemas, in initialization order.
-fn all_system_schemas() -> [Schema; 3] {
+/// Hardcoded schema for `__sys_table_stats` (P14.1). One row per user
+/// table. Populated by `ANALYZE TABLE` (P14.2) and consumed by the
+/// `SelingerPlanner` (P14.7) for cardinality estimates.
+pub fn sys_table_stats_schema() -> Schema {
+    Schema {
+        name: "__sys_table_stats".to_string(),
+        table_id: SYS_TABLE_STATS_ID,
+        columns: vec![
+            ColumnDef {
+                name: "table_id".to_string(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "row_count".to_string(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
+        ],
+        primary_key: vec![0],
+    }
+}
+
+/// Hardcoded schema for `__sys_column_stats` (P14.1). One row per
+/// (table_id, column_id). NDV = number of distinct values; histogram
+/// is a bincode-serialized blob whose decoded shape is the
+/// `CostModel`-side concern. Phase 14 uses equi-width int/decimal
+/// histograms; later phases may evolve the blob format — readers
+/// version-check via `histogram_kind`.
+pub fn sys_column_stats_schema() -> Schema {
+    Schema {
+        name: "__sys_column_stats".to_string(),
+        table_id: SYS_COLUMN_STATS_ID,
+        columns: vec![
+            ColumnDef {
+                name: "table_id".to_string(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "column_id".to_string(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "ndv".to_string(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "null_count".to_string(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "histogram_kind".to_string(),
+                // 0 = none, 1 = equi-width int. Discriminator so future
+                // histogram formats can coexist with stable on-disk reads.
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "histogram_blob".to_string(),
+                ty: ColumnType::Bytes(8192),
+                nullable: false,
+                default: None,
+            },
+        ],
+        // Composite PK: (table_id, column_id). Same encoding pattern as
+        // __sys_columns.
+        primary_key: vec![0, 1],
+    }
+}
+
+/// All five system schemas, in initialization order. Earlier schemas
+/// must be initialized first because each `create_table` step writes a
+/// row into `__sys_tables` + `__sys_columns`.
+fn all_system_schemas() -> [Schema; 5] {
     [
         sys_tables_schema(),
         sys_columns_schema(),
         sys_indexes_schema(),
+        sys_table_stats_schema(),
+        sys_column_stats_schema(),
     ]
 }
 
@@ -431,6 +518,163 @@ pub fn read_all_index_rows<E: StorageEngine>(
     Ok(out)
 }
 
+// ---- P14.1: stats read/write helpers --------------------------------------
+
+/// Table-level statistics. One row per user table in `__sys_table_stats`.
+/// Populated by `ANALYZE TABLE` (P14.2); consumed by the cost-based
+/// planner (P14.7) for cardinality estimates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableStats {
+    pub row_count: i64,
+}
+
+/// Column-level statistics. One row per (table_id, column_id) in
+/// `__sys_column_stats`. `histogram_kind` discriminates the on-disk
+/// blob format (currently: 0 = none, 1 = equi-width int). Newer kinds
+/// can be added without breaking older readers as long as the
+/// discriminator is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnStats {
+    pub ndv: i64,
+    pub null_count: i64,
+    pub histogram_kind: i32,
+    pub histogram_blob: Vec<u8>,
+}
+
+/// Stable discriminators for `ColumnStats::histogram_kind`. Don't
+/// renumber existing variants.
+pub const HISTOGRAM_KIND_NONE: i32 = 0;
+pub const HISTOGRAM_KIND_EQUI_WIDTH_INT: i32 = 1;
+
+/// Upsert a `__sys_table_stats` row.
+pub fn write_table_stats<E: StorageEngine>(
+    engine: &E,
+    table_id: crate::catalog::TableId,
+    stats: &TableStats,
+) -> Result<()> {
+    let schema = sys_table_stats_schema();
+    let column_types = schema.column_types();
+    let ctx = LayoutCtx {
+        column_types: &column_types,
+        table_id: SYS_TABLE_STATS_ID,
+    };
+    let pk = encode_int64_pk(table_id.0 as i64)?;
+    let values = vec![
+        Value::Int64(table_id.0 as i64),
+        Value::Int64(stats.row_count),
+    ];
+    RowLayout.put_row(engine, ctx, &pk, &values)
+}
+
+/// Read the `__sys_table_stats` row for `table_id`, or `None` if no
+/// ANALYZE has run for it yet.
+pub fn read_table_stats<E: StorageEngine>(
+    engine: &E,
+    table_id: crate::catalog::TableId,
+) -> Result<Option<TableStats>> {
+    let schema = sys_table_stats_schema();
+    let column_types = schema.column_types();
+    let ctx = LayoutCtx {
+        column_types: &column_types,
+        table_id: SYS_TABLE_STATS_ID,
+    };
+    let pk = encode_int64_pk(table_id.0 as i64)?;
+    let row = match RowLayout.get_row(engine, ctx, &pk)? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let row_count = match &row[1] {
+        Value::Int64(v) => *v,
+        _ => {
+            return Err(Error::StorageCorrupted(
+                "__sys_table_stats.row_count: expected Int64".into(),
+            ))
+        }
+    };
+    Ok(Some(TableStats { row_count }))
+}
+
+/// Upsert a `__sys_column_stats` row.
+pub fn write_column_stats<E: StorageEngine>(
+    engine: &E,
+    table_id: crate::catalog::TableId,
+    column_id: u32,
+    stats: &ColumnStats,
+) -> Result<()> {
+    let schema = sys_column_stats_schema();
+    let column_types = schema.column_types();
+    let ctx = LayoutCtx {
+        column_types: &column_types,
+        table_id: SYS_COLUMN_STATS_ID,
+    };
+    let pk = encode_int64_pair_pk(table_id.0 as i64, column_id as i64)?;
+    let values = vec![
+        Value::Int64(table_id.0 as i64),
+        Value::Int64(column_id as i64),
+        Value::Int64(stats.ndv),
+        Value::Int64(stats.null_count),
+        Value::Int32(stats.histogram_kind),
+        Value::Bytes(stats.histogram_blob.clone()),
+    ];
+    RowLayout.put_row(engine, ctx, &pk, &values)
+}
+
+/// Read the `__sys_column_stats` row for `(table_id, column_id)`, or
+/// `None` if no ANALYZE has populated it.
+pub fn read_column_stats<E: StorageEngine>(
+    engine: &E,
+    table_id: crate::catalog::TableId,
+    column_id: u32,
+) -> Result<Option<ColumnStats>> {
+    let schema = sys_column_stats_schema();
+    let column_types = schema.column_types();
+    let ctx = LayoutCtx {
+        column_types: &column_types,
+        table_id: SYS_COLUMN_STATS_ID,
+    };
+    let pk = encode_int64_pair_pk(table_id.0 as i64, column_id as i64)?;
+    let row = match RowLayout.get_row(engine, ctx, &pk)? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let ndv = match &row[2] {
+        Value::Int64(v) => *v,
+        _ => return Err(Error::StorageCorrupted("__sys_column_stats.ndv: expected Int64".into())),
+    };
+    let null_count = match &row[3] {
+        Value::Int64(v) => *v,
+        _ => {
+            return Err(Error::StorageCorrupted(
+                "__sys_column_stats.null_count: expected Int64".into(),
+            ))
+        }
+    };
+    let histogram_kind = match &row[4] {
+        Value::Int32(v) => *v,
+        _ => {
+            return Err(Error::StorageCorrupted(
+                "__sys_column_stats.histogram_kind: expected Int32".into(),
+            ))
+        }
+    };
+    let histogram_blob = match &row[5] {
+        Value::Bytes(b) => b.clone(),
+        _ => {
+            return Err(Error::StorageCorrupted(
+                "__sys_column_stats.histogram_blob: expected Bytes".into(),
+            ))
+        }
+    };
+    Ok(Some(ColumnStats {
+        ndv,
+        null_count,
+        histogram_kind,
+        histogram_blob,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+
 /// Insert / overwrite all `__sys_columns` rows describing `table`'s columns.
 fn write_sys_columns_rows<E: StorageEngine>(engine: &E, table: &Schema) -> Result<()> {
     let sys_columns = sys_columns_schema();
@@ -509,6 +753,31 @@ mod tests {
         assert_eq!(s.columns[5].name, "backend");
     }
 
+    #[test]
+    fn sys_table_stats_schema_shape() {
+        let s = sys_table_stats_schema();
+        assert_eq!(s.name, "__sys_table_stats");
+        assert_eq!(s.table_id, SYS_TABLE_STATS_ID);
+        assert_eq!(s.primary_key, vec![0]);
+        assert_eq!(s.columns.len(), 2);
+        assert_eq!(s.columns[0].name, "table_id");
+        assert_eq!(s.columns[1].name, "row_count");
+    }
+
+    #[test]
+    fn sys_column_stats_schema_shape() {
+        let s = sys_column_stats_schema();
+        assert_eq!(s.name, "__sys_column_stats");
+        assert_eq!(s.table_id, SYS_COLUMN_STATS_ID);
+        // Composite PK: (table_id, column_id).
+        assert_eq!(s.primary_key, vec![0, 1]);
+        assert_eq!(s.columns.len(), 6);
+        assert_eq!(s.columns[2].name, "ndv");
+        assert_eq!(s.columns[3].name, "null_count");
+        assert_eq!(s.columns[4].name, "histogram_kind");
+        assert_eq!(s.columns[5].name, "histogram_blob");
+    }
+
     /// Hardcoded schemas must each round-trip through their own
     /// `serialize_to_blob` / `deserialize_from_blob`. (Bincode shape
     /// invariant — if this breaks, init/load both break.)
@@ -538,8 +807,8 @@ mod tests {
 
     // ---- initialize -------------------------------------------------------
 
-    /// After init, `__sys_tables` contains exactly 3 rows (one per system
-    /// table). Verified via direct scan.
+    /// After init, `__sys_tables` contains one row per system table.
+    /// P14.1 added two stats tables → 5 system tables total.
     #[test]
     fn init_populates_three_sys_tables_rows() {
         let (engine, _dir) = fresh_engine();
@@ -555,7 +824,7 @@ mod tests {
             .scan_table(&engine, ctx)
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), all_system_schemas().len());
     }
 
     /// After init, `__sys_columns` contains rows totaling the sum of every
@@ -617,23 +886,31 @@ mod tests {
             .scan_table(&engine, ctx)
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), all_system_schemas().len());
     }
 
     // ---- load -------------------------------------------------------------
 
-    /// Init → load returns a HashMap with all three system schemas, keyed
-    /// by name, each Schema byte-equal to the hardcoded one.
+    /// Init → load returns a HashMap with all system schemas, keyed by
+    /// name, each Schema byte-equal to the hardcoded one.
     #[test]
     fn load_returns_three_system_schemas() {
         let (engine, _dir) = fresh_engine();
         initialize_system_tables(&engine).unwrap();
         let schemas = load_system_tables(&engine).unwrap();
 
-        assert_eq!(schemas.len(), 3);
+        assert_eq!(schemas.len(), all_system_schemas().len());
         assert_eq!(schemas.get("__sys_tables").unwrap().as_ref(), &sys_tables_schema());
         assert_eq!(schemas.get("__sys_columns").unwrap().as_ref(), &sys_columns_schema());
         assert_eq!(schemas.get("__sys_indexes").unwrap().as_ref(), &sys_indexes_schema());
+        assert_eq!(
+            schemas.get("__sys_table_stats").unwrap().as_ref(),
+            &sys_table_stats_schema()
+        );
+        assert_eq!(
+            schemas.get("__sys_column_stats").unwrap().as_ref(),
+            &sys_column_stats_schema()
+        );
     }
 
     /// User schemas inserted into __sys_tables (e.g., by Catalog::create_table
@@ -660,7 +937,8 @@ mod tests {
         write_sys_tables_row(&engine, &user_schema).unwrap();
 
         let schemas = load_system_tables(&engine).unwrap();
-        assert_eq!(schemas.len(), 4);
+        // 5 system schemas + 1 user schema = 6.
+        assert_eq!(schemas.len(), all_system_schemas().len() + 1);
         assert_eq!(schemas.get("users").unwrap().as_ref(), &user_schema);
     }
 

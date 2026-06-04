@@ -284,6 +284,132 @@ impl<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout> J
     }
 }
 
+// ===========================================================================
+// HashJoin (P14.5)
+// ===========================================================================
+
+/// Equi-join via hash table. The `inner` side is fully materialized into
+/// a `HashMap<Value, Vec<Tuple>>` keyed by the inner join column; the
+/// `outer` side is then iterated and each outer row probes the table
+/// once.
+///
+/// Cost shape: build is O(|inner|) memory + O(|inner|) CPU; probe is
+/// O(|outer|) lookups. Strictly linear in total — beats `NestedLoopJoin`
+/// (O(|outer| × |inner|)) past a few hundred rows per side, which is
+/// why the cost model (P14.3) ranks `HashJoin` cheaper at scale.
+///
+/// ## Limitations
+///
+/// - **Equi-join only.** The join condition must be `outer.col =
+///   inner.col`. Non-equi predicates (`<`, range) fall back to
+///   `NestedLoopJoin` and are not lowered here.
+/// - **Inner only.** No LEFT/RIGHT/FULL outer joins; matching the
+///   `NestedLoopJoin` story.
+/// - **NULL-skipping.** NULLs in either join column never match
+///   (standard SQL equi-join semantics). The `HashMap` uses `Value`'s
+///   own `Hash` (derived in P13.3) so other types hash deterministically.
+/// - **In-memory only.** Spill-to-disk for oversized inner sides is
+///   Phase 20. Phase 14's harness fits.
+pub struct HashJoin {
+    schema: Arc<Schema>,
+    outer: Box<dyn Executor>,
+    inner_table: std::collections::HashMap<crate::types::Value, Vec<crate::execution::Tuple>>,
+    outer_key_col: usize,
+    /// Cached current outer row + probe cursor through matched inner rows.
+    current_outer: Option<crate::execution::Tuple>,
+    matches_for_current: Vec<crate::execution::Tuple>,
+    match_cursor: usize,
+}
+
+impl HashJoin {
+    /// Construct. Drains `inner` immediately to build the hash table.
+    /// `outer_key_col` / `inner_key_col` are the column positions of
+    /// the join keys within each side's tuple.
+    pub fn new(
+        outer: Box<dyn Executor>,
+        mut inner: Box<dyn Executor>,
+        outer_key_col: usize,
+        inner_key_col: usize,
+    ) -> Result<Self> {
+        let schema = Arc::new(concat_schemas(outer.schema(), inner.schema()));
+        let mut inner_table: std::collections::HashMap<
+            crate::types::Value,
+            Vec<crate::execution::Tuple>,
+        > = std::collections::HashMap::new();
+        while let Some(row) = inner.next()? {
+            let key = row[inner_key_col].clone();
+            if matches!(key, crate::types::Value::Null) {
+                // SQL equi-join: NULL never matches.
+                continue;
+            }
+            inner_table.entry(key).or_insert_with(Vec::new).push(row);
+        }
+        Ok(Self {
+            schema,
+            outer,
+            inner_table,
+            outer_key_col,
+            current_outer: None,
+            matches_for_current: Vec::new(),
+            match_cursor: 0,
+        })
+    }
+}
+
+impl Executor for HashJoin {
+    fn next(&mut self) -> Result<Option<crate::execution::Tuple>> {
+        loop {
+            // Drain pending matches for the current outer row first.
+            if self.match_cursor < self.matches_for_current.len() {
+                let inner = &self.matches_for_current[self.match_cursor];
+                self.match_cursor += 1;
+                let outer = self.current_outer.as_ref().unwrap();
+                let mut joined = outer.clone();
+                joined.extend_from_slice(inner);
+                return Ok(Some(joined));
+            }
+            // Need a new outer row.
+            let row = match self.outer.next()? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            let key = &row[self.outer_key_col];
+            self.matches_for_current = if matches!(key, crate::types::Value::Null) {
+                Vec::new()
+            } else {
+                self.inner_table.get(key).cloned().unwrap_or_default()
+            };
+            self.match_cursor = 0;
+            self.current_outer = Some(row);
+        }
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn explain(&self, indent: usize) -> String {
+        let pad = "  ".repeat(indent);
+        let mut out = format!(
+            "{}HashJoin(outer_key={}, build_size={})\n",
+            pad, self.outer_key_col, self.inner_table.len()
+        );
+        out.push_str(&self.outer.explain(indent + 1));
+        out.push_str(&format!(
+            "{}<hash-table inner: {} key groups>\n",
+            "  ".repeat(indent + 1),
+            self.inner_table.len()
+        ));
+        out
+    }
+}
+
+impl JoinStrategy for HashJoin {
+    fn algorithm(&self) -> &'static str {
+        "hash"
+    }
+}
+
 /// Build the output schema for a join: outer columns then inner columns,
 /// with column names disambiguated by table-name prefix when both sides
 /// have a column of the same name.

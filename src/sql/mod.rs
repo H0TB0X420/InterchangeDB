@@ -11,15 +11,23 @@
 //! 17/18 (Cascades, as an interchangeable alternative).
 
 pub mod binder;
+pub mod cost;
 pub mod expr;
 pub mod frontend;
 pub mod logical;
 pub mod planner;
+pub mod selectivity;
+pub mod selinger;
 pub mod workload_log;
 
 pub use binder::Binder;
+pub use cost::{Cost, CostModel, CostWeights, DefaultCostModel};
+pub use selectivity::{
+    estimate_predicate_selectivity, EQ_FALLBACK, MIN_SELECTIVITY, RANGE_FALLBACK,
+};
 pub use expr::{BinaryOp, CompareOp, Expression, Predicate};
 pub use frontend::parse;
 pub use logical::LogicalPlan;
-pub use planner::{plan, PhysicalPlan};
+pub use planner::{plan, PhysicalPlan, PlannerStrategy, RuleBasedPlanner};
+pub use selinger::SelingerPlanner;
 pub use workload_log::WorkloadLog;

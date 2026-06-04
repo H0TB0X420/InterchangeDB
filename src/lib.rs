@@ -47,7 +47,7 @@
 //!
 //! # Quick Start
 //! ```no_run
-//! use interchangedb::storage::FileDiskManager;
+//! use interchangedb::storage::{DiskManager, FileDiskManager};
 //! use interchangedb::common::PageId;
 //!
 //! // Create a new database file

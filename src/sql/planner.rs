@@ -39,10 +39,63 @@ pub enum PhysicalPlan {
         columns: Vec<ColumnDef>,
         primary_key: Vec<usize>,
     },
+    /// `ANALYZE TABLE t` (P14.2). Side-effect-only — session handler
+    /// scans the table and persists stats; nothing runs through the
+    /// operator tree.
+    Analyze {
+        table: String,
+    },
     BeginTxn,
     CommitTxn,
     AbortTxn,
     Explain(String),
+}
+
+/// A strategy for turning a `LogicalPlan` into a `PhysicalPlan`.
+///
+/// V1 has one impl (`RuleBasedPlanner`); Selinger (P14.7) will add a
+/// second. The trait exists so the session — and tests — can swap
+/// planners without touching call sites. It is intentionally NOT
+/// dyn-compatible: each impl is picked at compile time at the session
+/// level, and the generic engine params would force erasure that buys
+/// nothing.
+pub trait PlannerStrategy {
+    /// Plan a single logical statement.
+    fn plan<TblE, CatE>(
+        &self,
+        logical: LogicalPlan,
+        engine: Arc<TblE>,
+        catalog: &Catalog<CatE>,
+    ) -> Result<PhysicalPlan>
+    where
+        TblE: StorageEngine + 'static,
+        CatE: StorageEngine;
+
+    /// Short identifier for logging / EXPLAIN headers.
+    fn name(&self) -> &'static str;
+}
+
+/// V1 planner: each LogicalPlan variant maps to one shape of executor
+/// tree. No cost model, no statistics. See module docs for tree shapes.
+pub struct RuleBasedPlanner;
+
+impl PlannerStrategy for RuleBasedPlanner {
+    fn plan<TblE, CatE>(
+        &self,
+        logical: LogicalPlan,
+        engine: Arc<TblE>,
+        catalog: &Catalog<CatE>,
+    ) -> Result<PhysicalPlan>
+    where
+        TblE: StorageEngine + 'static,
+        CatE: StorageEngine,
+    {
+        plan(logical, engine, catalog)
+    }
+
+    fn name(&self) -> &'static str {
+        "rule-based"
+    }
 }
 
 /// Plan a single logical statement.
@@ -65,6 +118,7 @@ where
         LogicalPlan::CreateTable { name, columns, primary_key } => {
             Ok(PhysicalPlan::CreateTable { name, columns, primary_key })
         }
+        LogicalPlan::Analyze { table } => Ok(PhysicalPlan::Analyze { table }),
         LogicalPlan::BeginTxn => Ok(PhysicalPlan::BeginTxn),
         LogicalPlan::CommitTxn => Ok(PhysicalPlan::CommitTxn),
         LogicalPlan::AbortTxn => Ok(PhysicalPlan::AbortTxn),
@@ -467,6 +521,7 @@ fn render_explain(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::Executor(exec) => exec.explain(0),
         PhysicalPlan::CreateTable { name, .. } => format!("CreateTable({})\n", name),
+        PhysicalPlan::Analyze { table } => format!("Analyze({})\n", table),
         PhysicalPlan::BeginTxn => "BeginTxn\n".to_string(),
         PhysicalPlan::CommitTxn => "CommitTxn\n".to_string(),
         PhysicalPlan::AbortTxn => "AbortTxn\n".to_string(),
@@ -726,6 +781,29 @@ Limit(3)
     }
 
     // ---- Error paths ----
+
+    // ---- PlannerStrategy ----
+
+    #[test]
+    fn rule_based_planner_strategy_matches_free_function() {
+        let env = setup();
+        create_warehouse(&env);
+        let stmts = parse("SELECT w_id FROM warehouse WHERE w_id = 1 LIMIT 3").unwrap();
+        let logical_a = env.binder.bind(stmts.clone().into_iter().next().unwrap()).unwrap();
+        let logical_b = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
+
+        let free = plan(logical_a, env.engine.clone(), &env.catalog).unwrap();
+        let via_strategy = RuleBasedPlanner
+            .plan(logical_b, env.engine.clone(), &env.catalog)
+            .unwrap();
+
+        let (free_tree, strat_tree) = match (free, via_strategy) {
+            (PhysicalPlan::Executor(a), PhysicalPlan::Executor(b)) => (a.explain(0), b.explain(0)),
+            _ => panic!("expected two executor trees"),
+        };
+        assert_eq!(free_tree, strat_tree);
+        assert_eq!(RuleBasedPlanner.name(), "rule-based");
+    }
 
     #[test]
     fn plan_on_unknown_table_errors() {

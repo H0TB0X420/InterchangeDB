@@ -82,6 +82,12 @@ pub enum LogicalPlan {
     /// `DELETE FROM table [WHERE filter]`.
     Delete { table: String, filter: Option<Predicate> },
 
+    // --- Catalog admin ----------------------------------------------------
+    /// `ANALYZE TABLE t` (P14.2) — scan `t` once, compute row count
+    /// + per-column NDV + per-column equi-width histogram, persist into
+    /// `__sys_table_stats` and `__sys_column_stats`.
+    Analyze { table: String },
+
     // --- Transaction control ----------------------------------------------
     BeginTxn,
     CommitTxn,
