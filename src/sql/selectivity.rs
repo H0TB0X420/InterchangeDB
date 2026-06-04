@@ -36,6 +36,11 @@ pub const EQ_FALLBACK: f64 = 0.1;
 /// is available. Matches PostgreSQL's `DEFAULT_INEQ_SEL`.
 pub const RANGE_FALLBACK: f64 = 1.0 / 3.0;
 
+/// Fallback equi-join selectivity when neither side has a usable NDV.
+/// Same value as `EQ_FALLBACK` — an unknown join column is treated like
+/// an unknown equality column, matching PostgreSQL's default.
+pub const JOIN_FALLBACK: f64 = EQ_FALLBACK;
+
 /// Minimum selectivity. Prevents zero-row estimates that would let
 /// degenerate plans look infinitely cheap.
 pub const MIN_SELECTIVITY: f64 = 1e-9;
@@ -65,6 +70,31 @@ pub fn estimate_predicate_selectivity(
             let s = estimate_predicate_selectivity(inner, column_stats);
             1.0 - s
         }
+    };
+    raw.clamp(MIN_SELECTIVITY, 1.0)
+}
+
+/// Selinger-style equi-join selectivity for `left.a = right.b`:
+/// `1 / max(ndv_a, ndv_b)`. This is the System R containment estimate —
+/// the smaller-NDV column's values are assumed to be a subset of the
+/// larger's, so the join's output cardinality is `|R| * |S| / max_ndv`.
+/// Multiply this selectivity by `|R| * |S|` to get that cardinality.
+///
+/// An NDV `<= 0` means "unknown / unanalyzed" for that side. `max` makes
+/// any positive NDV win over an unknown, so with one side known we use
+/// it; only when *neither* side is known do we fall back to
+/// `JOIN_FALLBACK`. Result is clamped to `[MIN_SELECTIVITY, 1.0]`.
+///
+/// NOTE (P14.10): NDV is taken from base-column stats and is NOT
+/// propagated through prior joins — matching System R's original
+/// simplification. A multi-join estimate therefore reuses base NDVs at
+/// every level; revisiting this is a Phase 16 tuning item.
+pub fn join_selectivity(ndv_left: i64, ndv_right: i64) -> f64 {
+    let max_ndv = ndv_left.max(ndv_right);
+    let raw = if max_ndv > 0 {
+        1.0 / max_ndv as f64
+    } else {
+        JOIN_FALLBACK
     };
     raw.clamp(MIN_SELECTIVITY, 1.0)
 }
@@ -371,5 +401,39 @@ mod tests {
         let p = cmp_pred(CompareOp::Gte, 0, Value::Int32(1));
         let s = estimate_predicate_selectivity(&p, &stats);
         assert!(s <= 1.0 && s > 0.0);
+    }
+
+    // ---- join_selectivity (P14.10) ----
+
+    #[test]
+    fn join_selectivity_is_inverse_of_larger_ndv() {
+        // max(100, 5) = 100 → 1/100. Containment: each row of the
+        // 100-NDV side matches 1/100 of the other.
+        let s = join_selectivity(100, 5);
+        assert!((s - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn join_selectivity_is_symmetric() {
+        assert!((join_selectivity(7, 42) - join_selectivity(42, 7)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn join_selectivity_uses_known_side_when_other_unknown() {
+        // ndv <= 0 means unknown; the positive side wins via max().
+        assert!((join_selectivity(0, 50) - 1.0 / 50.0).abs() < 1e-9);
+        assert!((join_selectivity(50, -1) - 1.0 / 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn join_selectivity_falls_back_when_both_unknown() {
+        assert!((join_selectivity(0, 0) - JOIN_FALLBACK).abs() < 1e-9);
+        assert!((join_selectivity(-3, -1) - JOIN_FALLBACK).abs() < 1e-9);
+    }
+
+    #[test]
+    fn join_selectivity_ndv_one_is_full_pass() {
+        // A constant column (NDV 1) on both sides → every row matches.
+        assert!((join_selectivity(1, 1) - 1.0).abs() < 1e-9);
     }
 }
