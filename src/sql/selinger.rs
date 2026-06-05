@@ -1,44 +1,51 @@
-//! P14.7: Selinger-style cost-based planner (scaffolding).
+//! Selinger-style cost-based planner.
 //!
-//! This file establishes the `SelingerPlanner` struct as a second
-//! `PlannerStrategy` impl. The strategy carries the two knobs a real
-//! Selinger optimizer needs — a `CostModel` and a `time_budget_ms` —
-//! so callers and tests can wire interchangeability today.
+//! `SelingerPlanner` is the second `PlannerStrategy` impl. It carries a
+//! `CostModel` and a `time_budget_ms`, and optimizes two axes:
 //!
-//! ## What this version does NOT do
+//!   - **Join order** (P14.13b): build the join graph from a `SELECT`,
+//!     run the `enumerate_join_orders` DP, and if it finds a *strictly
+//!     cheaper* left-deep order, rewrite the `LogicalPlan` into that
+//!     order — reordering tables and remapping every column reference via
+//!     `ColumnRemap`. The rewritten plan then flows through the *same*
+//!     textual lowering path the rule-based planner uses, so there is no
+//!     parallel executor-lowering to keep correct.
+//!   - **Join algorithm** (P14.13a): the textual lowering then picks the
+//!     cheapest of NLJ / Hash / INLJ per join under the cost model.
 //!
-//! Real Selinger DP enumerates subsets of base tables and considers
-//! every join order. We can't safely reorder joins yet: predicates
-//! carry tuple-global column indices (assigned by the binder against
-//! the left-to-right scan order), so a permuted join would invalidate
-//! every index in every predicate. The follow-up that introduces
-//! table-relative predicates will unlock real enumeration; until
-//! then, this planner produces the same tree the rule-based planner
-//! does, and the `PlannerStrategy` boundary is what's exercised.
+//! ## Why reorder the logical plan, not the executor tree
 //!
-//! ## Why ship the scaffold now
+//! Rewriting `LogicalPlan → LogicalPlan` (reorder + `ColumnRemap`) lets
+//! the existing, tested `plan_inner` lowering do all the executor
+//! construction. The reorder is gated on *strictly cheaper than textual*
+//! (`cost_of_order`), so tie-breaks — e.g. unanalyzed tables, all at the
+//! default row count — never reorder, and the rule-based / TPC-C path is
+//! untouched.
 //!
-//! It locks the *interchangeability promise* end-to-end: the session
-//! can choose `RuleBasedPlanner` or `SelingerPlanner` at compile
-//! time, and the planner-comparison tests (P14.8) pin both impls to
-//! the same plan output. When the real DP work lands, divergences
-//! show up as test diffs at the operator-tree level — exactly the
-//! signal we want.
+//! ## When reordering is skipped (falls back to textual order)
+//!
+//! Non-`SELECT` statements; queries with no joins; any join whose `ON` is
+//! not a single `col = col` equi-join (composite / non-equi / cross →
+//! can't be a clean graph edge); and orders the DP doesn't find cheaper.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::catalog::{Catalog, TableId};
 use crate::common::Result;
+use crate::sql::column_map::ColumnRemap;
 use crate::sql::cost::{CostModel, DefaultCostModel};
-use crate::sql::logical::LogicalPlan;
+use crate::sql::expr::{CompareOp, Expression, Predicate};
+use crate::sql::join_order::{
+    cost_of_order, enumerate_join_orders, JoinEdge, JoinOrder, JoinRelation, RelId,
+};
+use crate::sql::logical::{AggregateSpec, JoinClause, LogicalPlan, OrderDir};
 use crate::sql::planner::{plan_inner, JoinSelection, PhysicalPlan, PlannerStrategy};
 use crate::sql::stats::{CatalogStatsProvider, QueryStats};
 use crate::storage::StorageEngine;
 
-/// Cost-based planner. Carries the `CostModel` and a `time_budget_ms`
-/// budget; in scaffolding mode the search space has no branching, so
-/// the budget is never consumed. The knob exists so the contract
-/// future DP enumeration must respect is visible today.
+/// Cost-based planner. `cost_model` ranks plans; `time_budget_ms` bounds
+/// the join-order DP search (it bails to a greedy order when exceeded).
 pub struct SelingerPlanner<C: CostModel = DefaultCostModel> {
     pub cost_model: C,
     pub time_budget_ms: u64,
@@ -67,13 +74,11 @@ impl<C: CostModel> PlannerStrategy for SelingerPlanner<C> {
         TblE: StorageEngine + 'static,
         CatE: StorageEngine,
     {
-        // P14.13a: cost-based join-*algorithm* selection in textual order.
-        // Snapshot the query's stats once, then plan with a `CostBased`
-        // join selection. Join *reordering* (and the layout refactor it
-        // needs) is P14.12 / P14.13b; `time_budget_ms` starts mattering
-        // there, once the search space actually branches.
-        let _ = self.time_budget_ms;
+        // Snapshot stats once, then (P14.13b) optionally rewrite the plan
+        // into a strictly-cheaper join order, then (P14.13a) lower it,
+        // picking each join's algorithm by cost.
         let stats = gather_query_stats(&logical, catalog)?;
+        let logical = maybe_reorder(logical, catalog, &stats, &self.cost_model, self.time_budget_ms)?;
         let selection = JoinSelection::CostBased { cost_model: &self.cost_model, stats: &stats };
         plan_inner(logical, engine, catalog, &selection)
     }
@@ -118,6 +123,267 @@ fn gather_query_stats<CatE: StorageEngine>(
     let requests: Vec<(TableId, &[u32])> =
         requests_owned.iter().map(|(t, c)| (*t, c.as_slice())).collect();
     QueryStats::gather(&provider, &requests)
+}
+
+// ===========================================================================
+// P14.13b — join reordering as a LogicalPlan → LogicalPlan rewrite.
+// ===========================================================================
+
+/// The join graph extracted from a `SELECT`, plus the per-table metadata
+/// the rewrite needs. Tables are indexed by `RelId` in textual order
+/// (rel 0 = `FROM` table, rel i = `joins[i-1]`'s right table).
+struct JoinGraph {
+    relations: Vec<JoinRelation>,
+    edges: Vec<JoinEdge>,
+    /// Column count per table, textual order.
+    widths: Vec<usize>,
+    /// Tuple-global offset of each table's first column, textual order.
+    textual_base: Vec<usize>,
+    names: Vec<String>,
+    aliases: Vec<Option<String>>,
+}
+
+/// If `logical` is a join `SELECT` (or `EXPLAIN` of one) whose DP-optimal
+/// left-deep order is strictly cheaper than the textual order, return it
+/// rewritten into that order (tables reordered, all column references
+/// remapped). Otherwise return it unchanged — the textual lowering path
+/// then handles algorithm selection.
+fn maybe_reorder<CatE: StorageEngine>(
+    logical: LogicalPlan,
+    catalog: &Catalog<CatE>,
+    stats: &QueryStats,
+    cost_model: &dyn CostModel,
+    time_budget_ms: u64,
+) -> Result<LogicalPlan> {
+    match logical {
+        LogicalPlan::Explain(inner) => {
+            let reordered = maybe_reorder(*inner, catalog, stats, cost_model, time_budget_ms)?;
+            Ok(LogicalPlan::Explain(Box::new(reordered)))
+        }
+        LogicalPlan::Select { table, joins, projection, aggregates, filter, order_by, limit } => {
+            // No joins, or an `ON` we can't model as a clean equi-join
+            // graph → leave textual order for P14.13a to lower.
+            let graph = if joins.is_empty() {
+                None
+            } else {
+                build_join_graph(&table, &joins, catalog)?
+            };
+            let Some(graph) = graph else {
+                return Ok(LogicalPlan::Select {
+                    table, joins, projection, aggregates, filter, order_by, limit,
+                });
+            };
+
+            let budget = Some(Duration::from_millis(time_budget_ms));
+            let best = enumerate_join_orders(&graph.relations, &graph.edges, stats, cost_model, budget);
+            let textual: Vec<RelId> = (0..graph.relations.len()).collect();
+            let textual_cost = cost_of_order(&textual, &graph.relations, &graph.edges, stats, cost_model);
+
+            // Reorder only when the DP found a *strictly* cheaper order;
+            // ties (e.g. unanalyzed, all-equal tables) keep textual order.
+            let cheaper = match textual_cost {
+                Some(tc) => cost_model.scalar(best.cost) < cost_model.scalar(tc),
+                None => true,
+            };
+            if !cheaper {
+                return Ok(LogicalPlan::Select {
+                    table, joins, projection, aggregates, filter, order_by, limit,
+                });
+            }
+            Ok(rewrite_select(&graph, &best.order, projection, aggregates, filter, order_by, limit))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Extract the equi-join graph from a `SELECT`'s tables and `ON` clauses.
+/// Returns `None` (→ keep textual order) if any `ON` is missing or is not
+/// a single `Column = Column` equi-join, or references columns out of an
+/// expected (left-deep) ordering.
+fn build_join_graph<CatE: StorageEngine>(
+    table: &str,
+    joins: &[JoinClause],
+    catalog: &Catalog<CatE>,
+) -> Result<Option<JoinGraph>> {
+    let mut names = vec![table.to_string()];
+    let mut aliases: Vec<Option<String>> = vec![None];
+    for j in joins {
+        names.push(j.right_table.clone());
+        aliases.push(j.right_alias.clone());
+    }
+    let table_count = names.len();
+
+    let mut widths = Vec::with_capacity(table_count);
+    let mut relations = Vec::with_capacity(table_count);
+    let mut indexes_per_rel = Vec::with_capacity(table_count);
+    for name in &names {
+        let schema = catalog.get_table(name)?;
+        widths.push(schema.columns.len());
+        let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
+        relations.push(JoinRelation { table_id: schema.table_id, local_selectivity: 1.0 });
+        indexes_per_rel.push(indexes);
+    }
+    let mut textual_base = vec![0usize; table_count];
+    for t in 1..table_count {
+        textual_base[t] = textual_base[t - 1] + widths[t - 1];
+    }
+
+    let mut edges = Vec::with_capacity(joins.len());
+    for (i, join) in joins.iter().enumerate() {
+        let added = i + 1; // rel index of this join's right table
+        let (ga, gb) = match &join.on {
+            Some(Predicate::Compare {
+                op: CompareOp::Eq,
+                left: Expression::Column(a),
+                right: Expression::Column(b),
+            }) => (*a, *b),
+            _ => return Ok(None), // cross / non-equi / composite → bail
+        };
+        let (rel_a, loc_a) = match decompose(ga, &textual_base, &widths) {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let (rel_b, loc_b) = match decompose(gb, &textual_base, &widths) {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        // One side must be the table this join adds; the other earlier.
+        let (early_rel, early_loc, added_loc) = if rel_a == added && rel_b < added {
+            (rel_b, loc_b, loc_a)
+        } else if rel_b == added && rel_a < added {
+            (rel_a, loc_a, loc_b)
+        } else {
+            return Ok(None);
+        };
+        edges.push(JoinEdge {
+            left: early_rel,
+            right: added,
+            left_col: early_loc as u32,
+            right_col: added_loc as u32,
+            left_col_indexed: has_single_col_index(&indexes_per_rel[early_rel], early_loc),
+            right_col_indexed: has_single_col_index(&indexes_per_rel[added], added_loc),
+        });
+    }
+
+    Ok(Some(JoinGraph { relations, edges, widths, textual_base, names, aliases }))
+}
+
+/// True when some index on the table covers exactly `[column]`.
+fn has_single_col_index(indexes: &[crate::table::IndexHandle], column: usize) -> bool {
+    indexes.iter().any(|ix| ix.def.columns == [column])
+}
+
+/// Find the `(rel, local)` a tuple-global index belongs to in textual
+/// layout. `None` if out of range (treated as "can't reorder").
+fn decompose(global: usize, textual_base: &[usize], widths: &[usize]) -> Option<(usize, usize)> {
+    for r in 0..widths.len() {
+        if global >= textual_base[r] && global < textual_base[r] + widths[r] {
+            return Some((r, global - textual_base[r]));
+        }
+    }
+    None
+}
+
+/// Flatten a left-deep `JoinOrder` into its first (leftmost) relation and
+/// the sequence of `(added_rel, connecting_edge_indices)` steps. Iterative
+/// — depth is bounded by table count (≤ `MAX_RELATIONS`).
+fn flatten_join_order(order: &JoinOrder) -> (RelId, Vec<(RelId, Vec<usize>)>) {
+    let mut steps: Vec<(RelId, Vec<usize>)> = Vec::new();
+    let mut node = order;
+    loop {
+        match node {
+            JoinOrder::Join { left, right, edges, .. } => {
+                steps.push((*right, edges.clone()));
+                node = left;
+            }
+            JoinOrder::Scan { rel } => {
+                steps.reverse();
+                return (*rel, steps);
+            }
+        }
+    }
+}
+
+/// Rewrite a `SELECT` into the chosen physical order: reorder the tables,
+/// rebuild each join's `ON` from the connecting edges, and remap every
+/// column reference (predicates, projection, order-by, aggregates) to the
+/// physical layout. The result lowers through the normal textual path; its
+/// `Projection` selects columns in the original SELECT order, so output
+/// column order is preserved.
+fn rewrite_select(
+    graph: &JoinGraph,
+    order: &JoinOrder,
+    projection: Vec<usize>,
+    aggregates: Vec<AggregateSpec>,
+    filter: Option<Predicate>,
+    order_by: Vec<(usize, OrderDir)>,
+    limit: Option<usize>,
+) -> LogicalPlan {
+    let (first_rel, steps) = flatten_join_order(order);
+
+    let mut physical_order = Vec::with_capacity(steps.len() + 1);
+    physical_order.push(first_rel);
+    for (rel, _) in &steps {
+        physical_order.push(*rel);
+    }
+    let remap = ColumnRemap::new(&graph.widths, &physical_order);
+
+    let mut new_joins = Vec::with_capacity(steps.len());
+    for (rel, edge_idxs) in &steps {
+        let on = build_on_predicate(edge_idxs, &graph.edges, &graph.textual_base, &remap);
+        new_joins.push(JoinClause {
+            right_table: graph.names[*rel].clone(),
+            right_alias: graph.aliases[*rel].clone(),
+            on: Some(on),
+        });
+    }
+
+    LogicalPlan::Select {
+        table: graph.names[first_rel].clone(),
+        joins: new_joins,
+        projection: projection.into_iter().map(|c| remap.apply_index(c)).collect(),
+        aggregates: aggregates.into_iter().map(|a| remap_aggregate(a, &remap)).collect(),
+        filter: filter.map(|f| remap.apply_predicate(f)),
+        order_by: order_by.into_iter().map(|(c, d)| (remap.apply_index(c), d)).collect(),
+        limit,
+    }
+}
+
+/// Rebuild a join's `ON` predicate from its connecting edges, remapped to
+/// the physical layout. Single edge → one `col = col`; multiple → their
+/// conjunction.
+fn build_on_predicate(
+    edge_idxs: &[usize],
+    edges: &[JoinEdge],
+    textual_base: &[usize],
+    remap: &ColumnRemap,
+) -> Predicate {
+    let mut compares = edge_idxs.iter().map(|&ei| {
+        let e = &edges[ei];
+        let ga = textual_base[e.left] + e.left_col as usize;
+        let gb = textual_base[e.right] + e.right_col as usize;
+        Predicate::Compare {
+            op: CompareOp::Eq,
+            left: Expression::Column(remap.apply_index(ga)),
+            right: Expression::Column(remap.apply_index(gb)),
+        }
+    });
+    let first = compares.next().expect("a join step has at least one connecting edge");
+    compares.fold(first, |acc, c| Predicate::And(Box::new(acc), Box::new(c)))
+}
+
+/// Remap the column an aggregate reads (no-op for `COUNT(*)`).
+fn remap_aggregate(spec: AggregateSpec, remap: &ColumnRemap) -> AggregateSpec {
+    match spec {
+        AggregateSpec::CountStar => AggregateSpec::CountStar,
+        AggregateSpec::Count { col, distinct } => {
+            AggregateSpec::Count { col: remap.apply_index(col), distinct }
+        }
+        AggregateSpec::Sum(c) => AggregateSpec::Sum(remap.apply_index(c)),
+        AggregateSpec::Min(c) => AggregateSpec::Min(remap.apply_index(c)),
+        AggregateSpec::Max(c) => AggregateSpec::Max(remap.apply_index(c)),
+        AggregateSpec::Avg(c) => AggregateSpec::Avg(remap.apply_index(c)),
+    }
 }
 
 #[cfg(test)]

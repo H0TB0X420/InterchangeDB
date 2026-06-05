@@ -213,6 +213,35 @@ pub fn enumerate_join_orders(
     }
 }
 
+/// Cost of one *specific* left-deep order (typically the textual order),
+/// for deciding whether the DP's best is an actual improvement. Returns
+/// `None` if `order` is not a connected left-deep sequence. Because the DP
+/// minimizes over all orders, `enumerate_join_orders(...).cost <=
+/// cost_of_order(textual, ...)`, so a strict `<` means a genuinely cheaper
+/// reordering exists (ties — e.g. unanalyzed, all-equal tables — do not).
+pub fn cost_of_order(
+    order: &[RelId],
+    relations: &[JoinRelation],
+    edges: &[JoinEdge],
+    stats: &QueryStats,
+    cost_model: &dyn CostModel,
+) -> Option<Cost> {
+    if order.is_empty() {
+        return None;
+    }
+    let mut plan = sub_leaf(order[0], relations, stats, cost_model);
+    let mut joined: RelSet = 1u32 << order[0];
+    for &r in &order[1..] {
+        let connecting = connecting_edges(edges, r, joined);
+        if connecting.is_empty() {
+            return None; // disconnected at this step
+        }
+        plan = build_join(&plan, r, &connecting, relations, edges, stats, cost_model);
+        joined |= 1u32 << r;
+    }
+    Some(plan.cost)
+}
+
 /// Leaf access plan for one relation: a seq scan over the full table,
 /// plus a filter charge when a local predicate narrows it. Output
 /// cardinality is the filtered row count.
