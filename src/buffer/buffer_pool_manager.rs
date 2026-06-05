@@ -445,6 +445,12 @@ impl BufferPoolManager {
         let frame = &self.frames[frame_id.0];
         frame.pin();
 
+        // NOTE (perf): this per-hit `replacer` mutex is the dominant
+        // concurrency bottleneck for the write-heavy TPC-C mix (profiled —
+        // every page hit serializes here). Removing it is a known lever but
+        // conflicts with the push-based, pluggable `EvictionPolicy`. See
+        // docs/scalability-investigation.md for the full analysis and the
+        // refactor options before touching this.
         {
             let mut replacer = self.replacer.lock();
             replacer.record_access(frame_id, page_id);
