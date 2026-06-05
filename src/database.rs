@@ -355,7 +355,7 @@ impl<E: StorageEngine> Database<E> {
             low_water_mark,
             oldest_active_read_ts,
             active_snapshot_count: active.len(),
-            committed_txns_tracked: txn_mgr.committed_txns().len(),
+            committed_txns_tracked: txn_mgr.committed_txns_len(),
             aborted_txns_tracked: txn_mgr.aborted_txns().len(),
             current_timestamp,
         })
@@ -419,6 +419,13 @@ impl<E: StorageEngine> Database<E> {
     /// clones the Arc.
     pub fn engine_arc(&self) -> &Arc<E> {
         &self.engine
+    }
+
+    /// Number of WAL fsync syscalls issued so far (0 if WAL-disabled).
+    /// Group commit keeps this well below the commit count under
+    /// concurrency; used by benchmarks/tests to observe batching.
+    pub fn wal_fsync_count(&self) -> u64 {
+        self.wal.as_ref().map(|w| w.fsync_count()).unwrap_or(0)
     }
 
     /// Construct a per-call `TxnEngine` handle bound to `txn_id`. Cheap —
