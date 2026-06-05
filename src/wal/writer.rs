@@ -156,15 +156,38 @@ impl WalWriter {
     /// Flush the buffer and fsync the active segment to disk.
     pub fn sync(&mut self) -> Result<()> {
         self.active_writer.flush()?;
-        self.active_writer.get_ref().sync_all()?;
+        // `sync_data` (fdatasync on Linux) over `sync_all` (fsync): the WAL
+        // only needs the appended bytes durable, not file mtime/atime.
+        // POSIX fdatasync still flushes the size metadata required to read
+        // the new bytes back, so durability is preserved. ~2x cheaper on
+        // Linux ext4/NVMe; no worse elsewhere.
+        self.active_writer.get_ref().sync_data()?;
         Ok(())
+    }
+
+    /// Push the in-memory buffer to the OS file *without* fsync. Pairs with
+    /// a later `sync_data` on a cloned handle (see `active_file_clone`) so
+    /// the fsync can run without the writer lock held — the basis of group
+    /// commit. Returns once the bytes are in the OS page cache.
+    pub fn flush_buffer(&mut self) -> Result<()> {
+        self.active_writer.flush()?;
+        Ok(())
+    }
+
+    /// Dup the active segment's file handle for an unlocked fsync. Called
+    /// per-sync so it always targets the *current* segment across rotation.
+    /// The clone is used only for `sync_data` (never written through), so
+    /// it sharing the file offset with the writer is harmless.
+    pub fn active_file_clone(&self) -> Result<File> {
+        Ok(self.active_writer.get_ref().try_clone()?)
     }
 
     /// Close the active segment and open the next one.
     fn rotate_segment(&mut self) -> Result<()> {
         // Flush current segment.
         self.active_writer.flush()?;
-        self.active_writer.get_ref().sync_all()?;
+        // fdatasync over fsync — see `sync()`.
+        self.active_writer.get_ref().sync_data()?;
 
         // Open next segment.
         let next_id = self.active_segment_id + 1;

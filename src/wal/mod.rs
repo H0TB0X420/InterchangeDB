@@ -40,10 +40,20 @@ pub struct Wal {
     writer: Mutex<WalWriter>,
     wal_dir: PathBuf,
     last_checkpoint_lsn_raw: AtomicU64,
-    /// Highest LSN that has been fsync'd to disk.
+    /// Highest LSN that has been fsync'd to disk. Advanced with `fetch_max`
+    /// so it never regresses (a concurrent checkpoint `sync` and a commit
+    /// batch can publish out of order).
     synced_lsn: AtomicU64,
-    /// Condvar + Mutex for sleeping waiters. The Mutex holds no meaningful
-    /// state — it exists only to pair with the Condvar.
+    /// Group-commit leadership token, *separate* from `writer`. Only its
+    /// holder performs the fsync — and it flushes the buffer then releases
+    /// the writer lock *before* fsyncing, so appends proceed during the
+    /// fsync and accumulate into the next batch.
+    sync_lock: Mutex<()>,
+    /// Count of actual fsync syscalls. With group commit this is well below
+    /// the commit count under concurrency; used to observe/verify batching.
+    fsync_count: AtomicU64,
+    /// Mutex + Condvar for sleeping followers. The Mutex holds no
+    /// meaningful state — it pairs with the Condvar.
     sync_waiters: Mutex<()>,
     sync_notify: Condvar,
 }
@@ -64,6 +74,8 @@ impl Wal {
             wal_dir: wal_dir.to_path_buf(),
             last_checkpoint_lsn_raw: AtomicU64::new(last_checkpoint_lsn.0),
             synced_lsn: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
+            fsync_count: AtomicU64::new(0),
             sync_waiters: Mutex::new(()),
             sync_notify: Condvar::new(),
         })
@@ -74,59 +86,84 @@ impl Wal {
         self.writer.lock().append(record)
     }
 
-    /// Flush + fsync the WAL to disk. Syncs all buffered records.
+    /// Flush + fsync the WAL to disk. Syncs all buffered records. Used by
+    /// the single-threaded paths (checkpoint, `Database` shutdown); commit
+    /// durability goes through `sync_to`'s group commit.
     pub fn sync(&self) -> Result<()> {
         let mut writer = self.writer.lock();
         writer.sync()?;
-        // Update synced_lsn to cover everything written so far.
+        self.fsync_count.fetch_add(1, Ordering::Relaxed);
+        // Cover everything written so far. `fetch_max` so a concurrent
+        // group-commit batch can't be clobbered backwards.
         let new_synced = writer.next_lsn().0.saturating_sub(1);
-        self.synced_lsn.store(new_synced, Ordering::Release);
+        self.synced_lsn.fetch_max(new_synced, Ordering::AcqRel);
         drop(writer);
         // Wake all threads waiting for durability.
         self.sync_notify.notify_all();
         Ok(())
     }
 
-    /// Group commit: wait until `target_lsn` is durable on disk.
+    /// Group commit: return once `target_lsn` is durable on disk.
     ///
-    /// If another thread already synced past our LSN, returns immediately.
-    /// Otherwise, becomes the sync leader (acquires writer lock, fsyncs,
-    /// wakes all waiters). Threads that arrive while a sync is in progress
-    /// sleep on the Condvar and get woken when the sync completes.
+    /// A committer either (a) finds its LSN already durable, (b) becomes
+    /// the sync leader for a batch, or (c) sleeps briefly while another
+    /// leader fsyncs and then re-checks / leads the next batch.
+    ///
+    /// The batching happens because the leader **releases the writer lock
+    /// before fsyncing** (flush under the lock, fsync on a cloned handle
+    /// without it). So while a leader fsyncs, other committers append their
+    /// records into the buffer; the next leader's single flush+fsync makes
+    /// all of them durable at once.
     pub fn sync_to(&self, target_lsn: Lsn) -> Result<()> {
-        // Fast path: already synced past our LSN.
-        if self.synced_lsn.load(Ordering::Acquire) >= target_lsn.0 {
-            return Ok(());
-        }
-
-        // Try to become sync leader by acquiring writer lock.
-        // If we get it, we fsync. If not, we sleep on the Condvar.
-        if let Some(mut writer) = self.writer.try_lock() {
-            // Double-check after acquiring lock (another leader may have synced).
-            if self.synced_lsn.load(Ordering::Acquire) >= target_lsn.0 {
-                return Ok(());
-            }
-
-            // We're the sync leader — flush everything buffered.
-            writer.sync()?;
-            let new_synced = writer.next_lsn().0.saturating_sub(1);
-            self.synced_lsn.store(new_synced, Ordering::Release);
-            drop(writer);
-
-            // Wake all sleeping waiters.
-            self.sync_notify.notify_all();
-            return Ok(());
-        }
-
-        // Another thread holds the writer (likely syncing). Sleep until woken.
-        let mut guard = self.sync_waiters.lock();
         loop {
+            // (a) Already durable.
             if self.synced_lsn.load(Ordering::Acquire) >= target_lsn.0 {
                 return Ok(());
             }
-            // Sleep until a sync leader wakes us (bounded by one fsync duration).
-            self.sync_notify.wait(&mut guard);
+
+            // (b) Try to lead a sync batch. Leadership is a dedicated lock,
+            // distinct from the writer lock.
+            if let Some(_leader) = self.sync_lock.try_lock() {
+                // A prior batch may have just covered us.
+                if self.synced_lsn.load(Ordering::Acquire) >= target_lsn.0 {
+                    return Ok(());
+                }
+                // Flush under the writer lock, capturing what we'll fsync,
+                // then drop the writer lock so appends resume during fsync.
+                let (flushed_lsn, file) = {
+                    let mut writer = self.writer.lock();
+                    writer.flush_buffer()?;
+                    let flushed = writer.next_lsn().0.saturating_sub(1);
+                    let file = writer.active_file_clone()?;
+                    (flushed, file)
+                };
+                // fsync — no writer lock held. We appended `target_lsn`
+                // before calling sync_to, so `flushed_lsn >= target_lsn`:
+                // leading always makes our own commit durable.
+                file.sync_data()?;
+                self.fsync_count.fetch_add(1, Ordering::Relaxed);
+                self.synced_lsn.fetch_max(flushed_lsn, Ordering::AcqRel);
+                self.sync_notify.notify_all();
+                return Ok(());
+            }
+
+            // (c) A leader is mid-fsync. Sleep briefly, then loop to
+            // re-check or lead the next batch. The short timeout guarantees
+            // liveness even if a wake-up is missed (a lone late committer
+            // re-checks and leads its own batch rather than stalling).
+            let mut guard = self.sync_waiters.lock();
+            if self.synced_lsn.load(Ordering::Acquire) < target_lsn.0 {
+                let _ = self
+                    .sync_notify
+                    .wait_for(&mut guard, std::time::Duration::from_millis(1));
+            }
         }
+    }
+
+    /// Number of fsync syscalls issued so far. Under group commit this
+    /// sits well below the commit count when commits overlap.
+    pub fn fsync_count(&self) -> u64 {
+        self.fsync_count.load(Ordering::Relaxed)
     }
 
     /// Create a reader for this WAL's segments.

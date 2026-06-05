@@ -74,7 +74,7 @@ impl<E: StorageEngine> TxnEngine<E> {
         user_key: &[u8],
         my_begin_ts: Timestamp,
     ) -> Result<Option<TxnId>> {
-        let committed = self.txn_mgr.committed_txns();
+        let committed = self.txn_mgr.committed_txns_read();
         let start = mvcc::encode_mvcc_key_start(user_key);
         let end = mvcc::encode_mvcc_key_end(user_key);
 
@@ -121,7 +121,7 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
     /// recovery-loaded uncommitted), and the pre-checkpoint heuristic.
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let snapshot = self.snapshot_for_read()?;
-        let committed = self.txn_mgr.committed_txns();
+        let committed = self.txn_mgr.committed_txns_read();
         let non_committed = self.txn_mgr.known_not_committed();
         mvcc::mvcc_get(
             &*self.engine,

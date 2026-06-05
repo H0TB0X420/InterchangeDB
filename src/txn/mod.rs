@@ -409,9 +409,30 @@ impl TransactionManager {
     }
 
     /// Access the committed transactions map (for visibility checks).
-    /// Returns a clone to avoid holding the RwLock across engine operations.
+    /// Returns a clone — use for callers that need an owned snapshot they
+    /// hold across engine iteration (GC purge, the scan iterator).
     pub fn committed_txns(&self) -> HashMap<TxnId, Timestamp> {
         self.committed_txns.read().clone()
+    }
+
+    /// Borrow the committed map without cloning. Single-shot hot paths
+    /// (`mvcc_get`, the write-conflict check) hold this guard only for the
+    /// brief duration of one lookup, so a read is O(1) regardless of how
+    /// large the map has grown — rather than deep-cloning it every time.
+    /// The guard blocks commits (which take the write lock) for just that
+    /// lookup. NOTE (perf, found 2026-06-02): the map is never pruned
+    /// (insert-only until recovery), so it grows unboundedly under
+    /// sustained load — a memory concern to address separately (prune at
+    /// checkpoint); not cloning here removes its effect on read *latency*.
+    pub fn committed_txns_read(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, HashMap<TxnId, Timestamp>> {
+        self.committed_txns.read()
+    }
+
+    /// Number of tracked committed txns, without cloning the map.
+    pub fn committed_txns_len(&self) -> usize {
+        self.committed_txns.read().len()
     }
 
     /// Access the known-uncommitted transactions set (for visibility checks).
