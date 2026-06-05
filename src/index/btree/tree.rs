@@ -17,6 +17,7 @@ use super::page_layout::{
     decode_leaf_node, decode_internal_node,
     encode_leaf_node, encode_internal_node,
     calculate_leaf_max_size, calculate_internal_max_size,
+    lookup_in_encoded_leaf,
 };
 use super::BTreeHeaderPage;
 
@@ -125,12 +126,10 @@ impl<'a> BTree<'a> {
             None => return Ok(None),
         };
 
-        let leaf = decode_leaf_node(guard.as_slice());
-
-        match leaf.lookup(key) {
-            Some(index) => Ok(Some(leaf.value_at(index).to_vec())),
-            None => Ok(None),
-        }
+        // Fast path: scan the encoded leaf in place and copy only the one
+        // matching value, instead of decoding the whole leaf into ~400
+        // `Vec`s just to read a single entry.
+        Ok(lookup_in_encoded_leaf(guard.as_slice(), key).map(|v| v.to_vec()))
     }
 
     /// Check if a key exists (not tombstoned).
@@ -141,9 +140,7 @@ impl<'a> BTree<'a> {
             None => return Ok(false),
         };
 
-        let leaf = decode_leaf_node(guard.as_slice());
-
-        Ok(leaf.lookup(key).is_some())
+        Ok(lookup_in_encoded_leaf(guard.as_slice(), key).is_some())
     }
 
     /// Check if the tree is empty.

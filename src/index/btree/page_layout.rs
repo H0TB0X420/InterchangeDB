@@ -163,6 +163,83 @@ pub fn decode_internal_node(buf: &[u8]) -> InternalNode {
     node
 }
 
+/// Point lookup directly on an encoded leaf page — without decoding it.
+///
+/// `decode_leaf_node` materializes the whole leaf (a `Vec` per key AND per
+/// value — up to ~400 heap allocations for a full leaf) just so the caller
+/// can read one value. This walks the encoded entries in place and returns
+/// the matching value as a slice into `buf`, so the only allocation is the
+/// caller's final copy of the one value it wants. Keys are stored sorted,
+/// so the scan early-exits once it passes the target.
+///
+/// Returns `None` if the key is absent or tombstoned — identical semantics
+/// to `decode_leaf_node(buf).lookup(key)`. The page checksum is still
+/// verified, matching the decode path's safety check.
+pub fn lookup_in_encoded_leaf<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    // Verify page checksum (parity with `decode_leaf_node`).
+    let stored_checksum = u32::from_le_bytes([
+        buf[PageHeader::OFFSET_CHECKSUM],
+        buf[PageHeader::OFFSET_CHECKSUM + 1],
+        buf[PageHeader::OFFSET_CHECKSUM + 2],
+        buf[PageHeader::OFFSET_CHECKSUM + 3],
+    ]);
+    if stored_checksum != 0 {
+        assert_eq!(
+            stored_checksum,
+            PageHeader::compute_checksum(buf),
+            "leaf node page checksum mismatch"
+        );
+    }
+    debug_assert_eq!(buf[PageHeader::SIZE], NodeType::Leaf as u8);
+
+    // `size` follows the 1-byte node_type; `tombstone_count` follows
+    // size + max_size + next + prev (see `decode_leaf_node`).
+    let size = u16::from_le_bytes([buf[PageHeader::SIZE + 1], buf[PageHeader::SIZE + 2]]) as usize;
+    let tombstone_count_offset = PageHeader::SIZE + 1 + 2 + 2 + 4 + 4;
+    let tombstone_count =
+        u16::from_le_bytes([buf[tombstone_count_offset], buf[tombstone_count_offset + 1]]) as usize;
+
+    let tombstones_offset = LEAF_HEADER_SIZE;
+    let mut offset = tombstones_offset + tombstone_count * 2; // entries follow the tombstone indices
+
+    for physical_index in 0..size {
+        let key_len = u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
+        let key_start = offset + 2;
+        let entry_key = &buf[key_start..key_start + key_len];
+        let val_len_offset = key_start + key_len;
+        let val_len = u16::from_le_bytes([buf[val_len_offset], buf[val_len_offset + 1]]) as usize;
+        let val_start = val_len_offset + 2;
+
+        match entry_key.cmp(key) {
+            std::cmp::Ordering::Equal => {
+                if is_tombstoned(buf, tombstones_offset, tombstone_count, physical_index) {
+                    return None; // physically present but deleted
+                }
+                return Some(&buf[val_start..val_start + val_len]);
+            }
+            // Keys are sorted ascending — once we pass the target it's absent.
+            std::cmp::Ordering::Greater => return None,
+            std::cmp::Ordering::Less => offset = val_start + val_len,
+        }
+    }
+    None
+}
+
+/// Whether `physical_index` is in the leaf's tombstone-index region. Scans
+/// in place; the region is small (usually empty → no work).
+fn is_tombstoned(
+    buf: &[u8],
+    tombstones_offset: usize,
+    tombstone_count: usize,
+    physical_index: usize,
+) -> bool {
+    let target = physical_index as u16;
+    (0..tombstone_count).any(|i| {
+        let off = tombstones_offset + i * 2;
+        u16::from_le_bytes([buf[off], buf[off + 1]]) == target
+    })
+}
+
 /// Encode a leaf node to a page buffer.
 ///
 /// Returns the number of bytes written.
@@ -425,6 +502,50 @@ mod tests {
         for i in 0..node.tombstones.len() {
             assert_eq!(decoded.tombstones[i], node.tombstones[i]);
         }
+    }
+
+    #[test]
+    fn lookup_in_encoded_leaf_matches_decode() {
+        // The fast in-place lookup must return exactly what
+        // `decode_leaf_node(buf).lookup(key)` would — including tombstone
+        // semantics and absent keys before/between/after the entries.
+        let mut node = LeafNode::new(100);
+        node.insert(vec![1, 2], vec![10, 20, 30]);
+        node.insert(vec![3, 4, 5], vec![40, 50]);
+        node.insert(vec![6], vec![60, 70, 80, 90]);
+        node.delete(&[3, 4, 5], 8); // tombstone the middle key
+
+        let mut buf = vec![0u8; PAGE_SIZE];
+        encode_leaf_node(&node, &mut buf);
+
+        let expected = |k: &[u8]| -> Option<Vec<u8>> {
+            let leaf = decode_leaf_node(&buf);
+            leaf.lookup(k).map(|i| leaf.value_at(i).to_vec())
+        };
+
+        for probe in [
+            &[1u8, 2][..], // present, first
+            &[6][..],      // present, last
+            &[3, 4, 5][..], // physically present but tombstoned → None
+            &[0][..],      // before all keys
+            &[2][..],      // between keys (absent)
+            &[9][..],      // after all keys
+        ] {
+            assert_eq!(
+                lookup_in_encoded_leaf(&buf, probe).map(|v| v.to_vec()),
+                expected(probe),
+                "mismatch for {:?}",
+                probe
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_in_encoded_leaf_empty() {
+        let node = LeafNode::new(100);
+        let mut buf = vec![0u8; PAGE_SIZE];
+        encode_leaf_node(&node, &mut buf);
+        assert_eq!(lookup_in_encoded_leaf(&buf, &[1]), None);
     }
 
     #[test]
