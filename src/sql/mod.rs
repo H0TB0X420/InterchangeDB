@@ -11,6 +11,7 @@
 //! 17/18 (Cascades, as an interchangeable alternative).
 
 pub mod binder;
+pub mod column_map;
 pub mod cost;
 pub mod expr;
 pub mod frontend;
@@ -23,9 +24,11 @@ pub mod stats;
 pub mod workload_log;
 
 pub use binder::Binder;
+pub use column_map::ColumnRemap;
 pub use cost::{Cost, CostModel, CostWeights, DefaultCostModel};
 pub use join_order::{
-    enumerate_join_orders, JoinAlgorithm, JoinEdge, JoinOrder, JoinPlan, JoinRelation, RelId,
+    cost_of_order, enumerate_join_orders, JoinAlgorithm, JoinEdge, JoinOrder, JoinPlan,
+    JoinRelation, RelId,
 };
 pub use selectivity::{
     estimate_predicate_selectivity, join_selectivity, EQ_FALLBACK, JOIN_FALLBACK, MIN_SELECTIVITY,
