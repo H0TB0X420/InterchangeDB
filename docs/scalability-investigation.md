@@ -10,6 +10,12 @@ Environment: macOS (APFS, fsync ~11 ms), single node, smoke-scale data.
 The absolute numbers are OS/hardware-bound; the *shape* (what scales, what
 doesn't, and why) is what generalizes.
 
+> **Re-measured 2026-06-06 on an Apple M2 Pro (10 cores, 16 GB, macOS Tahoe
+> 26.1).** Magnitudes came in ~2–3.5× the original numbers (faster machine),
+> but the *shape* reproduced exactly: B-tree peaks early then declines, LSM
+> scales worse than B-tree at every point, 0% aborts throughout. See
+> "Re-measurement" below.
+
 ---
 
 ## Tooling built for this (kept in the repo)
@@ -49,6 +55,46 @@ experiment killed a plausible structural hypothesis before code was written.
 0% aborts throughout (terminal isolation: per-terminal home warehouse +
 disjoint PK ranges). Throughput is flat/declining with concurrency → a
 serialization problem.
+
+---
+
+## Re-measurement (2026-06-06, Apple M2 Pro, 10 cores)
+
+Re-ran the harness on a faster box (Apple M2 Pro, 10 cores, 16 GB, macOS
+Tahoe 26.1). 10 s runs, `warehouses == terminals`, seed 1, arc policy. The
+absolute throughput is ~2–3.5× higher (faster CPU/SSD), but the scaling
+*shape* is unchanged.
+
+**B-tree (`--engine btree`):**
+
+| config | original | M2 Pro | notes |
+|---|---|---|---|
+| 1 terminal | ~46 txn/s | **100 txn/s** | ~10 ms/txn |
+| 8 terminals | ~53 txn/s | **168 txn/s** | peak — modest scaling (+68%), then declines |
+| 16 terminals | ~50 txn/s | **151 txn/s** | declining |
+| 32 terminals | ~42 txn/s | **133 txn/s** | declining further |
+
+**LSM (`--engine lsm`):**
+
+| config | original | M2 Pro |
+|---|---|---|
+| 1×1 | 31 txn/s | **65 txn/s** |
+| 8×8 | 21 txn/s | **72 txn/s** |
+| 32×32 | 12 txn/s | **54 txn/s** |
+
+0% aborts throughout (one stray abort at LSM 32×32). Caveat: the original
+16/32-terminal rows held warehouses=8; this re-run scaled warehouses with
+terminals (per the harness's `warehouses >= terminals` isolation rule), so
+only the 1T and 8×8 points are strictly apples-to-apples.
+
+**What reproduced:** (1) B-tree shows no real scale-out — it peaks (here at 8
+terminals) then declines as concurrency rises, the serialization ceiling the
+investigation is about. (2) LSM is ~half B-tree's throughput at every point
+and also declines — its read path is still the bottleneck. (3)
+Interchangeability: both engines ran the identical SQL/MVCC/WAL stack with
+only `--engine` changed. The faster machine surfaced *slightly* more early
+scaling (peak at 8 vs near-flat originally) but the same downward slope past
+the peak — the structural conclusions all stand.
 
 ---
 
