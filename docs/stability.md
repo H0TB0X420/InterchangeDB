@@ -2,7 +2,7 @@
 
 A roadmap for turning InterchangeDB from a well-tested course-grade project
 into a research artifact with a defensible correctness story. This document
-is forward-looking; it complements `QUALITY.md` (which tracks discrete open
+is forward-looking; it complements `ISSUES.md` (the Quality Tracker, which tracks discrete open
 items as `Q-NN`) by laying out the *categories* of work and their relative
 leverage.
 
@@ -32,8 +32,13 @@ So the rest of this document is grounded, not generic. Current assets:
 - Soak test (`tests/soak_test.rs`, 30 s, `#[ignore]`).
 - Concurrency + policy-swap stress tests; large-scale (25K–100K key) tests.
 - `MemoryDiskManager` — an in-memory `DiskManager` impl (a key seam, below).
+- `FaultInjectionDiskManager` — a fault-injecting `DiskManager` (torn writes,
+  dropped/reordered flushes, crash-at-LSN), already wired into
+  `tests/fault_injection_test.rs` and `tests/crash_recovery_test.rs`. The DST
+  mechanism in pillar D **already exists** — pillar D is about extending its
+  *coverage*, not building it.
 - `[lints.clippy] all = "warn"` in `Cargo.toml`.
-- `QUALITY.md` Q-NN tracker.
+- `ISSUES.md` (Quality Tracker) Q-NN tracker.
 
 The gap is everything in pillars 2–4, plus the automation floor (pillar 1).
 
@@ -111,9 +116,13 @@ The FoundationDB / TigerBeetle approach: run the whole DB on a seeded RNG, a
 simulated clock, and a **fault-injecting disk**, then run millions of
 randomized scenarios where a single seed reproduces any failure.
 
-It is tractable here *because the seam already exists*: `DiskManager` is a
-trait and `MemoryDiskManager` already implements it. A `FaultyDiskManager`
-wrapper is the whole mechanism.
+It is tractable here *because the mechanism already exists*: `DiskManager` is a
+trait, and `FaultInjectionDiskManager` already implements torn writes,
+dropped/reordered flushes, and crash-at-LSN — exercised today by
+`tests/fault_injection_test.rs` and `tests/crash_recovery_test.rs`. The
+remaining work is not building the fault injector; it is wrapping it in a
+**seeded scenario driver** that sweeps the failure space (crash at *every* LSN,
+randomized op streams) and asserts the invariants below on every recovery.
 
 ```
    ┌─────────────────────────────────────────────┐
@@ -126,7 +135,7 @@ wrapper is the whole mechanism.
    └───────────────────┬─────────────────────────┘
                        ▼
    ┌─────────────────────────────────────────────┐
-   │  FaultyDiskManager : DiskManager             │
+   │  FaultInjectionDiskManager : DiskManager     │
    │   • torn writes (persist first N bytes only) │
    │   • reordered / dropped flushes              │
    │   • partial fsync, latency injection         │
@@ -169,12 +178,12 @@ should be *demonstrated*, not asserted.
 
 ## F. GitHub hygiene & legibility
 
-`QUALITY.md` is good process but invisible to a repo skimmer.
+`ISSUES.md` is good process but invisible to a repo skimmer.
 
 - **Mirror Q-NN into GitHub Issues** with labels (`area:wal`, `area:txn`,
   `area:buffer-pool`, `area:query`, `kind:correctness`, `kind:perf`,
   `kind:test-debt`, `sev:{critical,high,med,low}`) and **Milestones tied to
-  phases**. Keep `QUALITY.md` as source of truth if preferred; the issues
+  phases**. Keep `ISSUES.md` as source of truth if preferred; the issues
   are the shop window.
 - **Convert the known defects** (first-updater-wins, abort tracking,
   deadlock victim selection) into issues with a *failing regression test
@@ -197,8 +206,9 @@ research/learning vehicle):
 1. **CI** — a day; unblocks everything.
 2. **Fuzz the decode surfaces** — cheap; invariants already exist;
    immediate bug yield.
-3. **`FaultyDiskManager` + crash-recovery torture** — the differentiator;
-   the trait seam already exists.
+3. **Seeded scenario driver over the existing `FaultInjectionDiskManager`**
+   (crash-at-every-LSN torture) — the differentiator; the fault injector and
+   its tests already exist, so this is coverage extension, not new mechanism.
 4. **History checker for SI** — validates the headline isolation claim;
    folds in `Q-24`.
 5. **`shuttle`** (closes `Q-25`), then **`cargo-mutants`** (honest
