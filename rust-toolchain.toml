@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned for reproducible builds across CI and contributors. Matches the
+# version the project is developed against; bump deliberately, not by drift.
+channel = "1.89.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

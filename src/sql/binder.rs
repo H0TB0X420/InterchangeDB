@@ -6,7 +6,7 @@
 //!
 //! Phase 11 surface — what binds:
 //!   CREATE TABLE, INSERT VALUES, SELECT, UPDATE, DELETE,
-//!   BEGIN / COMMIT / ROLLBACK, EXPLAIN <stmt>.
+//!   BEGIN / COMMIT / ROLLBACK, EXPLAIN `<stmt>`.
 //!
 //! Joins, aggregates, ORDER BY, subqueries — deferred to Phase 12/13.
 //! Each unsupported variant errors with a descriptive message so the

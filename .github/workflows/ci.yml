@@ -1,0 +1,65 @@
+name: CI
+
+# Quality gate on every push and PR. No nightly/cron path — the slow
+# `#[ignore]` soak and large-scale tests stay off CI by design.
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A newer push to the same ref cancels the in-flight run for that ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Promote the crate's `warn` lints to `deny` here only — drift fails CI
+      # without making local `cargo build` noisy.
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test
+
+  test-release:
+    name: test (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Release surfaces timing/overflow bugs that debug masks.
+      - name: Test (release)
+        run: cargo test --release
+
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs
+        run: cargo doc --no-deps

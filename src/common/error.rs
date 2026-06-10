@@ -106,7 +106,7 @@ pub enum Error {
 
     /// A constraint check rejected a value or row (NOT NULL, type mismatch,
     /// length bound, decimal scale, etc.). The `rule` field carries the
-    /// specific violation; `column` identifies which column or "<row>" for
+    /// specific violation; `column` identifies which column or `<row>` for
     /// row-level violations like arity mismatch.
     ConstraintViolation {
         column: String,

@@ -99,7 +99,7 @@ impl NodeHeader {
 /// Contains n keys and n+1 child pointers. The first key (index 0) is
 /// considered invalid/unused to maintain the n keys, n+1 children invariant.
 ///
-/// Routing: For key K, follow child[i] where keys[i] <= K < keys[i+1].
+/// Routing: For key K, follow `child[i]` where `keys[i] <= K < keys[i+1]`.
 #[derive(Debug, Clone)]
 pub struct InternalNode {
     /// Node header.
@@ -107,7 +107,7 @@ pub struct InternalNode {
     /// Keys (index 0 is unused/invalid).
     pub keys: Vec<Vec<u8>>,
     /// Child page IDs. children.len() == keys.len() for our representation.
-    /// children[i] is the child for keys <= keys[i].
+    /// `children[i]` is the child for keys <= `keys[i]`.
     pub children: Vec<PageId>,
 }
 
@@ -145,7 +145,7 @@ impl InternalNode {
 
     /// Find which child to follow for the given key.
     ///
-    /// Uses binary search to find the largest index i where keys[i] <= key.
+    /// Uses binary search to find the largest index i where `keys[i] <= key`.
     /// Returns the index of the child to follow.
     pub fn find_child_index(&self, key: &[u8]) -> usize {
         if self.children.is_empty() {
@@ -195,7 +195,7 @@ impl InternalNode {
 
     /// Remove the entry at the given index.
     ///
-    /// When removing key[i], also removes children[i] (the child to the left
+    /// When removing `key[i]`, also removes `children[i]` (the child to the left
     /// of the separator, which was merged).
     pub fn remove_at(&mut self, index: usize) {
         if index < self.keys.len() {

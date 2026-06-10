@@ -249,7 +249,7 @@ impl LogRecord {
 
     /// Encode this record into a byte buffer.
     ///
-    /// Layout: [length:u32][type:u8][lsn:u64][txn_id:u64][prev_lsn:u64][payload...][crc32:u32]
+    /// Layout: `[length:u32][type:u8][lsn:u64][txn_id:u64][prev_lsn:u64][payload...][crc32:u32]`
     pub fn encode(&self) -> Vec<u8> {
         let payload_size = self.payload_size();
         let total_size = HEADER_SIZE + payload_size + CRC_SIZE;

@@ -46,6 +46,14 @@ The gap is everything in pillars 2–4, plus the automation floor (pillar 1).
 
 ## A. Automation floor (CI)
 
+> **Status: DONE — `Q-28` (2026-06-10).** Shipped `rust-toolchain.toml`
+> (pin `1.89.0`) and `.github/workflows/ci.yml`: fmt / clippy-deny / test
+> (debug + release) / doc jobs on push + PR, with `rust-cache` and
+> cancel-in-progress. The nightly `--ignored` cron row below was
+> **intentionally not adopted** — per-push only, by request. Required a
+> green-baseline cleanup first (whole-repo `cargo fmt`, clippy 33→0,
+> rustdoc 14→0); see the `Q-28` audit entry in `ISSUES.md`.
+
 No `.github/workflows/` exists today. This is the cheapest high-value add
 and the most visible — the green check is the first thing a reviewer sees.
 
@@ -203,7 +211,7 @@ should be *demonstrated*, not asserted.
 Sequenced for return on the stated goals (FAANG interviews, PhD apps,
 research/learning vehicle):
 
-1. **CI** — a day; unblocks everything.
+1. ~~**CI** — a day; unblocks everything.~~ ✅ **DONE** (`Q-28`).
 2. **Fuzz the decode surfaces** — cheap; invariants already exist;
    immediate bug yield.
 3. **Seeded scenario driver over the existing `FaultInjectionDiskManager`**
