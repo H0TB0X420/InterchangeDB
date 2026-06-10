@@ -65,6 +65,9 @@ pub mod database;
 pub mod layout;
 pub mod storage;
 
+/// Synchronization-primitive shim (parking_lot in prod, shuttle under test).
+pub(crate) mod sync;
+
 // Future modules (placeholders)
 pub mod concurrency;
 pub mod execution;

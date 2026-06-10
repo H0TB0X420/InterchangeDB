@@ -1,7 +1,7 @@
 //! Buffer pool statistics tracking.
 
+use crate::sync::{AtomicU64, Ordering};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Statistics tracked by the buffer pool.
 ///

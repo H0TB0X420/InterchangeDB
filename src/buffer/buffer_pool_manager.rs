@@ -7,11 +7,9 @@
 //! - Pluggable eviction policies
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
-
 use std::time::Instant;
 
-use parking_lot::{Mutex, RwLock};
+use crate::sync::{Mutex, Ordering, RwLock};
 
 use crate::buffer::replacer::{EvictionPolicy, FifoReplacer};
 use crate::buffer::swap::{SwapMode, SwapResult};

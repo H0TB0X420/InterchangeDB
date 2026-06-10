@@ -5,9 +5,9 @@
 //! - Pin count for reference counting
 //! - Dirty flag for write-back tracking
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::sync::{
+    AtomicBool, AtomicU32, Mutex, Ordering, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
 use crate::common::PageId;
 use crate::storage::page::Page;

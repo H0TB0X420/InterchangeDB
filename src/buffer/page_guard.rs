@@ -9,7 +9,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
+use crate::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 use crate::common::{FrameId, PageId};
 use crate::storage::page::Page;
