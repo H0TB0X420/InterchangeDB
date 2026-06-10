@@ -42,6 +42,10 @@ impl Cost {
 
     /// Sum two costs (e.g., to total a child + its parent operator's
     /// own contribution).
+    // CLIPPY-ALLOW(should_implement_trait): inherent `add` reads naturally at
+    // the cost-summation call sites; a std::ops::Add impl would force `+` and a
+    // trait import for no real gain.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: Cost) -> Cost {
         Cost {
             io_units: self.io_units + other.io_units,

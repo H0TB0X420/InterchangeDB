@@ -344,7 +344,7 @@ impl HashJoin {
                 // SQL equi-join: NULL never matches.
                 continue;
             }
-            inner_table.entry(key).or_insert_with(Vec::new).push(row);
+            inner_table.entry(key).or_default().push(row);
         }
         Ok(Self {
             schema,

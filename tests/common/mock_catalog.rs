@@ -124,8 +124,8 @@ mod tests {
         assert_eq!(s.name, "t");
         assert_eq!(s.columns.len(), 2);
         assert_eq!(s.primary_key, vec![0]);
-        assert_eq!(s.columns[0].nullable, false);
-        assert_eq!(s.columns[1].nullable, true);
+        assert!(!s.columns[0].nullable);
+        assert!(s.columns[1].nullable);
     }
 
     #[test]

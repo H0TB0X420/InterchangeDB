@@ -115,7 +115,7 @@ fn warehouse_row(id: i32, name: &str) -> Vec<Value> {
         Value::Varchar("Anytown".into()),
         Value::Char("12345----".into()), // padded to 9
         Value::Decimal(Decimal::from_i64_with_scale(750, 4)), // 7.50%
-        Value::Decimal(Decimal::from_i64_with_scale(300_000_00, 2)), // 300,000.00
+        Value::Decimal(Decimal::from_i64_with_scale(30_000_000, 2)), // 300,000.00
     ]
 }
 

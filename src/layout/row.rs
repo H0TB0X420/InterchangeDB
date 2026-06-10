@@ -15,7 +15,7 @@
 
 use crate::catalog::TableId;
 use crate::common::{Error, Result};
-use crate::layout::{DataLayout, LayoutCtx};
+use crate::layout::{DataLayout, LayoutCtx, RowScan};
 use crate::storage::StorageEngine;
 use crate::types::{tuple, Value};
 
@@ -150,11 +150,7 @@ impl DataLayout for RowLayout {
         engine.put(&key, &blob)
     }
 
-    fn scan_table<'a, E: StorageEngine>(
-        &self,
-        engine: &'a E,
-        ctx: LayoutCtx<'a>,
-    ) -> Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<Value>)>> + 'a> {
+    fn scan_table<'a, E: StorageEngine>(&self, engine: &'a E, ctx: LayoutCtx<'a>) -> RowScan<'a> {
         // Build the half-open prefix range [tid | …] .. [tid+1 | …].
         // tid+1 can overflow u32; surface that as an immediate error item
         // rather than panicking inside the iterator.
@@ -181,7 +177,7 @@ impl DataLayout for RowLayout {
         ctx: LayoutCtx<'a>,
         pk_start: &[u8],
         pk_end: &[u8],
-    ) -> Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<Value>)>> + 'a> {
+    ) -> RowScan<'a> {
         // Half-open: [make_row_key(tid, pk_start), make_row_key(tid, pk_end)).
         // The same table_id prefix is used on both bounds so we never cross
         // into adjacent tables' keyspaces.

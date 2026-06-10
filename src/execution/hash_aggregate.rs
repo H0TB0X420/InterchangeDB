@@ -302,7 +302,7 @@ fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<
             match &row[*i] {
                 Value::Decimal(d) => {
                     *acc = Some(match acc {
-                        None => d.clone(),
+                        None => *d,
                         Some(prev) => prev
                             .add(d)
                             .map_err(|e| crate::common::Error::SqlParse(format!("SUM: {}", e)))?,
@@ -364,7 +364,7 @@ fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<
             match &row[*i] {
                 Value::Decimal(d) => {
                     *sum = Some(match sum {
-                        None => d.clone(),
+                        None => *d,
                         Some(prev) => prev
                             .add(d)
                             .map_err(|e| crate::common::Error::SqlParse(format!("AVG: {}", e)))?,

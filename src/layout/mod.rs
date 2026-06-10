@@ -35,6 +35,11 @@ pub struct LayoutCtx<'a> {
     pub table_id: TableId,
 }
 
+/// A boxed iterator over `(storage_key, decoded_row)` pairs from a table
+/// scan. Each item is fallible because decoding a stored tuple can hit a
+/// corrupt page. The `'a` lifetime ties the iterator to the borrowed engine.
+pub type RowScan<'a> = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<Value>)>> + 'a>;
+
 /// Maps logical rows to physical storage entries.
 ///
 /// Implementors decide the storage key shape (e.g., `[table_id|pk]` for row
@@ -128,11 +133,7 @@ pub trait DataLayout: Send + Sync + 'static {
     /// internally — `RowLayout` scans `[tid|0]..[tid+1|0]`, `ColumnLayout`
     /// scans the analogous prefix and groups N consecutive entries back
     /// into one logical row.
-    fn scan_table<'a, E: StorageEngine>(
-        &self,
-        engine: &'a E,
-        ctx: LayoutCtx<'a>,
-    ) -> Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<Value>)>> + 'a>;
+    fn scan_table<'a, E: StorageEngine>(&self, engine: &'a E, ctx: LayoutCtx<'a>) -> RowScan<'a>;
 
     /// Scan rows whose PK falls in `[pk_start, pk_end)`. Half-open: `pk_end`
     /// is exclusive. Empty range yields zero rows.
@@ -146,5 +147,5 @@ pub trait DataLayout: Send + Sync + 'static {
         ctx: LayoutCtx<'a>,
         pk_start: &[u8],
         pk_end: &[u8],
-    ) -> Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<Value>)>> + 'a>;
+    ) -> RowScan<'a>;
 }

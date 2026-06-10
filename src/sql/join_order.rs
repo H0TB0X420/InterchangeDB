@@ -467,9 +467,12 @@ mod tests {
     use crate::sql::cost::DefaultCostModel;
     use crate::sql::stats::MockStatsProvider;
 
+    /// `(table_id, row_count, &[(col, ndv)])` — terse table spec for DP tests.
+    type TableSpec<'a> = (u32, i64, &'a [(u32, i64)]);
+
     /// Build a `QueryStats` from `(table_id, row_count, &[(col, ndv)])`
     /// triples — terse setup for the DP tests.
-    fn stats_for(tables: &[(u32, i64, &[(u32, i64)])]) -> QueryStats {
+    fn stats_for(tables: &[TableSpec]) -> QueryStats {
         let mut provider = MockStatsProvider::new();
         let mut requests: Vec<(TableId, Vec<u32>)> = Vec::new();
         for &(tid, rows, cols) in tables {
@@ -629,7 +632,7 @@ mod tests {
         // 13 relations (> MAX_DP_RELATIONS) chained → greedy path. The
         // result must still cover every relation.
         let n = MAX_DP_RELATIONS + 1;
-        let mut tables: Vec<(u32, i64, &[(u32, i64)])> = Vec::new();
+        let mut tables: Vec<TableSpec> = Vec::new();
         for i in 0..n {
             tables.push(((i + 1) as u32, (i as i64 + 1) * 100, &[]));
         }

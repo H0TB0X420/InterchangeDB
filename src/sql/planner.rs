@@ -252,6 +252,10 @@ where
     }
 }
 
+// CLIPPY-ALLOW(too_many_arguments): a SELECT carries table/joins/projection/
+// aggregates/filter/order/limit plus engine + catalog + join selection; a
+// params struct would just rename the same fields without simplifying callers.
+#[allow(clippy::too_many_arguments)]
 fn plan_select<TblE, CatE>(
     table_name: String,
     joins: Vec<crate::sql::logical::JoinClause>,

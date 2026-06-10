@@ -13,10 +13,12 @@ Legend: `(built)` exists in code · `(planned)` designed, not yet built ·
 `(stretch)` aspirational / research.
 
 Validation status at a glance:
-- Validated (2+ impls): `DiskManager`, `EvictionPolicy`, `StorageEngine`
-- Hypothesis (1 impl, needs a second): `ConcurrencyControl`, `CommitProtocol`
-- Not yet a trait (extract it): `Optimizer`, `CostModel`, `StatsProvider`,
-  `ExecutionModel`, `QueryEngine`, `SecondaryIndex`
+- Validated (2+ impls): `DiskManager`, `EvictionPolicy`, `StorageEngine`,
+  `Optimizer` (RuleBased + Selinger, runtime-swappable via the `Planner` enum),
+  `StatsProvider` (Catalog + Mock)
+- Hypothesis (1 impl, needs a second): `ConcurrencyControl`, `CommitProtocol`,
+  `CostModel` (DefaultCostModel only)
+- Not yet a trait (extract it): `ExecutionModel`, `QueryEngine`, `SecondaryIndex`
 
 ---
 
@@ -105,18 +107,24 @@ extract the policy.
 ## 7. Query optimizer — `Optimizer`
 
 Logical → physical plan selection. The four-stage progression is the portfolio
-centerpiece; extract the trait so they're swappable and comparable.
+centerpiece. The seam exists today as the `Planner` enum (`RuleBased` +
+`Selinger`), runtime-swappable on the `Session`; there is also a
+`PlannerStrategy` trait, but dispatch is via the enum rather than `dyn` (the
+"Option B" decision — an open set can move to `dyn` later if needed).
 
-- **Heuristic** (built/early) — rule-based rewrites, no cost.
-- **SystemR / Selinger** (planned) — dynamic-programming join ordering.
+- **Heuristic / RuleBased** (built) — rule-based rewrites, no cost.
+- **SystemR / Selinger** (built) — dynamic-programming join ordering, cost-
+  driven; the second implementation that makes this a validated seam.
 - **Volcano** (planned) — top-down cost-based search.
 - **Cascades** (planned) — memo + rules; the differentiator.
 
 ## 8. Cost model — `CostModel`
 
-Estimates plan cost for the optimizer. **Not yet a trait.**
+Estimates plan cost for the optimizer. Now a trait (`trait CostModel`),
+consumed generically by the Selinger planner (`SelingerPlanner<DefaultCostModel>`).
+One impl so far — a hypothesis until a second rides the trait.
 
-- **Heuristic cost** (planned) — simple cardinality/IO formulas.
+- **DefaultCostModel** (built) — cardinality / IO cost formulas; the first impl.
 - **Calibrated cost** (planned) — coefficients tied to measured per-engine
   profiles (addresses the known storage/optimizer cost-coupling leak).
 - **Learned cost** (stretch) — trained on `workload_log`; the V3 adaptive
@@ -124,10 +132,13 @@ Estimates plan cost for the optimizer. **Not yet a trait.**
 
 ## 9. Statistics — `StatsProvider`
 
-Feeds the cost model. **Not yet a trait.**
+Feeds the cost model. Now a trait (`trait StatsProvider`).
 
-- **NoStats** (planned) — fixed guesses; baseline.
-- **HistogramStats** (planned) — per-column histograms.
+- **CatalogStatsProvider** (built) — reads per-table/column statistics from the
+  catalog; the production impl.
+- **MockStatsProvider** (built, test) — fixed guesses; the baseline / test double
+  that proves the seam (the old "NoStats").
+- **HistogramStats** (planned) — richer per-column histograms.
 - **SamplingStats** (stretch) — runtime sampling / sketches.
 
 ## 10. Execution model — `ExecutionModel`
@@ -152,8 +163,10 @@ largest grain. **Not yet a trait.**
 ## Build order (dependency-aware)
 
 1. Extract `ConcurrencyControl` from the hard-wired MVCC (unblocks SSI/OCC/2PL).
-2. Extract `Optimizer` + `CostModel` + `StatsProvider` together (the query
-   triad; needed before the four-optimizer progression).
+2. ~~Extract `Optimizer` + `CostModel` + `StatsProvider` (the query triad)~~ —
+   **done** (Phase 14: `Planner` enum with RuleBased + Selinger, plus the
+   `CostModel` and `StatsProvider` traits). Remaining triad work: a second
+   `CostModel` impl, and the Volcano/Cascades optimizers.
 3. `InMemoryEngine` behind `StorageEngine` (first speed-ladder rung).
 4. `EpochCommit` behind `CommitProtocol`.
 5. `ExecutionModel` extraction, then `Vectorized`.

@@ -58,13 +58,16 @@ fn make_lsm() -> (Arc<LsmEngine>, TempDir) {
     (engine, dir)
 }
 
-/// Materialize a scan over `range` into a `Vec<(Vec<u8>, Vec<u8>)>`,
-/// sorted by key (which is what `StorageEngine::scan` guarantees).
+/// A materialized key/value run, sorted by key.
+type KvRun = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Materialize a scan over `range` into a `KvRun`, sorted by key (which is
+/// what `StorageEngine::scan` guarantees).
 fn collect_scan<E: StorageEngine>(
     engine: &E,
     start: Bound<Vec<u8>>,
     end: Bound<Vec<u8>>,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, interchangedb::Error> {
+) -> Result<KvRun, interchangedb::Error> {
     engine.scan((start, end)).collect::<Result<Vec<_>, _>>()
 }
 

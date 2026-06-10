@@ -123,11 +123,9 @@ fn write_heavy_8_threads() {
                     let key = format!("wh_t{}_{:04}", thread_idx, iter);
                     let val = format!("val_{}_{}", thread_idx, iter);
 
-                    match db.put(key.as_bytes(), val.as_bytes()) {
-                        Ok(()) => {
-                            committed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => {} // Deadlock/timeout acceptable under contention.
+                    // Deadlock/timeout acceptable under contention.
+                    if db.put(key.as_bytes(), val.as_bytes()).is_ok() {
+                        committed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })
@@ -279,11 +277,8 @@ fn gc_under_concurrent_writes() {
             let mut total_removed = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(500));
-                match db.gc() {
-                    Ok(stats) => {
-                        total_removed += stats.versions_removed;
-                    }
-                    Err(_) => {}
+                if let Ok(stats) = db.gc() {
+                    total_removed += stats.versions_removed;
                 }
             }
             let _ = total_removed;

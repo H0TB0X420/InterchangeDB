@@ -45,7 +45,7 @@ struct Env {
 
 fn setup() -> Env {
     let dir = tempdir().unwrap();
-    let dm = FileDiskManager::create(&dir.path().join("test.db")).unwrap();
+    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
     let bpm = BufferPoolManager::new(256, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
@@ -221,10 +221,10 @@ fn scan_emits_newest_visible_version_per_key() {
     let pairs: Vec<_> = h3.scan(..).map(|r| r.unwrap()).collect();
     let by_key: std::collections::HashMap<Vec<u8>, Vec<u8>> = pairs.into_iter().collect();
 
-    assert_eq!(by_key.get(&b"k1".to_vec()), Some(&b"v1".to_vec()));
-    assert_eq!(by_key.get(&b"k2".to_vec()), Some(&b"v2_updated".to_vec()));
+    assert_eq!(by_key.get(b"k1".as_slice()), Some(&b"v1".to_vec()));
+    assert_eq!(by_key.get(b"k2".as_slice()), Some(&b"v2_updated".to_vec()));
     assert!(
-        !by_key.contains_key(&b"k3".to_vec()),
+        !by_key.contains_key(b"k3".as_slice()),
         "tombstoned key must not appear in scan output"
     );
     commit(&env, t3);

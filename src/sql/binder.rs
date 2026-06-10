@@ -493,7 +493,7 @@ impl<E: StorageEngine> Binder<E> {
             };
             let idx = column_index(&scope, &col_name)?;
             // Single-table scope in UPDATE — table[0] is the target.
-            let target_ty = scope.tables[0].schema.columns[idx].ty.clone();
+            let target_ty = scope.tables[0].schema.columns[idx].ty;
             let expr = bind_expression(&scope, a.value)?;
             // The SET result must match the target column's type — Table's
             // update_columns rejects type mismatch outright. Narrow Int64

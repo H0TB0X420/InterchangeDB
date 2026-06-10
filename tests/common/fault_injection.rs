@@ -76,10 +76,10 @@ fn consume_one(counter: &AtomicUsize) -> bool {
 }
 
 fn injected_error(op: &str) -> Error {
-    Error::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        format!("FaultInjection: injected failure on {}", op),
-    ))
+    Error::Io(std::io::Error::other(format!(
+        "FaultInjection: injected failure on {}",
+        op
+    )))
 }
 
 impl<D: DiskManager> DiskManager for FaultInjectionDiskManager<D> {

@@ -348,6 +348,10 @@ fn max_user_key_at_length_le(end: &[u8], l: usize) -> Option<Vec<u8>> {
 /// NOTE (perf): still buffers into a `Vec` rather than streaming. The Vec
 /// is the next bottleneck for analytical workloads — Phase 11 streaming
 /// refactor.
+// CLIPPY-ALLOW(too_many_arguments): MVCC scan needs the engine, key range,
+// snapshot, and txn-manager handles all at once; bundling them into a struct
+// would only relocate the same parameters with no clarity gain.
+#[allow(clippy::too_many_arguments)]
 pub fn mvcc_scan<E: StorageEngine>(
     engine: &E,
     start_key: &[u8],

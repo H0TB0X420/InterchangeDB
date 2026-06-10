@@ -111,16 +111,13 @@ fn lsm_value_one_byte_over_u16_max_errors_cleanly() {
     // Either accepted by LSM (no u16 limit in LsmEngine path — only WAL
     // has that) and gets() back the same value, or fails cleanly. Either
     // is OK; we just don't want a panic or a silent truncation.
-    match e.put(b"k", &val) {
-        Ok(_) => {
-            let got = e.get(b"k").unwrap();
-            assert_eq!(
-                got,
-                Some(val),
-                "silent truncation/corruption at u16::MAX + 1"
-            );
-        }
-        Err(_) => {}
+    if e.put(b"k", &val).is_ok() {
+        let got = e.get(b"k").unwrap();
+        assert_eq!(
+            got,
+            Some(val),
+            "silent truncation/corruption at u16::MAX + 1"
+        );
     }
 }
 

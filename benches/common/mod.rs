@@ -116,7 +116,7 @@ pub mod rng {
         /// For very large n the constructor is the dominant cost; use sparingly.
         pub fn new(n: usize, theta: f64) -> Self {
             assert!(n > 0, "Zipfian requires n > 0");
-            assert!(theta >= 0.0 && theta < 1.0, "theta must be in [0, 1)");
+            assert!((0.0..1.0).contains(&theta), "theta must be in [0, 1)");
 
             let zetan = zeta(n, theta);
             let zeta2 = zeta(2, theta);

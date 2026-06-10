@@ -298,13 +298,15 @@ fn eval_compare(op: CompareOp, l: &Value, r: &Value) -> bool {
                 _ => return false,
             };
             use std::cmp::Ordering::*;
-            match (op, ord) {
-                (CompareOp::Lt, Less) => true,
-                (CompareOp::Lte, Less) | (CompareOp::Lte, Equal) => true,
-                (CompareOp::Gt, Greater) => true,
-                (CompareOp::Gte, Greater) | (CompareOp::Gte, Equal) => true,
-                _ => false,
-            }
+            matches!(
+                (op, ord),
+                (CompareOp::Lt, Less)
+                    | (CompareOp::Lte, Less)
+                    | (CompareOp::Lte, Equal)
+                    | (CompareOp::Gt, Greater)
+                    | (CompareOp::Gte, Greater)
+                    | (CompareOp::Gte, Equal)
+            )
         }
     }
 }

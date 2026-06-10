@@ -39,7 +39,7 @@ struct Env {
 
 fn setup() -> Env {
     let dir = tempdir().unwrap();
-    let dm = FileDiskManager::create(&dir.path().join("test.db")).unwrap();
+    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
     let bpm = BufferPoolManager::new(512, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());

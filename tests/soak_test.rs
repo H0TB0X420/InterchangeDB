@@ -161,11 +161,8 @@ fn soak_30_seconds() {
                 thread::sleep(Duration::from_secs(3));
 
                 // GC.
-                match db.gc() {
-                    Ok(_stats) => {
-                        gc_runs.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => {}
+                if let Ok(_stats) = db.gc() {
+                    gc_runs.fetch_add(1, Ordering::Relaxed);
                 }
                 // Checkpoint.
                 let _ = db.checkpoint();

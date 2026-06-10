@@ -16,7 +16,7 @@
 //! - `bulk_insert`        — N unique keys, each value fresh.
 //! - `uniform_updates`    — pre-fill K keys, then update random keys uniformly.
 //! - `zipfian_updates`    — pre-fill K keys, then update keys with theta=0.99
-//!                          (top 1% of keys see ~50% of writes).
+//!   (top 1% of keys see ~50% of writes).
 //!
 //! ## Caveats
 //! - LSM WAF is a *lower bound*. Sub-poll-interval flush+compact storms can
@@ -250,17 +250,15 @@ fn run_btree(workload: Workload, bpm_frames: usize) -> AmpResult {
 
     // --- Reset stats so the timed phase is clean ---
     bpm.stats().reset();
-    let user_bytes_written;
-
     // --- Workload phase ---
-    match workload {
+    let user_bytes_written = match workload {
         Workload::BulkInsert => {
             for key in 0..BULK_KEYS {
                 let k = encode_key_i64(key as i64);
                 let v = encode_value_u64(key as u64);
                 tree.insert(&k, &v).unwrap();
             }
-            user_bytes_written = (BULK_KEYS * RECORD_BYTES) as u64;
+            (BULK_KEYS * RECORD_BYTES) as u64
         }
         Workload::UniformUpdates => {
             let mut rng = Lcg64::new(0xA1B2_C3D4);
@@ -270,7 +268,7 @@ fn run_btree(workload: Workload, bpm_frames: usize) -> AmpResult {
                 let v = encode_value_u64(rng.next_u64());
                 let _ = tree.insert(&k, &v);
             }
-            user_bytes_written = (UPDATE_OPS * RECORD_BYTES) as u64;
+            (UPDATE_OPS * RECORD_BYTES) as u64
         }
         Workload::ZipfianUpdates => {
             let mut rng = Lcg64::new(0xA1B2_C3D4);
@@ -281,9 +279,9 @@ fn run_btree(workload: Workload, bpm_frames: usize) -> AmpResult {
                 let v = encode_value_u64(rng.next_u64());
                 let _ = tree.insert(&k, &v);
             }
-            user_bytes_written = (UPDATE_OPS * RECORD_BYTES) as u64;
+            (UPDATE_OPS * RECORD_BYTES) as u64
         }
-    }
+    };
     bpm.flush_all_pages().unwrap();
 
     let pages_written = bpm.stats().pages_written.load(Ordering::Relaxed);
@@ -345,15 +343,14 @@ fn run_lsm(workload: Workload, memtable_bytes: usize) -> AmpResult {
     // the result reflects only the workload phase.
     let pre_workload_disk = tree.level_state().total_disk_size();
 
-    let user_bytes_written;
-    match workload {
+    let user_bytes_written = match workload {
         Workload::BulkInsert => {
             for key in 0..BULK_KEYS {
                 let k = encode_key_vec(key as i64);
                 let v = encode_value_vec(key as u64);
                 tree.put(k, v).unwrap();
             }
-            user_bytes_written = (BULK_KEYS * RECORD_BYTES) as u64;
+            (BULK_KEYS * RECORD_BYTES) as u64
         }
         Workload::UniformUpdates => {
             let mut rng = Lcg64::new(0xA1B2_C3D4);
@@ -363,7 +360,7 @@ fn run_lsm(workload: Workload, memtable_bytes: usize) -> AmpResult {
                 let v = encode_value_vec(rng.next_u64());
                 tree.put(k, v).unwrap();
             }
-            user_bytes_written = (UPDATE_OPS * RECORD_BYTES) as u64;
+            (UPDATE_OPS * RECORD_BYTES) as u64
         }
         Workload::ZipfianUpdates => {
             let mut rng = Lcg64::new(0xA1B2_C3D4);
@@ -374,9 +371,9 @@ fn run_lsm(workload: Workload, memtable_bytes: usize) -> AmpResult {
                 let v = encode_value_vec(rng.next_u64());
                 tree.put(k, v).unwrap();
             }
-            user_bytes_written = (UPDATE_OPS * RECORD_BYTES) as u64;
+            (UPDATE_OPS * RECORD_BYTES) as u64
         }
-    }
+    };
     // Drain the memtable so its bytes hit disk and get counted by the poller.
     tree.flush_memtable().unwrap();
 

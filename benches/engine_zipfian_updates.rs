@@ -224,7 +224,7 @@ fn run_btree(dist: Distribution, bpm_frames: usize) -> CellResult {
     // Reset stats so we measure only the workload phase.
     bpm.stats().reset();
 
-    let mut rng = Lcg64::new(0xBADC_0DE);
+    let mut rng = Lcg64::new(0x0BAD_C0DE);
     let zipf = Zipfian::new(PREFILL_KEYS, ZIPFIAN_THETA);
 
     let start = Instant::now();
@@ -277,7 +277,7 @@ fn run_lsm(dist: Distribution, memtable_bytes: usize) -> CellResult {
     let sst_dir = dir.path().join("sst");
     let poller = SstDirPoller::start(sst_dir, POLL_INTERVAL);
 
-    let mut rng = Lcg64::new(0xBADC_0DE);
+    let mut rng = Lcg64::new(0x0BAD_C0DE);
     let zipf = Zipfian::new(PREFILL_KEYS, ZIPFIAN_THETA);
 
     let start = Instant::now();
