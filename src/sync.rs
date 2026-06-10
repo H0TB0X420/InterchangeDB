@@ -25,6 +25,23 @@ pub use model::*;
 #[cfg(not(feature = "shuttle"))]
 pub use real::*;
 
+/// Trace point for `shuttle` model-check debugging. Under `--features shuttle`
+/// it prints with the current task id (replay is deterministic, so output
+/// order is the interleaving); in production it compiles to nothing.
+#[cfg(feature = "shuttle")]
+#[macro_export]
+macro_rules! sync_trace {
+    ($($arg:tt)*) => {
+        eprintln!("[task {:?}] {}", ::shuttle::current::me(), format_args!($($arg)*))
+    };
+}
+
+#[cfg(not(feature = "shuttle"))]
+#[macro_export]
+macro_rules! sync_trace {
+    ($($arg:tt)*) => {{}};
+}
+
 /// Production backend: real `parking_lot` locks and `std` atomics, re-exported
 /// verbatim. Zero overhead — these are the exact types used before the shim.
 #[cfg(not(feature = "shuttle"))]

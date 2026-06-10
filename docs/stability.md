@@ -114,6 +114,18 @@ release, wait-for graph acyclicity outside deadlock).
 
 ## C. Concurrency correctness
 
+> **Realized — `Q-30` fixed (2026-06-10).** `shuttle` is adopted for the
+> buffer pool via a perf-preserving shim (`src/sync.rs`): prod keeps
+> `parking_lot`, `--features shuttle` swaps in shuttle's instrumented
+> primitives. The harness (`tests/bpm_swap_shuttle.rs`) **deterministically
+> reproduced** the Q-30 eviction-flush race that defeated months of
+> inspection, drove the fix, then **confirmed its absence** (PCT 50k + random
+> 100k explore clean; the marquee stress went from 3/12 to 25/25 in release).
+> It even caught a regression in the *first* fix attempt within milliseconds.
+> This is the end-to-end pillar-C loop — find → fix → prove — and it partially
+> answers `Q-25`: shuttle adopted where it pays off (the BPM) without the
+> codebase-wide `std` migration Q-25 deferred for perf.
+
 Closes `Q-25` (shuttle adoption vs. plan correction).
 
 | Tool | Scope | Trade-off |

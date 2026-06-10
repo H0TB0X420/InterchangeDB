@@ -509,41 +509,34 @@ impl BufferPoolManager {
     }
 
     fn evict_page(&self, incoming_page: PageId) -> Result<FrameId> {
-        // Q-27: `evict_for_page` only consults the replacer's evictable
-        // set, which is updated by `set_evictable` calls *after* a
-        // cache-hit thread pins a frame. There is a window where a frame
-        // is still in the evictable set but a concurrent cache-hit has
-        // selected it and is about to pin. Without the pin-count check
-        // below, we'd flush + overwrite a frame that another thread
-        // holds — surfacing as "byte 0 of page X is page Y's data" reads.
+        // Selecting and reusing a victim frame races two other operations:
+        // concurrent cache-hits (which pin) and concurrent fetches of the
+        // victim's *own* page. Both are handled by serializing on `pt.write`
+        // plus a flush-before-unmap ordering.
         //
-        // The check has to happen *under* `pt.write`: cache-hit threads
-        // hold `pt.read` for the entirety of `handle_cache_hit`, which is
-        // exclusive with `pt.write`. So while we hold `pt.write`, no
-        // cache-hit can complete its pin, and `pin_count` is the final
-        // value, not a moving target.
+        // Q-27 (pin check under pt.write): `evict_for_page` consults the
+        // replacer's evictable set, but a cache-hit may have selected the same
+        // frame and be about to pin it. `handle_cache_hit` holds `pt.read` for
+        // its entirety, which is exclusive with `pt.write`; so checking
+        // `pin_count` under `pt.write` sees the final value, and `swap_policy`
+        // (also gated on pt.write) cannot re-register a mid-eviction victim.
         //
-        // If the victim is pinned at check time, we abandon it (don't
-        // re-add to the evictable set; the pinning thread's eventual
-        // `unpin_page_internal` will set_evictable(true)) and try again.
-        // Bounded by frame count to avoid pathological retry loops.
-        // Q-27 also addresses a swap_policy race: swap_policy iterates the
-        // page table and re-registers each frame's evictability in the new
-        // replacer. If swap_policy runs after our `evict_for_page` (which
-        // removed our victim from the old policy's evictable set) but
-        // before our `pt.remove`, the victim is still in pt and the new
-        // replacer marks it evictable again — a second concurrent
-        // eviction can then select the same frame, and we end up with
-        // two threads "owning" it. Holding pt.write across evict_for_page
-        // prevents the window: swap_policy must also acquire pt.write,
-        // so it serializes with our entire selection-and-removal.
+        // Q-30 (flush before unmap): a dirty victim must be flushed to disk
+        // *before* it leaves the page table. Otherwise a concurrent fetch of
+        // the victim's page would miss the cache and read the stale, un-flushed
+        // disk slot — a lost write. So we keep the page mapped across the flush
+        // (concurrent fetches cache-hit the correct in-pool data), flush
+        // without holding `pt.write` (keeping disk I/O off the hot path), then
+        // re-validate and unmap under `pt.write`.
         const MAX_EVICT_RETRIES: usize = 64;
         for _ in 0..MAX_EVICT_RETRIES {
             let frame_id;
             let old_page_id;
-            let was_dirty;
+
+            // Phase 1: select + reserve a victim (removed from the replacer),
+            // but leave it in the page table for now.
             {
-                let mut pt = self.page_table.write();
+                let pt = self.page_table.write();
                 frame_id = {
                     let mut replacer = self.replacer.lock();
                     match replacer.evict_for_page(incoming_page) {
@@ -553,14 +546,54 @@ impl BufferPoolManager {
                 };
                 let frame = &self.frames[frame_id.0];
                 if frame.pin_count() > 0 {
-                    // Cache-hit raced ahead. Abandon this victim; the
-                    // unpinning thread will set_evictable(true) and add
-                    // the frame back to the evictable set.
+                    // Cache-hit raced ahead (and re-tracked the frame via
+                    // record_access). Abandon and retry.
                     drop(pt);
                     continue;
                 }
+                // Reserve the victim by pinning it. While we flush it below
+                // (pt.write released, page still mapped), this pin makes the
+                // frame un-reusable: a concurrent evictor's pin check sees our
+                // pin and abandons, so the frame can't be double-owned even if
+                // a cache-hit re-tracks it in the replacer.
+                frame.pin();
                 old_page_id = frame.page_id();
-                was_dirty = frame.is_dirty();
+            }
+
+            // Phase 2: flush the (possibly dirty) victim while it is still
+            // mapped, so a concurrent fetch of `old_page_id` cache-hits the
+            // correct in-pool frame rather than the stale disk slot.
+            // `flush_frame` is a no-op when the frame is clean.
+            if let Some(pid) = old_page_id {
+                self.flush_frame(frame_id, pid)?;
+            }
+
+            // Phase 3: commit. If a racing fetch pinned or re-dirtied the frame
+            // during the flush, abandon — that racer re-tracked it in the
+            // replacer, so nothing is lost — and retry. Otherwise unmap it and
+            // hand off a clean frame.
+            {
+                let mut pt = self.page_table.write();
+                let frame = &self.frames[frame_id.0];
+                // Drop our reservation; the remaining pin count and dirty flag
+                // now reflect only other threads that touched the page during
+                // the flush.
+                frame.unpin();
+                if frame.pin_count() > 0 || frame.is_dirty() {
+                    // Still in use, or re-dirtied during the flush. Whichever
+                    // fetch did so re-tracked the frame in the replacer, so
+                    // abandon and retry.
+                    drop(pt);
+                    continue;
+                }
+                // Safe to evict. A read-only cache-hit during the flush may
+                // have re-tracked this frame in the replacer (record_access);
+                // remove it again so no other evictor can select it while
+                // handle_cache_miss reloads it.
+                {
+                    let mut replacer = self.replacer.lock();
+                    replacer.remove(frame_id);
+                }
                 if let Some(pid) = old_page_id {
                     pt.remove(&pid);
                 }
@@ -568,14 +601,6 @@ impl BufferPoolManager {
             }
 
             self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-
-            if was_dirty {
-                if let Some(pid) = old_page_id {
-                    self.flush_frame(frame_id, pid)?;
-                }
-            }
-            let frame = &self.frames[frame_id.0];
-            frame.clear_dirty();
             return Ok(frame_id);
         }
         Err(Error::NoFreeFrames)

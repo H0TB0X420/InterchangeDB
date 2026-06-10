@@ -68,16 +68,12 @@ fn seed_pages(bpm: &BufferPoolManager) -> Vec<(PageId, u8)> {
     pages
 }
 
-// Q-30: QUARANTINED. This test reliably fails ~25% of runs in release —
-// `swap_policy` racing concurrent eviction/fetch corrupts a frame's
-// page→data association, surfacing as "byte 0 of page X holds page Y's
-// data" after the storm. The no-swap bisection test below stays green, so
-// the race is specific to the swap path; Q-27's `pt.write` serialization is
-// necessary but not sufficient. Reopened as Q-30 in ISSUES.md; the real fix
-// wants a `shuttle` deterministic-interleaving repro (stability.md pillar C),
-// not a per-push hard gate that's red a quarter of the time. Run explicitly
-// with `cargo test -- --ignored` to reproduce.
-#[ignore = "Q-30: swap_policy <-> evict data race (~25% repro, release); see ISSUES.md"]
+// Q-30 (FIXED): this once failed ~25% of runs in release — `swap_policy`'s
+// eviction churn exposed a race where eviction removed a dirty page from the
+// page table before flushing it, so a concurrent fetch of that page read the
+// stale disk slot (a lost write surfacing as cross-page corruption). Fixed by
+// flushing the victim while it stays mapped + pinned (see `evict_page`); the
+// deterministic `shuttle` repro lives in `tests/bpm_swap_shuttle.rs`.
 #[test]
 fn marquee_hot_swap_storm_all_six_policies_both_modes() {
     let bpm = build_bpm();

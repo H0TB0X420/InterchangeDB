@@ -21,7 +21,7 @@ use interchangedb::buffer::replacer::{ClockReplacer, FifoReplacer, LruReplacer};
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::storage::MemoryDiskManager;
 
-use shuttle::scheduler::{PctScheduler, RandomScheduler, ReplayScheduler};
+use shuttle::scheduler::{PctScheduler, RandomScheduler};
 use shuttle::sync::Arc;
 use shuttle::{Config, Runner};
 
@@ -118,44 +118,20 @@ fn config_with_stack() -> Config {
     config
 }
 
-// IGNORED until Q-30 is fixed: at 100k iterations on this scenario, even
-// uniform-random reproduces the race (PCT finds it far faster). Un-ignore once
-// the BPM fix lands.
-#[ignore = "Q-30: reproduces the open BPM swap/eviction race; un-ignore after fix"]
+// Q-30 regression guard. Before the eviction-flush-ordering fix, uniform-random
+// reproduced the race at 100k iterations (PCT found it far faster); both now
+// explore clean. A failure here means the swap↔eviction race has regressed.
 #[test]
 fn shuttle_swap_vs_eviction_random() {
-    // Randomized interleaving search — prints a reproducing seed on failure.
     let scheduler = RandomScheduler::new(100_000);
     Runner::new(scheduler, config_with_stack()).run(swap_vs_eviction_scenario);
 }
 
-// IGNORED until Q-30 is fixed: PCT reliably finds the swap↔eviction race, so
-// this currently fails by design. Un-ignore once the BPM fix lands — it then
-// becomes the robust regression guard (explores and finds nothing). Run now
-// with `cargo test --features shuttle -- --ignored` to reproduce.
-#[ignore = "Q-30: reproduces the open BPM swap/eviction race; un-ignore after fix"]
+// Q-30 regression guard. PCT is biased toward bugs needing only a few
+// preemptions — it found this race in milliseconds where uniform-random needed
+// 100k iterations. This is the regression of record.
 #[test]
 fn shuttle_swap_vs_eviction_pct() {
-    // PCT is biased toward bugs that need only a few preemptions — often finds
-    // concurrency bugs that uniform-random misses.
     let scheduler = PctScheduler::new(5, 50_000);
-    Runner::new(scheduler, config_with_stack()).run(swap_vs_eviction_scenario);
-}
-
-/// A schedule (found by `shuttle_swap_vs_eviction_pct`) that deterministically
-/// triggers the Q-30 race: a writer holding `fetch_page_write(P2)` observes a
-/// zeroed frame (byte 0 == 0) — P2's dirty page was lost and reloaded as the
-/// blank on-disk version. Replays in a single execution for debugging and as a
-/// hard regression: once the race is fixed this must run clean.
-const Q30_RACE_SCHEDULE: &str = "91028f02a3cc9ce495e9ddd17f0000000000000000000000000000000000000000000000000000000000489224499224499224499224818445dbb66ddbb66d5b922449922489a42449924892244992244992244992244992244992244992244992244992242549922449922489922449204912";
-
-// IGNORED until Q-30 is fixed: deterministically reproduces the race in one
-// execution. After the fix, replaying this exact schedule should no longer
-// corrupt (or the schedule may legitimately diverge if the fix changes
-// scheduling points — at which point PCT is the regression of record).
-#[ignore = "Q-30: deterministic repro of the open race; un-ignore/re-evaluate after fix"]
-#[test]
-fn shuttle_replay_q30_race() {
-    let scheduler = ReplayScheduler::new_from_encoded(Q30_RACE_SCHEDULE);
     Runner::new(scheduler, config_with_stack()).run(swap_vs_eviction_scenario);
 }
