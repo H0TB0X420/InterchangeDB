@@ -78,7 +78,6 @@ impl Scope {
             column_offset,
         });
     }
-
 }
 
 impl<E: StorageEngine> Binder<E> {
@@ -137,7 +136,13 @@ impl<E: StorageEngine> Binder<E> {
             let coldef = self.bind_column_def(col)?;
             // Detect inline `PRIMARY KEY` column option.
             let is_inline_pk = col.options.iter().any(|opt| {
-                matches!(opt.option, ColumnOption::Unique { is_primary: true, .. })
+                matches!(
+                    opt.option,
+                    ColumnOption::Unique {
+                        is_primary: true,
+                        ..
+                    }
+                )
             });
             if is_inline_pk {
                 if inline_pk.is_some() {
@@ -153,7 +158,10 @@ impl<E: StorageEngine> Binder<E> {
         // Table-level PRIMARY KEY (...) constraint.
         let mut table_pk: Option<Vec<usize>> = None;
         for c in &ct.constraints {
-            if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = c {
+            if let TableConstraint::PrimaryKey {
+                columns: pk_cols, ..
+            } = c
+            {
                 let mut indices = Vec::with_capacity(pk_cols.len());
                 for name in pk_cols {
                     let pos = columns
@@ -210,7 +218,10 @@ impl<E: StorageEngine> Binder<E> {
             matches!(
                 o.option,
                 ColumnOption::NotNull
-                    | ColumnOption::Unique { is_primary: true, .. }
+                    | ColumnOption::Unique {
+                        is_primary: true,
+                        ..
+                    }
             )
         });
         Ok(ColumnDef {
@@ -227,10 +238,11 @@ impl<E: StorageEngine> Binder<E> {
 
     fn bind_query(&self, q: Query) -> Result<LogicalPlan> {
         let limit = match q.limit {
-            Some(AstExpr::Value(AstValue::Number(n, _))) => Some(
-                n.parse::<usize>()
-                    .map_err(|e| Error::SqlParse(format!("LIMIT must be a non-negative integer: {}", e)))?,
-            ),
+            Some(AstExpr::Value(AstValue::Number(n, _))) => {
+                Some(n.parse::<usize>().map_err(|e| {
+                    Error::SqlParse(format!("LIMIT must be a non-negative integer: {}", e))
+                })?)
+            }
             Some(other) => {
                 return Err(Error::SqlParse(format!(
                     "binder: only literal integer LIMIT supported, got {:?}",
@@ -309,7 +321,8 @@ impl<E: StorageEngine> Binder<E> {
         // — predicates over earlier tables still work, and over later
         // tables that haven't been joined yet would be a forward
         // reference (unusual, the binder rejects via column-not-found).
-        let mut joins: Vec<crate::sql::logical::JoinClause> = Vec::with_capacity(joined_tables.len());
+        let mut joins: Vec<crate::sql::logical::JoinClause> =
+            Vec::with_capacity(joined_tables.len());
         for (right_table, right_alias, on_expr) in joined_tables {
             let on = match on_expr {
                 Some(e) => Some(bind_predicate(&scope, e)?),
@@ -341,7 +354,7 @@ impl<E: StorageEngine> Binder<E> {
                     let col = resolve_column_expr(&scope, &obe.expr)?;
                     let dir = match obe.asc {
                         Some(false) => OrderDir::Desc,
-                        _ => OrderDir::Asc,  // None defaults to ASC per SQL spec
+                        _ => OrderDir::Asc, // None defaults to ASC per SQL spec
                     };
                     keys.push((col, dir));
                 }
@@ -369,9 +382,9 @@ impl<E: StorageEngine> Binder<E> {
         let table_name = object_name_to_string(&ins.table_name);
         let schema = self.catalog.get_table(&table_name)?;
 
-        let source = ins.source.ok_or_else(|| {
-            Error::SqlParse("binder: INSERT without source not supported".into())
-        })?;
+        let source = ins
+            .source
+            .ok_or_else(|| Error::SqlParse("binder: INSERT without source not supported".into()))?;
         let values = match *source.body {
             SetExpr::Values(Values { rows, .. }) => rows,
             other => {
@@ -415,8 +428,9 @@ impl<E: StorageEngine> Binder<E> {
             }
             // Build a full-width row of Expressions; fill specified columns,
             // leave others as Literal(Null) (column list semantics).
-            let mut full: Vec<Expression> =
-                (0..schema.columns.len()).map(|_| Expression::Literal(Value::Null)).collect();
+            let mut full: Vec<Expression> = (0..schema.columns.len())
+                .map(|_| Expression::Literal(Value::Null))
+                .collect();
             for (src_pos, expr) in row.into_iter().enumerate() {
                 let dst = col_indices[src_pos];
                 full[dst] = insert_value_expr(expr, &schema.columns[dst].ty)?;
@@ -663,8 +677,11 @@ fn bind_select_items(
                 projection.push(column_index(scope, &ident.value)?);
             }
             AstExpr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                projection
-                    .push(column_index_qualified(scope, &parts[0].value, &parts[1].value)?);
+                projection.push(column_index_qualified(
+                    scope,
+                    &parts[0].value,
+                    &parts[1].value,
+                )?);
             }
             AstExpr::Function(func) => {
                 aggregates.push(bind_aggregate_function(scope, func)?);
@@ -739,9 +756,7 @@ fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<Aggreg
             match &args[0] {
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => {
                     if distinct {
-                        return Err(Error::SqlParse(
-                            "COUNT(DISTINCT *) is not valid SQL".into(),
-                        ));
+                        return Err(Error::SqlParse("COUNT(DISTINCT *) is not valid SQL".into()));
                     }
                     Ok(AggregateSpec::CountStar)
                 }
@@ -936,10 +951,7 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
             //   later. For now, accept only $N to keep this stateless.
             if let Some(rest) = s.strip_prefix('$') {
                 let n: usize = rest.parse().map_err(|e| {
-                    Error::SqlParse(format!(
-                        "invalid parameter placeholder '{}': {}",
-                        s, e
-                    ))
+                    Error::SqlParse(format!("invalid parameter placeholder '{}': {}", s, e))
                 })?;
                 if n == 0 {
                     return Err(Error::SqlParse(
@@ -952,7 +964,8 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
                 // occurrence order in the binder. Defer to a Phase 14
                 // refactor; for now require explicit `$N`.
                 Err(Error::SqlParse(
-                    "use $1, $2, … for parameter placeholders (anonymous `?` not supported yet)".into(),
+                    "use $1, $2, … for parameter placeholders (anonymous `?` not supported yet)"
+                        .into(),
                 ))
             } else {
                 Err(Error::SqlParse(format!(
@@ -974,9 +987,9 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
         } => match *expr {
             AstExpr::Value(AstValue::Number(n, _)) => {
                 let neg = format!("-{}", n);
-                Ok(Expression::Literal(
-                    ast_value_to_value_unconstrained(AstValue::Number(neg, false))?,
-                ))
+                Ok(Expression::Literal(ast_value_to_value_unconstrained(
+                    AstValue::Number(neg, false),
+                )?))
             }
             other => {
                 let inner = bind_expression(scope, other)?;
@@ -1043,7 +1056,10 @@ fn ast_value_to_value_unconstrained(v: AstValue) -> Result<Value> {
                 let scale = n.split_once('.').map(|(_, f)| f.len() as u8).unwrap_or(0);
                 Ok(Value::Decimal(decimal_from_str(&n, scale)?))
             } else {
-                Err(Error::SqlParse(format!("cannot parse number literal: {}", n)))
+                Err(Error::SqlParse(format!(
+                    "cannot parse number literal: {}",
+                    n
+                )))
             }
         }
         AstValue::SingleQuotedString(s) => Ok(Value::Varchar(s)),
@@ -1223,9 +1239,16 @@ mod tests {
     #[test]
     fn create_table_inline_pk() {
         let (binder, _dir) = fresh_catalog();
-        let plan = bind_first(&binder, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))");
+        let plan = bind_first(
+            &binder,
+            "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))",
+        );
         match plan {
-            LogicalPlan::CreateTable { name, columns, primary_key } => {
+            LogicalPlan::CreateTable {
+                name,
+                columns,
+                primary_key,
+            } => {
                 assert_eq!(name, "t");
                 assert_eq!(columns.len(), 2);
                 assert_eq!(columns[0].name, "id");
@@ -1249,12 +1272,19 @@ mod tests {
                  PRIMARY KEY (w_id))",
         );
         match plan {
-            LogicalPlan::CreateTable { columns, primary_key, .. } => {
+            LogicalPlan::CreateTable {
+                columns,
+                primary_key,
+                ..
+            } => {
                 assert_eq!(columns[0].ty, ColumnType::Int32);
                 assert!(!columns[0].nullable);
                 assert_eq!(
                     columns[1].ty,
-                    ColumnType::Decimal { precision: 12, scale: 2 }
+                    ColumnType::Decimal {
+                        precision: 12,
+                        scale: 2
+                    }
                 );
                 assert_eq!(primary_key, vec![0]);
             }
@@ -1284,7 +1314,11 @@ mod tests {
         // We need to actually create the table in the catalog so subsequent
         // binds can resolve it. Run the CreateTable plan through the catalog.
         match plan {
-            LogicalPlan::CreateTable { name, columns, primary_key } => {
+            LogicalPlan::CreateTable {
+                name,
+                columns,
+                primary_key,
+            } => {
                 let schema = Schema {
                     name: name.clone(),
                     table_id: crate::catalog::TableId(0), // will be assigned by catalog
@@ -1352,7 +1386,15 @@ mod tests {
         let (binder, _dir) = binder_with_warehouse();
         let plan = bind_first(&binder, "SELECT * FROM warehouse");
         match plan {
-            LogicalPlan::Select { table, joins, projection, aggregates, filter, order_by, limit } => {
+            LogicalPlan::Select {
+                table,
+                joins,
+                projection,
+                aggregates,
+                filter,
+                order_by,
+                limit,
+            } => {
                 assert_eq!(table, "warehouse");
                 assert!(joins.is_empty());
                 assert!(aggregates.is_empty());
@@ -1373,7 +1415,12 @@ mod tests {
             "SELECT w_name, w_ytd FROM warehouse WHERE w_id = 1 LIMIT 5",
         );
         match plan {
-            LogicalPlan::Select { projection, filter, limit, .. } => {
+            LogicalPlan::Select {
+                projection,
+                filter,
+                limit,
+                ..
+            } => {
                 assert_eq!(projection, vec![2, 1]);
                 assert!(matches!(filter, Some(Predicate::Compare { .. })));
                 assert_eq!(limit, Some(5));
@@ -1390,7 +1437,10 @@ mod tests {
             "SELECT w_id FROM warehouse WHERE w_id > 0 AND NOT (w_id = 5 OR w_id = 7)",
         );
         match plan {
-            LogicalPlan::Select { filter: Some(Predicate::And(_, b)), .. } => {
+            LogicalPlan::Select {
+                filter: Some(Predicate::And(_, b)),
+                ..
+            } => {
                 assert!(matches!(*b, Predicate::Not(_)));
             }
             _ => panic!("expected And(_, Not(...))"),
@@ -1416,12 +1466,19 @@ mod tests {
             "UPDATE warehouse SET w_ytd = w_ytd + 100.00 WHERE w_id = 1",
         );
         match plan {
-            LogicalPlan::Update { set_clauses, filter, .. } => {
+            LogicalPlan::Update {
+                set_clauses,
+                filter,
+                ..
+            } => {
                 assert_eq!(set_clauses.len(), 1);
                 assert_eq!(set_clauses[0].0, 1); // w_ytd is index 1
                 assert!(matches!(
                     set_clauses[0].1,
-                    Expression::BinaryOp { op: BinaryOp::Add, .. }
+                    Expression::BinaryOp {
+                        op: BinaryOp::Add,
+                        ..
+                    }
                 ));
                 assert!(filter.is_some());
             }
@@ -1495,7 +1552,11 @@ mod tests {
                 assert_eq!(joins[0].right_alias.as_deref(), Some("w2"));
                 let on = joins[0].on.as_ref().expect("ON predicate");
                 match on {
-                    Predicate::Compare { op: crate::sql::expr::CompareOp::Eq, left, right } => {
+                    Predicate::Compare {
+                        op: crate::sql::expr::CompareOp::Eq,
+                        left,
+                        right,
+                    } => {
                         // Left is `w.w_id` (column 0 of warehouse; tuple
                         // offset 0). Right is `w2.w_id` (column 0 of the
                         // second `warehouse`; tuple offset 3 — warehouse

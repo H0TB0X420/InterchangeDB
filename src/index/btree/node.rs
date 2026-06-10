@@ -308,7 +308,8 @@ impl LeafNode {
     ///
     /// Returns Some(index) if key found and not tombstoned, None otherwise.
     pub fn lookup(&self, key: &[u8]) -> Option<usize> {
-        self.lookup_physical(key).filter(|&idx| !self.is_tombstone(idx))
+        self.lookup_physical(key)
+            .filter(|&idx| !self.is_tombstone(idx))
     }
 
     /// Lookup key ignoring tombstones (physical lookup).
@@ -581,16 +582,16 @@ mod tests {
     fn test_internal_node_find_child_index() {
         let mut node = InternalNode::new(10);
         node.keys = vec![
-            vec![],       // index 0: invalid
-            vec![5],      // index 1: separator
-            vec![10],     // index 2: separator
-            vec![15],     // index 3: separator
+            vec![],   // index 0: invalid
+            vec![5],  // index 1: separator
+            vec![10], // index 2: separator
+            vec![15], // index 3: separator
         ];
         node.children = vec![
-            PageId::new(0),  // < 5
-            PageId::new(1),  // 5 <= x < 10
-            PageId::new(2),  // 10 <= x < 15
-            PageId::new(3),  // >= 15
+            PageId::new(0), // < 5
+            PageId::new(1), // 5 <= x < 10
+            PageId::new(2), // 10 <= x < 15
+            PageId::new(3), // >= 15
         ];
         node.header.size = 4;
 
@@ -794,10 +795,10 @@ mod tests {
         node.insert(vec![3], vec![30]);
         node.delete(&[2], MAX_TOMBSTONES);
 
-        assert_eq!(node.size(), 2);          // logical
+        assert_eq!(node.size(), 2); // logical
         assert_eq!(node.physical_size(), 3);
         assert_eq!(node.logical_size(), 2);
-        assert_eq!(node.min_size(), 5);      // floor(10/2)
-        assert!(node.has_underflowed());     // 2 < 5
+        assert_eq!(node.min_size(), 5); // floor(10/2)
+        assert!(node.has_underflowed()); // 2 < 5
     }
 }

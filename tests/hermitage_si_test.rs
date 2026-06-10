@@ -60,7 +60,10 @@ fn g0_write_cycles_prevented() {
     // concurrent writers can both finalize x, the classic dirty-write bug.
     let t2_x = db.txn_put(t2, b"x", b"12");
     assert!(
-        matches!(t2_x, Err(Error::WriteConflict { .. }) | Err(Error::LockTimeout)),
+        matches!(
+            t2_x,
+            Err(Error::WriteConflict { .. }) | Err(Error::LockTimeout)
+        ),
         "expected WriteConflict or LockTimeout, got: {:?}",
         t2_x
     );

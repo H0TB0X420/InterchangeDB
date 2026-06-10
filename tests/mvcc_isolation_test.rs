@@ -50,7 +50,11 @@ fn no_dirty_reads() {
     let val = db.txn_get(t2, b"key").unwrap();
 
     // T2 sees the original value, NOT T1's dirty write.
-    assert_eq!(val, Some(b"original".to_vec()), "T2 should not see T1's uncommitted write");
+    assert_eq!(
+        val,
+        Some(b"original".to_vec()),
+        "T2 should not see T1's uncommitted write"
+    );
 
     db.commit_txn(t2).unwrap();
     db.txn_abort(t1).unwrap();
@@ -95,7 +99,11 @@ fn no_non_repeatable_reads() {
 
     // T1 reads again — still sees v1 (snapshot frozen).
     let second_read = db.txn_get(t1, b"key").unwrap();
-    assert_eq!(second_read, Some(b"v1".to_vec()), "Snapshot should be frozen — no repeatable read anomaly");
+    assert_eq!(
+        second_read,
+        Some(b"v1".to_vec()),
+        "Snapshot should be frozen — no repeatable read anomaly"
+    );
 
     db.commit_txn(t1).unwrap();
 }
@@ -129,7 +137,10 @@ fn no_phantom_reads() {
 
     // T1 reads again — "b" still doesn't exist in T1's snapshot.
     let b_after = db.txn_get(t1, b"b").unwrap();
-    assert_eq!(b_after, None, "Phantom should not appear in frozen snapshot");
+    assert_eq!(
+        b_after, None,
+        "Phantom should not appear in frozen snapshot"
+    );
 
     db.commit_txn(t1).unwrap();
 }
@@ -147,7 +158,11 @@ fn own_writes_visible() {
     db.txn_put(t1, b"key", b"my_value").unwrap();
 
     let val = db.txn_get(t1, b"key").unwrap();
-    assert_eq!(val, Some(b"my_value".to_vec()), "Transaction should see its own write");
+    assert_eq!(
+        val,
+        Some(b"my_value".to_vec()),
+        "Transaction should see its own write"
+    );
 
     db.commit_txn(t1).unwrap();
 }
@@ -200,7 +215,11 @@ fn aborted_overwrite_preserves_original() {
     db.txn_abort(t1).unwrap();
 
     let val = db.get(b"key").unwrap();
-    assert_eq!(val, Some(b"original".to_vec()), "Original should survive abort");
+    assert_eq!(
+        val,
+        Some(b"original".to_vec()),
+        "Original should survive abort"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +259,11 @@ fn tombstone_not_visible_to_earlier_snapshot() {
 
     // T1 still sees the key (snapshot frozen before delete).
     let val_after = db.txn_get(t1, b"key").unwrap();
-    assert_eq!(val_after, Some(b"value".to_vec()), "Earlier snapshot should not see later delete");
+    assert_eq!(
+        val_after,
+        Some(b"value".to_vec()),
+        "Earlier snapshot should not see later delete"
+    );
 
     db.commit_txn(t1).unwrap();
 }

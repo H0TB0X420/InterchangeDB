@@ -11,18 +11,18 @@
 //! - Tombstones are dropped only at the bottom (highest populated) level.
 //! - Output SSTables are split at ~TARGET_SSTABLE_SIZE_BYTES.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
-use parking_lot::Mutex;
 
 use crate::common::error::Result;
-use crate::index::lsm::Entry;
 use crate::index::lsm::config::{
     LEVEL_SIZE_RATIO, MAX_L0_SSTABLE_COUNT, MAX_LEVEL_COUNT, TARGET_SSTABLE_SIZE_BYTES,
 };
 use crate::index::lsm::manifest::{LevelState, Manifest};
 use crate::index::lsm::merge_iterator::MergeIterator;
-use crate::index::lsm::sstable::{SSTableMeta, SSTableReader, write_sstable};
+use crate::index::lsm::sstable::{write_sstable, SSTableMeta, SSTableReader};
+use crate::index::lsm::Entry;
 
 /// Check if compaction is needed and run it.
 ///
@@ -170,11 +170,10 @@ fn compact_level(
     let max_key = &picked.last_key;
 
     // Find overlapping SSTables in target level.
-    let (target_overlapping, target_remaining): (Vec<_>, Vec<_>) =
-        level_state.levels[target_level]
-            .iter()
-            .cloned()
-            .partition(|m| m.last_key >= *min_key && m.first_key <= *max_key);
+    let (target_overlapping, target_remaining): (Vec<_>, Vec<_>) = level_state.levels[target_level]
+        .iter()
+        .cloned()
+        .partition(|m| m.last_key >= *min_key && m.first_key <= *max_key);
 
     // Collect entries. Picked SSTable has higher priority.
     let mut sources = Vec::new();
@@ -233,8 +232,8 @@ fn compact_level(
     // Replace target level.
     level_state.levels[target_level] = target_remaining;
     for meta in new_metas {
-        let pos = level_state.levels[target_level]
-            .partition_point(|m| m.first_key < meta.first_key);
+        let pos =
+            level_state.levels[target_level].partition_point(|m| m.first_key < meta.first_key);
         level_state.levels[target_level].insert(pos, meta);
     }
 
@@ -394,12 +393,7 @@ mod tests {
         // After compaction, data should have moved below L0.
         // With cascading, it may be in L1, L2, or deeper.
         let l0_count = tree.level_state().levels[0].len();
-        let below_l0_count: usize = tree
-            .level_state()
-            .levels[1..]
-            .iter()
-            .map(|l| l.len())
-            .sum();
+        let below_l0_count: usize = tree.level_state().levels[1..].iter().map(|l| l.len()).sum();
 
         assert!(
             l0_count < MAX_L0_SSTABLE_COUNT,
@@ -437,10 +431,7 @@ mod tests {
 
         // Scan should return exactly one entry.
         let results = tree.scan::<std::ops::RangeFull>(..).unwrap();
-        let same_key_entries: Vec<_> = results
-            .iter()
-            .filter(|(k, _)| k == b"same_key")
-            .collect();
+        let same_key_entries: Vec<_> = results.iter().filter(|(k, _)| k == b"same_key").collect();
         assert_eq!(same_key_entries.len(), 1);
         assert_eq!(same_key_entries[0].1, b"v9");
     }

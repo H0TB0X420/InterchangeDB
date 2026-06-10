@@ -166,7 +166,9 @@ fn generate_access_sequence(
             while i < length {
                 // Scan phase: sequential scan over cold pages
                 for _ in 0..scan_burst_len {
-                    if i >= length { break; }
+                    if i >= length {
+                        break;
+                    }
                     let page = hot_set_size + (scan_cursor % cold_range);
                     scan_cursor += 1;
                     seq.push(PageId::new(page as u32));
@@ -177,7 +179,9 @@ fn generate_access_sequence(
                 // Two accesses gives LRU-K (K=2) a finite backward distance
                 for _ in 0..2 {
                     for h in 0..hot_set_size {
-                        if i >= length { break; }
+                        if i >= length {
+                            break;
+                        }
                         seq.push(PageId::new(h as u32));
                         i += 1;
                     }
@@ -235,7 +239,10 @@ impl SimulatedPool {
             fid
         } else {
             // Evict — pass incoming page so ARC can check B2 before REPLACE.
-            let victim = self.policy.evict_for_page(page_id).expect("no evictable frames");
+            let victim = self
+                .policy
+                .evict_for_page(page_id)
+                .expect("no evictable frames");
             if let Some(old_page) = self.frame_to_page[victim.0].take() {
                 self.page_table.remove(&old_page);
             }
@@ -321,20 +328,16 @@ fn bench_eviction_policies(c: &mut Criterion) {
         group.throughput(Throughput::Elements(ACCESS_LENGTH as u64));
 
         for factory in policy_factories() {
-            group.bench_with_input(
-                BenchmarkId::new(factory.name, ""),
-                &seq,
-                |b, seq| {
-                    b.iter(|| {
-                        let policy = (factory.make)(POOL_SIZE);
-                        let mut pool = SimulatedPool::new(policy, POOL_SIZE);
-                        for &page_id in seq {
-                            pool.access(page_id);
-                        }
-                        pool.hit_rate()
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new(factory.name, ""), &seq, |b, seq| {
+                b.iter(|| {
+                    let policy = (factory.make)(POOL_SIZE);
+                    let mut pool = SimulatedPool::new(policy, POOL_SIZE);
+                    for &page_id in seq {
+                        pool.access(page_id);
+                    }
+                    pool.hit_rate()
+                });
+            });
         }
 
         group.finish();
@@ -402,9 +405,7 @@ fn print_survival_summary() {
     let hot_set_size = pool_size / 4;
 
     // Hot pages: 0..hot_set_size
-    let hot_pages: Vec<PageId> = (0..hot_set_size)
-        .map(|i| PageId::new(i as u32))
-        .collect();
+    let hot_pages: Vec<PageId> = (0..hot_set_size).map(|i| PageId::new(i as u32)).collect();
 
     // Cold page range: disjoint from hot set.
     let cold_start = hot_set_size;
@@ -458,7 +459,10 @@ fn print_survival_summary() {
     // Available novel cold pages: [warmup_cold_end, num_pages).
     let scan_cold_start = warmup_cold_end;
     let scan_cold_range = num_pages - scan_cold_start;
-    assert!(scan_cold_range > pool_size, "not enough novel cold pages for scan");
+    assert!(
+        scan_cold_range > pool_size,
+        "not enough novel cold pages for scan"
+    );
     let scan_length = scan_cold_range; // one access per unique cold page
     let scan_seq: Vec<PageId> = (0..scan_length)
         .map(|i| PageId::new((scan_cold_start + i) as u32))
@@ -466,9 +470,15 @@ fn print_survival_summary() {
 
     println!();
     println!("## Hot Page Survival After One-Time Scan (ARC Theorem 4)");
-    println!("Pool={}, hot_set={}, scan={} cold pages", pool_size, hot_set_size, scan_length);
+    println!(
+        "Pool={}, hot_set={}, scan={} cold pages",
+        pool_size, hot_set_size, scan_length
+    );
     println!();
-    println!("| {:>10} | {:>10} | {:>10} |", "Policy", "survived", "survival %");
+    println!(
+        "| {:>10} | {:>10} | {:>10} |",
+        "Policy", "survived", "survival %"
+    );
     println!("|{:-<12}|{:-<12}|{:-<12}|", "", "", "");
 
     for factory in &factories {
@@ -486,14 +496,18 @@ fn print_survival_summary() {
         }
 
         // Measure: how many hot pages survived?
-        let surviving = hot_pages.iter()
+        let surviving = hot_pages
+            .iter()
             .filter(|&&pid| pool.contains_page(pid))
             .count();
         let survival_pct = surviving as f64 / hot_pages.len() as f64 * 100.0;
 
         println!(
             "| {:>10} | {:>7}/{:<2} | {:>9.1}% |",
-            factory.name, surviving, hot_pages.len(), survival_pct
+            factory.name,
+            surviving,
+            hot_pages.len(),
+            survival_pct
         );
     }
 }

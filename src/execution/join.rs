@@ -159,7 +159,10 @@ impl JoinStrategy for NestedLoopJoin {
 /// BTree-backed indexes. Strictly better than `NestedLoopJoin` when the
 /// inner has a usable index on the join key; Phase 14's cost model
 /// picks between them.
-pub struct IndexNestedLoopJoin<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout> {
+pub struct IndexNestedLoopJoin<
+    E: crate::storage::StorageEngine + 'static,
+    L: crate::layout::DataLayout,
+> {
     schema: Arc<Schema>,
     outer: Box<dyn Executor>,
     inner_table: Arc<crate::table::Table<E, L>>,
@@ -175,7 +178,9 @@ pub struct IndexNestedLoopJoin<E: crate::storage::StorageEngine + 'static, L: cr
     inner_cursor: usize,
 }
 
-impl<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout> IndexNestedLoopJoin<E, L> {
+impl<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout>
+    IndexNestedLoopJoin<E, L>
+{
     pub fn new(
         outer: Box<dyn Executor>,
         inner_table: Arc<crate::table::Table<E, L>>,
@@ -218,11 +223,8 @@ impl<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout> I
             .iter()
             .map(|&i| outer_row[i].clone())
             .collect();
-        let mut scan = crate::execution::IndexScan::new(
-            &*self.inner_table,
-            &self.inner_index,
-            &prefix,
-        )?;
+        let mut scan =
+            crate::execution::IndexScan::new(&*self.inner_table, &self.inner_index, &prefix)?;
         while let Some(row) = scan.next()? {
             self.current_inner_buffer.push(row);
         }
@@ -392,7 +394,9 @@ impl Executor for HashJoin {
         let pad = "  ".repeat(indent);
         let mut out = format!(
             "{}HashJoin(outer_key={}, build_size={})\n",
-            pad, self.outer_key_col, self.inner_table.len()
+            pad,
+            self.outer_key_col,
+            self.inner_table.len()
         );
         out.push_str(&self.outer.explain(indent + 1));
         out.push_str(&format!(

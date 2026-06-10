@@ -295,9 +295,7 @@ pub fn initialize_system_tables<E: StorageEngine>(engine: &E) -> Result<()> {
 /// Performs drift detection: every system table's stored schema must equal
 /// the hardcoded schema, byte-for-byte (via PartialEq). Errors with
 /// `CatalogDrift` if any system schema is missing or differs.
-pub fn load_system_tables<E: StorageEngine>(
-    engine: &E,
-) -> Result<HashMap<String, Arc<Schema>>> {
+pub fn load_system_tables<E: StorageEngine>(engine: &E) -> Result<HashMap<String, Arc<Schema>>> {
     let sys_tables = sys_tables_schema();
     let column_types = sys_tables.column_types();
     let ctx = LayoutCtx {
@@ -465,21 +463,27 @@ pub fn read_all_index_rows<E: StorageEngine>(
         let (_, values) = row_result?;
         let index_id = match &values[0] {
             Value::Int64(v) => crate::catalog::IndexId(*v as u32),
-            _ => return Err(Error::StorageCorrupted(
-                "__sys_indexes.index_id: expected Int64".into(),
-            )),
+            _ => {
+                return Err(Error::StorageCorrupted(
+                    "__sys_indexes.index_id: expected Int64".into(),
+                ))
+            }
         };
         let table_id = match &values[1] {
             Value::Int64(v) => crate::catalog::TableId(*v as u32),
-            _ => return Err(Error::StorageCorrupted(
-                "__sys_indexes.table_id: expected Int64".into(),
-            )),
+            _ => {
+                return Err(Error::StorageCorrupted(
+                    "__sys_indexes.table_id: expected Int64".into(),
+                ))
+            }
         };
         let name = match &values[2] {
             Value::Varchar(s) => s.clone(),
-            _ => return Err(Error::StorageCorrupted(
-                "__sys_indexes.name: expected Varchar".into(),
-            )),
+            _ => {
+                return Err(Error::StorageCorrupted(
+                    "__sys_indexes.name: expected Varchar".into(),
+                ))
+            }
         };
         let columns: Vec<usize> = match &values[3] {
             Value::Bytes(b) => bincode::deserialize(b).map_err(|e| {
@@ -488,21 +492,27 @@ pub fn read_all_index_rows<E: StorageEngine>(
                     e
                 ))
             })?,
-            _ => return Err(Error::StorageCorrupted(
-                "__sys_indexes.columns_blob: expected Bytes".into(),
-            )),
+            _ => {
+                return Err(Error::StorageCorrupted(
+                    "__sys_indexes.columns_blob: expected Bytes".into(),
+                ))
+            }
         };
         let unique = match &values[4] {
             Value::Boolean(b) => *b,
-            _ => return Err(Error::StorageCorrupted(
-                "__sys_indexes.unique: expected Boolean".into(),
-            )),
+            _ => {
+                return Err(Error::StorageCorrupted(
+                    "__sys_indexes.unique: expected Boolean".into(),
+                ))
+            }
         };
         let backend = match &values[5] {
             Value::Int32(v) => crate::catalog::IndexBackend::from_i32(*v)?,
-            _ => return Err(Error::StorageCorrupted(
-                "__sys_indexes.backend: expected Int32".into(),
-            )),
+            _ => {
+                return Err(Error::StorageCorrupted(
+                    "__sys_indexes.backend: expected Int32".into(),
+                ))
+            }
         };
         out.push((
             index_id,
@@ -639,7 +649,11 @@ pub fn read_column_stats<E: StorageEngine>(
     };
     let ndv = match &row[2] {
         Value::Int64(v) => *v,
-        _ => return Err(Error::StorageCorrupted("__sys_column_stats.ndv: expected Int64".into())),
+        _ => {
+            return Err(Error::StorageCorrupted(
+                "__sys_column_stats.ndv: expected Int64".into(),
+            ))
+        }
     };
     let null_count = match &row[3] {
         Value::Int64(v) => *v,
@@ -845,7 +859,12 @@ mod tests {
             .collect::<Result<Vec<_>>>()
             .unwrap();
         let expected: usize = all_system_schemas().iter().map(|s| s.columns.len()).sum();
-        assert_eq!(rows.len(), expected, "expected {} __sys_columns rows", expected);
+        assert_eq!(
+            rows.len(),
+            expected,
+            "expected {} __sys_columns rows",
+            expected
+        );
     }
 
     /// After init, `__sys_indexes` is empty (Phase 9 registers no indexes).
@@ -900,9 +919,18 @@ mod tests {
         let schemas = load_system_tables(&engine).unwrap();
 
         assert_eq!(schemas.len(), all_system_schemas().len());
-        assert_eq!(schemas.get("__sys_tables").unwrap().as_ref(), &sys_tables_schema());
-        assert_eq!(schemas.get("__sys_columns").unwrap().as_ref(), &sys_columns_schema());
-        assert_eq!(schemas.get("__sys_indexes").unwrap().as_ref(), &sys_indexes_schema());
+        assert_eq!(
+            schemas.get("__sys_tables").unwrap().as_ref(),
+            &sys_tables_schema()
+        );
+        assert_eq!(
+            schemas.get("__sys_columns").unwrap().as_ref(),
+            &sys_columns_schema()
+        );
+        assert_eq!(
+            schemas.get("__sys_indexes").unwrap().as_ref(),
+            &sys_indexes_schema()
+        );
         assert_eq!(
             schemas.get("__sys_table_stats").unwrap().as_ref(),
             &sys_table_stats_schema()

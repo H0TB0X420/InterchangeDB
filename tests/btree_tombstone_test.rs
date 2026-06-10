@@ -190,7 +190,8 @@ fn test_tombstone_split() {
     assert!(
         leaves_after > leaves_before,
         "Splits should have increased leaf count from {} to {}",
-        leaves_before, leaves_after,
+        leaves_before,
+        leaves_after,
     );
 
     // Verify all expected keys are present.
@@ -265,7 +266,11 @@ fn test_tombstone_borrow() {
     // Each key individually retrievable.
     for &key in &expected {
         let result = tree.get(&encode_key(key)).unwrap();
-        assert!(result.is_some(), "Key {} should be present after borrow", key);
+        assert!(
+            result.is_some(),
+            "Key {} should be present after borrow",
+            key
+        );
         assert_eq!(decode_value(&result.unwrap()), key);
     }
 
@@ -316,7 +321,8 @@ fn test_tombstone_coalesce() {
     assert!(
         leaves_after <= leaves_before,
         "Merges should reduce leaf count: before={}, after={}",
-        leaves_before, leaves_after,
+        leaves_before,
+        leaves_after,
     );
 
     // Verify remaining keys.
@@ -331,7 +337,11 @@ fn test_tombstone_coalesce() {
     // Each key individually retrievable.
     for &key in &expected {
         let result = tree.get(&encode_key(key)).unwrap();
-        assert!(result.is_some(), "Key {} should be present after coalesce", key);
+        assert!(
+            result.is_some(),
+            "Key {} should be present after coalesce",
+            key
+        );
         assert_eq!(decode_value(&result.unwrap()), key);
     }
 

@@ -110,7 +110,12 @@ impl MockStatsProvider {
 
     /// Set the full `ColumnStats` for a column — for selectivity tests
     /// that need a histogram blob, not just NDV.
-    pub fn with_column_stats(mut self, table_id: TableId, column_id: u32, stats: ColumnStats) -> Self {
+    pub fn with_column_stats(
+        mut self,
+        table_id: TableId,
+        column_id: u32,
+        stats: ColumnStats,
+    ) -> Self {
         self.column_stats.insert((table_id, column_id), stats);
         self
     }
@@ -206,7 +211,10 @@ mod tests {
     #[test]
     fn mock_returns_set_table_rows() {
         let p = MockStatsProvider::new().with_table_rows(TableId(7), 30_000);
-        assert_eq!(p.table_stats(TableId(7)).unwrap().unwrap().row_count, 30_000);
+        assert_eq!(
+            p.table_stats(TableId(7)).unwrap().unwrap().row_count,
+            30_000
+        );
     }
 
     #[test]
@@ -280,11 +288,7 @@ mod tests {
             .with_table_rows(TableId(1), 1)
             .with_table_rows(TableId(2), 6_000_000)
             .with_column_ndv(TableId(2), 0, 1_500_000);
-        let snap = QueryStats::gather(
-            &provider,
-            &[(TableId(1), &[]), (TableId(2), &[0])],
-        )
-        .unwrap();
+        let snap = QueryStats::gather(&provider, &[(TableId(1), &[]), (TableId(2), &[0])]).unwrap();
         assert_eq!(snap.row_count(TableId(1)), 1.0);
         assert_eq!(snap.row_count(TableId(2)), 6_000_000.0);
         assert_eq!(snap.ndv(TableId(2), 0), 1_500_000);

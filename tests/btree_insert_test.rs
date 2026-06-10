@@ -136,7 +136,11 @@ fn test_optimistic_insert() {
 
     // Verify inserted key is present.
     let result = tree.get(&k).unwrap();
-    assert!(result.is_some(), "Inserted key {} should be present", to_insert);
+    assert!(
+        result.is_some(),
+        "Inserted key {} should be present",
+        to_insert
+    );
 
     // Verify all original keys still present.
     for i in 0..num_keys {

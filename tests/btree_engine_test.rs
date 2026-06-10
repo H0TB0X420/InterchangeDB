@@ -6,8 +6,8 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::index::btree::BTreeEngine;
-use interchangedb::storage::FileDiskManager;
 use interchangedb::storage::engine::StorageEngine;
+use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;
 
 // =============================================================================
@@ -52,7 +52,10 @@ fn test_engine_initial_disk_size() {
     // LSM starts at 0 — this is a BTree-specific invariant.
     let (engine, _dir) = setup_engine();
     let status = engine.status();
-    assert!(status.disk_size > 0, "btree should have header page on disk");
+    assert!(
+        status.disk_size > 0,
+        "btree should have header page on disk"
+    );
 }
 
 #[test]
@@ -79,9 +82,7 @@ fn test_engine_many_keys_with_splits() {
     }
 
     // Full scan returns all 100 in order.
-    let results: Vec<_> = engine.scan(..)
-        .map(|r| r.unwrap())
-        .collect();
+    let results: Vec<_> = engine.scan(..).map(|r| r.unwrap()).collect();
     assert_eq!(results.len(), 100);
 
     // Verify sorted order.

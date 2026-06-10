@@ -76,7 +76,10 @@ fn gc_preserves_versions_above_watermark() {
     // GC — watermark is pinned at reader's read_ts.
     // v2 and v3 are above watermark, v1 is below but it's the keeper.
     let stats = db.gc().unwrap();
-    assert_eq!(stats.versions_removed, 0, "All versions should be kept while reader is active");
+    assert_eq!(
+        stats.versions_removed, 0,
+        "All versions should be kept while reader is active"
+    );
 
     // Reader still sees v1.
     let val = db.txn_get(reader, b"key").unwrap();
@@ -86,7 +89,10 @@ fn gc_preserves_versions_above_watermark() {
 
     // Now GC can clean up — no active snapshots.
     let stats2 = db.gc().unwrap();
-    assert!(stats2.versions_removed >= 2, "Should remove old versions after reader commits");
+    assert!(
+        stats2.versions_removed >= 2,
+        "Should remove old versions after reader commits"
+    );
 
     // Latest version still visible.
     assert_eq!(db.get(b"key").unwrap(), Some(b"v3".to_vec()));
@@ -105,7 +111,10 @@ fn gc_removes_aborted_versions() {
     assert_eq!(db.get(b"ghost").unwrap(), None);
 
     let stats = db.gc().unwrap();
-    assert_eq!(stats.versions_removed, 1, "Aborted version should be removed");
+    assert_eq!(
+        stats.versions_removed, 1,
+        "Aborted version should be removed"
+    );
 
     // Still not visible (was never visible).
     assert_eq!(db.get(b"ghost").unwrap(), None);
@@ -173,7 +182,10 @@ fn gc_idempotent() {
     assert_eq!(stats1.versions_removed, 9);
 
     let stats2 = db.gc().unwrap();
-    assert_eq!(stats2.versions_removed, 0, "Second GC should remove nothing");
+    assert_eq!(
+        stats2.versions_removed, 0,
+        "Second GC should remove nothing"
+    );
 
     let stats3 = db.gc().unwrap();
     assert_eq!(stats3.versions_removed, 0, "Third GC should remove nothing");
@@ -275,7 +287,10 @@ fn gc_status_multiple_snapshots_watermark_is_oldest() {
     db.commit_txn(t2).unwrap();
     let s_after_t2 = db.gc_status().unwrap();
     assert_eq!(s_after_t2.active_snapshot_count, 1);
-    assert_eq!(s_after_t2.low_water_mark, pinned, "older snapshot still pinning");
+    assert_eq!(
+        s_after_t2.low_water_mark, pinned,
+        "older snapshot still pinning"
+    );
 
     // Committing the older snapshot lets the watermark advance.
     db.commit_txn(t1).unwrap();

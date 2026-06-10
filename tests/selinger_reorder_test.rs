@@ -33,9 +33,15 @@ fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     let mut session = Session::new(database.clone(), catalog.clone());
 
     // a (2 rows) — b (4 rows, b_a → a_id) — c (8 rows, c_b → b_id).
-    session.execute("CREATE TABLE a (a_id INT PRIMARY KEY, a_val INT)").unwrap();
-    session.execute("CREATE TABLE b (b_id INT PRIMARY KEY, b_a INT, b_val INT)").unwrap();
-    session.execute("CREATE TABLE c (c_id INT PRIMARY KEY, c_b INT, c_val INT)").unwrap();
+    session
+        .execute("CREATE TABLE a (a_id INT PRIMARY KEY, a_val INT)")
+        .unwrap();
+    session
+        .execute("CREATE TABLE b (b_id INT PRIMARY KEY, b_a INT, b_val INT)")
+        .unwrap();
+    session
+        .execute("CREATE TABLE c (c_id INT PRIMARY KEY, c_b INT, c_val INT)")
+        .unwrap();
 
     for a_id in 1..=2 {
         session
@@ -46,14 +52,22 @@ fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     for b_id in 1..=4 {
         let b_a = (b_id - 1) % 2 + 1; // 1,2,1,2
         session
-            .execute(&format!("INSERT INTO b VALUES ({}, {}, {})", b_id, b_a, b_id * 10))
+            .execute(&format!(
+                "INSERT INTO b VALUES ({}, {}, {})",
+                b_id,
+                b_a,
+                b_id * 10
+            ))
             .unwrap();
     }
     // 8 c rows, two per b.
     for c_id in 1..=8 {
         let c_b = (c_id - 1) % 4 + 1; // 1..4 cycling
         session
-            .execute(&format!("INSERT INTO c VALUES ({}, {}, {})", c_id, c_b, c_id))
+            .execute(&format!(
+                "INSERT INTO c VALUES ({}, {}, {})",
+                c_id, c_b, c_id
+            ))
             .unwrap();
     }
 
@@ -99,7 +113,9 @@ fn selinger_reordered_join_matches_rule_based_results() {
     assert_eq!(rule_rows[0].len(), 3);
 
     // Selinger result — reordered + remapped — must match exactly.
-    session.set_planner(Planner::Selinger(SelingerPlanner::<DefaultCostModel>::default()));
+    session.set_planner(Planner::Selinger(
+        SelingerPlanner::<DefaultCostModel>::default(),
+    ));
     let selinger_rows = sorted(rows(&mut session, QUERY));
 
     assert_eq!(
@@ -122,7 +138,9 @@ fn selinger_actually_reorders_the_plan() {
 
     // Selinger reorders to small-table-first: a becomes the base scan,
     // and the plan differs from rule-based.
-    session.set_planner(Planner::Selinger(SelingerPlanner::<DefaultCostModel>::default()));
+    session.set_planner(Planner::Selinger(
+        SelingerPlanner::<DefaultCostModel>::default(),
+    ));
     let selinger_plan = explain(&mut session, QUERY);
     assert_ne!(
         selinger_plan, rule_plan,
@@ -143,7 +161,9 @@ fn selinger_preserves_output_column_order() {
     // position. Check a known row: c_val=1 (c_id 1) → c_b=1 → b_id=1,
     // b_val=10, b_a=1 → a_id=1, a_val=100.
     let (mut session, _d) = setup();
-    session.set_planner(Planner::Selinger(SelingerPlanner::<DefaultCostModel>::default()));
+    session.set_planner(Planner::Selinger(
+        SelingerPlanner::<DefaultCostModel>::default(),
+    ));
     let result = rows(&mut session, QUERY);
     let row_for_c1 = result
         .iter()

@@ -227,7 +227,8 @@ fn serialization_counter_increment() {
             let old_bytes = db.txn_get(txn, key.as_bytes()).unwrap().unwrap();
             let old_val = u64::from_le_bytes(old_bytes.try_into().unwrap());
             let new_val = old_val + 1;
-            db.txn_put(txn, key.as_bytes(), &new_val.to_le_bytes()).unwrap();
+            db.txn_put(txn, key.as_bytes(), &new_val.to_le_bytes())
+                .unwrap();
             db.commit_txn(txn).unwrap();
 
             total_increments += 1;
@@ -244,10 +245,8 @@ fn serialization_counter_increment() {
     }
 
     assert_eq!(
-        sum,
-        total_increments,
+        sum, total_increments,
         "Sum of counters should equal total increments: {} vs {}",
-        sum,
-        total_increments
+        sum, total_increments
     );
 }

@@ -8,9 +8,9 @@ use interchangedb::database::Database;
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::storage::FileDiskManager;
-use interchangedb::types::Value;
 #[allow(unused_imports)]
-use interchangedb::storage::StorageEngine; // for Database engine accessor
+use interchangedb::storage::StorageEngine;
+use interchangedb::types::Value; // for Database engine accessor
 
 fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -23,9 +23,15 @@ fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     session
         .execute("CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
         .unwrap();
-    session.execute("INSERT INTO accounts VALUES (1, 100)").unwrap();
-    session.execute("INSERT INTO accounts VALUES (2, 200)").unwrap();
-    session.execute("INSERT INTO accounts VALUES (3, 300)").unwrap();
+    session
+        .execute("INSERT INTO accounts VALUES (1, 100)")
+        .unwrap();
+    session
+        .execute("INSERT INTO accounts VALUES (2, 200)")
+        .unwrap();
+    session
+        .execute("INSERT INTO accounts VALUES (3, 300)")
+        .unwrap();
     (session, dir)
 }
 
@@ -39,7 +45,9 @@ fn rows(r: QueryResult) -> Vec<Vec<Value>> {
 #[test]
 fn prepare_select_with_one_parameter_runs_multiple_times() {
     let (mut s, _d) = setup();
-    let ps = s.prepare("SELECT id, balance FROM accounts WHERE id = $1").unwrap();
+    let ps = s
+        .prepare("SELECT id, balance FROM accounts WHERE id = $1")
+        .unwrap();
 
     let r1 = rows(s.execute_prepared(&ps, &[Value::Int32(1)]).unwrap());
     assert_eq!(r1.len(), 1);
@@ -72,7 +80,8 @@ fn prepared_update_substitutes_into_set_clause_and_where() {
         .execute_prepared(&ps, &[Value::Int32(999), Value::Int32(1)])
         .unwrap();
     let r = rows(
-        s.execute("SELECT balance FROM accounts WHERE id = 1").unwrap(),
+        s.execute("SELECT balance FROM accounts WHERE id = 1")
+            .unwrap(),
     );
     assert_eq!(r[0][0], Value::Int32(999));
 }
@@ -81,9 +90,7 @@ fn prepared_update_substitutes_into_set_clause_and_where() {
 fn prepared_delete_with_parameter() {
     let (mut s, _d) = setup();
     let ps = s.prepare("DELETE FROM accounts WHERE id = $1").unwrap();
-    let _ = s
-        .execute_prepared(&ps, &[Value::Int32(2)])
-        .unwrap();
+    let _ = s.execute_prepared(&ps, &[Value::Int32(2)]).unwrap();
     let remaining = rows(s.execute("SELECT id FROM accounts").unwrap());
     let ids: Vec<i32> = remaining
         .iter()

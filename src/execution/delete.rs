@@ -42,8 +42,7 @@ impl<E: StorageEngine + 'static, L: DataLayout> Executor for Delete<E, L> {
         let pk_indices = self.table.schema().primary_key.clone();
         let mut count: i64 = 0;
         while let Some(row) = self.child.next()? {
-            let pk_values: Vec<Value> =
-                pk_indices.iter().map(|&i| row[i].clone()).collect();
+            let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
             self.table.delete_by_pk(&pk_values)?;
             count += 1;
         }
@@ -89,8 +88,18 @@ mod tests {
             name: "account".into(),
             table_id: TableId(1),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                ColumnDef { name: "balance".into(), ty: ColumnType::Int64, nullable: false, default: None },
+                ColumnDef {
+                    name: "id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "balance".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
             ],
             primary_key: vec![0],
         });
@@ -123,9 +132,10 @@ mod tests {
             table.insert(&row(i, 100)).unwrap();
         }
         let scan = Box::new(SeqScan::new(&*table).unwrap());
-        let filt = Box::new(Filter::new(scan, |t| {
-            matches!(t[0], Value::Int32(n) if n > 3)
-        }));
+        let filt = Box::new(Filter::new(
+            scan,
+            |t| matches!(t[0], Value::Int32(n) if n > 3),
+        ));
         let mut op = Delete::new(table.clone(), filt);
 
         assert_eq!(op.next().unwrap(), Some(vec![Value::Int64(2)]));

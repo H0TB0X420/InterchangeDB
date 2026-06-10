@@ -112,7 +112,9 @@ pub enum JoinAlgorithm {
 /// the ON predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JoinOrder {
-    Scan { rel: RelId },
+    Scan {
+        rel: RelId,
+    },
     Join {
         left: Box<JoinOrder>,
         right: RelId,
@@ -152,11 +154,19 @@ pub fn enumerate_join_orders(
 ) -> JoinPlan {
     let n = relations.len();
     assert!(n >= 1, "join enumeration needs at least one relation");
-    assert!(n <= MAX_RELATIONS, "join enumeration capped at {} relations", MAX_RELATIONS);
+    assert!(
+        n <= MAX_RELATIONS,
+        "join enumeration capped at {} relations",
+        MAX_RELATIONS
+    );
 
     if n == 1 {
         let leaf = sub_leaf(0, relations, stats, cost_model);
-        return JoinPlan { order: leaf.order, cost: leaf.cost, cardinality: leaf.cardinality };
+        return JoinPlan {
+            order: leaf.order,
+            cost: leaf.cost,
+            cardinality: leaf.cardinality,
+        };
     }
     if n > MAX_DP_RELATIONS {
         return greedy_left_deep(relations, edges, stats, cost_model);
@@ -206,7 +216,11 @@ pub fn enumerate_join_orders(
     }
 
     match best.remove(&full) {
-        Some(sp) => JoinPlan { order: sp.order, cost: sp.cost, cardinality: sp.cardinality },
+        Some(sp) => JoinPlan {
+            order: sp.order,
+            cost: sp.cost,
+            cardinality: sp.cardinality,
+        },
         // Disconnected join graph: no DP plan spans every relation. Fall
         // back to greedy, which permits cross products to complete.
         None => greedy_left_deep(relations, edges, stats, cost_model),
@@ -260,7 +274,11 @@ fn sub_leaf(
         cost = cost.add(cost_model.cost_filter(raw_rows));
     }
     let out_card = (raw_rows * local_sel).max(MIN_CARD);
-    SubPlan { cardinality: out_card, cost, order: JoinOrder::Scan { rel: r } }
+    SubPlan {
+        cardinality: out_card,
+        cost,
+        order: JoinOrder::Scan { rel: r },
+    }
 }
 
 /// Build the join of sub-plan `left` with base relation `r` over
@@ -410,8 +428,15 @@ fn greedy_left_deep(
                 .product()
         };
         let out_card = (plan.cardinality * r_leaf.cardinality * sel).max(MIN_CARD);
-        let (algorithm, incremental) =
-            best_algorithm(plan.cardinality, &r_leaf, sel, r, &connecting, edges, cost_model);
+        let (algorithm, incremental) = best_algorithm(
+            plan.cardinality,
+            &r_leaf,
+            sel,
+            r,
+            &connecting,
+            edges,
+            cost_model,
+        );
         plan = SubPlan {
             cardinality: out_card,
             cost: plan.cost.add(incremental),
@@ -424,7 +449,11 @@ fn greedy_left_deep(
         };
         joined |= 1u32 << r;
     }
-    JoinPlan { order: plan.order, cost: plan.cost, cardinality: plan.cardinality }
+    JoinPlan {
+        order: plan.order,
+        cost: plan.cost,
+        cardinality: plan.cardinality,
+    }
 }
 
 /// Base output cardinality of one relation after its local predicate.
@@ -458,7 +487,10 @@ mod tests {
     }
 
     fn rel(table_id: u32) -> JoinRelation {
-        JoinRelation { table_id: TableId(table_id), local_selectivity: 1.0 }
+        JoinRelation {
+            table_id: TableId(table_id),
+            local_selectivity: 1.0,
+        }
     }
 
     /// Count the leaf scans in an order — i.e. relations covered.
@@ -489,8 +521,13 @@ mod tests {
             left_col_indexed: false,
             right_col_indexed: false,
         }];
-        let plan =
-            enumerate_join_orders(&[rel(1), rel(2)], &edges, &stats, &DefaultCostModel::new(), None);
+        let plan = enumerate_join_orders(
+            &[rel(1), rel(2)],
+            &edges,
+            &stats,
+            &DefaultCostModel::new(),
+            None,
+        );
         match plan.order {
             JoinOrder::Join { algorithm, .. } => assert_eq!(algorithm, JoinAlgorithm::Hash),
             _ => panic!("expected a join"),
@@ -507,8 +544,22 @@ mod tests {
             (3, 1_000_000, &[(0, 1_000_000)]),
         ]);
         let edges = vec![
-            JoinEdge { left: 0, right: 1, left_col: 0, right_col: 0, left_col_indexed: false, right_col_indexed: false },
-            JoinEdge { left: 1, right: 2, left_col: 1, right_col: 0, left_col_indexed: false, right_col_indexed: false },
+            JoinEdge {
+                left: 0,
+                right: 1,
+                left_col: 0,
+                right_col: 0,
+                left_col_indexed: false,
+                right_col_indexed: false,
+            },
+            JoinEdge {
+                left: 1,
+                right: 2,
+                left_col: 1,
+                right_col: 0,
+                left_col_indexed: false,
+                right_col_indexed: false,
+            },
         ];
         let plan = enumerate_join_orders(
             &[rel(1), rel(2), rel(3)],
@@ -518,7 +569,9 @@ mod tests {
             None,
         );
         match plan.order {
-            JoinOrder::Join { right, .. } => assert_eq!(right, 2, "big table C should be joined last"),
+            JoinOrder::Join { right, .. } => {
+                assert_eq!(right, 2, "big table C should be joined last")
+            }
             _ => panic!("expected a join"),
         }
         assert_eq!(scan_count(&plan.order), 3);
@@ -538,10 +591,17 @@ mod tests {
             left_col_indexed: false,
             right_col_indexed: true,
         }];
-        let plan =
-            enumerate_join_orders(&[rel(1), rel(2)], &edges, &stats, &DefaultCostModel::new(), None);
+        let plan = enumerate_join_orders(
+            &[rel(1), rel(2)],
+            &edges,
+            &stats,
+            &DefaultCostModel::new(),
+            None,
+        );
         match plan.order {
-            JoinOrder::Join { right, algorithm, .. } => {
+            JoinOrder::Join {
+                right, algorithm, ..
+            } => {
                 assert_eq!(right, 1, "indexed B should be the inner/probed side");
                 assert_eq!(algorithm, JoinAlgorithm::IndexNestedLoop);
             }
@@ -554,8 +614,13 @@ mod tests {
         // Two relations, no edge → DP forms no spanning plan; greedy
         // crosses them and still returns a complete order.
         let stats = stats_for(&[(1, 10, &[]), (2, 20, &[])]);
-        let plan =
-            enumerate_join_orders(&[rel(1), rel(2)], &[], &stats, &DefaultCostModel::new(), None);
+        let plan = enumerate_join_orders(
+            &[rel(1), rel(2)],
+            &[],
+            &stats,
+            &DefaultCostModel::new(),
+            None,
+        );
         assert_eq!(scan_count(&plan.order), 2);
     }
 

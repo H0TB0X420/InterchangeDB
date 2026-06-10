@@ -188,7 +188,8 @@ impl EvictionPolicy for LruKReplacer {
 
         // Find evictable frame with MAXIMUM K-distance (lowest score)
         // Tie-break: among +∞ frames, evict the one with oldest first_access (FIFO)
-        let victim = self.evictable
+        let victim = self
+            .evictable
             .iter()
             .filter_map(|&fid| {
                 self.history.get(&fid).map(|hist| {
@@ -206,7 +207,7 @@ impl EvictionPolicy for LruKReplacer {
                     }
                     (None, Some(_)) => std::cmp::Ordering::Greater, // +∞ > finite
                     (Some(_), None) => std::cmp::Ordering::Less,    // finite < +∞
-                    (Some(a), Some(b)) => a.cmp(b), // Larger distance = evict first
+                    (Some(a), Some(b)) => a.cmp(b),                 // Larger distance = evict first
                 }
             })
             .map(|(fid, _, _)| fid);
@@ -393,11 +394,15 @@ mod tests {
         assert_eq!(state.source_policy, "lru-k");
         assert_eq!(state.hot_pages.len(), 2);
 
-        let score_100 = state.hot_pages.iter()
+        let score_100 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(100))
             .map(|(_, s)| *s)
             .unwrap();
-        let score_101 = state.hot_pages.iter()
+        let score_101 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(101))
             .map(|(_, s)| *s)
             .unwrap();

@@ -225,7 +225,10 @@ mod tests {
         assert!(matches!(
             err,
             Error::ConstraintViolation {
-                rule: ConstraintRule::Arity { expected: 3, actual: 1 },
+                rule: ConstraintRule::Arity {
+                    expected: 3,
+                    actual: 1
+                },
                 ..
             }
         ));
@@ -248,7 +251,11 @@ mod tests {
     fn check_nullability_null_in_nullable_passes() {
         let s = three_col_schema();
         // Column 1 (name) is nullable.
-        let v = vec![Value::Int32(1), Value::Null, Value::Decimal(Decimal::from_i64_with_scale(0, 2))];
+        let v = vec![
+            Value::Int32(1),
+            Value::Null,
+            Value::Decimal(Decimal::from_i64_with_scale(0, 2)),
+        ];
         assert!(check_nullability(&s, &v).is_ok());
     }
 
@@ -303,7 +310,10 @@ mod tests {
         assert!(matches!(
             err,
             Error::ConstraintViolation {
-                rule: ConstraintRule::DecimalScaleMismatch { expected: 2, actual: 3 },
+                rule: ConstraintRule::DecimalScaleMismatch {
+                    expected: 2,
+                    actual: 3
+                },
                 ..
             }
         ));

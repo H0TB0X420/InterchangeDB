@@ -44,7 +44,12 @@ fn setup() -> Env {
     let database = Arc::new(Database::open(dir.path(), engine).unwrap());
     let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
     let session = Session::new(database.clone(), catalog.clone());
-    Env { session, database, catalog, _dir: dir }
+    Env {
+        session,
+        database,
+        catalog,
+        _dir: dir,
+    }
 }
 
 fn setup_with_log() -> (Env, std::path::PathBuf) {
@@ -122,9 +127,17 @@ fn tpcc_payment_shape_via_sql() {
     env.session.execute("COMMIT").unwrap();
 
     // Verify post-commit state.
-    let r1 = rows(env.session.execute("SELECT w_ytd FROM warehouse WHERE w_id = 1").unwrap());
+    let r1 = rows(
+        env.session
+            .execute("SELECT w_ytd FROM warehouse WHERE w_id = 1")
+            .unwrap(),
+    );
     assert_eq!(r1[0][0], Value::Int64(1100));
-    let r2 = rows(env.session.execute("SELECT w_ytd FROM warehouse WHERE w_id = 2").unwrap());
+    let r2 = rows(
+        env.session
+            .execute("SELECT w_ytd FROM warehouse WHERE w_id = 2")
+            .unwrap(),
+    );
     assert_eq!(r2[0][0], Value::Int64(2050));
 }
 
@@ -184,7 +197,9 @@ fn tpcc_order_status_point_lookup() {
         )
         .unwrap();
     env.session
-        .execute("INSERT INTO customer VALUES (1, 100, 'alice'), (2, 200, 'bob'), (3, 300, 'carol')")
+        .execute(
+            "INSERT INTO customer VALUES (1, 100, 'alice'), (2, 200, 'bob'), (3, 300, 'carol')",
+        )
         .unwrap();
 
     let r = rows(
@@ -220,7 +235,11 @@ fn tpcc_delivery_delete_and_update() {
         .unwrap();
 
     env.session.execute("BEGIN").unwrap();
-    let d = affected(env.session.execute("DELETE FROM new_order WHERE no_o_id = 1").unwrap());
+    let d = affected(
+        env.session
+            .execute("DELETE FROM new_order WHERE no_o_id = 1")
+            .unwrap(),
+    );
     assert_eq!(d, 1);
     let u = affected(
         env.session
@@ -231,9 +250,17 @@ fn tpcc_delivery_delete_and_update() {
     env.session.execute("COMMIT").unwrap();
 
     // Post-commit: new_order no longer has row 1, orders.o_carrier_id = 7.
-    let r = rows(env.session.execute("SELECT * FROM new_order WHERE no_o_id = 1").unwrap());
+    let r = rows(
+        env.session
+            .execute("SELECT * FROM new_order WHERE no_o_id = 1")
+            .unwrap(),
+    );
     assert!(r.is_empty());
-    let o = rows(env.session.execute("SELECT o_carrier_id FROM orders WHERE o_id = 1").unwrap());
+    let o = rows(
+        env.session
+            .execute("SELECT o_carrier_id FROM orders WHERE o_id = 1")
+            .unwrap(),
+    );
     assert_eq!(o[0][0], Value::Int32(7));
 }
 
@@ -271,11 +298,15 @@ fn read_your_own_writes_within_explicit_txn() {
         .unwrap();
 
     env.session.execute("BEGIN").unwrap();
-    env.session.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    env.session
+        .execute("INSERT INTO t VALUES (1, 100)")
+        .unwrap();
     // Inside the same txn, the insert is visible.
     let r = rows(env.session.execute("SELECT n FROM t WHERE id = 1").unwrap());
     assert_eq!(r[0][0], Value::Int64(100));
-    env.session.execute("UPDATE t SET n = 200 WHERE id = 1").unwrap();
+    env.session
+        .execute("UPDATE t SET n = 200 WHERE id = 1")
+        .unwrap();
     let r2 = rows(env.session.execute("SELECT n FROM t WHERE id = 1").unwrap());
     assert_eq!(r2[0][0], Value::Int64(200));
     env.session.execute("COMMIT").unwrap();

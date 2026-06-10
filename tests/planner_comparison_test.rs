@@ -43,8 +43,18 @@ fn setup() -> Env {
         name: "warehouse".into(),
         table_id: TableId(0),
         columns: vec![
-            ColumnDef { name: "w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "w_ytd".into(), ty: ColumnType::Int64, nullable: false, default: None },
+            ColumnDef {
+                name: "w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "w_ytd".into(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     };
@@ -55,15 +65,35 @@ fn setup() -> Env {
         name: "district".into(),
         table_id: TableId(0),
         columns: vec![
-            ColumnDef { name: "d_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "d_w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "d_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+            ColumnDef {
+                name: "d_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "d_w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "d_name".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     };
     catalog.create_table("district".into(), district).unwrap();
 
-    Env { engine, catalog, binder, _dir: dir }
+    Env {
+        engine,
+        catalog,
+        binder,
+        _dir: dir,
+    }
 }
 
 /// Plan the same SQL through both strategies. For executor plans,
@@ -71,7 +101,10 @@ fn setup() -> Env {
 /// returns rendered placeholders that must match exactly.
 fn plans_match(env: &Env, sql: &str) -> (String, String) {
     let stmts = parse(sql).unwrap();
-    let a = env.binder.bind(stmts.clone().into_iter().next().unwrap()).unwrap();
+    let a = env
+        .binder
+        .bind(stmts.clone().into_iter().next().unwrap())
+        .unwrap();
     let b = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
 
     let p_rule = RuleBasedPlanner
@@ -176,10 +209,7 @@ fn insert_matches() {
 #[test]
 fn update_with_where_matches() {
     let env = setup();
-    assert_match(
-        &env,
-        "UPDATE warehouse SET w_ytd = 9999 WHERE w_id = 1",
-    );
+    assert_match(&env, "UPDATE warehouse SET w_ytd = 9999 WHERE w_id = 1");
 }
 
 #[test]

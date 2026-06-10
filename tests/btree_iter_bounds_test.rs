@@ -50,12 +50,7 @@ fn out_of_range_next_page_id_returns_storage_corrupted() {
 
     let pid = write_leaf(&bpm, &leaf);
 
-    let mut iter = BTreeScanIterator::new(
-        &bpm,
-        pid,
-        Bound::Unbounded,
-        Bound::Unbounded,
-    );
+    let mut iter = BTreeScanIterator::new(&bpm, pid, Bound::Unbounded, Bound::Unbounded);
 
     // The validation fires inside `load_next_page` before any entries are
     // yielded — if `next_page_id` is corrupt, the rest of the leaf may be
@@ -88,16 +83,14 @@ fn valid_invalid_terminator_iterates_cleanly() {
 
     let pid = write_leaf(&bpm, &leaf);
 
-    let mut iter = BTreeScanIterator::new(
-        &bpm,
-        pid,
-        Bound::Unbounded,
-        Bound::Unbounded,
-    );
+    let mut iter = BTreeScanIterator::new(&bpm, pid, Bound::Unbounded, Bound::Unbounded);
     let collected: Vec<_> = (&mut iter).collect::<Result<_, _>>().unwrap();
     assert_eq!(
         collected,
-        vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), b"2".to_vec())]
+        vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec())
+        ]
     );
     assert!(iter.next().is_none());
 }
@@ -122,12 +115,7 @@ fn next_page_id_at_disk_page_count_is_out_of_range() {
     encode_leaf_node(&patched, guard.as_mut_slice());
     drop(guard);
 
-    let mut iter = BTreeScanIterator::new(
-        &bpm,
-        pid,
-        Bound::Unbounded,
-        Bound::Unbounded,
-    );
+    let mut iter = BTreeScanIterator::new(&bpm, pid, Bound::Unbounded, Bound::Unbounded);
     match iter.next() {
         Some(Err(Error::StorageCorrupted(msg))) => {
             assert!(msg.contains("out of range"), "got: {}", msg);

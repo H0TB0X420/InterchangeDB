@@ -61,8 +61,8 @@
 pub mod buffer;
 pub mod catalog;
 pub mod common;
-pub mod layout;
 pub mod database;
+pub mod layout;
 pub mod storage;
 
 // Future modules (placeholders)

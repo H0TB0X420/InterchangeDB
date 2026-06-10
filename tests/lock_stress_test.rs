@@ -31,8 +31,7 @@ fn high_contention_stress() {
 
                 for iteration in 0usize..1000 {
                     // Deterministic pseudo-random key (5 hotspot keys).
-                    let key_idx =
-                        (thread_idx.wrapping_mul(31) + iteration.wrapping_mul(17)) % 5;
+                    let key_idx = (thread_idx.wrapping_mul(31) + iteration.wrapping_mul(17)) % 5;
                     let key = format!("hot_{}", key_idx);
 
                     // Deterministic pseudo-random mode.

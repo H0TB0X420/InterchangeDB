@@ -62,8 +62,12 @@ fn btree_100k_keys_bounded_pool_no_eviction_failures() {
 
     for i in 0..N {
         let v = e.get(&key_for(i)).unwrap();
-        assert_eq!(v.as_deref(), Some(value_for(i).as_slice()),
-            "missing key {} after bulk insert", i);
+        assert_eq!(
+            v.as_deref(),
+            Some(value_for(i).as_slice()),
+            "missing key {} after bulk insert",
+            i
+        );
     }
 }
 
@@ -76,12 +80,21 @@ fn btree_25k_scan_returns_sorted() {
     }
 
     let collected: Vec<_> = e.scan(..).collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(collected.len(), N as usize, "scan returned {} keys, expected {}", collected.len(), N);
+    assert_eq!(
+        collected.len(),
+        N as usize,
+        "scan returned {} keys, expected {}",
+        collected.len(),
+        N
+    );
     assert_eq!(collected[0].0, key_for(0));
     assert_eq!(collected[N as usize - 1].0, key_for(N - 1));
     for i in 1..collected.len() {
-        assert!(collected[i - 1].0 < collected[i].0,
-            "scan unsorted at index {}", i);
+        assert!(
+            collected[i - 1].0 < collected[i].0,
+            "scan unsorted at index {}",
+            i
+        );
     }
 }
 
@@ -96,8 +109,12 @@ fn lsm_50k_keys_bulk_workload() {
     }
     for i in [0u32, 1, N / 4, N / 2, (3 * N) / 4, N - 1].iter() {
         let v = e.get(&key_for(*i)).unwrap();
-        assert_eq!(v.as_deref(), Some(value_for(*i).as_slice()),
-            "missing key {} in LSM at scale", i);
+        assert_eq!(
+            v.as_deref(),
+            Some(value_for(*i).as_slice()),
+            "missing key {} in LSM at scale",
+            i
+        );
     }
 }
 
@@ -117,14 +134,20 @@ fn btree_random_read_pattern_under_eviction_pressure() {
     let mut state: u64 = 0xDEADBEEF;
     let mut misses = 0u32;
     for _ in 0..READS {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         let idx = (state as u32) % N;
         match e.get(&key_for(idx)).unwrap() {
             Some(v) => assert_eq!(v, value_for(idx)),
             None => misses += 1,
         }
     }
-    assert_eq!(misses, 0, "{} reads returned None on keys that were inserted", misses);
+    assert_eq!(
+        misses, 0,
+        "{} reads returned None on keys that were inserted",
+        misses
+    );
 }
 
 // ---- 1M-scale tests (ignored by default) ----
@@ -140,8 +163,12 @@ fn btree_1m_keys_release_build_recommended() {
     // Spot-check, not full sweep — 1M reads would be very slow in debug.
     for i in [0u32, N / 4, N / 2, (3 * N) / 4, N - 1].iter() {
         let v = e.get(&key_for(*i)).unwrap();
-        assert_eq!(v.as_deref(), Some(value_for(*i).as_slice()),
-            "missing key {} at 1M scale", i);
+        assert_eq!(
+            v.as_deref(),
+            Some(value_for(*i).as_slice()),
+            "missing key {} at 1M scale",
+            i
+        );
     }
 }
 
@@ -155,7 +182,11 @@ fn lsm_1m_keys_release_build_recommended() {
     }
     for i in [0u32, N / 4, N / 2, (3 * N) / 4, N - 1].iter() {
         let v = e.get(&key_for(*i)).unwrap();
-        assert_eq!(v.as_deref(), Some(value_for(*i).as_slice()),
-            "missing key {} at 1M scale (LSM)", i);
+        assert_eq!(
+            v.as_deref(),
+            Some(value_for(*i).as_slice()),
+            "missing key {} at 1M scale (LSM)",
+            i
+        );
     }
 }

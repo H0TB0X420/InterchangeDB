@@ -298,7 +298,10 @@ mod tests {
         // First access should go to A1in
         replacer.record_access(FrameId::new(0), PageId::new(100));
 
-        assert_eq!(replacer.frame_location.get(&FrameId::new(0)), Some(&QueueLocation::A1In));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(0)),
+            Some(&QueueLocation::A1In)
+        );
         assert_eq!(replacer.a1_in.len(), 1);
         assert_eq!(replacer.am.len(), 0);
     }
@@ -319,7 +322,10 @@ mod tests {
         // Second access: page 100 hits ghost buffer, should go to Am
         replacer.record_access(FrameId::new(1), PageId::new(100));
 
-        assert_eq!(replacer.frame_location.get(&FrameId::new(1)), Some(&QueueLocation::Am));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(1)),
+            Some(&QueueLocation::Am)
+        );
         assert_eq!(replacer.am.len(), 1);
         assert!(!replacer.a1_out_set.contains(&PageId::new(100))); // Removed from ghost
     }
@@ -462,11 +468,15 @@ mod tests {
         assert_eq!(state.source_policy, "2q");
         assert_eq!(state.hot_pages.len(), 2);
 
-        let score_100 = state.hot_pages.iter()
+        let score_100 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(100))
             .map(|(_, s)| *s)
             .unwrap();
-        let score_101 = state.hot_pages.iter()
+        let score_101 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(101))
             .map(|(_, s)| *s)
             .unwrap();
@@ -491,8 +501,14 @@ mod tests {
         replacer.record_access(FrameId::new(1), PageId::new(101)); // hot -> Am
 
         // Verify placement
-        assert_eq!(replacer.frame_location.get(&FrameId::new(0)), Some(&QueueLocation::A1In));
-        assert_eq!(replacer.frame_location.get(&FrameId::new(1)), Some(&QueueLocation::Am));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(0)),
+            Some(&QueueLocation::A1In)
+        );
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(1)),
+            Some(&QueueLocation::Am)
+        );
 
         replacer.set_evictable(FrameId::new(0), true);
         replacer.set_evictable(FrameId::new(1), true);

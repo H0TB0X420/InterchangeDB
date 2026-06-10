@@ -43,10 +43,7 @@ fn concurrent_shared_readers() {
 
     // All 8 hold the lock.
     for i in 1..=8 {
-        assert_eq!(
-            lm.held_by(TxnId::new(i)),
-            vec![b"shared_key".to_vec()]
-        );
+        assert_eq!(lm.held_by(TxnId::new(i)), vec![b"shared_key".to_vec()]);
     }
 }
 
@@ -108,9 +105,7 @@ fn mixed_readers_writer() {
 
     // Writer thread requests X — will block.
     let lm2 = lm.clone();
-    let writer_handle = thread::spawn(move || {
-        lm2.acquire(t_writer, b"key", LockMode::Exclusive)
-    });
+    let writer_handle = thread::spawn(move || lm2.acquire(t_writer, b"key", LockMode::Exclusive));
 
     thread::sleep(Duration::from_millis(50));
 

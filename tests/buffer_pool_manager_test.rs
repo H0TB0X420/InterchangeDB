@@ -451,7 +451,7 @@ fn test_page_access() {
 
     let pid0 = bpm.allocate_page_id().unwrap();
     let pid1 = bpm.allocate_page_id().unwrap();
-    
+
     // Bring pages into pool
     drop(bpm.fetch_page_write(pid0).unwrap());
     drop(bpm.fetch_page_write(pid1).unwrap());

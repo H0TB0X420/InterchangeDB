@@ -10,7 +10,7 @@
 
 use interchangedb::database::Database;
 use interchangedb::index::lsm::LsmEngine;
-use interchangedb::wal::{Lsn, LogPayload, WalReader};
+use interchangedb::wal::{LogPayload, Lsn, WalReader};
 use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
@@ -325,7 +325,12 @@ fn multi_op_crash_recovery() {
         // Odd keys should be present.
         for i in (1u16..100).step_by(2) {
             let val = db.get(&i.to_be_bytes()).unwrap();
-            assert_eq!(val, Some((i * 10).to_be_bytes().to_vec()), "key {} missing", i);
+            assert_eq!(
+                val,
+                Some((i * 10).to_be_bytes().to_vec()),
+                "key {} missing",
+                i
+            );
         }
 
         // Even keys should be deleted.

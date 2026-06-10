@@ -50,7 +50,12 @@ fn setup() -> Env {
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
     let txn_mgr = Arc::new(TransactionManager::new());
-    Env { engine, txn_mgr, wal, _dir: dir }
+    Env {
+        engine,
+        txn_mgr,
+        wal,
+        _dir: dir,
+    }
 }
 
 fn handle(env: &Env, txn_id: TxnId) -> TxnEngine<BTreeEngine> {
@@ -146,7 +151,11 @@ fn snapshot_hides_concurrent_write() {
 
     // T1 has not committed yet — uncommitted version invisible.
     let h2 = handle(&env, t2);
-    assert_eq!(h2.get(b"k").unwrap(), None, "uncommitted write must be invisible");
+    assert_eq!(
+        h2.get(b"k").unwrap(),
+        None,
+        "uncommitted write must be invisible"
+    );
 
     commit(&env, t1);
 

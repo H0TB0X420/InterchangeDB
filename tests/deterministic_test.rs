@@ -17,8 +17,8 @@ use interchangedb::common::Error;
 use interchangedb::database::Database;
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::storage::FileDiskManager;
-use interchangedb::txn::{TxnId, TxnMode};
 use interchangedb::txn::lock_manager::{LockManager, LockMode};
+use interchangedb::txn::{TxnId, TxnMode};
 
 // ---------------------------------------------------------------------------
 // Lock Manager: forced orderings
@@ -67,9 +67,7 @@ fn lock_ordering_x_then_s_blocked() {
     lm.acquire(t1, b"key", LockMode::Exclusive).unwrap();
 
     let lm2 = lm.clone();
-    let handle = thread::spawn(move || {
-        lm2.acquire(t2, b"key", LockMode::Shared)
-    });
+    let handle = thread::spawn(move || lm2.acquire(t2, b"key", LockMode::Shared));
 
     thread::sleep(Duration::from_millis(50));
     assert!(lm.held_by(t2).is_empty(), "T2 should be blocked by X");
@@ -92,9 +90,7 @@ fn lock_ordering_deadlock_detected_immediately() {
 
     // T1 requests B — blocks (T2 holds B).
     let lm2 = lm.clone();
-    let handle = thread::spawn(move || {
-        lm2.acquire(t1, b"B", LockMode::Exclusive)
-    });
+    let handle = thread::spawn(move || lm2.acquire(t1, b"B", LockMode::Exclusive));
     thread::sleep(Duration::from_millis(50));
 
     // T2 requests A — should detect cycle immediately (not timeout after 5s).
@@ -102,10 +98,16 @@ fn lock_ordering_deadlock_detected_immediately() {
     let result = lm.acquire(t2, b"A", LockMode::Exclusive);
     let elapsed = start.elapsed();
 
-    assert!(matches!(result, Err(Error::Deadlock(_))),
-        "Should get Deadlock, got: {:?}", result);
-    assert!(elapsed < Duration::from_secs(1),
-        "Deadlock should be detected immediately, not after timeout ({:?})", elapsed);
+    assert!(
+        matches!(result, Err(Error::Deadlock(_))),
+        "Should get Deadlock, got: {:?}",
+        result
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "Deadlock should be detected immediately, not after timeout ({:?})",
+        elapsed
+    );
 
     // Cleanup: release T2's B so T1 can proceed.
     lm.release(t2, b"B");
@@ -136,16 +138,22 @@ fn mvcc_write_then_read_sees_nothing() {
     // T2 reads — forced to start AFTER T1's write but BEFORE T1's commit.
     let t2 = db.begin_txn(TxnMode::ReadOnly).unwrap();
     let val = db.txn_get(t2, b"key").unwrap();
-    assert_eq!(val, Some(b"original".to_vec()),
-        "T2 must see original, not T1's uncommitted write");
+    assert_eq!(
+        val,
+        Some(b"original".to_vec()),
+        "T2 must see original, not T1's uncommitted write"
+    );
 
     // T1 commits.
     db.commit_txn(t1).unwrap();
 
     // T2 STILL sees original (snapshot frozen).
     let val_after = db.txn_get(t2, b"key").unwrap();
-    assert_eq!(val_after, Some(b"original".to_vec()),
-        "T2's snapshot is frozen — must not see T1's commit");
+    assert_eq!(
+        val_after,
+        Some(b"original".to_vec()),
+        "T2's snapshot is frozen — must not see T1's commit"
+    );
 
     db.commit_txn(t2).unwrap();
 
@@ -174,7 +182,8 @@ fn mvcc_concurrent_writes_one_wins() {
     let result = db.txn_put(t2, b"contested", b"t2_tries");
     assert!(
         matches!(result, Err(Error::Deadlock(_)) | Err(Error::LockTimeout)),
-        "T2 should fail with conflict, got: {:?}", result
+        "T2 should fail with conflict, got: {:?}",
+        result
     );
 
     // T1 commits — its value persists.
@@ -202,8 +211,11 @@ fn mvcc_abort_then_read_sees_original() {
     // T2 reads — must see original.
     let t2 = db.begin_txn(TxnMode::ReadOnly).unwrap();
     let val = db.txn_get(t2, b"key").unwrap();
-    assert_eq!(val, Some(b"original".to_vec()),
-        "Aborted write must be invisible");
+    assert_eq!(
+        val,
+        Some(b"original".to_vec()),
+        "Aborted write must be invisible"
+    );
     db.commit_txn(t2).unwrap();
 }
 
@@ -221,8 +233,11 @@ fn mvcc_own_write_visible_before_commit() {
     db.txn_put(t1, b"new_key", b"my_value").unwrap();
 
     let val = db.txn_get(t1, b"new_key").unwrap();
-    assert_eq!(val, Some(b"my_value".to_vec()),
-        "Transaction must see its own uncommitted write");
+    assert_eq!(
+        val,
+        Some(b"my_value".to_vec()),
+        "Transaction must see its own uncommitted write"
+    );
 
     db.commit_txn(t1).unwrap();
 }

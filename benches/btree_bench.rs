@@ -101,7 +101,11 @@ fn setup_tree() -> BTreeBenchState {
         tree.insert(&k, &v).unwrap();
     }
 
-    BTreeBenchState { bpm, header_id, _dir: dir }
+    BTreeBenchState {
+        bpm,
+        header_id,
+        _dir: dir,
+    }
 }
 
 // ============================================================================
@@ -124,7 +128,10 @@ fn bench_btree_insert(c: &mut Criterion) {
                     let bpm = BufferPoolManager::new(BPM_SIZE, dm);
                     let header_page = bpm.new_page().unwrap();
                     let hid = header_page.page_id();
-                    { let mut g = header_page; BTreeHeaderPage::new().encode(g.as_mut_slice()); }
+                    {
+                        let mut g = header_page;
+                        BTreeHeaderPage::new().encode(g.as_mut_slice());
+                    }
                     (bpm, hid, dir)
                 },
                 |(bpm, hid, _dir)| {
@@ -241,5 +248,10 @@ fn bench_btree_write(c: &mut Criterion) {
     eprintln!("[btree_write] {}", state.bpm.stats().snapshot());
 }
 
-criterion_group!(benches, bench_btree_insert, bench_btree_read, bench_btree_write);
+criterion_group!(
+    benches,
+    bench_btree_insert,
+    bench_btree_read,
+    bench_btree_write
+);
 criterion_main!(benches);

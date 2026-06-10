@@ -37,11 +37,24 @@ fn setup() -> Setup {
                 name: "payments".into(),
                 table_id: TableId(0),
                 columns: vec![
-                    ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                    ColumnDef { name: "amount".into(), ty: ColumnType::Int64, nullable: false, default: None },
+                    ColumnDef {
+                        name: "id".into(),
+                        ty: ColumnType::Int32,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDef {
+                        name: "amount".into(),
+                        ty: ColumnType::Int64,
+                        nullable: false,
+                        default: None,
+                    },
                     ColumnDef {
                         name: "price".into(),
-                        ty: ColumnType::Decimal { precision: 10, scale: 2 },
+                        ty: ColumnType::Decimal {
+                            precision: 10,
+                            scale: 2,
+                        },
                         nullable: false,
                         default: None,
                     },
@@ -76,7 +89,11 @@ fn setup() -> Setup {
         ])
         .unwrap();
 
-    Setup { catalog, engine, _dir: dir }
+    Setup {
+        catalog,
+        engine,
+        _dir: dir,
+    }
 }
 
 fn run_select(s: &Setup, sql: &str) -> Vec<Vec<Value>> {
@@ -121,7 +138,7 @@ fn count_distinct_returns_unique_count() {
 fn sum_returns_total() {
     let s = setup();
     let rows = run_select(&s, "SELECT SUM(amount) FROM payments");
-    assert_eq!(rows, vec![vec![Value::Int64(60)]]);  // 10 + 30 + 20
+    assert_eq!(rows, vec![vec![Value::Int64(60)]]); // 10 + 30 + 20
 }
 
 #[test]
@@ -138,7 +155,12 @@ fn avg_returns_decimal_scale_4() {
     let s = setup();
     let rows = run_select(&s, "SELECT AVG(amount) FROM payments");
     // (10 + 30 + 20) / 3 = 20.0000 → mantissa 200000 at scale 4.
-    assert_eq!(rows, vec![vec![Value::Decimal(Decimal::from_i64_with_scale(200000, 4))]]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::Decimal(Decimal::from_i64_with_scale(
+            200000, 4
+        ))]]
+    );
 }
 
 #[test]

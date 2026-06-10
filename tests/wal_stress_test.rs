@@ -489,7 +489,12 @@ fn idempotent_recovery_loop() {
             );
         }
 
-        assert_eq!(db.scan(..).count(), 50, "attempt {}: wrong key count", attempt);
+        assert_eq!(
+            db.scan(..).count(),
+            50,
+            "attempt {}: wrong key count",
+            attempt
+        );
     }
 }
 

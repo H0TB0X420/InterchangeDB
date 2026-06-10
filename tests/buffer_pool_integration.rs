@@ -76,9 +76,7 @@ fn test_concurrent_writers() {
     let (bpm, _dir) = create_bpm(10);
     let bpm = Arc::new(bpm);
 
-    let page_ids: Vec<PageId> = (0..5)
-        .map(|_| bpm.new_page().unwrap().page_id())
-        .collect();
+    let page_ids: Vec<PageId> = (0..5).map(|_| bpm.new_page().unwrap().page_id()).collect();
 
     let mut handles = vec![];
 

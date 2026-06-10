@@ -90,7 +90,11 @@ fn re_register_overwrites_previous_handle() {
     let looked_up = cat.index_engine(IndexId(7)).unwrap();
     looked_up.put(b"k", b"v").unwrap();
     assert_eq!(second.get(b"k").unwrap(), Some(b"v".to_vec()));
-    assert_eq!(first.get(b"k").unwrap(), None, "first handle should be detached");
+    assert_eq!(
+        first.get(b"k").unwrap(),
+        None,
+        "first handle should be detached"
+    );
 }
 
 #[test]

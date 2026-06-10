@@ -86,8 +86,11 @@ fn test_scan_full_range() {
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
-    let results: Vec<_> = tree.scan(..).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(..)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 10);
     for (i, (k, v)) in results.iter().enumerate() {
@@ -109,8 +112,11 @@ fn test_scan_from_start_inclusive() {
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
     let start = encode_key(5);
-    let results: Vec<_> = tree.scan(start..).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(start..)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 5);
     for (i, (k, _v)) in results.iter().enumerate() {
@@ -132,8 +138,11 @@ fn test_scan_range_inclusive() {
 
     let start = encode_key(3);
     let end = encode_key(7);
-    let results: Vec<_> = tree.scan(start..=end).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(start..=end)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 5);
     for (i, (k, _v)) in results.iter().enumerate() {
@@ -155,8 +164,11 @@ fn test_scan_range_exclusive_end() {
 
     let start = encode_key(3);
     let end = encode_key(7);
-    let results: Vec<_> = tree.scan(start..end).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(start..end)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 4);
     for (i, (k, _v)) in results.iter().enumerate() {
@@ -177,8 +189,11 @@ fn test_scan_up_to_exclusive() {
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
     let end = encode_key(5);
-    let results: Vec<_> = tree.scan(..end).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(..end)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 5);
     for (i, (k, _v)) in results.iter().enumerate() {
@@ -195,8 +210,11 @@ fn test_scan_up_to_inclusive() {
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
     let end = encode_key(5);
-    let results: Vec<_> = tree.scan(..=end).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(..=end)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 6);
     for (i, (k, _v)) in results.iter().enumerate() {
@@ -219,8 +237,11 @@ fn test_scan_empty_range_start_past_end() {
 
     let start = encode_key(5);
     let end = encode_key(3);
-    let results: Vec<_> = tree.scan(start..end).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(start..end)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 0);
 }
@@ -233,8 +254,11 @@ fn test_scan_empty_tree() {
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 3, 3);
 
-    let results: Vec<_> = tree.scan(..).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(..)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 0);
 }
@@ -253,8 +277,11 @@ fn test_scan_range_between_keys() {
     // With encoded keys, key 3 > key 2 and key 4 < key 5.
     let start = encode_key(3);
     let end = encode_key(5);
-    let results: Vec<_> = tree.scan(start..end).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(start..end)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 2);
     assert_eq!(decode_key(&results[0].0), 3);
@@ -283,8 +310,11 @@ fn test_scan_skips_tombstones() {
     tree.delete(&encode_key(5)).unwrap();
     tree.delete(&encode_key(7)).unwrap();
 
-    let results: Vec<_> = tree.scan(..).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(..)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     let keys: Vec<i64> = results.iter().map(|(k, _)| decode_key(k)).collect();
     assert_eq!(keys, vec![0, 1, 2, 4, 6, 8, 9]);
@@ -305,9 +335,12 @@ fn test_scan_early_termination() {
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 100);
 
-    let first_five: Vec<_> = tree.scan(..).unwrap()
+    let first_five: Vec<_> = tree
+        .scan(..)
+        .unwrap()
         .take(5)
-        .collect::<Result<Vec<_>, _>>().unwrap();
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(first_five.len(), 5);
     for (i, (k, _v)) in first_five.iter().enumerate() {
@@ -328,8 +361,11 @@ fn test_scan_large() {
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 4, 4, 500);
 
-    let results: Vec<_> = tree.scan(..).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(..)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(results.len(), 500);
     for (i, (k, v)) in results.iter().enumerate() {
@@ -402,8 +438,11 @@ fn test_scan_single_entry() {
 
     tree.insert(&encode_key(42), &encode_value(42)).unwrap();
 
-    let results: Vec<_> = tree.scan(..).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(..)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(decode_key(&results[0].0), 42);
 }
@@ -419,8 +458,11 @@ fn test_scan_point_range() {
     tree.insert(&encode_key(42), &encode_value(42)).unwrap();
 
     let k = encode_key(42);
-    let results: Vec<_> = tree.scan(k.clone()..=k).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(k.clone()..=k)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(decode_key(&results[0].0), 42);
 }
@@ -435,7 +477,10 @@ fn test_scan_past_all_entries() {
 
     tree.insert(&encode_key(42), &encode_value(42)).unwrap();
 
-    let results: Vec<_> = tree.scan(encode_key(43)..).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let results: Vec<_> = tree
+        .scan(encode_key(43)..)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(results.len(), 0);
 }

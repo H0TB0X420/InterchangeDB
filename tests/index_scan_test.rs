@@ -37,16 +37,35 @@ fn warehouse_schema() -> Schema {
         name: "warehouse".into(),
         table_id: TableId(0),
         columns: vec![
-            ColumnDef { name: "w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "w_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
-            ColumnDef { name: "w_region".into(), ty: ColumnType::Varchar(8), nullable: false, default: None },
+            ColumnDef {
+                name: "w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "w_name".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "w_region".into(),
+                ty: ColumnType::Varchar(8),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
 }
 
 fn row(id: i32, name: &str, region: &str) -> Vec<Value> {
-    vec![Value::Int32(id), Value::Varchar(name.into()), Value::Varchar(region.into())]
+    vec![
+        Value::Int32(id),
+        Value::Varchar(name.into()),
+        Value::Varchar(region.into()),
+    ]
 }
 
 fn make_setup(
@@ -59,7 +78,9 @@ fn make_setup(
 ) {
     let dir = tempfile::tempdir().unwrap();
     let cat = open_catalog_at(dir.path());
-    let table_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let table_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
     cat.create_index(IndexDef {
         name: "warehouse_by_name".into(),
         table_id,

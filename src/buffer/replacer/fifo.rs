@@ -60,9 +60,7 @@ impl FifoReplacer {
         // and this is only used during warm swap
         self.queue
             .iter()
-            .position(|&fid| {
-                self.frame_scores.get(&fid).copied().unwrap_or(0) > score
-            })
+            .position(|&fid| self.frame_scores.get(&fid).copied().unwrap_or(0) > score)
             .unwrap_or(self.queue.len())
     }
 }
@@ -106,7 +104,9 @@ impl EvictionPolicy for FifoReplacer {
 
     fn evict(&mut self) -> Option<FrameId> {
         // Find the position of the first evictable frame
-        let position = self.queue.iter()
+        let position = self
+            .queue
+            .iter()
             .position(|&fid| self.evictable.contains(&fid))?;
 
         // Remove only that frame
@@ -321,15 +321,21 @@ mod tests {
         assert_eq!(state.hot_pages.len(), 3);
 
         // Scores increase with arrival order: first = lowest score (evicted first)
-        let page_100_score = state.hot_pages.iter()
+        let page_100_score = state
+            .hot_pages
+            .iter()
             .find(|(pid, _)| *pid == PageId::new(100))
             .map(|(_, score)| *score)
             .unwrap();
-        let page_101_score = state.hot_pages.iter()
+        let page_101_score = state
+            .hot_pages
+            .iter()
             .find(|(pid, _)| *pid == PageId::new(101))
             .map(|(_, score)| *score)
             .unwrap();
-        let page_102_score = state.hot_pages.iter()
+        let page_102_score = state
+            .hot_pages
+            .iter()
             .find(|(pid, _)| *pid == PageId::new(102))
             .map(|(_, score)| *score)
             .unwrap();
@@ -365,7 +371,7 @@ mod tests {
         // Import state from another policy (e.g., LRU)
         // Page 101 is "hot" (score 100), Page 100 is "cold" (score 10)
         let mut state = PolicyState::new("lru");
-        state.hot_pages.push((PageId::new(100), 10));  // cold
+        state.hot_pages.push((PageId::new(100), 10)); // cold
         state.hot_pages.push((PageId::new(101), 100)); // hot
 
         replacer.import_state(&state);

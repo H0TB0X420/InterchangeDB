@@ -67,7 +67,10 @@ fn select_with_filter_and_limit_is_deterministic() {
 
 #[test]
 fn insert_multi_row_is_deterministic() {
-    assert_deterministic("INSERT INTO t VALUES (1, 'a', 20), (2, 'b', 30), (3, 'c', 40)", 10);
+    assert_deterministic(
+        "INSERT INTO t VALUES (1, 'a', 20), (2, 'b', 30), (3, 'c', 40)",
+        10,
+    );
 }
 
 #[test]

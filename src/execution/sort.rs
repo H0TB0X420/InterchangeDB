@@ -89,10 +89,16 @@ impl Executor for Sort {
         let keys: Vec<String> = self
             .keys
             .iter()
-            .map(|(c, d)| format!("{}{}", c, match d {
-                SortDir::Asc => " ASC",
-                SortDir::Desc => " DESC",
-            }))
+            .map(|(c, d)| {
+                format!(
+                    "{}{}",
+                    c,
+                    match d {
+                        SortDir::Asc => " ASC",
+                        SortDir::Desc => " DESC",
+                    }
+                )
+            })
             .collect();
         let mut out = format!("{}Sort[{}]\n", pad, keys.join(", "));
         out.push_str(&self.child.explain(indent + 1));

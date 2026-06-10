@@ -38,8 +38,7 @@ use crate::common::PageId;
 use crate::storage::page::{PageHeader, PageType};
 
 use super::node::{
-    InternalNode, LeafNode, NodeType,
-    INTERNAL_HEADER_SIZE, LEAF_HEADER_SIZE, MAX_TOMBSTONES,
+    InternalNode, LeafNode, NodeType, INTERNAL_HEADER_SIZE, LEAF_HEADER_SIZE, MAX_TOMBSTONES,
 };
 
 /// Encode an internal node to a page buffer.
@@ -524,12 +523,12 @@ mod tests {
         };
 
         for probe in [
-            &[1u8, 2][..], // present, first
-            &[6][..],      // present, last
+            &[1u8, 2][..],  // present, first
+            &[6][..],       // present, last
             &[3, 4, 5][..], // physically present but tombstoned → None
-            &[0][..],      // before all keys
-            &[2][..],      // between keys (absent)
-            &[9][..],      // after all keys
+            &[0][..],       // before all keys
+            &[2][..],       // between keys (absent)
+            &[9][..],       // after all keys
         ] {
             assert_eq!(
                 lookup_in_encoded_leaf(&buf, probe).map(|v| v.to_vec()),

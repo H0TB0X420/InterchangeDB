@@ -59,7 +59,11 @@ impl<E: StorageEngine> TxnEngine<E> {
         if self.txn_id == TxnId::AUTO_COMMIT {
             let oracle_ts = self.txn_mgr.ts_oracle_peek();
             let ckpt_ts = self.txn_mgr.checkpoint_ts();
-            let read_ts = if ckpt_ts > oracle_ts { ckpt_ts } else { oracle_ts };
+            let read_ts = if ckpt_ts > oracle_ts {
+                ckpt_ts
+            } else {
+                oracle_ts
+            };
             Ok(Snapshot { read_ts })
         } else {
             self.txn_mgr.snapshot(self.txn_id)
@@ -154,7 +158,11 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
         });
         let prev_lsn = self.txn_mgr.last_lsn(self.txn_id)?;
         let mut record = LogRecord::txn_put(
-            self.txn_id.0, prev_lsn, mvcc_key.clone(), mvcc_val.clone(), None,
+            self.txn_id.0,
+            prev_lsn,
+            mvcc_key.clone(),
+            mvcc_val.clone(),
+            None,
         );
         let lsn = self.wal.append(&mut record)?;
         self.txn_mgr.update_last_lsn(self.txn_id, lsn)?;
@@ -177,7 +185,11 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
         });
         let prev_lsn = self.txn_mgr.last_lsn(self.txn_id)?;
         let mut record = LogRecord::txn_put(
-            self.txn_id.0, prev_lsn, mvcc_key.clone(), mvcc_val.clone(), None,
+            self.txn_id.0,
+            prev_lsn,
+            mvcc_key.clone(),
+            mvcc_val.clone(),
+            None,
         );
         let lsn = self.wal.append(&mut record)?;
         self.txn_mgr.update_last_lsn(self.txn_id, lsn)?;

@@ -13,7 +13,11 @@ use interchangedb::index::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::storage::FileDiskManager;
 
-fn setup() -> (Session<BTreeEngine>, Arc<Catalog<BTreeEngine>>, tempfile::TempDir) {
+fn setup() -> (
+    Session<BTreeEngine>,
+    Arc<Catalog<BTreeEngine>>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
     let bpm = BufferPoolManager::new(512, dm);
@@ -31,7 +35,8 @@ fn table_id(catalog: &Catalog<BTreeEngine>, name: &str) -> TableId {
 #[test]
 fn analyze_empty_table_writes_zero_row_count() {
     let (mut s, cat, _d) = setup();
-    s.execute("CREATE TABLE t (id INT PRIMARY KEY, balance BIGINT)").unwrap();
+    s.execute("CREATE TABLE t (id INT PRIMARY KEY, balance BIGINT)")
+        .unwrap();
     let r = s.execute("ANALYZE TABLE t").unwrap();
     assert!(matches!(r, QueryResult::Ack));
 
@@ -51,10 +56,12 @@ fn analyze_empty_table_writes_zero_row_count() {
 #[test]
 fn analyze_counts_rows_and_ndv() {
     let (mut s, cat, _d) = setup();
-    s.execute("CREATE TABLE t (id INT PRIMARY KEY, kind INT)").unwrap();
+    s.execute("CREATE TABLE t (id INT PRIMARY KEY, kind INT)")
+        .unwrap();
     for i in 1..=10 {
         // kind cycles 0,1,2,0,1,2,... → 3 distinct values across 10 rows.
-        s.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i % 3)).unwrap();
+        s.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i % 3))
+            .unwrap();
     }
     s.execute("ANALYZE TABLE t").unwrap();
 
@@ -64,7 +71,7 @@ fn analyze_counts_rows_and_ndv() {
 
     let c_id = cat.get_column_stats(tid, 0).unwrap().unwrap();
     let c_kind = cat.get_column_stats(tid, 1).unwrap().unwrap();
-    assert_eq!(c_id.ndv, 10);  // every id distinct
+    assert_eq!(c_id.ndv, 10); // every id distinct
     assert_eq!(c_kind.ndv, 3); // 0, 1, 2 only
 }
 
@@ -103,7 +110,8 @@ fn analyze_writes_equi_width_histogram_for_int_columns() {
 #[test]
 fn analyze_skips_histogram_for_non_int_columns() {
     let (mut s, cat, _d) = setup();
-    s.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))").unwrap();
+    s.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))")
+        .unwrap();
     s.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
     s.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
     s.execute("ANALYZE TABLE t").unwrap();

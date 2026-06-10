@@ -88,8 +88,18 @@ mod tests {
             name: "account".into(),
             table_id: TableId(1),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                ColumnDef { name: "balance".into(), ty: ColumnType::Int64, nullable: false, default: None },
+                ColumnDef {
+                    name: "id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "balance".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
             ],
             primary_key: vec![0],
         }
@@ -135,7 +145,9 @@ mod tests {
         let mut op = SeqScan::new(&table).unwrap();
         let mut ids = Vec::new();
         while let Some(t) = op.next().unwrap() {
-            if let Value::Int32(n) = t[0] { ids.push(n); }
+            if let Value::Int32(n) = t[0] {
+                ids.push(n);
+            }
         }
         assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 9]);
     }

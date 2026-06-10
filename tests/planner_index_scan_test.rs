@@ -35,8 +35,18 @@ fn setup_with_name_index() -> Setup {
                 name: "t".into(),
                 table_id: TableId(0),
                 columns: vec![
-                    ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                    ColumnDef { name: "name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+                    ColumnDef {
+                        name: "id".into(),
+                        ty: ColumnType::Int32,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDef {
+                        name: "name".into(),
+                        ty: ColumnType::Varchar(20),
+                        nullable: false,
+                        default: None,
+                    },
                 ],
                 primary_key: vec![0],
             },
@@ -52,7 +62,11 @@ fn setup_with_name_index() -> Setup {
         })
         .unwrap();
 
-    Setup { catalog, engine, _dir: dir }
+    Setup {
+        catalog,
+        engine,
+        _dir: dir,
+    }
 }
 
 fn plan_sql(s: &Setup, sql: &str) -> PhysicalPlan {
@@ -65,7 +79,10 @@ fn plan_sql(s: &Setup, sql: &str) -> PhysicalPlan {
 fn explain_of(p: PhysicalPlan) -> String {
     match p {
         PhysicalPlan::Executor(exec) => exec.explain(0),
-        other => panic!("expected Executor plan, got: {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "expected Executor plan, got: {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }
 
@@ -73,18 +90,38 @@ fn explain_of(p: PhysicalPlan) -> String {
 fn select_with_equality_on_indexed_column_lowers_to_indexscan() {
     let s = setup_with_name_index();
     let text = explain_of(plan_sql(&s, "SELECT id FROM t WHERE name = 'alpha'"));
-    assert!(text.contains("IndexScan"), "expected IndexScan in plan:\n{}", text);
-    assert!(text.contains("t_by_name"), "expected index name in plan:\n{}", text);
+    assert!(
+        text.contains("IndexScan"),
+        "expected IndexScan in plan:\n{}",
+        text
+    );
+    assert!(
+        text.contains("t_by_name"),
+        "expected index name in plan:\n{}",
+        text
+    );
     // Predicate dropped — no Filter should appear above the IndexScan.
-    assert!(!text.contains("Filter"), "predicate should be dropped:\n{}", text);
+    assert!(
+        !text.contains("Filter"),
+        "predicate should be dropped:\n{}",
+        text
+    );
 }
 
 #[test]
 fn select_with_equality_on_non_indexed_column_uses_seqscan() {
     let s = setup_with_name_index();
     let text = explain_of(plan_sql(&s, "SELECT name FROM t WHERE id = 1"));
-    assert!(text.contains("SeqScan"), "expected SeqScan in plan:\n{}", text);
-    assert!(text.contains("Filter"), "expected Filter in plan:\n{}", text);
+    assert!(
+        text.contains("SeqScan"),
+        "expected SeqScan in plan:\n{}",
+        text
+    );
+    assert!(
+        text.contains("Filter"),
+        "expected Filter in plan:\n{}",
+        text
+    );
     assert!(!text.contains("IndexScan"), "id is not indexed:\n{}", text);
 }
 
@@ -110,7 +147,11 @@ fn select_with_range_predicate_falls_back_to_seqscan() {
 fn update_with_indexed_predicate_uses_indexscan() {
     let s = setup_with_name_index();
     let text = explain_of(plan_sql(&s, "UPDATE t SET id = 99 WHERE name = 'alpha'"));
-    assert!(text.contains("IndexScan"), "expected index-driven UPDATE:\n{}", text);
+    assert!(
+        text.contains("IndexScan"),
+        "expected index-driven UPDATE:\n{}",
+        text
+    );
     assert!(text.contains("Update"));
 }
 
@@ -118,7 +159,11 @@ fn update_with_indexed_predicate_uses_indexscan() {
 fn delete_with_indexed_predicate_uses_indexscan() {
     let s = setup_with_name_index();
     let text = explain_of(plan_sql(&s, "DELETE FROM t WHERE name = 'alpha'"));
-    assert!(text.contains("IndexScan"), "expected index-driven DELETE:\n{}", text);
+    assert!(
+        text.contains("IndexScan"),
+        "expected index-driven DELETE:\n{}",
+        text
+    );
     assert!(text.contains("Delete"));
 }
 
@@ -127,5 +172,9 @@ fn literal_on_left_is_recognized_symmetrically() {
     let s = setup_with_name_index();
     // `'alpha' = name` should lower just like `name = 'alpha'`.
     let text = explain_of(plan_sql(&s, "SELECT id FROM t WHERE 'alpha' = name"));
-    assert!(text.contains("IndexScan"), "expected symmetric lowering:\n{}", text);
+    assert!(
+        text.contains("IndexScan"),
+        "expected symmetric lowering:\n{}",
+        text
+    );
 }

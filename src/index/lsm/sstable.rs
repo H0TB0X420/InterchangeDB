@@ -30,8 +30,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::common::error::{Error, Result};
 use super::Entry;
+use crate::common::error::{Error, Result};
 
 /// Magic number: "SST\x01" in little-endian.
 const MAGIC: u32 = 0x01545353;
@@ -253,7 +253,10 @@ pub fn write_sstable(
     }
 
     // Flush the last block.
-    assert!(block_first_key.is_some(), "last block must have a first key");
+    assert!(
+        block_first_key.is_some(),
+        "last block must have a first key"
+    );
     flush_block(
         &mut writer,
         &mut block_buf,
@@ -523,10 +526,7 @@ impl SSTableReader {
     }
 
     /// Read all entries from a single data block at the given offset.
-    fn read_block(
-        &mut self,
-        offset: u64,
-    ) -> Result<Vec<Entry>> {
+    fn read_block(&mut self, offset: u64) -> Result<Vec<Entry>> {
         self.file.seek(SeekFrom::Start(offset))?;
         let mut buf = [0u8; BLOCK_SIZE];
         self.file.read_exact(&mut buf)?;
@@ -553,28 +553,31 @@ impl SSTableReader {
 // ---------------------------------------------------------------------------
 
 /// Decode entries from a data block's raw bytes.
-fn decode_block_entries(
-    data: &[u8],
-    entry_count: u16,
-) -> Result<Vec<Entry>> {
+fn decode_block_entries(data: &[u8], entry_count: u16) -> Result<Vec<Entry>> {
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos = 0;
 
     for _ in 0..entry_count {
         if pos + 2 > data.len() {
-            return Err(Error::StorageCorrupted("block entry truncated (key_len)".into()));
+            return Err(Error::StorageCorrupted(
+                "block entry truncated (key_len)".into(),
+            ));
         }
         let key_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
 
         if pos + key_len > data.len() {
-            return Err(Error::StorageCorrupted("block entry truncated (key)".into()));
+            return Err(Error::StorageCorrupted(
+                "block entry truncated (key)".into(),
+            ));
         }
         let key = data[pos..pos + key_len].to_vec();
         pos += key_len;
 
         if pos + 2 > data.len() {
-            return Err(Error::StorageCorrupted("block entry truncated (value_len)".into()));
+            return Err(Error::StorageCorrupted(
+                "block entry truncated (value_len)".into(),
+            ));
         }
         let value_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
         pos += 2;
@@ -584,7 +587,9 @@ fn decode_block_entries(
         } else {
             let vlen = value_len as usize;
             if pos + vlen > data.len() {
-                return Err(Error::StorageCorrupted("block entry truncated (value)".into()));
+                return Err(Error::StorageCorrupted(
+                    "block entry truncated (value)".into(),
+                ));
             }
             let value = data[pos..pos + vlen].to_vec();
             pos += vlen;
@@ -615,19 +620,25 @@ fn decode_index_block(data: &[u8], expected_count: u32) -> Result<Vec<IndexEntry
 
     for _ in 0..count {
         if pos + 2 > payload.len() {
-            return Err(Error::StorageCorrupted("index entry truncated (key_len)".into()));
+            return Err(Error::StorageCorrupted(
+                "index entry truncated (key_len)".into(),
+            ));
         }
         let key_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
 
         if pos + key_len > payload.len() {
-            return Err(Error::StorageCorrupted("index entry truncated (key)".into()));
+            return Err(Error::StorageCorrupted(
+                "index entry truncated (key)".into(),
+            ));
         }
         let first_key = payload[pos..pos + key_len].to_vec();
         pos += key_len;
 
         if pos + 4 > payload.len() {
-            return Err(Error::StorageCorrupted("index entry truncated (offset)".into()));
+            return Err(Error::StorageCorrupted(
+                "index entry truncated (offset)".into(),
+            ));
         }
         let block_offset = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
         pos += 4;
@@ -647,8 +658,7 @@ fn read_last_key_in_block(file: &mut BufReader<File>, offset: u64) -> Result<Vec
     let mut buf = [0u8; BLOCK_SIZE];
     file.read_exact(&mut buf)?;
 
-    let entry_count =
-        u16::from_le_bytes(buf[BLOCK_DATA_CAPACITY..BLOCK_SIZE].try_into().unwrap());
+    let entry_count = u16::from_le_bytes(buf[BLOCK_DATA_CAPACITY..BLOCK_SIZE].try_into().unwrap());
     let entries = decode_block_entries(&buf[..BLOCK_DATA_CAPACITY], entry_count)?;
 
     assert!(!entries.is_empty(), "block has no entries");
@@ -656,10 +666,7 @@ fn read_last_key_in_block(file: &mut BufReader<File>, offset: u64) -> Result<Vec
 }
 
 /// Count total entries across all blocks.
-fn count_all_entries(
-    file: &mut BufReader<File>,
-    index: &[IndexEntry],
-) -> Result<u64> {
+fn count_all_entries(file: &mut BufReader<File>, index: &[IndexEntry]) -> Result<u64> {
     let mut total = 0u64;
     for entry in index {
         file.seek(SeekFrom::Start(entry.block_offset as u64))?;
@@ -753,18 +760,9 @@ mod tests {
         assert_eq!(reader.block_count(), 1);
 
         // Point lookups.
-        assert_eq!(
-            reader.get(b"alice").unwrap(),
-            Some(Some(b"100".to_vec()))
-        );
-        assert_eq!(
-            reader.get(b"bob").unwrap(),
-            Some(Some(b"200".to_vec()))
-        );
-        assert_eq!(
-            reader.get(b"charlie").unwrap(),
-            Some(Some(b"300".to_vec()))
-        );
+        assert_eq!(reader.get(b"alice").unwrap(), Some(Some(b"100".to_vec())));
+        assert_eq!(reader.get(b"bob").unwrap(), Some(Some(b"200".to_vec())));
+        assert_eq!(reader.get(b"charlie").unwrap(), Some(Some(b"300".to_vec())));
         assert_eq!(reader.get(b"dave").unwrap(), None);
         assert_eq!(reader.get(b"aaa").unwrap(), None);
     }
@@ -820,15 +818,9 @@ mod tests {
         assert_eq!(meta.entry_count, 3);
 
         let mut reader = SSTableReader::open(&path, 3).unwrap();
-        assert_eq!(
-            reader.get(b"alive").unwrap(),
-            Some(Some(b"yes".to_vec()))
-        );
+        assert_eq!(reader.get(b"alive").unwrap(), Some(Some(b"yes".to_vec())));
         assert_eq!(reader.get(b"dead").unwrap(), Some(None)); // Tombstone.
-        assert_eq!(
-            reader.get(b"zombie").unwrap(),
-            Some(Some(b"no".to_vec()))
-        );
+        assert_eq!(reader.get(b"zombie").unwrap(), Some(Some(b"no".to_vec())));
     }
 
     #[test]

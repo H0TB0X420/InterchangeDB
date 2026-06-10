@@ -65,10 +65,9 @@ impl IndexScan {
 
         let indexed_len = index.def.columns.len();
         let mut rows = Vec::new();
-        let scan = index.engine.scan_range(
-            std::ops::Bound::Included(encoded_prefix),
-            end_bound,
-        );
+        let scan = index
+            .engine
+            .scan_range(std::ops::Bound::Included(encoded_prefix), end_bound);
         for entry in scan {
             let (key, _) = entry?;
             // Decode the full key (indexed cols + PK cols). The PK suffix

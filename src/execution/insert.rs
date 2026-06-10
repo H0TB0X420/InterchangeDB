@@ -90,8 +90,18 @@ mod tests {
             name: "account".into(),
             table_id: TableId(1),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                ColumnDef { name: "balance".into(), ty: ColumnType::Int64, nullable: false, default: None },
+                ColumnDef {
+                    name: "id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "balance".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
             ],
             primary_key: vec![0],
         });
@@ -111,9 +121,18 @@ mod tests {
         assert_eq!(op.next().unwrap(), None);
 
         // Rows are now in the table.
-        assert_eq!(table.get_by_pk(&[Value::Int32(1)]).unwrap(), Some(row(1, 10)));
-        assert_eq!(table.get_by_pk(&[Value::Int32(2)]).unwrap(), Some(row(2, 20)));
-        assert_eq!(table.get_by_pk(&[Value::Int32(3)]).unwrap(), Some(row(3, 30)));
+        assert_eq!(
+            table.get_by_pk(&[Value::Int32(1)]).unwrap(),
+            Some(row(1, 10))
+        );
+        assert_eq!(
+            table.get_by_pk(&[Value::Int32(2)]).unwrap(),
+            Some(row(2, 20))
+        );
+        assert_eq!(
+            table.get_by_pk(&[Value::Int32(3)]).unwrap(),
+            Some(row(3, 30))
+        );
     }
 
     #[test]

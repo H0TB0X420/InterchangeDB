@@ -112,17 +112,13 @@ macro_rules! database_tests {
                 }
 
                 // Half-open range [3, 7).
-                let results: Vec<_> = db.scan(vec![3u8]..vec![7u8])
-                    .map(|r| r.unwrap())
-                    .collect();
+                let results: Vec<_> = db.scan(vec![3u8]..vec![7u8]).map(|r| r.unwrap()).collect();
                 assert_eq!(results.len(), 4);
                 assert_eq!(results[0].0, vec![3]);
                 assert_eq!(results[3].0, vec![6]);
 
                 // Inclusive range [5, 8].
-                let results: Vec<_> = db.scan(vec![5u8]..=vec![8u8])
-                    .map(|r| r.unwrap())
-                    .collect();
+                let results: Vec<_> = db.scan(vec![5u8]..=vec![8u8]).map(|r| r.unwrap()).collect();
                 assert_eq!(results.len(), 4);
                 assert_eq!(results[0].0, vec![5]);
                 assert_eq!(results[3].0, vec![8]);
@@ -253,7 +249,7 @@ macro_rules! database_tests {
                 db.put(b"c", b"3").unwrap();
 
                 db.put(b"b", b"22").unwrap(); // Overwrite.
-                db.delete(b"a").unwrap();       // Delete.
+                db.delete(b"a").unwrap(); // Delete.
 
                 assert_eq!(db.get(b"a").unwrap(), None);
                 assert_eq!(db.get(b"b").unwrap(), Some(b"22".to_vec()));

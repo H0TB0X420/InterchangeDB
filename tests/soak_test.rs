@@ -71,7 +71,10 @@ fn soak_30_seconds() {
 
                 let txn = match db.begin_txn(TxnMode::ReadOnly) {
                     Ok(t) => t,
-                    Err(_) => { errors.fetch_add(1, Ordering::Relaxed); continue; }
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 };
 
                 match db.txn_get(txn, key.as_bytes()) {
@@ -82,7 +85,9 @@ fn soak_30_seconds() {
                         }
                     }
                     Ok(None) => {} // Key not yet written — fine.
-                    Err(_) => { errors.fetch_add(1, Ordering::Relaxed); }
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
 
                 let _ = db.commit_txn(txn);
@@ -109,7 +114,10 @@ fn soak_30_seconds() {
 
                 let txn = match db.begin_txn(TxnMode::ReadWrite) {
                     Ok(t) => t,
-                    Err(_) => { errors.fetch_add(1, Ordering::Relaxed); continue; }
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 };
 
                 let put_result = db.txn_put(txn, key.as_bytes(), val.as_bytes());
@@ -120,8 +128,12 @@ fn soak_30_seconds() {
                             aborted_ops.fetch_add(1, Ordering::Relaxed);
                         } else {
                             match db.commit_txn(txn) {
-                                Ok(()) => { committed_ops.fetch_add(1, Ordering::Relaxed); }
-                                Err(_) => { errors.fetch_add(1, Ordering::Relaxed); }
+                                Ok(()) => {
+                                    committed_ops.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(_) => {
+                                    errors.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -150,7 +162,9 @@ fn soak_30_seconds() {
 
                 // GC.
                 match db.gc() {
-                    Ok(_stats) => { gc_runs.fetch_add(1, Ordering::Relaxed); }
+                    Ok(_stats) => {
+                        gc_runs.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(_) => {}
                 }
                 // Checkpoint.

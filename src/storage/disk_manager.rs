@@ -67,7 +67,10 @@ impl FileDiskManager {
             .write(true)
             .create_new(true)
             .open(path)?;
-        Ok(Self { file, page_count: 0 })
+        Ok(Self {
+            file,
+            page_count: 0,
+        })
     }
 
     /// Open an existing database file. Errors if it doesn't exist.
@@ -169,7 +172,8 @@ impl DiskManager for MemoryDiskManager {
             return Err(crate::common::Error::PageNotFound(page_id.0));
         }
         let mut page = Page::new();
-        page.as_mut_slice().copy_from_slice(&self.pages[page_id.0 as usize]);
+        page.as_mut_slice()
+            .copy_from_slice(&self.pages[page_id.0 as usize]);
         Ok(page)
     }
 

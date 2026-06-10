@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::common::{Error, Result};
 use super::TxnId;
+use crate::common::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -214,14 +214,15 @@ impl LockManager {
 
         {
             let graph = Self::build_wait_for_graph(&state);
-            if let Some(cycle) = Self::detect_cycle(&graph, txn_id){
+            if let Some(cycle) = Self::detect_cycle(&graph, txn_id) {
                 let _victim = Self::choose_victim(&cycle);
-                if let Some(entry) = state.lock_table.get_mut(&key_vec){
-                    entry.wait_queue.retain(|r| !Arc::ptr_eq(&r.granted, &granted_flag)); 
-                if entry.is_empty() {
-                    state.lock_table.remove(&key_vec);
-                }
-
+                if let Some(entry) = state.lock_table.get_mut(&key_vec) {
+                    entry
+                        .wait_queue
+                        .retain(|r| !Arc::ptr_eq(&r.granted, &granted_flag));
+                    if entry.is_empty() {
+                        state.lock_table.remove(&key_vec);
+                    }
                 }
                 return Err(Error::Deadlock(txn_id.0));
             }
@@ -464,16 +465,16 @@ impl LockManager {
 
         granted_any
     }
-/// Deadlock detection
-/// Build a wait-for graph from current lock state
-/// HOW: For each key with waiters, add an edge from each waiter to each holder. When the waiter's
-/// requested mode is incompatible with the granted mode. Edges represent "this waiter is blocked
-/// by this hold"
-/// WHY: A cycle means deadlock. No txn in the cycle can make progress.
+    /// Deadlock detection
+    /// Build a wait-for graph from current lock state
+    /// HOW: For each key with waiters, add an edge from each waiter to each holder. When the waiter's
+    /// requested mode is incompatible with the granted mode. Edges represent "this waiter is blocked
+    /// by this hold"
+    /// WHY: A cycle means deadlock. No txn in the cycle can make progress.
     fn build_wait_for_graph(state: &LockState) -> HashMap<TxnId, HashSet<TxnId>> {
         let mut graph: HashMap<TxnId, HashSet<TxnId>> = HashMap::new();
-        for entry in state.lock_table.values(){
-            if entry.wait_queue.is_empty(){
+        for entry in state.lock_table.values() {
+            if entry.wait_queue.is_empty() {
                 continue;
             }
 
@@ -483,12 +484,12 @@ impl LockManager {
             };
 
             for request in &entry.wait_queue {
-                if request.mode.is_compatible(granted_mode){
+                if request.mode.is_compatible(granted_mode) {
                     continue;
                 }
 
                 for &holder_id in &entry.holders {
-                    if holder_id == request.txn_id{
+                    if holder_id == request.txn_id {
                         continue;
                     }
                     graph.entry(request.txn_id).or_default().insert(holder_id);
@@ -497,65 +498,65 @@ impl LockManager {
         }
         graph
     }
-/// Detect if start_txn is part of a cycle
-/// HOW: BFS from start_txn neighbors. If any path leads back to strat_txn, there is a cycle.
-/// WHY: Only the newly queued waiter can complete a new cycle.
-///
-fn detect_cycle(graph: &HashMap<TxnId, HashSet<TxnId>>,
-                start_txn: TxnId,
-                ) -> Option<Vec<TxnId>> {
-    let start_neighbors = graph.get(&start_txn)?;
+    /// Detect if start_txn is part of a cycle
+    /// HOW: BFS from start_txn neighbors. If any path leads back to strat_txn, there is a cycle.
+    /// WHY: Only the newly queued waiter can complete a new cycle.
+    ///
+    fn detect_cycle(
+        graph: &HashMap<TxnId, HashSet<TxnId>>,
+        start_txn: TxnId,
+    ) -> Option<Vec<TxnId>> {
+        let start_neighbors = graph.get(&start_txn)?;
 
-    let mut parent: HashMap<TxnId,TxnId> = HashMap::new();
-    let mut queue: VecDeque<TxnId> = VecDeque::new();
+        let mut parent: HashMap<TxnId, TxnId> = HashMap::new();
+        let mut queue: VecDeque<TxnId> = VecDeque::new();
 
-    for &neighbor in start_neighbors {
-        parent.insert(neighbor, start_txn);
-        queue.push_back(neighbor);
-    }
+        for &neighbor in start_neighbors {
+            parent.insert(neighbor, start_txn);
+            queue.push_back(neighbor);
+        }
 
-    let mut iterations = 0usize;
-    const MAX_BFS_ITERATIONS: usize = 65536;
+        let mut iterations = 0usize;
+        const MAX_BFS_ITERATIONS: usize = 65536;
 
-    while let Some(current) = queue.pop_front(){
-        iterations += 1;
-        assert!(
-            iterations <= MAX_BFS_ITERATIONS,
-            "BFS exceeded max iterations in deadlock detection"
+        while let Some(current) = queue.pop_front() {
+            iterations += 1;
+            assert!(
+                iterations <= MAX_BFS_ITERATIONS,
+                "BFS exceeded max iterations in deadlock detection"
             );
-        
-        let neighbors = match graph.get(&current) {
-            Some(n) => n,
-            None => continue,
-        };
 
-        for &neighbor in neighbors {
-            if neighbor == start_txn{
-                let mut cycle = Vec::new();
-                let mut node = current;
-                while node != start_txn {
-                    cycle.push(node);
-                    node = parent[&node];
+            let neighbors = match graph.get(&current) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            for &neighbor in neighbors {
+                if neighbor == start_txn {
+                    let mut cycle = Vec::new();
+                    let mut node = current;
+                    while node != start_txn {
+                        cycle.push(node);
+                        node = parent[&node];
+                    }
+                    cycle.push(start_txn);
+                    return Some(cycle);
                 }
-                cycle.push(start_txn);
-                return Some(cycle);
-            }
-            if let std::collections::hash_map::Entry::Vacant(e) = parent.entry(neighbor) {
-                e.insert(current);
-                queue.push_back(neighbor);
-            }
+                if let std::collections::hash_map::Entry::Vacant(e) = parent.entry(neighbor) {
+                    e.insert(current);
+                    queue.push_back(neighbor);
+                }
             }
         }
         None
     }
 
-///Choose the deadlock victim from a cycle. The youngest transaction.
-///WHY: The youngest transaction has done the least work, so aborting wastes the fewest resources.
-fn choose_victim(cycle: &[TxnId]) -> TxnId {
-    assert!(!cycle.is_empty(), "Cycle must not be empty");
-    *cycle.iter().max().unwrap()
-}
-
+    ///Choose the deadlock victim from a cycle. The youngest transaction.
+    ///WHY: The youngest transaction has done the least work, so aborting wastes the fewest resources.
+    fn choose_victim(cycle: &[TxnId]) -> TxnId {
+        assert!(!cycle.is_empty(), "Cycle must not be empty");
+        *cycle.iter().max().unwrap()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -592,7 +593,8 @@ mod tests {
     #[test]
     fn acquire_exclusive_unlocked() {
         let lm = LockManager::new();
-        lm.acquire(TxnId::new(1), b"key", LockMode::Exclusive).unwrap();
+        lm.acquire(TxnId::new(1), b"key", LockMode::Exclusive)
+            .unwrap();
         assert_eq!(lm.held_by(TxnId::new(1)), vec![b"key".to_vec()]);
     }
 
@@ -701,9 +703,7 @@ mod tests {
         lm.acquire(t1, b"key", LockMode::Shared).unwrap();
 
         let lm2 = lm.clone();
-        let handle = thread::spawn(move || {
-            lm2.acquire(t2, b"key", LockMode::Exclusive)
-        });
+        let handle = thread::spawn(move || lm2.acquire(t2, b"key", LockMode::Exclusive));
 
         thread::sleep(SETTLE_TIME);
         // T2 should be waiting — verify it doesn't hold the lock yet.
@@ -726,9 +726,7 @@ mod tests {
         lm.acquire(t1, b"key", LockMode::Exclusive).unwrap();
 
         let lm2 = lm.clone();
-        let handle = thread::spawn(move || {
-            lm2.acquire(t2, b"key", LockMode::Shared)
-        });
+        let handle = thread::spawn(move || lm2.acquire(t2, b"key", LockMode::Shared));
 
         thread::sleep(SETTLE_TIME);
         assert!(lm.held_by(t2).is_empty());
@@ -749,9 +747,7 @@ mod tests {
         lm.acquire(t1, b"key", LockMode::Exclusive).unwrap();
 
         let lm2 = lm.clone();
-        let handle = thread::spawn(move || {
-            lm2.acquire(t2, b"key", LockMode::Exclusive)
-        });
+        let handle = thread::spawn(move || lm2.acquire(t2, b"key", LockMode::Exclusive));
 
         thread::sleep(SETTLE_TIME);
         assert!(lm.held_by(t2).is_empty());
@@ -799,9 +795,7 @@ mod tests {
         lm.acquire(t1, b"key", LockMode::Exclusive).unwrap();
 
         let lm2 = lm.clone();
-        let handle = thread::spawn(move || {
-            lm2.acquire(t2, b"key", LockMode::Shared)
-        });
+        let handle = thread::spawn(move || lm2.acquire(t2, b"key", LockMode::Shared));
 
         thread::sleep(SETTLE_TIME);
         lm.release(t1, b"key");
@@ -838,10 +832,7 @@ mod tests {
 
         // All three hold S.
         for i in 2..=4 {
-            assert_eq!(
-                lm.held_by(TxnId::new(i)),
-                vec![b"key".to_vec()]
-            );
+            assert_eq!(lm.held_by(TxnId::new(i)), vec![b"key".to_vec()]);
         }
     }
 
@@ -855,9 +846,7 @@ mod tests {
         lm.acquire(t1, b"key", LockMode::Exclusive).unwrap();
 
         let lm2 = lm.clone();
-        let handle = thread::spawn(move || {
-            lm2.acquire(t2, b"key", LockMode::Exclusive)
-        });
+        let handle = thread::spawn(move || lm2.acquire(t2, b"key", LockMode::Exclusive));
 
         let result = handle.join().unwrap();
         assert!(matches!(result, Err(Error::LockTimeout)));
@@ -881,16 +870,12 @@ mod tests {
 
         // T2 waits for X.
         let lm2 = lm.clone();
-        let h2 = thread::spawn(move || {
-            lm2.acquire(t2, b"key", LockMode::Exclusive)
-        });
+        let h2 = thread::spawn(move || lm2.acquire(t2, b"key", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // T3 requests S — should NOT be granted because T2(X) is ahead in queue.
         let lm3 = lm.clone();
-        let h3 = thread::spawn(move || {
-            lm3.acquire(t3, b"key", LockMode::Shared)
-        });
+        let h3 = thread::spawn(move || lm3.acquire(t3, b"key", LockMode::Shared));
         thread::sleep(SETTLE_TIME);
 
         // Neither T2 nor T3 should hold the lock yet.
@@ -929,9 +914,7 @@ mod tests {
 
         // T1 requests B — blocks because T2 holds B.
         let lm2 = lm.clone();
-        let t1_handle = thread::spawn(move || {
-            lm2.acquire(t1, b"B", LockMode::Exclusive)
-        });
+        let t1_handle = thread::spawn(move || lm2.acquire(t1, b"B", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // T2 requests A — detects cycle: T2→T1(A), T1→T2(B). T2 is victim.
@@ -960,16 +943,12 @@ mod tests {
 
         // T1 requests B — blocks (T2 holds B).
         let lm_t1 = lm.clone();
-        let t1_handle = thread::spawn(move || {
-            lm_t1.acquire(t1, b"B", LockMode::Exclusive)
-        });
+        let t1_handle = thread::spawn(move || lm_t1.acquire(t1, b"B", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // T2 requests C — blocks (T3 holds C).
         let lm_t2 = lm.clone();
-        let t2_handle = thread::spawn(move || {
-            lm_t2.acquire(t2, b"C", LockMode::Exclusive)
-        });
+        let t2_handle = thread::spawn(move || lm_t2.acquire(t2, b"C", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // T3 requests A — detects cycle T3→T1→T2→T3, returns Deadlock.
@@ -1003,16 +982,12 @@ mod tests {
 
         // T2 requests C — blocks on T3.
         let lm_t2 = lm.clone();
-        let t2_handle = thread::spawn(move || {
-            lm_t2.acquire(t2, b"C", LockMode::Exclusive)
-        });
+        let t2_handle = thread::spawn(move || lm_t2.acquire(t2, b"C", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // T1 requests B — blocks on T2. Chain: T1→T2→T3. No cycle.
         let lm_t1 = lm.clone();
-        let t1_handle = thread::spawn(move || {
-            lm_t1.acquire(t1, b"B", LockMode::Exclusive)
-        });
+        let t1_handle = thread::spawn(move || lm_t1.acquire(t1, b"B", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // Unblock: T3 releases C → T2 gets C. T2 releases B → T1 gets B.
@@ -1041,9 +1016,7 @@ mod tests {
 
         // T1 requests B — blocks on T2. Graph: T1→T2. No cycle.
         let lm_t1 = lm.clone();
-        let t1_handle = thread::spawn(move || {
-            lm_t1.acquire(t1, b"B", LockMode::Exclusive)
-        });
+        let t1_handle = thread::spawn(move || lm_t1.acquire(t1, b"B", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // Release T2's B → T1 gets it. No deadlock.
@@ -1064,9 +1037,7 @@ mod tests {
         lm.acquire(t2, b"B", LockMode::Exclusive).unwrap();
 
         let lm2 = lm.clone();
-        let t1_handle = thread::spawn(move || {
-            lm2.acquire(t1, b"B", LockMode::Exclusive)
-        });
+        let t1_handle = thread::spawn(move || lm2.acquire(t1, b"B", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         let result = lm.acquire(t2, b"A", LockMode::Exclusive);
@@ -1087,9 +1058,7 @@ mod tests {
         lm.acquire(t2, b"B", LockMode::Exclusive).unwrap();
 
         let lm2 = lm.clone();
-        let _t1_handle = thread::spawn(move || {
-            lm2.acquire(t1, b"B", LockMode::Exclusive)
-        });
+        let _t1_handle = thread::spawn(move || lm2.acquire(t1, b"B", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         let result = lm.acquire(t2, b"A", LockMode::Exclusive);
@@ -1118,9 +1087,7 @@ mod tests {
 
         // T1 requests B — blocks.
         let lm2 = lm.clone();
-        let t1_handle = thread::spawn(move || {
-            lm2.acquire(t1, b"B", LockMode::Exclusive)
-        });
+        let t1_handle = thread::spawn(move || lm2.acquire(t1, b"B", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // T2 requests A — deadlock, T2 is victim.
@@ -1154,9 +1121,7 @@ mod tests {
 
         // T1 requests C — blocks (T2 holds C).
         let lm2 = lm.clone();
-        let t1_handle = thread::spawn(move || {
-            lm2.acquire(t1, b"C", LockMode::Exclusive)
-        });
+        let t1_handle = thread::spawn(move || lm2.acquire(t1, b"C", LockMode::Exclusive));
         thread::sleep(SETTLE_TIME);
 
         // T2 requests B — deadlock: T2→T1(via B), T1→T2(via C).

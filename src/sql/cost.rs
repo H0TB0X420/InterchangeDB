@@ -108,11 +108,7 @@ pub trait CostModel: Send + Sync {
 
     /// Index nested-loop join: for each outer row, do one index probe
     /// returning ~`avg_matches_per_outer` rows.
-    fn cost_index_nested_loop_join(
-        &self,
-        outer_rows: f64,
-        avg_matches_per_outer: f64,
-    ) -> Cost;
+    fn cost_index_nested_loop_join(&self, outer_rows: f64, avg_matches_per_outer: f64) -> Cost;
 
     /// Hash join: build hash table from `build_rows`, probe with
     /// `probe_rows`. Build side traditionally the smaller relation.
@@ -225,11 +221,7 @@ impl CostModel for DefaultCostModel {
         }
     }
 
-    fn cost_index_nested_loop_join(
-        &self,
-        outer_rows: f64,
-        avg_matches_per_outer: f64,
-    ) -> Cost {
+    fn cost_index_nested_loop_join(&self, outer_rows: f64, avg_matches_per_outer: f64) -> Cost {
         // Per outer row: one index probe + materialize matches.
         let per_outer = self.cost_index_scan(avg_matches_per_outer);
         Cost {
@@ -266,15 +258,33 @@ mod tests {
 
     #[test]
     fn cost_add_is_component_wise() {
-        let a = Cost { io_units: 1.0, cpu_units: 10.0 };
-        let b = Cost { io_units: 2.0, cpu_units: 5.0 };
-        assert_eq!(a.add(b), Cost { io_units: 3.0, cpu_units: 15.0 });
+        let a = Cost {
+            io_units: 1.0,
+            cpu_units: 10.0,
+        };
+        let b = Cost {
+            io_units: 2.0,
+            cpu_units: 5.0,
+        };
+        assert_eq!(
+            a.add(b),
+            Cost {
+                io_units: 3.0,
+                cpu_units: 15.0
+            }
+        );
     }
 
     #[test]
     fn total_applies_weights() {
-        let c = Cost { io_units: 100.0, cpu_units: 1_000.0 };
-        let w = CostWeights { io_weight: 1.0, cpu_weight: 0.001 };
+        let c = Cost {
+            io_units: 100.0,
+            cpu_units: 1_000.0,
+        };
+        let w = CostWeights {
+            io_weight: 1.0,
+            cpu_weight: 0.001,
+        };
         // 100 * 1.0 + 1000 * 0.001 = 100 + 1 = 101.
         assert!((c.total(&w) - 101.0).abs() < 1e-9);
     }

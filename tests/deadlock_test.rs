@@ -76,7 +76,8 @@ fn concurrent_deadlock_detection() {
     assert!(
         t1_was_victim ^ t2_was_victim,
         "Exactly one txn should be deadlock victim: T1={}, T2={}",
-        t1_was_victim, t2_was_victim
+        t1_was_victim,
+        t2_was_victim
     );
 }
 
@@ -101,8 +102,7 @@ fn concurrent_three_way_deadlock() {
 
     let resolved_count = Arc::new(AtomicUsize::new(0));
 
-    let requests: Vec<(TxnId, &'static [u8])> =
-        vec![(t1, b"B"), (t2, b"C"), (t3, b"A")];
+    let requests: Vec<(TxnId, &'static [u8])> = vec![(t1, b"B"), (t2, b"C"), (t3, b"A")];
 
     let handles: Vec<_> = requests
         .into_iter()

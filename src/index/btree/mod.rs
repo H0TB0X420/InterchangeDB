@@ -84,23 +84,22 @@
 //! - Comer, "The Ubiquitous B-Tree" (1979)
 //! - BusTub CMU 15-445 B+Tree implementation
 
-pub mod engine;
 mod context;
+pub mod engine;
 mod iterator;
 mod node;
 mod page_layout;
 mod tree;
 
+pub use engine::BTreeEngine;
+pub use iterator::BTreeScanIterator;
 pub use node::{
-    InternalNode, LeafNode, NodeHeader, NodeType,
-    INTERNAL_HEADER_SIZE, LEAF_HEADER_SIZE, MAX_TOMBSTONES,
+    InternalNode, LeafNode, NodeHeader, NodeType, INTERNAL_HEADER_SIZE, LEAF_HEADER_SIZE,
+    MAX_TOMBSTONES,
 };
 pub use page_layout::{
-    decode_internal_node, decode_leaf_node,
-    encode_internal_node, encode_leaf_node,
+    decode_internal_node, decode_leaf_node, encode_internal_node, encode_leaf_node,
 };
-pub use iterator::BTreeScanIterator;
-pub use engine::BTreeEngine;
 pub use tree::BTree;
 
 use crate::common::PageId;
@@ -163,10 +162,7 @@ impl BTreeHeaderPage {
             ]);
             if stored_checksum != 0 {
                 let computed = PageHeader::compute_checksum(buf);
-                assert_eq!(
-                    stored_checksum, computed,
-                    "header page checksum mismatch"
-                );
+                assert_eq!(stored_checksum, computed, "header page checksum mismatch");
             }
         }
 

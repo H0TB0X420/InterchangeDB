@@ -29,7 +29,9 @@ fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     let mut session = Session::new(database.clone(), catalog.clone());
     // Two tables joined on a non-PK column (no index on the join key), so
     // the planners diverge: rule-based → NestedLoopJoin, Selinger → Hash.
-    session.execute("CREATE TABLE warehouse (w_id INT PRIMARY KEY, w_name VARCHAR(20))").unwrap();
+    session
+        .execute("CREATE TABLE warehouse (w_id INT PRIMARY KEY, w_name VARCHAR(20))")
+        .unwrap();
     session
         .execute("CREATE TABLE district (d_id INT PRIMARY KEY, d_w_id INT, d_name VARCHAR(20))")
         .unwrap();
@@ -52,7 +54,9 @@ fn default_planner_is_rule_based() {
 #[test]
 fn set_planner_switches_active_strategy_name() {
     let (mut session, _d) = setup();
-    session.set_planner(Planner::Selinger(SelingerPlanner::<DefaultCostModel>::default()));
+    session.set_planner(Planner::Selinger(
+        SelingerPlanner::<DefaultCostModel>::default(),
+    ));
     assert_eq!(session.planner_name(), "selinger");
     session.set_planner(Planner::default());
     assert_eq!(session.planner_name(), "rule-based");
@@ -72,7 +76,9 @@ fn swapping_planner_changes_the_join_algorithm() {
     );
 
     // Swap to Selinger on the same live session → HashJoin.
-    session.set_planner(Planner::Selinger(SelingerPlanner::<DefaultCostModel>::default()));
+    session.set_planner(Planner::Selinger(
+        SelingerPlanner::<DefaultCostModel>::default(),
+    ));
     let selinger_plan = explain(&mut session, sql);
     assert!(
         selinger_plan.contains("HashJoin"),
@@ -91,9 +97,13 @@ fn non_select_statements_are_unaffected_by_planner_choice() {
     // The planner choice only touches SELECT join lowering; DML returns
     // identical results under either planner.
     let (mut session, _d) = setup();
-    session.execute("INSERT INTO warehouse VALUES (1, 'DC1')").unwrap();
+    session
+        .execute("INSERT INTO warehouse VALUES (1, 'DC1')")
+        .unwrap();
 
-    session.set_planner(Planner::Selinger(SelingerPlanner::<DefaultCostModel>::default()));
+    session.set_planner(Planner::Selinger(
+        SelingerPlanner::<DefaultCostModel>::default(),
+    ));
     let affected = match session
         .execute("INSERT INTO warehouse VALUES (2, 'DC2')")
         .unwrap()

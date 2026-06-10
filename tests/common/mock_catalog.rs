@@ -33,7 +33,11 @@ impl MockCatalog {
         let bpm = BufferPoolManager::new(512, dm);
         let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
         let catalog = Arc::new(Catalog::open(engine.clone()).unwrap());
-        Self { engine, catalog, _dir: dir }
+        Self {
+            engine,
+            catalog,
+            _dir: dir,
+        }
     }
 
     /// Register a user table.
@@ -45,12 +49,7 @@ impl MockCatalog {
     /// Panics if a PK name doesn't appear in `columns`. Mock-side panics are
     /// preferred over `Result` returns — test fixtures must be obviously
     /// correct at the call site.
-    pub fn with_table(
-        self,
-        name: &str,
-        columns: &[(&str, ColumnType, bool)],
-        pk: &[&str],
-    ) -> Self {
+    pub fn with_table(self, name: &str, columns: &[(&str, ColumnType, bool)], pk: &[&str]) -> Self {
         let column_defs: Vec<ColumnDef> = columns
             .iter()
             .map(|(n, ty, nullable)| ColumnDef {
@@ -103,7 +102,11 @@ mod tests {
     fn empty_catalog_lists_only_system_tables() {
         let mc = MockCatalog::new();
         for t in mc.catalog.list_tables() {
-            assert!(t.starts_with("__sys_"), "unexpected non-system table: {}", t);
+            assert!(
+                t.starts_with("__sys_"),
+                "unexpected non-system table: {}",
+                t
+            );
         }
     }
 
@@ -155,10 +158,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "PK column 'missing' not in column list")]
     fn missing_pk_column_panics_with_clear_message() {
-        MockCatalog::new().with_table(
-            "t",
-            &[("id", ColumnType::Int32, false)],
-            &["missing"],
-        );
+        MockCatalog::new().with_table("t", &[("id", ColumnType::Int32, false)], &["missing"]);
     }
 }

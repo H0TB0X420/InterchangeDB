@@ -828,10 +828,7 @@ mod tests {
         let (bpm, _dir) = create_test_bpm(10);
         assert_eq!(bpm.get_policy_name(), "fifo");
 
-        let result = bpm.swap_policy(
-            Box::new(LruReplacer::new(10)),
-            SwapMode::Cold,
-        );
+        let result = bpm.swap_policy(Box::new(LruReplacer::new(10)), SwapMode::Cold);
 
         assert_eq!(result.old_policy, "fifo");
         assert_eq!(result.new_policy, "lru");
@@ -855,10 +852,7 @@ mod tests {
 
         assert_eq!(bpm.page_count(), 3);
 
-        let result = bpm.swap_policy(
-            Box::new(LruReplacer::new(5)),
-            SwapMode::Cold,
-        );
+        let result = bpm.swap_policy(Box::new(LruReplacer::new(5)), SwapMode::Cold);
 
         assert_eq!(result.frames_registered, 3);
         assert_eq!(result.pages_transferred, 0);
@@ -898,10 +892,7 @@ mod tests {
         // but the export scores will reflect insertion order
         let _ = bpm.fetch_page_read(pid2).unwrap();
 
-        let result = bpm.swap_policy(
-            Box::new(LruReplacer::new(3)),
-            SwapMode::Warm,
-        );
+        let result = bpm.swap_policy(Box::new(LruReplacer::new(3)), SwapMode::Warm);
 
         assert_eq!(result.old_policy, "fifo");
         assert_eq!(result.new_policy, "lru");
@@ -937,16 +928,16 @@ mod tests {
 
         // Warm swap to LRU — imported scores should preserve FIFO ordering:
         // pid0 coldest (lowest score), pid2 hottest (highest score)
-        bpm.swap_policy(
-            Box::new(LruReplacer::new(3)),
-            SwapMode::Warm,
-        );
+        bpm.swap_policy(Box::new(LruReplacer::new(3)), SwapMode::Warm);
 
         // Pool is full (3/3). Creating a new page forces eviction.
         // With imported scores, pid0 should be evicted first (coldest).
         let _pid3 = bpm.new_page().unwrap().page_id();
 
-        assert!(!bpm.contains_page(pid0), "pid0 should have been evicted (coldest)");
+        assert!(
+            !bpm.contains_page(pid0),
+            "pid0 should have been evicted (coldest)"
+        );
         assert!(bpm.contains_page(pid1));
         assert!(bpm.contains_page(pid2));
     }
@@ -963,10 +954,7 @@ mod tests {
         // Hold pid0 pinned during swap
         let _guard = bpm.fetch_page_read(pid0).unwrap();
 
-        bpm.swap_policy(
-            Box::new(LruReplacer::new(3)),
-            SwapMode::Cold,
-        );
+        bpm.swap_policy(Box::new(LruReplacer::new(3)), SwapMode::Cold);
 
         // pid0 is pinned → should NOT be evictable after swap
         // pid1 is unpinned → should be evictable
@@ -980,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_multiple_consecutive_swaps() {
-        use crate::buffer::replacer::{ClockReplacer, LruReplacer, LruKReplacer};
+        use crate::buffer::replacer::{ClockReplacer, LruKReplacer, LruReplacer};
 
         let (bpm, _dir) = create_test_bpm(5);
 

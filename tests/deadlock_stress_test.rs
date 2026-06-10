@@ -36,10 +36,8 @@ fn deadlock_storm() {
 
                 for iteration in 0usize..100 {
                     // Deterministic pseudo-random key selection.
-                    let key_a_idx =
-                        (thread_idx.wrapping_mul(37) + iteration.wrapping_mul(13)) % 8;
-                    let key_b_idx =
-                        (thread_idx.wrapping_mul(53) + iteration.wrapping_mul(7)) % 8;
+                    let key_a_idx = (thread_idx.wrapping_mul(37) + iteration.wrapping_mul(13)) % 8;
+                    let key_b_idx = (thread_idx.wrapping_mul(53) + iteration.wrapping_mul(7)) % 8;
 
                     // Same key — skip, no interesting contention.
                     if key_a_idx == key_b_idx {

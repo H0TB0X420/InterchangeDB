@@ -99,7 +99,8 @@ impl EvictionPolicy for LruReplacer {
 
         // Find the evictable frame with the lowest score (least recently used)
         // This respects imported scores for warm swap consistency
-        let victim = self.evictable
+        let victim = self
+            .evictable
             .iter()
             .min_by_key(|&fid| self.frame_access_order.get(fid).copied().unwrap_or(0))
             .copied();
@@ -254,15 +255,21 @@ mod tests {
         assert_eq!(state.hot_pages.len(), 3);
 
         // Find scores for each page
-        let score_100 = state.hot_pages.iter()
+        let score_100 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(100))
             .map(|(_, s)| *s)
             .unwrap();
-        let score_101 = state.hot_pages.iter()
+        let score_101 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(101))
             .map(|(_, s)| *s)
             .unwrap();
-        let score_102 = state.hot_pages.iter()
+        let score_102 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(102))
             .map(|(_, s)| *s)
             .unwrap();
@@ -278,7 +285,7 @@ mod tests {
 
         // Import state: page 100 is cold (score 10), page 101 is hot (score 100)
         let mut state = PolicyState::new("fifo");
-        state.hot_pages.push((PageId::new(100), 10));  // cold
+        state.hot_pages.push((PageId::new(100), 10)); // cold
         state.hot_pages.push((PageId::new(101), 100)); // hot
 
         replacer.import_state(&state);

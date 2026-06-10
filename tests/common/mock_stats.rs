@@ -65,7 +65,9 @@ impl MockStats {
     /// `Some(1.0 / ndv)` if NDV is known and non-zero, else `None`. The
     /// caller (cost model) decides the fallback (typically 0.1).
     pub fn selectivity_eq(&self, table: TableId, col: ColumnId) -> Option<f64> {
-        self.ndv(table, col).filter(|&n| n > 0).map(|n| 1.0 / n as f64)
+        self.ndv(table, col)
+            .filter(|&n| n > 0)
+            .map(|n| 1.0 / n as f64)
     }
 }
 
@@ -74,8 +76,12 @@ mod tests {
     use super::*;
     use interchangedb::types::Value;
 
-    fn t() -> TableId { TableId(100) }
-    fn c() -> ColumnId { ColumnId(0) }
+    fn t() -> TableId {
+        TableId(100)
+    }
+    fn c() -> ColumnId {
+        ColumnId(0)
+    }
 
     #[test]
     fn empty_stats_returns_none_everywhere() {

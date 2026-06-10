@@ -45,7 +45,10 @@ fn fresh_catalog() -> MockCatalog {
 #[test]
 fn golden_create_table() {
     let mc = MockCatalog::new();
-    let p = plan_sql(&mc, "CREATE TABLE t2 (id INT PRIMARY KEY, name VARCHAR(50))");
+    let p = plan_sql(
+        &mc,
+        "CREATE TABLE t2 (id INT PRIMARY KEY, name VARCHAR(50))",
+    );
     assert_plan_matches(&p, "CreateTable(t2)");
 }
 

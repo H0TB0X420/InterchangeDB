@@ -202,7 +202,9 @@ impl ArcReplacer {
     /// Evict the LRU evictable frame from T1.
     fn evict_from_t1(&mut self) -> Option<FrameId> {
         // Find first evictable frame in T1 (from front = LRU)
-        let victim_idx = self.t1.iter()
+        let victim_idx = self
+            .t1
+            .iter()
             .position(|&fid| self.evictable.contains(&fid))?;
 
         let frame_id = self.t1.remove(victim_idx)?;
@@ -222,7 +224,9 @@ impl ArcReplacer {
     /// Evict the LRU evictable frame from T2.
     fn evict_from_t2(&mut self) -> Option<FrameId> {
         // Find first evictable frame in T2 (from front = LRU)
-        let victim_idx = self.t2.iter()
+        let victim_idx = self
+            .t2
+            .iter()
             .position(|&fid| self.evictable.contains(&fid))?;
 
         let frame_id = self.t2.remove(victim_idx)?;
@@ -468,7 +472,10 @@ mod tests {
 
         replacer.record_access(FrameId::new(0), PageId::new(100));
 
-        assert_eq!(replacer.frame_location.get(&FrameId::new(0)), Some(&ListLocation::T1));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(0)),
+            Some(&ListLocation::T1)
+        );
         assert_eq!(replacer.t1.len(), 1);
         assert_eq!(replacer.t2.len(), 0);
     }
@@ -479,11 +486,17 @@ mod tests {
 
         // First access: goes to T1
         replacer.record_access(FrameId::new(0), PageId::new(100));
-        assert_eq!(replacer.frame_location.get(&FrameId::new(0)), Some(&ListLocation::T1));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(0)),
+            Some(&ListLocation::T1)
+        );
 
         // Second access: promotes to T2
         replacer.record_access(FrameId::new(0), PageId::new(100));
-        assert_eq!(replacer.frame_location.get(&FrameId::new(0)), Some(&ListLocation::T2));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(0)),
+            Some(&ListLocation::T2)
+        );
         assert_eq!(replacer.t1.len(), 0);
         assert_eq!(replacer.t2.len(), 1);
     }
@@ -525,7 +538,10 @@ mod tests {
 
         assert!(replacer.p > initial_p);
         // Page should go to T2, not T1
-        assert_eq!(replacer.frame_location.get(&FrameId::new(0)), Some(&ListLocation::T2));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(0)),
+            Some(&ListLocation::T2)
+        );
         // Page should be removed from B1
         assert!(!replacer.b1.contains(&PageId::new(100)));
     }
@@ -548,7 +564,10 @@ mod tests {
 
         assert!(replacer.p < initial_p);
         // Page should go to T2
-        assert_eq!(replacer.frame_location.get(&FrameId::new(0)), Some(&ListLocation::T2));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(0)),
+            Some(&ListLocation::T2)
+        );
         // Page should be removed from B2
         assert!(!replacer.b2.contains(&PageId::new(100)));
     }
@@ -663,11 +682,15 @@ mod tests {
         assert_eq!(state.source_policy, "arc");
         assert_eq!(state.hot_pages.len(), 2);
 
-        let score_100 = state.hot_pages.iter()
+        let score_100 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(100))
             .map(|(_, s)| *s)
             .unwrap();
-        let score_101 = state.hot_pages.iter()
+        let score_101 = state
+            .hot_pages
+            .iter()
             .find(|(p, _)| *p == PageId::new(101))
             .map(|(_, s)| *s)
             .unwrap();
@@ -692,8 +715,14 @@ mod tests {
         replacer.record_access(FrameId::new(1), PageId::new(101)); // hot -> T2
 
         // Verify placement
-        assert_eq!(replacer.frame_location.get(&FrameId::new(0)), Some(&ListLocation::T1));
-        assert_eq!(replacer.frame_location.get(&FrameId::new(1)), Some(&ListLocation::T2));
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(0)),
+            Some(&ListLocation::T1)
+        );
+        assert_eq!(
+            replacer.frame_location.get(&FrameId::new(1)),
+            Some(&ListLocation::T2)
+        );
     }
 
     #[test]

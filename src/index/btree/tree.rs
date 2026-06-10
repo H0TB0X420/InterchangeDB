@@ -5,21 +5,19 @@
 use std::ops::{Bound, RangeBounds};
 
 use crate::buffer::{BufferPoolManager, PageReadGuard, PageWriteGuard};
-use crate::common::{PageId, Result, Error};
+use crate::common::{Error, PageId, Result};
 
 use super::context::Context;
 
 use super::iterator::BTreeScanIterator;
 
-use crate::storage::page::PageHeader;
-use super::node::{NodeType, LeafNode, InternalNode};
+use super::node::{InternalNode, LeafNode, NodeType};
 use super::page_layout::{
-    decode_leaf_node, decode_internal_node,
-    encode_leaf_node, encode_internal_node,
-    calculate_leaf_max_size, calculate_internal_max_size,
-    lookup_in_encoded_leaf,
+    calculate_internal_max_size, calculate_leaf_max_size, decode_internal_node, decode_leaf_node,
+    encode_internal_node, encode_leaf_node, lookup_in_encoded_leaf,
 };
 use super::BTreeHeaderPage;
+use crate::storage::page::PageHeader;
 
 // =============================================================================
 // Constants
@@ -89,8 +87,17 @@ impl<'a> BTree<'a> {
         internal_max_size: u16,
     ) -> Self {
         debug_assert!(leaf_max_size >= 2, "leaf_max_size must be at least 2");
-        debug_assert!(internal_max_size >= 3, "internal_max_size must be at least 3");
-        Self { bpm, header_page_id, leaf_max_size, internal_max_size, max_tombstones: 0 }
+        debug_assert!(
+            internal_max_size >= 3,
+            "internal_max_size must be at least 3"
+        );
+        Self {
+            bpm,
+            header_page_id,
+            leaf_max_size,
+            internal_max_size,
+            max_tombstones: 0,
+        }
     }
 
     /// Create a new B+Tree handle with explicit max sizes and tombstone limit.
@@ -102,8 +109,17 @@ impl<'a> BTree<'a> {
         max_tombstones: usize,
     ) -> Self {
         debug_assert!(leaf_max_size >= 2, "leaf_max_size must be at least 2");
-        debug_assert!(internal_max_size >= 3, "internal_max_size must be at least 3");
-        Self { bpm, header_page_id, leaf_max_size, internal_max_size, max_tombstones }
+        debug_assert!(
+            internal_max_size >= 3,
+            "internal_max_size must be at least 3"
+        );
+        Self {
+            bpm,
+            header_page_id,
+            leaf_max_size,
+            internal_max_size,
+            max_tombstones,
+        }
     }
 
     /// Get the header page ID.
@@ -177,10 +193,12 @@ impl<'a> BTree<'a> {
 
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
-            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
-                .ok_or_else(|| Error::StorageCorrupted(
-                    format!("Invalid node type at page {}", current_guard.page_id().0)
-                ))?;
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE]).ok_or_else(|| {
+                Error::StorageCorrupted(format!(
+                    "Invalid node type at page {}",
+                    current_guard.page_id().0
+                ))
+            })?;
 
             match node_type {
                 NodeType::Leaf => {
@@ -205,9 +223,10 @@ impl<'a> BTree<'a> {
             }
         }
 
-        Err(Error::StorageCorrupted(
-            format!("Tree exceeds max height {}", MAX_TREE_HEIGHT)
-        ))
+        Err(Error::StorageCorrupted(format!(
+            "Tree exceeds max height {}",
+            MAX_TREE_HEIGHT
+        )))
     }
 
     /// Insert into an empty tree — creates first leaf as root.
@@ -432,10 +451,9 @@ impl<'a> BTree<'a> {
                 None => {
                     // No more parents in write_set. If header_guard is held,
                     // the split reached the root level.
-                    let header_guard = ctx.header_guard.take()
-                        .ok_or_else(|| Error::StorageCorrupted(
-                            "Split propagation lost header guard".into()
-                        ))?;
+                    let header_guard = ctx.header_guard.take().ok_or_else(|| {
+                        Error::StorageCorrupted("Split propagation lost header guard".into())
+                    })?;
 
                     // We need the old root ID from the header.
                     let header = BTreeHeaderPage::decode(header_guard.as_slice());
@@ -471,10 +489,9 @@ impl<'a> BTree<'a> {
         }
 
         // Update header using held guard.
-        let mut header_guard = ctx.header_guard.take()
-            .ok_or_else(|| Error::StorageCorrupted(
-                "create_new_root_ctx: no header guard".into()
-            ))?;
+        let mut header_guard = ctx.header_guard.take().ok_or_else(|| {
+            Error::StorageCorrupted("create_new_root_ctx: no header guard".into())
+        })?;
         let mut header = BTreeHeaderPage::decode(header_guard.as_slice());
 
         debug_assert_eq!(header.root_page_id, old_root_id);
@@ -512,10 +529,12 @@ impl<'a> BTree<'a> {
 
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
-            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
-                .ok_or_else(|| Error::StorageCorrupted(
-                    format!("Invalid node type at page {}", current_guard.page_id().0)
-                ))?;
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE]).ok_or_else(|| {
+                Error::StorageCorrupted(format!(
+                    "Invalid node type at page {}",
+                    current_guard.page_id().0
+                ))
+            })?;
 
             match node_type {
                 NodeType::Leaf => {
@@ -539,9 +558,10 @@ impl<'a> BTree<'a> {
             }
         }
 
-        Err(Error::StorageCorrupted(
-            format!("Tree exceeds max height {}", MAX_TREE_HEIGHT)
-        ))
+        Err(Error::StorageCorrupted(format!(
+            "Tree exceeds max height {}",
+            MAX_TREE_HEIGHT
+        )))
     }
 
     /// Delete a key from the leaf, handling underflow and rebalancing.
@@ -603,21 +623,15 @@ impl<'a> BTree<'a> {
     ///
     /// Sibling guards are acquired fresh from BPM — safe because the parent
     /// write latch prevents concurrent sibling access.
-    fn rebalance_leaf_ctx(
-        &self,
-        leaf_page_id: PageId,
-        ctx: &mut Context<'a>,
-    ) -> Result<()> {
-        let mut parent_guard = ctx.pop()
-            .ok_or_else(|| Error::StorageCorrupted(
-                "rebalance_leaf_ctx: no parent in write_set".into()
-            ))?;
+    fn rebalance_leaf_ctx(&self, leaf_page_id: PageId, ctx: &mut Context<'a>) -> Result<()> {
+        let mut parent_guard = ctx.pop().ok_or_else(|| {
+            Error::StorageCorrupted("rebalance_leaf_ctx: no parent in write_set".into())
+        })?;
 
         let parent = decode_internal_node(parent_guard.as_slice());
-        let child_index = parent.find_child_position(leaf_page_id)
-            .ok_or_else(|| Error::StorageCorrupted(
-                "Leaf not found in parent".into()
-            ))?;
+        let child_index = parent
+            .find_child_position(leaf_page_id)
+            .ok_or_else(|| Error::StorageCorrupted("Leaf not found in parent".into()))?;
 
         // Try redistribute from left sibling.
         if child_index > 0 {
@@ -625,7 +639,10 @@ impl<'a> BTree<'a> {
             let left_leaf = self.read_leaf(left_page_id)?;
             if left_leaf.is_safe_for_delete() {
                 return self.redistribute_leaf_from_left_ctx(
-                    &mut parent_guard, child_index, left_page_id, leaf_page_id,
+                    &mut parent_guard,
+                    child_index,
+                    left_page_id,
+                    leaf_page_id,
                 );
             }
         }
@@ -636,7 +653,10 @@ impl<'a> BTree<'a> {
             let right_leaf = self.read_leaf(right_page_id)?;
             if right_leaf.is_safe_for_delete() {
                 return self.redistribute_leaf_from_right_ctx(
-                    &mut parent_guard, child_index, leaf_page_id, right_page_id,
+                    &mut parent_guard,
+                    child_index,
+                    leaf_page_id,
+                    right_page_id,
                 );
             }
         }
@@ -656,9 +676,7 @@ impl<'a> BTree<'a> {
             };
 
             if leaf_empty {
-                return self.remove_empty_subtree_ctx(
-                    leaf_page_id, parent_guard, ctx,
-                );
+                return self.remove_empty_subtree_ctx(leaf_page_id, parent_guard, ctx);
             }
 
             // Leaf has entries but no siblings. Rebalance parent.
@@ -668,13 +686,14 @@ impl<'a> BTree<'a> {
         // Merge with a sibling. Parent guard is used to update parent.
         if has_left {
             let left_page_id = parent.child_at(child_index - 1);
-            self.merge_leaves_ctx(
-                &mut parent_guard, child_index, left_page_id, leaf_page_id,
-            )?;
+            self.merge_leaves_ctx(&mut parent_guard, child_index, left_page_id, leaf_page_id)?;
         } else {
             let right_page_id = parent.child_at(child_index + 1);
             self.merge_leaves_ctx(
-                &mut parent_guard, child_index + 1, leaf_page_id, right_page_id,
+                &mut parent_guard,
+                child_index + 1,
+                leaf_page_id,
+                right_page_id,
             )?;
         }
 
@@ -808,7 +827,12 @@ impl<'a> BTree<'a> {
         let (right_keys, right_values, right_tombstones, right_next) = {
             let guard = self.bpm.fetch_page_read(right_page_id)?;
             let right = decode_leaf_node(guard.as_slice());
-            (right.keys, right.values, right.tombstones, right.next_page_id)
+            (
+                right.keys,
+                right.values,
+                right.tombstones,
+                right.next_page_id,
+            )
         };
 
         {
@@ -892,16 +916,14 @@ impl<'a> BTree<'a> {
         }
 
         // Need parent from write_set.
-        let mut parent_guard = ctx.pop()
-            .ok_or_else(|| Error::StorageCorrupted(
-                "rebalance_internal_ctx: no parent in write_set".into()
-            ))?;
+        let mut parent_guard = ctx.pop().ok_or_else(|| {
+            Error::StorageCorrupted("rebalance_internal_ctx: no parent in write_set".into())
+        })?;
 
         let parent = decode_internal_node(parent_guard.as_slice());
-        let child_index = parent.find_child_position(node_page_id)
-            .ok_or_else(|| Error::StorageCorrupted(
-                "Internal node not found in parent".into()
-            ))?;
+        let child_index = parent
+            .find_child_position(node_page_id)
+            .ok_or_else(|| Error::StorageCorrupted("Internal node not found in parent".into()))?;
 
         // Try redistribute from left sibling.
         if child_index > 0 {
@@ -911,7 +933,10 @@ impl<'a> BTree<'a> {
                 drop(node);
                 drop(node_guard);
                 return self.redistribute_internal_from_left_ctx(
-                    &mut parent_guard, child_index, left_page_id, node_page_id,
+                    &mut parent_guard,
+                    child_index,
+                    left_page_id,
+                    node_page_id,
                 );
             }
         }
@@ -924,7 +949,10 @@ impl<'a> BTree<'a> {
                 drop(node);
                 drop(node_guard);
                 return self.redistribute_internal_from_right_ctx(
-                    &mut parent_guard, child_index, node_page_id, right_page_id,
+                    &mut parent_guard,
+                    child_index,
+                    node_page_id,
+                    right_page_id,
                 );
             }
         }
@@ -944,13 +972,14 @@ impl<'a> BTree<'a> {
 
         if has_left {
             let left_page_id = parent.child_at(child_index - 1);
-            self.merge_internals_ctx(
-                &mut parent_guard, child_index, left_page_id, node_page_id,
-            )?;
+            self.merge_internals_ctx(&mut parent_guard, child_index, left_page_id, node_page_id)?;
         } else {
             let right_page_id = parent.child_at(child_index + 1);
             self.merge_internals_ctx(
-                &mut parent_guard, child_index + 1, node_page_id, right_page_id,
+                &mut parent_guard,
+                child_index + 1,
+                node_page_id,
+                right_page_id,
             )?;
         }
 
@@ -1099,10 +1128,9 @@ impl<'a> BTree<'a> {
 
             if node.children.len() > 1 {
                 // This ancestor has multiple children. Remove the degenerate one.
-                let child_index = node.find_child_position(child_to_remove)
-                    .ok_or_else(|| Error::StorageCorrupted(
-                        "Degenerate child not found in parent".into()
-                    ))?;
+                let child_index = node.find_child_position(child_to_remove).ok_or_else(|| {
+                    Error::StorageCorrupted("Degenerate child not found in parent".into())
+                })?;
 
                 drop(node);
                 let mut n = decode_internal_node(node_guard.as_slice());
@@ -1186,21 +1214,22 @@ impl<'a> BTree<'a> {
 
         // Determine the start page based on the start bound.
         let start_page_id = match &start_bound {
-            Bound::Unbounded => {
-                match self.get_first_leaf()? {
-                    Some(id) => id,
-                    None => PageId::INVALID,
-                }
-            }
-            Bound::Included(key) | Bound::Excluded(key) => {
-                match self.find_leaf(key)? {
-                    Some(id) => id,
-                    None => PageId::INVALID,
-                }
-            }
+            Bound::Unbounded => match self.get_first_leaf()? {
+                Some(id) => id,
+                None => PageId::INVALID,
+            },
+            Bound::Included(key) | Bound::Excluded(key) => match self.find_leaf(key)? {
+                Some(id) => id,
+                None => PageId::INVALID,
+            },
         };
 
-        Ok(BTreeScanIterator::new(self.bpm, start_page_id, start_bound, end_bound))
+        Ok(BTreeScanIterator::new(
+            self.bpm,
+            start_page_id,
+            start_bound,
+            end_bound,
+        ))
     }
 
     /// Get the first leaf page (leftmost). Uses latch coupling.
@@ -1215,10 +1244,12 @@ impl<'a> BTree<'a> {
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
 
-            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
-                .ok_or_else(|| Error::StorageCorrupted(
-                    format!("Invalid node type at page {}", current_guard.page_id().0)
-                ))?;
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE]).ok_or_else(|| {
+                Error::StorageCorrupted(format!(
+                    "Invalid node type at page {}",
+                    current_guard.page_id().0
+                ))
+            })?;
 
             match node_type {
                 NodeType::Leaf => return Ok(Some(current_guard.page_id())),
@@ -1233,9 +1264,10 @@ impl<'a> BTree<'a> {
             }
         }
 
-        Err(Error::StorageCorrupted(
-            format!("Tree exceeds max height {}", MAX_TREE_HEIGHT)
-        ))
+        Err(Error::StorageCorrupted(format!(
+            "Tree exceeds max height {}",
+            MAX_TREE_HEIGHT
+        )))
     }
 
     /// Get the last leaf page (rightmost). Uses latch coupling.
@@ -1250,10 +1282,12 @@ impl<'a> BTree<'a> {
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
 
-            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
-                .ok_or_else(|| Error::StorageCorrupted(
-                    format!("Invalid node type at page {}", current_guard.page_id().0)
-                ))?;
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE]).ok_or_else(|| {
+                Error::StorageCorrupted(format!(
+                    "Invalid node type at page {}",
+                    current_guard.page_id().0
+                ))
+            })?;
 
             match node_type {
                 NodeType::Leaf => return Ok(Some(current_guard.page_id())),
@@ -1268,9 +1302,10 @@ impl<'a> BTree<'a> {
             }
         }
 
-        Err(Error::StorageCorrupted(
-            format!("Tree exceeds max height {}", MAX_TREE_HEIGHT)
-        ))
+        Err(Error::StorageCorrupted(format!(
+            "Tree exceeds max height {}",
+            MAX_TREE_HEIGHT
+        )))
     }
 
     /// Collect all live (non-tombstoned) key-value pairs in sorted order.
@@ -1350,10 +1385,13 @@ impl<'a> BTree<'a> {
         for _depth in 0..MAX_TREE_HEIGHT {
             let data = current_guard.as_slice();
 
-            let node_type = NodeType::from_u8(data[PageHeader::SIZE])
-                .ok_or_else(|| Error::StorageCorrupted(
-                    format!("Invalid node type {} at page {}", data[PageHeader::SIZE], current_guard.page_id().0)
-                ))?;
+            let node_type = NodeType::from_u8(data[PageHeader::SIZE]).ok_or_else(|| {
+                Error::StorageCorrupted(format!(
+                    "Invalid node type {} at page {}",
+                    data[PageHeader::SIZE],
+                    current_guard.page_id().0
+                ))
+            })?;
 
             match node_type {
                 NodeType::Leaf => return Ok(Some(current_guard)),
@@ -1370,9 +1408,10 @@ impl<'a> BTree<'a> {
             }
         }
 
-        Err(Error::StorageCorrupted(
-            format!("Tree exceeds max height {}", MAX_TREE_HEIGHT)
-        ))
+        Err(Error::StorageCorrupted(format!(
+            "Tree exceeds max height {}",
+            MAX_TREE_HEIGHT
+        )))
     }
 
     /// Read a leaf node from a page.
@@ -1380,15 +1419,15 @@ impl<'a> BTree<'a> {
         let guard = self.bpm.fetch_page_read(page_id)?;
         let data = guard.as_slice();
 
-        let node_type = NodeType::from_u8(data[PageHeader::SIZE])
-            .ok_or_else(|| Error::StorageCorrupted(
-                format!("Invalid node type at page {}", page_id.0)
-            ))?;
+        let node_type = NodeType::from_u8(data[PageHeader::SIZE]).ok_or_else(|| {
+            Error::StorageCorrupted(format!("Invalid node type at page {}", page_id.0))
+        })?;
 
         if node_type != NodeType::Leaf {
-            return Err(Error::StorageCorrupted(
-                format!("Expected leaf at page {}", page_id.0)
-            ));
+            return Err(Error::StorageCorrupted(format!(
+                "Expected leaf at page {}",
+                page_id.0
+            )));
         }
 
         Ok(decode_leaf_node(data))
@@ -1399,15 +1438,15 @@ impl<'a> BTree<'a> {
         let guard = self.bpm.fetch_page_read(page_id)?;
         let data = guard.as_slice();
 
-        let node_type = NodeType::from_u8(data[PageHeader::SIZE])
-            .ok_or_else(|| Error::StorageCorrupted(
-                format!("Invalid node type at page {}", page_id.0)
-            ))?;
+        let node_type = NodeType::from_u8(data[PageHeader::SIZE]).ok_or_else(|| {
+            Error::StorageCorrupted(format!("Invalid node type at page {}", page_id.0))
+        })?;
 
         if node_type != NodeType::Internal {
-            return Err(Error::StorageCorrupted(
-                format!("Expected internal node at page {}", page_id.0)
-            ));
+            return Err(Error::StorageCorrupted(format!(
+                "Expected internal node at page {}",
+                page_id.0
+            )));
         }
 
         Ok(decode_internal_node(data))
@@ -1416,10 +1455,10 @@ impl<'a> BTree<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::page_layout::encode_internal_node;
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::storage::FileDiskManager;
-    use super::super::page_layout::encode_internal_node;
     use tempfile::tempdir;
 
     fn setup_bpm() -> (BufferPoolManager, tempfile::TempDir) {
@@ -1601,7 +1640,8 @@ mod tests {
             assert_eq!(
                 tree.get(key.as_bytes()).unwrap(),
                 Some(value.into_bytes()),
-                "Failed to retrieve key{:04}", i
+                "Failed to retrieve key{:04}",
+                i
             );
         }
 
@@ -1609,7 +1649,11 @@ mod tests {
         let root_id = tree.get_root_page_id().unwrap().unwrap();
         let guard = bpm.fetch_page_read(root_id).unwrap();
         let node_type = NodeType::from_u8(guard.as_slice()[PageHeader::SIZE]).unwrap();
-        assert_eq!(node_type, NodeType::Internal, "Root should be internal after split");
+        assert_eq!(
+            node_type,
+            NodeType::Internal,
+            "Root should be internal after split"
+        );
     }
 
     #[test]
@@ -1633,7 +1677,8 @@ mod tests {
             assert_eq!(
                 tree.get(key.as_bytes()).unwrap(),
                 Some(value.into_bytes()),
-                "Failed at key k{:05}", i
+                "Failed at key k{:05}",
+                i
             );
         }
 

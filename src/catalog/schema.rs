@@ -159,9 +159,9 @@ mod tests {
                         scale: 2,
                     },
                     nullable: false,
-                    default: Some(Value::Decimal(
-                        crate::types::Decimal::from_i64_with_scale(0, 2),
-                    )),
+                    default: Some(Value::Decimal(crate::types::Decimal::from_i64_with_scale(
+                        0, 2,
+                    ))),
                 },
             ],
             primary_key: vec![0],

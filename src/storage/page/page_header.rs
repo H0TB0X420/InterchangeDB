@@ -235,7 +235,7 @@ mod tests {
     fn test_page_header_byte_layout() {
         let header = PageHeader {
             page_type: PageType::Data,
-            checksum: 0x04030201, // Little-endian: 01 02 03 04
+            checksum: 0x04030201,    // Little-endian: 01 02 03 04
             lsn: 0x0807060504030201, // Little-endian: 01 02 03 04 05 06 07 08
         };
 

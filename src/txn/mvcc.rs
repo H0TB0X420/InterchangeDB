@@ -44,14 +44,12 @@ pub fn decode_mvcc_key(encoded: &[u8]) -> Result<(Vec<u8>, Timestamp)> {
     if encoded.len() < 12 {
         return Err(Error::StorageCorrupted("mvcc key too short".into()));
     }
-    let key_len =
-        u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+    let key_len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
     if encoded.len() != 4 + key_len + 8 {
         return Err(Error::StorageCorrupted("mvcc key length mismatch".into()));
     }
     let user_key = encoded[4..4 + key_len].to_vec();
-    let inverted_ts =
-        u64::from_be_bytes(encoded[4 + key_len..4 + key_len + 8].try_into().unwrap());
+    let inverted_ts = u64::from_be_bytes(encoded[4 + key_len..4 + key_len + 8].try_into().unwrap());
     Ok((user_key, Timestamp(u64::MAX - inverted_ts)))
 }
 
@@ -120,11 +118,8 @@ pub fn decode_mvcc_value(encoded: &[u8]) -> Result<MvccValue> {
                     "mvcc value too short for Value".into(),
                 ));
             }
-            let txn_id = TxnId(u64::from_le_bytes(
-                encoded[1..9].try_into().unwrap(),
-            ));
-            let data_len =
-                u32::from_le_bytes(encoded[9..13].try_into().unwrap()) as usize;
+            let txn_id = TxnId(u64::from_le_bytes(encoded[1..9].try_into().unwrap()));
+            let data_len = u32::from_le_bytes(encoded[9..13].try_into().unwrap()) as usize;
             if encoded.len() != 13 + data_len {
                 return Err(Error::StorageCorrupted(
                     "mvcc value data length mismatch".into(),
@@ -139,14 +134,13 @@ pub fn decode_mvcc_value(encoded: &[u8]) -> Result<MvccValue> {
                     "mvcc value too short for Tombstone".into(),
                 ));
             }
-            let txn_id = TxnId(u64::from_le_bytes(
-                encoded[1..9].try_into().unwrap(),
-            ));
+            let txn_id = TxnId(u64::from_le_bytes(encoded[1..9].try_into().unwrap()));
             Ok(MvccValue::Tombstone { txn_id })
         }
-        tag => Err(Error::StorageCorrupted(
-            format!("invalid mvcc value tag: {}", tag),
-        )),
+        tag => Err(Error::StorageCorrupted(format!(
+            "invalid mvcc value tag: {}",
+            tag
+        ))),
     }
 }
 
@@ -187,9 +181,7 @@ pub fn is_visible(
     let commit_ts = match committed_txns.get(&version_txn_id) {
         Some(ts) => *ts,
         None => {
-            if version_ts <= checkpoint_ts
-                && !known_uncommitted.contains(&version_txn_id)
-            {
+            if version_ts <= checkpoint_ts && !known_uncommitted.contains(&version_txn_id) {
                 version_ts
             } else {
                 return false;
@@ -242,7 +234,15 @@ pub fn mvcc_get<E: StorageEngine>(
         };
 
         // Check visibility.
-        if !is_visible(version_txn_id, version_ts, my_txn_id, snapshot, committed_txns, checkpoint_ts, known_uncommitted) {
+        if !is_visible(
+            version_txn_id,
+            version_ts,
+            my_txn_id,
+            snapshot,
+            committed_txns,
+            checkpoint_ts,
+            known_uncommitted,
+        ) {
             continue;
         }
 
@@ -381,12 +381,8 @@ pub fn mvcc_scan<E: StorageEngine>(
         if probe_key.len() < 4 {
             break;
         }
-        let bucket_len = u32::from_be_bytes([
-            probe_key[0],
-            probe_key[1],
-            probe_key[2],
-            probe_key[3],
-        ]) as usize;
+        let bucket_len =
+            u32::from_be_bytes([probe_key[0], probe_key[1], probe_key[2], probe_key[3]]) as usize;
 
         // Validate that this probe key is actually MVCC-encoded. When the
         // engine is shared between TxnEngine (MVCC entries) and Catalog
@@ -514,7 +510,10 @@ mod tests {
     #[test]
     fn min_uk_returns_none_when_overflow() {
         // start prefix is all 0xFF at shorter length: no length-L uk can exceed it.
-        assert_eq!(min_user_key_at_length_ge(&[0xFF, 0xFF, 0xFF, 0xFF], 3), None);
+        assert_eq!(
+            min_user_key_at_length_ge(&[0xFF, 0xFF, 0xFF, 0xFF], 3),
+            None
+        );
     }
 
     // ---- max_user_key_at_length_le ----
@@ -574,4 +573,3 @@ mod tests {
         assert!(min <= max, "bucket should be non-empty for this range");
     }
 }
-

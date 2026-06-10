@@ -70,7 +70,11 @@ impl PolicyState {
     pub fn top_hot_pages(&self, n: usize) -> Vec<PageId> {
         let mut sorted = self.hot_pages.clone();
         sorted.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by score descending
-        sorted.into_iter().take(n).map(|(page_id, _)| page_id).collect()
+        sorted
+            .into_iter()
+            .take(n)
+            .map(|(page_id, _)| page_id)
+            .collect()
     }
 }
 

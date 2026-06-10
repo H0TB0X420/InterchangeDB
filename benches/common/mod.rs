@@ -177,7 +177,12 @@ pub mod hist {
 
     impl LatencyHistogram {
         pub fn new() -> Self {
-            Self { samples_ns: Vec::new(), sorted: true, cap: None, dropped_count: 0 }
+            Self {
+                samples_ns: Vec::new(),
+                sorted: true,
+                cap: None,
+                dropped_count: 0,
+            }
         }
 
         pub fn with_capacity(cap: usize) -> Self {
@@ -214,9 +219,15 @@ pub mod hist {
         }
 
         /// Number of recorded samples.
-        pub fn len(&self) -> usize { self.samples_ns.len() }
-        pub fn is_empty(&self) -> bool { self.samples_ns.is_empty() }
-        pub fn dropped(&self) -> u64 { self.dropped_count }
+        pub fn len(&self) -> usize {
+            self.samples_ns.len()
+        }
+        pub fn is_empty(&self) -> bool {
+            self.samples_ns.is_empty()
+        }
+        pub fn dropped(&self) -> u64 {
+            self.dropped_count
+        }
 
         /// Percentile in `[0.0, 1.0]`. Returns `Duration::ZERO` if empty.
         /// Uses nearest-rank: index = ceil(p * n) - 1, clamped to [0, n-1].
@@ -227,7 +238,9 @@ pub mod hist {
             }
             self.ensure_sorted();
             let n = self.samples_ns.len();
-            let idx = ((p * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+            let idx = ((p * n as f64).ceil() as usize)
+                .saturating_sub(1)
+                .min(n - 1);
             Duration::from_nanos(self.samples_ns[idx])
         }
 
@@ -259,7 +272,9 @@ pub mod hist {
     }
 
     impl Default for LatencyHistogram {
-        fn default() -> Self { Self::new() }
+        fn default() -> Self {
+            Self::new()
+        }
     }
 }
 
@@ -321,7 +336,9 @@ pub mod output {
             writeln!(f, "{}", fields.join(",")).unwrap();
         }
 
-        pub fn path(&self) -> &Path { &self.path }
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
     }
 
     /// Collects rows in memory and prints a Markdown table at the end.
@@ -345,7 +362,8 @@ pub mod output {
 
         pub fn row(&mut self, fields: &[&str]) {
             assert_eq!(fields.len(), self.header.len());
-            self.rows.push(fields.iter().map(|s| s.to_string()).collect());
+            self.rows
+                .push(fields.iter().map(|s| s.to_string()).collect());
         }
 
         /// Print to stdout in GitHub-flavoured Markdown.

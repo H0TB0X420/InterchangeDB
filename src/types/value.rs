@@ -113,8 +113,10 @@ mod tests {
         assert!(Value::Char("a".into()).matches(&ColumnType::Char(10)));
         assert!(Value::Bytes(vec![0]).matches(&ColumnType::Bytes(10)));
         assert!(
-            Value::Decimal(Decimal::from_i64_with_scale(0, 2))
-                .matches(&ColumnType::Decimal { precision: 10, scale: 2 })
+            Value::Decimal(Decimal::from_i64_with_scale(0, 2)).matches(&ColumnType::Decimal {
+                precision: 10,
+                scale: 2
+            })
         );
     }
 
@@ -140,7 +142,10 @@ mod tests {
             ColumnType::Varchar(10),
             ColumnType::Char(10),
             ColumnType::Bytes(10),
-            ColumnType::Decimal { precision: 10, scale: 2 },
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
             ColumnType::Timestamp,
             ColumnType::Boolean,
         ];
@@ -155,11 +160,23 @@ mod tests {
     fn decimal_matches_only_when_scale_agrees() {
         let d = Value::Decimal(Decimal::from_i64_with_scale(123, 2));
         // Same scale, different precision: matches.
-        assert!(d.matches(&ColumnType::Decimal { precision: 5, scale: 2 }));
-        assert!(d.matches(&ColumnType::Decimal { precision: 18, scale: 2 }));
+        assert!(d.matches(&ColumnType::Decimal {
+            precision: 5,
+            scale: 2
+        }));
+        assert!(d.matches(&ColumnType::Decimal {
+            precision: 18,
+            scale: 2
+        }));
         // Different scale: doesn't match.
-        assert!(!d.matches(&ColumnType::Decimal { precision: 10, scale: 3 }));
-        assert!(!d.matches(&ColumnType::Decimal { precision: 10, scale: 0 }));
+        assert!(!d.matches(&ColumnType::Decimal {
+            precision: 10,
+            scale: 3
+        }));
+        assert!(!d.matches(&ColumnType::Decimal {
+            precision: 10,
+            scale: 0
+        }));
     }
 
     #[test]
@@ -183,7 +200,10 @@ mod tests {
             Value::Varchar("hello".into()).type_of(),
             Some(ColumnType::Varchar(5))
         );
-        assert_eq!(Value::Char("ab".into()).type_of(), Some(ColumnType::Char(2)));
+        assert_eq!(
+            Value::Char("ab".into()).type_of(),
+            Some(ColumnType::Char(2))
+        );
         assert_eq!(
             Value::Bytes(vec![0, 1, 2]).type_of(),
             Some(ColumnType::Bytes(3))
@@ -248,7 +268,10 @@ mod tests {
             ColumnType::Varchar(64),
             ColumnType::Char(8),
             ColumnType::Bytes(256),
-            ColumnType::Decimal { precision: 12, scale: 2 },
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2,
+            },
             ColumnType::Timestamp,
             ColumnType::Boolean,
         ];

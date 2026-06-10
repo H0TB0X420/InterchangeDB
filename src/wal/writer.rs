@@ -297,7 +297,11 @@ mod tests {
         writer.sync().unwrap();
 
         let segments = segment::list_segments(&wal_dir).unwrap();
-        assert!(segments.len() > 1, "Expected multiple segments, got {}", segments.len());
+        assert!(
+            segments.len() > 1,
+            "Expected multiple segments, got {}",
+            segments.len()
+        );
 
         // Segment IDs should be consecutive.
         for (i, (id, _)) in segments.iter().enumerate() {
@@ -382,10 +386,7 @@ mod tests {
             writer.set_max_segment_size(100);
 
             for i in 0..20 {
-                let mut record = LogRecord::put(
-                    format!("key{:04}", i).into_bytes(),
-                    b"v".to_vec(),
-                );
+                let mut record = LogRecord::put(format!("key{:04}", i).into_bytes(), b"v".to_vec());
                 writer.append(&mut record).unwrap();
             }
             writer.sync().unwrap();

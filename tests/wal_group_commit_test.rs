@@ -84,7 +84,12 @@ fn concurrent_commits_batch_into_fewer_fsyncs() {
         total,
         fsyncs
     );
-    eprintln!("group commit: {} commits → {} fsyncs ({:.1}x batch)", total, fsyncs, total as f64 / fsyncs as f64);
+    eprintln!(
+        "group commit: {} commits → {} fsyncs ({:.1}x batch)",
+        total,
+        fsyncs,
+        total as f64 / fsyncs as f64
+    );
 }
 
 #[test]
@@ -99,6 +104,9 @@ fn single_threaded_commits_are_each_durable() {
     }
     for i in 0..50 {
         let key = format!("solo_{:03}", i);
-        assert_eq!(db.get(key.as_bytes()).unwrap().as_deref(), Some(key.as_bytes()));
+        assert_eq!(
+            db.get(key.as_bytes()).unwrap().as_deref(),
+            Some(key.as_bytes())
+        );
     }
 }

@@ -88,7 +88,11 @@ fn orphan_tmp_file_swept_at_open() {
 
     // Reopening must sweep the orphan and succeed.
     let tree = LsmTree::open(&data_dir).unwrap();
-    assert!(!orphan.exists(), "orphan .sst.tmp survived open(): {:?}", orphan);
+    assert!(
+        !orphan.exists(),
+        "orphan .sst.tmp survived open(): {:?}",
+        orphan
+    );
 
     // Tree must still function — the sweep didn't break anything.
     tree.put(b"k".to_vec(), b"v".to_vec()).unwrap();
@@ -145,7 +149,8 @@ fn manifest_entry_survives_drop_and_reopen() {
     let data_dir = dir.path().to_path_buf();
     {
         let tree = LsmTree::open(&data_dir).unwrap();
-        tree.put(b"durable_key".to_vec(), b"durable_value".to_vec()).unwrap();
+        tree.put(b"durable_key".to_vec(), b"durable_value".to_vec())
+            .unwrap();
         tree.flush_memtable().unwrap();
     }
     // No graceful shutdown — the flush's manifest write must be self-sufficient.

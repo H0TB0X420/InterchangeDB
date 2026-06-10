@@ -29,8 +29,18 @@ fn warehouse_schema() -> Schema {
         name: "warehouse".into(),
         table_id: TableId(0),
         columns: vec![
-            ColumnDef { name: "w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "w_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+            ColumnDef {
+                name: "w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "w_name".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -41,9 +51,24 @@ fn district_schema() -> Schema {
         name: "district".into(),
         table_id: TableId(0),
         columns: vec![
-            ColumnDef { name: "d_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "d_w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "d_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+            ColumnDef {
+                name: "d_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "d_w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "d_name".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -55,20 +80,31 @@ fn index_nested_loop_join_produces_matching_pairs() {
     let cat = open_catalog_at(dir.path());
 
     // Warehouse — outer; SeqScan.
-    let w_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let w_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
     let w_schema = cat.get_table("warehouse").unwrap();
     let w_table = Table::with_indexes(
         cat.engine().clone(),
         w_schema,
         RowLayout,
-        cat.indexes_for_table(w_id, &cat.get_table("warehouse").unwrap()).unwrap(),
+        cat.indexes_for_table(w_id, &cat.get_table("warehouse").unwrap())
+            .unwrap(),
     );
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
-    w_table.insert(&[Value::Int32(2), Value::Varchar("DC2".into())]).unwrap();
-    w_table.insert(&[Value::Int32(3), Value::Varchar("DC3".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
+    w_table
+        .insert(&[Value::Int32(2), Value::Varchar("DC2".into())])
+        .unwrap();
+    w_table
+        .insert(&[Value::Int32(3), Value::Varchar("DC3".into())])
+        .unwrap();
 
     // District — inner; indexed on d_w_id (column 1).
-    let d_id = cat.create_table("district".into(), district_schema()).unwrap();
+    let d_id = cat
+        .create_table("district".into(), district_schema())
+        .unwrap();
     cat.create_index(IndexDef {
         name: "district_by_w_id".into(),
         table_id: d_id,
@@ -86,9 +122,27 @@ fn index_nested_loop_join_produces_matching_pairs() {
         RowLayout,
         d_indexes,
     ));
-    d_table.insert(&[Value::Int32(10), Value::Int32(1), Value::Varchar("east".into())]).unwrap();
-    d_table.insert(&[Value::Int32(11), Value::Int32(1), Value::Varchar("west".into())]).unwrap();
-    d_table.insert(&[Value::Int32(20), Value::Int32(2), Value::Varchar("only".into())]).unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(1),
+            Value::Varchar("east".into()),
+        ])
+        .unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(11),
+            Value::Int32(1),
+            Value::Varchar("west".into()),
+        ])
+        .unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(20),
+            Value::Int32(2),
+            Value::Varchar("only".into()),
+        ])
+        .unwrap();
     // w_id=3 has no districts → that outer row should produce zero joined rows.
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
@@ -103,8 +157,14 @@ fn index_nested_loop_join_produces_matching_pairs() {
     // 3 expected pairs: (w=1, d=10), (w=1, d=11), (w=2, d=20).
     assert_eq!(joined.len(), 3);
     for row in &joined {
-        let w_id = match row[0] { Value::Int32(i) => i, _ => panic!() };
-        let d_w_id = match row[3] { Value::Int32(i) => i, _ => panic!() };
+        let w_id = match row[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        };
+        let d_w_id = match row[3] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        };
         assert_eq!(w_id, d_w_id);
     }
 
@@ -116,14 +176,18 @@ fn arity_mismatch_errors_at_construction() {
     let dir = tempfile::tempdir().unwrap();
     let cat = open_catalog_at(dir.path());
 
-    let w_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let w_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
     let w_table = Table::new(
         cat.engine().clone(),
         cat.get_table("warehouse").unwrap(),
         RowLayout,
     );
 
-    let d_id = cat.create_table("district".into(), district_schema()).unwrap();
+    let d_id = cat
+        .create_table("district".into(), district_schema())
+        .unwrap();
     cat.create_index(IndexDef {
         name: "district_by_w_id".into(),
         table_id: d_id,
@@ -132,7 +196,9 @@ fn arity_mismatch_errors_at_construction() {
         backend: IndexBackend::BTree,
     })
     .unwrap();
-    let d_indexes = cat.indexes_for_table(d_id, &cat.get_table("district").unwrap()).unwrap();
+    let d_indexes = cat
+        .indexes_for_table(d_id, &cat.get_table("district").unwrap())
+        .unwrap();
     let d_index = d_indexes[0].clone();
     let d_table = Arc::new(Table::with_indexes(
         cat.engine().clone(),
@@ -156,16 +222,22 @@ fn arity_mismatch_errors_at_construction() {
 fn outer_with_no_inner_match_yields_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let cat = open_catalog_at(dir.path());
-    let w_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let w_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
     let _ = w_id;
     let w_table = Table::new(
         cat.engine().clone(),
         cat.get_table("warehouse").unwrap(),
         RowLayout,
     );
-    w_table.insert(&[Value::Int32(99), Value::Varchar("orphan".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(99), Value::Varchar("orphan".into())])
+        .unwrap();
 
-    let d_id = cat.create_table("district".into(), district_schema()).unwrap();
+    let d_id = cat
+        .create_table("district".into(), district_schema())
+        .unwrap();
     cat.create_index(IndexDef {
         name: "district_by_w_id".into(),
         table_id: d_id,
@@ -174,7 +246,9 @@ fn outer_with_no_inner_match_yields_nothing() {
         backend: IndexBackend::BTree,
     })
     .unwrap();
-    let d_indexes = cat.indexes_for_table(d_id, &cat.get_table("district").unwrap()).unwrap();
+    let d_indexes = cat
+        .indexes_for_table(d_id, &cat.get_table("district").unwrap())
+        .unwrap();
     let d_index = d_indexes[0].clone();
     let d_table = Arc::new(Table::with_indexes(
         cat.engine().clone(),

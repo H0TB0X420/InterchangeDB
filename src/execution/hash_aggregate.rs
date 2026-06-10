@@ -79,9 +79,9 @@ impl AggregateFn {
     /// and the input's scale for `Decimal` inputs.
     fn output_type(&self, input_schema: &Schema) -> ColumnType {
         match self {
-            AggregateFn::CountStar
-            | AggregateFn::Count(_)
-            | AggregateFn::CountDistinct(_) => ColumnType::Int64,
+            AggregateFn::CountStar | AggregateFn::Count(_) | AggregateFn::CountDistinct(_) => {
+                ColumnType::Int64
+            }
             AggregateFn::Sum(i) | AggregateFn::Max(i) | AggregateFn::Min(i) => {
                 let input = input_schema.columns[*i].ty;
                 if matches!(self, AggregateFn::Sum(_)) && matches!(input, ColumnType::Int32) {
@@ -92,9 +92,10 @@ impl AggregateFn {
                 }
             }
             AggregateFn::Avg(i) => match input_schema.columns[*i].ty {
-                ColumnType::Int32 | ColumnType::Int64 => {
-                    ColumnType::Decimal { precision: 18, scale: 4 }
-                }
+                ColumnType::Int32 | ColumnType::Int64 => ColumnType::Decimal {
+                    precision: 18,
+                    scale: 4,
+                },
                 other => other,
             },
         }
@@ -115,8 +116,14 @@ enum AggState {
     MinMaxValue(Option<Value>),
     /// `AVG` tracks both running sum and non-NULL count. Integer-sourced
     /// AVG uses `SumInt`; Decimal-sourced AVG uses `SumDecimal`.
-    AvgInt { sum: Option<i64>, count: u64 },
-    AvgDecimal { sum: Option<Decimal>, count: u64 },
+    AvgInt {
+        sum: Option<i64>,
+        count: u64,
+    },
+    AvgDecimal {
+        sum: Option<Decimal>,
+        count: u64,
+    },
 }
 
 impl AggState {
@@ -134,10 +141,14 @@ impl AggState {
             },
             AggregateFn::Min(_) | AggregateFn::Max(_) => Ok(AggState::MinMaxValue(None)),
             AggregateFn::Avg(i) => match input_schema.columns[*i].ty {
-                ColumnType::Int32 | ColumnType::Int64 => {
-                    Ok(AggState::AvgInt { sum: None, count: 0 })
-                }
-                ColumnType::Decimal { .. } => Ok(AggState::AvgDecimal { sum: None, count: 0 }),
+                ColumnType::Int32 | ColumnType::Int64 => Ok(AggState::AvgInt {
+                    sum: None,
+                    count: 0,
+                }),
+                ColumnType::Decimal { .. } => Ok(AggState::AvgDecimal {
+                    sum: None,
+                    count: 0,
+                }),
                 other => Err(crate::common::Error::SqlParse(format!(
                     "AVG of non-numeric column type {:?} not supported",
                     other
@@ -390,7 +401,13 @@ fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Value 
             opt.unwrap_or(Value::Null)
         }
         (AggregateFn::Avg(_), AggState::AvgInt { sum: None, .. }) => Value::Null,
-        (AggregateFn::Avg(_), AggState::AvgInt { sum: Some(s), count }) => {
+        (
+            AggregateFn::Avg(_),
+            AggState::AvgInt {
+                sum: Some(s),
+                count,
+            },
+        ) => {
             if count == 0 {
                 Value::Null
             } else {
@@ -401,7 +418,13 @@ fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Value 
             }
         }
         (AggregateFn::Avg(_), AggState::AvgDecimal { sum: None, .. }) => Value::Null,
-        (AggregateFn::Avg(_), AggState::AvgDecimal { sum: Some(d), count }) => {
+        (
+            AggregateFn::Avg(_),
+            AggState::AvgDecimal {
+                sum: Some(d),
+                count,
+            },
+        ) => {
             if count == 0 {
                 Value::Null
             } else {

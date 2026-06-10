@@ -203,7 +203,9 @@ impl<E: StorageEngine> Catalog<E> {
             .read()
             .get(name)
             .cloned()
-            .ok_or_else(|| Error::TableNotFound { name: name.to_string() })
+            .ok_or_else(|| Error::TableNotFound {
+                name: name.to_string(),
+            })
     }
 
     /// Drop a table by name. Removes catalog metadata (`__sys_tables` +
@@ -216,7 +218,9 @@ impl<E: StorageEngine> Catalog<E> {
             .read()
             .get(name)
             .cloned()
-            .ok_or_else(|| Error::TableNotFound { name: name.to_string() })?;
+            .ok_or_else(|| Error::TableNotFound {
+                name: name.to_string(),
+            })?;
         if schema.table_id.is_system() {
             return Err(Error::ConstraintViolation {
                 column: format!("<table {}>", name),
@@ -303,12 +307,7 @@ impl<E: StorageEngine> Catalog<E> {
         column_id: u32,
         stats: &crate::catalog::system_tables::ColumnStats,
     ) -> Result<()> {
-        crate::catalog::system_tables::write_column_stats(
-            &*self.engine,
-            table_id,
-            column_id,
-            stats,
-        )
+        crate::catalog::system_tables::write_column_stats(&*self.engine, table_id, column_id, stats)
     }
 
     /// Look up the table-level statistics row for `table_id`. `None` if
@@ -464,7 +463,7 @@ mod tests {
 
     fn users_schema() -> Schema {
         Schema {
-            name: "".into(), // create_table will set this
+            name: "".into(),      // create_table will set this
             table_id: TableId(0), // create_table will set this
             columns: vec![
                 ColumnDef {

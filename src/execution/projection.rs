@@ -66,11 +66,7 @@ impl Executor for Projection {
     }
 
     fn explain(&self, indent: usize) -> String {
-        let mut out = format!(
-            "{}Projection({:?})\n",
-            "  ".repeat(indent),
-            self.cols
-        );
+        let mut out = format!("{}Projection({:?})\n", "  ".repeat(indent), self.cols);
         out.push_str(&self.child.explain(indent + 1));
         out
     }
@@ -88,9 +84,24 @@ mod tests {
             name: "t".into(),
             table_id: TableId(1),
             columns: vec![
-                ColumnDef { name: "a".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                ColumnDef { name: "b".into(), ty: ColumnType::Int64, nullable: false, default: None },
-                ColumnDef { name: "c".into(), ty: ColumnType::Boolean, nullable: false, default: None },
+                ColumnDef {
+                    name: "a".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "c".into(),
+                    ty: ColumnType::Boolean,
+                    nullable: false,
+                    default: None,
+                },
             ],
             primary_key: vec![0],
         }

@@ -26,18 +26,18 @@ pub mod workload_log;
 pub use binder::Binder;
 pub use column_map::ColumnRemap;
 pub use cost::{Cost, CostModel, CostWeights, DefaultCostModel};
+pub use expr::{BinaryOp, CompareOp, Expression, Predicate};
+pub use frontend::parse;
 pub use join_order::{
     cost_of_order, enumerate_join_orders, JoinAlgorithm, JoinEdge, JoinOrder, JoinPlan,
     JoinRelation, RelId,
 };
+pub use logical::LogicalPlan;
+pub use planner::{plan, PhysicalPlan, Planner, PlannerStrategy, RuleBasedPlanner};
 pub use selectivity::{
     estimate_predicate_selectivity, join_selectivity, EQ_FALLBACK, JOIN_FALLBACK, MIN_SELECTIVITY,
     RANGE_FALLBACK,
 };
-pub use expr::{BinaryOp, CompareOp, Expression, Predicate};
-pub use frontend::parse;
-pub use logical::LogicalPlan;
-pub use planner::{plan, PhysicalPlan, Planner, PlannerStrategy, RuleBasedPlanner};
 pub use selinger::SelingerPlanner;
 pub use stats::{
     CatalogStatsProvider, MockStatsProvider, QueryStats, StatsProvider, DEFAULT_ROW_COUNT,

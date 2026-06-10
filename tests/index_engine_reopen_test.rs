@@ -48,7 +48,9 @@ fn warehouse_schema() -> Schema {
 fn create_index_auto_allocates_engine() {
     let dir = tempfile::tempdir().unwrap();
     let cat = open_catalog_at(dir.path());
-    let table_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let table_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
 
     let idx = cat
         .create_index(IndexDef {
@@ -71,7 +73,9 @@ fn create_index_auto_allocates_engine() {
 fn lsm_backed_index_is_lsm_engine() {
     let dir = tempfile::tempdir().unwrap();
     let cat = open_catalog_at(dir.path());
-    let table_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let table_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
     let idx = cat
         .create_index(IndexDef {
             name: "warehouse_lsm".into(),
@@ -137,8 +141,12 @@ fn reopen_repopulates_index_engines_with_correct_backend() {
     // Reopen. The catalog must rehydrate both index engines at the right
     // backend type and find the data we wrote.
     let cat2 = open_catalog_at(dir.path());
-    let b = cat2.index_engine(btree_idx_id).expect("btree index missing post-reopen");
-    let l = cat2.index_engine(lsm_idx_id).expect("lsm index missing post-reopen");
+    let b = cat2
+        .index_engine(btree_idx_id)
+        .expect("btree index missing post-reopen");
+    let l = cat2
+        .index_engine(lsm_idx_id)
+        .expect("lsm index missing post-reopen");
     assert_eq!(b.name(), "btree");
     assert_eq!(l.name(), "lsm");
     assert_eq!(b.get(b"k").unwrap(), Some(b"from_btree".to_vec()));
@@ -153,7 +161,9 @@ fn catalog_open_without_dir_skips_auto_allocation() {
     let bpm = BufferPoolManager::new(64, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let cat = Catalog::open(engine).unwrap();
-    let table_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let table_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
     let idx = cat
         .create_index(IndexDef {
             name: "ix".into(),

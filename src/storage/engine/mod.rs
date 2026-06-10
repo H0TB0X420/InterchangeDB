@@ -188,7 +188,10 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Clears existing data and imports all key-value pairs from the iterator.
     /// Used for runtime engine swapping.
-    fn import_data(&self, data: &mut dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>) -> Result<()> {
+    fn import_data(
+        &self,
+        data: &mut dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
+    ) -> Result<()> {
         for item in data {
             let (key, value) = item?;
             self.put(&key, &value)?;

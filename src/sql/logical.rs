@@ -68,7 +68,10 @@ pub enum LogicalPlan {
     /// Each row is a vector of *expressions* in schema order. Most are
     /// literals; `Expression::Parameter(i)` slots support prepared
     /// statements. Computed inserts (`INSERT … SELECT`) are Phase 14.
-    Insert { table: String, rows: Vec<Vec<Expression>> },
+    Insert {
+        table: String,
+        rows: Vec<Vec<Expression>>,
+    },
 
     /// `UPDATE table SET col = expr, … [WHERE filter]`.
     Update {
@@ -80,13 +83,18 @@ pub enum LogicalPlan {
     },
 
     /// `DELETE FROM table [WHERE filter]`.
-    Delete { table: String, filter: Option<Predicate> },
+    Delete {
+        table: String,
+        filter: Option<Predicate>,
+    },
 
     // --- Catalog admin ----------------------------------------------------
     /// `ANALYZE TABLE t` (P14.2) — scan `t` once, compute row count
     /// + per-column NDV + per-column equi-width histogram, persist into
     /// `__sys_table_stats` and `__sys_column_stats`.
-    Analyze { table: String },
+    Analyze {
+        table: String,
+    },
 
     // --- Transaction control ----------------------------------------------
     BeginTxn,
@@ -194,7 +202,9 @@ impl LogicalPlan {
             } => {
                 let set_clauses = set_clauses
                     .into_iter()
-                    .map(|(idx, expr)| Ok::<_, crate::common::Error>((idx, expr.substitute_params(params)?)))
+                    .map(|(idx, expr)| {
+                        Ok::<_, crate::common::Error>((idx, expr.substitute_params(params)?))
+                    })
                     .collect::<crate::common::Result<Vec<_>>>()?;
                 let filter = match filter {
                     Some(p) => Some(p.substitute_params(params)?),

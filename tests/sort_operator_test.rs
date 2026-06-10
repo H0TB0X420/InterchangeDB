@@ -23,9 +23,24 @@ fn customer_schema() -> Schema {
         name: "customer".into(),
         table_id: TableId(1),
         columns: vec![
-            ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "last".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
-            ColumnDef { name: "first".into(), ty: ColumnType::Varchar(20), nullable: true, default: None },
+            ColumnDef {
+                name: "id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "last".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "first".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: true,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -40,7 +55,9 @@ fn row(id: i32, last: &str, first: Option<&str>) -> Vec<Value> {
     vec![
         Value::Int32(id),
         Value::Varchar(last.into()),
-        first.map(|s| Value::Varchar(s.into())).unwrap_or(Value::Null),
+        first
+            .map(|s| Value::Varchar(s.into()))
+            .unwrap_or(Value::Null),
     ]
 }
 
@@ -69,7 +86,13 @@ fn single_key_ascending() {
     let child = Box::new(SeqScan::new(&t).unwrap());
     let mut op = Sort::new(child, vec![(0, SortDir::Asc)]).unwrap();
     let rows = drain(&mut op);
-    let ids: Vec<i32> = rows.iter().map(|r| match r[0] { Value::Int32(i) => i, _ => panic!() }).collect();
+    let ids: Vec<i32> = rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![1, 2, 3]);
 }
 
@@ -82,7 +105,13 @@ fn single_key_descending() {
     let child = Box::new(SeqScan::new(&t).unwrap());
     let mut op = Sort::new(child, vec![(0, SortDir::Desc)]).unwrap();
     let rows = drain(&mut op);
-    let ids: Vec<i32> = rows.iter().map(|r| match r[0] { Value::Int32(i) => i, _ => panic!() }).collect();
+    let ids: Vec<i32> = rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![3, 2, 1]);
 }
 
@@ -97,7 +126,13 @@ fn multi_key_breaks_ties_by_second_key() {
     // ORDER BY last ASC, first ASC.
     let mut op = Sort::new(child, vec![(1, SortDir::Asc), (2, SortDir::Asc)]).unwrap();
     let rows = drain(&mut op);
-    let ids: Vec<i32> = rows.iter().map(|r| match r[0] { Value::Int32(i) => i, _ => panic!() }).collect();
+    let ids: Vec<i32> = rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        })
+        .collect();
     // kim/abe (2), kim/zoe (1), smith/bob (3).
     assert_eq!(ids, vec![2, 1, 3]);
 }
@@ -106,13 +141,19 @@ fn multi_key_breaks_ties_by_second_key() {
 fn nulls_sort_last_under_asc() {
     let (t, _d) = customer_table();
     t.insert(&row(1, "kim", Some("a"))).unwrap();
-    t.insert(&row(2, "kim", None)).unwrap();      // NULL first name
+    t.insert(&row(2, "kim", None)).unwrap(); // NULL first name
     t.insert(&row(3, "kim", Some("b"))).unwrap();
     let child = Box::new(SeqScan::new(&t).unwrap());
     // ORDER BY first ASC.
     let mut op = Sort::new(child, vec![(2, SortDir::Asc)]).unwrap();
     let rows = drain(&mut op);
-    let ids: Vec<i32> = rows.iter().map(|r| match r[0] { Value::Int32(i) => i, _ => panic!() }).collect();
+    let ids: Vec<i32> = rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        })
+        .collect();
     // 'a', 'b', NULL.
     assert_eq!(ids, vec![1, 3, 2]);
 }
@@ -126,7 +167,13 @@ fn nulls_sort_last_under_desc() {
     let child = Box::new(SeqScan::new(&t).unwrap());
     let mut op = Sort::new(child, vec![(2, SortDir::Desc)]).unwrap();
     let rows = drain(&mut op);
-    let ids: Vec<i32> = rows.iter().map(|r| match r[0] { Value::Int32(i) => i, _ => panic!() }).collect();
+    let ids: Vec<i32> = rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        })
+        .collect();
     // DESC: 'b', 'a', then NULL (still last — convention).
     assert_eq!(ids, vec![3, 1, 2]);
 }
@@ -143,7 +190,13 @@ fn stable_sort_preserves_original_order_on_ties() {
     let child = Box::new(SeqScan::new(&t).unwrap());
     let mut op = Sort::new(child, vec![(1, SortDir::Asc)]).unwrap();
     let rows = drain(&mut op);
-    let ids: Vec<i32> = rows.iter().map(|r| match r[0] { Value::Int32(i) => i, _ => panic!() }).collect();
+    let ids: Vec<i32> = rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![1, 2, 3]);
 }
 

@@ -73,7 +73,11 @@ fn setup_bench(pool_size: usize, page_count: usize) -> BpmBenchState {
         page_ids.push(pid);
     }
 
-    BpmBenchState { bpm, page_ids, _dir: dir }
+    BpmBenchState {
+        bpm,
+        page_ids,
+        _dir: dir,
+    }
 }
 
 // ============================================================================
@@ -87,7 +91,10 @@ fn bench_bpm_scan(c: &mut Criterion) {
     let state = setup_bench(BPM_SIZE, PAGE_COUNT);
 
     group.bench_function(
-        BenchmarkId::new("sequential", format!("{}pages_{}pool", PAGE_COUNT, BPM_SIZE)),
+        BenchmarkId::new(
+            "sequential",
+            format!("{}pages_{}pool", PAGE_COUNT, BPM_SIZE),
+        ),
         |b| {
             b.iter(|| {
                 // One full scan of all pages.
@@ -127,7 +134,10 @@ fn bench_bpm_get_modify(c: &mut Criterion) {
                         .wrapping_add(1442695040888963407);
                     let page_idx = (rng_state >> 33) as usize % PAGE_COUNT;
 
-                    let mut guard = state.bpm.fetch_page_write(state.page_ids[page_idx]).unwrap();
+                    let mut guard = state
+                        .bpm
+                        .fetch_page_write(state.page_ids[page_idx])
+                        .unwrap();
                     check_page_with_seed(guard.as_slice(), page_idx, seeds[page_idx]);
                     seeds[page_idx] += 1;
                     modify_page(guard.as_mut_slice(), page_idx, seeds[page_idx]);

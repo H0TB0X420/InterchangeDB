@@ -76,13 +76,7 @@ fn main() {
     let csv_path = results_path("engine_space_amplification");
     let mut csv = CsvWriter::create(
         &csv_path,
-        &[
-            "engine",
-            "phase",
-            "user_bytes",
-            "disk_bytes",
-            "space_amp",
-        ],
+        &["engine", "phase", "user_bytes", "disk_bytes", "space_amp"],
     );
     let mut table = MarkdownTable::new(
         &[

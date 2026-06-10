@@ -201,9 +201,15 @@ where
     CatE: StorageEngine,
 {
     match logical {
-        LogicalPlan::CreateTable { name, columns, primary_key } => {
-            Ok(PhysicalPlan::CreateTable { name, columns, primary_key })
-        }
+        LogicalPlan::CreateTable {
+            name,
+            columns,
+            primary_key,
+        } => Ok(PhysicalPlan::CreateTable {
+            name,
+            columns,
+            primary_key,
+        }),
         LogicalPlan::Analyze { table } => Ok(PhysicalPlan::Analyze { table }),
         LogicalPlan::BeginTxn => Ok(PhysicalPlan::BeginTxn),
         LogicalPlan::CommitTxn => Ok(PhysicalPlan::CommitTxn),
@@ -212,7 +218,15 @@ where
             let inner_phys = plan_inner(*inner, engine, catalog, selection)?;
             Ok(PhysicalPlan::Explain(render_explain(&inner_phys)))
         }
-        LogicalPlan::Select { table, joins, projection, aggregates, filter, order_by, limit } => {
+        LogicalPlan::Select {
+            table,
+            joins,
+            projection,
+            aggregates,
+            filter,
+            order_by,
+            limit,
+        } => {
             let exec = plan_select(
                 table, joins, projection, aggregates, filter, order_by, limit, engine, catalog,
                 selection,
@@ -223,7 +237,11 @@ where
             let exec = plan_insert(table, rows, engine, catalog)?;
             Ok(PhysicalPlan::Executor(exec))
         }
-        LogicalPlan::Update { table, set_clauses, filter } => {
+        LogicalPlan::Update {
+            table,
+            set_clauses,
+            filter,
+        } => {
             let exec = plan_update(table, set_clauses, filter, engine, catalog)?;
             Ok(PhysicalPlan::Executor(exec))
         }
@@ -252,8 +270,7 @@ where
 {
     let left_schema = catalog.get_table(&table_name)?;
     let left_table_id = left_schema.table_id;
-    let left_indexes =
-        catalog.indexes_for_table(left_schema.table_id, &left_schema)?;
+    let left_indexes = catalog.indexes_for_table(left_schema.table_id, &left_schema)?;
     let left_table = Arc::new(Table::with_indexes(
         engine.clone(),
         left_schema,
@@ -305,8 +322,7 @@ where
     };
     for join in joins {
         let right_schema = catalog.get_table(&join.right_table)?;
-        let right_indexes =
-            catalog.indexes_for_table(right_schema.table_id, &right_schema)?;
+        let right_indexes = catalog.indexes_for_table(right_schema.table_id, &right_schema)?;
         let right_table = Arc::new(Table::with_indexes(
             engine.clone(),
             right_schema.clone(),
@@ -323,7 +339,12 @@ where
                     .as_ref()
                     .and_then(|pred| try_match_inlj(pred, outer_offset, &right_indexes));
                 if let Some((outer_col, handle)) = inlj_choice {
-                    Box::new(IndexNestedLoopJoin::new(current, right_table, handle, vec![outer_col])?)
+                    Box::new(IndexNestedLoopJoin::new(
+                        current,
+                        right_table,
+                        handle,
+                        vec![outer_col],
+                    )?)
                 } else {
                     build_nested_loop_join(current, right_table, join.on)?
                 }
@@ -364,7 +385,12 @@ where
                 match algorithm {
                     JoinAlgorithm::IndexNestedLoop => {
                         let (outer_col, handle) = inlj.expect("INLJ chosen only when available");
-                        Box::new(IndexNestedLoopJoin::new(current, right_table, handle, vec![outer_col])?)
+                        Box::new(IndexNestedLoopJoin::new(
+                            current,
+                            right_table,
+                            handle,
+                            vec![outer_col],
+                        )?)
                     }
                     JoinAlgorithm::Hash => {
                         let (outer_col, inner_col) =
@@ -437,8 +463,14 @@ fn translate_aggregate_spec(
     use crate::sql::logical::AggregateSpec;
     match spec {
         AggregateSpec::CountStar => AggregateFn::CountStar,
-        AggregateSpec::Count { col, distinct: false } => AggregateFn::Count(col),
-        AggregateSpec::Count { col, distinct: true } => AggregateFn::CountDistinct(col),
+        AggregateSpec::Count {
+            col,
+            distinct: false,
+        } => AggregateFn::Count(col),
+        AggregateSpec::Count {
+            col,
+            distinct: true,
+        } => AggregateFn::CountDistinct(col),
         AggregateSpec::Sum(col) => AggregateFn::Sum(col),
         AggregateSpec::Min(col) => AggregateFn::Min(col),
         AggregateSpec::Max(col) => AggregateFn::Max(col),
@@ -525,7 +557,8 @@ fn choose_join_algorithm(
     }
     if inlj_available {
         let avg_matches = (inner_card * edge_sel).max(0.0);
-        let inlj_cost = cost_model.scalar(cost_model.cost_index_nested_loop_join(outer_card, avg_matches));
+        let inlj_cost =
+            cost_model.scalar(cost_model.cost_index_nested_loop_join(outer_card, avg_matches));
         if inlj_cost < best_cost {
             best_algorithm = JoinAlgorithm::IndexNestedLoop;
         }
@@ -639,11 +672,7 @@ where
     // a bug — `Expression::compile` debug-asserts.)
     let rows: Vec<Vec<crate::types::Value>> = rows
         .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|e| e.compile()(&Vec::new()))
-                .collect()
-        })
+        .map(|row| row.into_iter().map(|e| e.compile()(&Vec::new())).collect())
         .collect();
     let schema = catalog.get_table(&table_name)?;
     let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
@@ -664,7 +693,12 @@ where
 {
     let schema = catalog.get_table(&table_name)?;
     let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
-    let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes.clone()));
+    let table = Arc::new(Table::with_indexes(
+        engine,
+        schema,
+        RowLayout,
+        indexes.clone(),
+    ));
 
     // Same IndexScan lowering as plan_select. Index-driven updates are
     // common in OLTP: `UPDATE customer SET … WHERE c_id = ?`.
@@ -708,7 +742,12 @@ where
 {
     let schema = catalog.get_table(&table_name)?;
     let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
-    let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes.clone()));
+    let table = Arc::new(Table::with_indexes(
+        engine,
+        schema,
+        RowLayout,
+        indexes.clone(),
+    ));
 
     let mut child: Box<dyn Executor>;
     let mut residual_filter: Option<Predicate> = filter;
@@ -780,7 +819,12 @@ mod tests {
         let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
         let catalog = Arc::new(Catalog::open(engine.clone()).unwrap());
         let binder = Binder::new(catalog.clone());
-        TestEnv { engine, catalog, binder, _dir: dir }
+        TestEnv {
+            engine,
+            catalog,
+            binder,
+            _dir: dir,
+        }
     }
 
     fn create_warehouse(env: &TestEnv) {
@@ -788,12 +832,24 @@ mod tests {
             name: "warehouse".into(),
             table_id: TableId(0),
             columns: vec![
-                ColumnDef { name: "w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                ColumnDef { name: "w_ytd".into(), ty: ColumnType::Int64, nullable: false, default: None },
+                ColumnDef {
+                    name: "w_id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "w_ytd".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
             ],
             primary_key: vec![0],
         };
-        env.catalog.create_table("warehouse".into(), schema).unwrap();
+        env.catalog
+            .create_table("warehouse".into(), schema)
+            .unwrap();
     }
 
     fn plan_sql(env: &TestEnv, sql: &str) -> PhysicalPlan {
@@ -858,10 +914,7 @@ Projection([0])
     fn plans_select_with_full_chain() {
         let env = setup();
         create_warehouse(&env);
-        let p = plan_sql(
-            &env,
-            "SELECT w_id FROM warehouse WHERE w_id = 1 LIMIT 3",
-        );
+        let p = plan_sql(&env, "SELECT w_id FROM warehouse WHERE w_id = 1 LIMIT 3");
         match p {
             PhysicalPlan::Executor(exec) => {
                 let tree = exec.explain(0);
@@ -899,10 +952,7 @@ Limit(3)
         let env = setup();
         create_warehouse(&env);
         // Seed: 1, 1000; 2, 2000.
-        let seed = plan_sql(
-            &env,
-            "INSERT INTO warehouse VALUES (1, 1000), (2, 2000)",
-        );
+        let seed = plan_sql(&env, "INSERT INTO warehouse VALUES (1, 1000), (2, 2000)");
         if let PhysicalPlan::Executor(mut e) = seed {
             e.next().unwrap();
         }
@@ -943,10 +993,7 @@ Limit(3)
     fn plans_explain_returns_tree_string() {
         let env = setup();
         create_warehouse(&env);
-        let p = plan_sql(
-            &env,
-            "EXPLAIN SELECT w_id FROM warehouse WHERE w_id = 1",
-        );
+        let p = plan_sql(&env, "EXPLAIN SELECT w_id FROM warehouse WHERE w_id = 1");
         match p {
             PhysicalPlan::Explain(text) => {
                 assert!(text.contains("Projection"));
@@ -987,7 +1034,11 @@ Limit(3)
         match p {
             PhysicalPlan::Explain(text) => {
                 assert!(text.starts_with("Explain\n"), "got: {}", text);
-                assert!(!text.contains("Explain[nested]"), "old stub leaked: {}", text);
+                assert!(
+                    !text.contains("Explain[nested]"),
+                    "old stub leaked: {}",
+                    text
+                );
                 assert!(text.contains("  Projection"), "got: {}", text);
                 assert!(text.contains("SeqScan(warehouse)"), "got: {}", text);
                 for line in text.lines().skip(1).filter(|l| !l.is_empty()) {
@@ -1007,7 +1058,10 @@ Limit(3)
         let env = setup();
         create_warehouse(&env);
         let stmts = parse("SELECT w_id FROM warehouse WHERE w_id = 1 LIMIT 3").unwrap();
-        let logical_a = env.binder.bind(stmts.clone().into_iter().next().unwrap()).unwrap();
+        let logical_a = env
+            .binder
+            .bind(stmts.clone().into_iter().next().unwrap())
+            .unwrap();
         let logical_b = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
 
         let free = plan(logical_a, env.engine.clone(), &env.catalog).unwrap();

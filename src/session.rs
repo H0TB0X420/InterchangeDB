@@ -56,10 +56,7 @@ pub struct PreparedStatement {
 #[derive(Debug)]
 pub enum QueryResult {
     /// SELECT result. `schema` describes the columns of `rows`.
-    Rows {
-        schema: Schema,
-        rows: Vec<Tuple>,
-    },
+    Rows { schema: Schema, rows: Vec<Tuple> },
     /// Row count from INSERT / UPDATE / DELETE.
     Affected(u64),
     /// DDL or transaction-control acknowledgment.
@@ -237,11 +234,7 @@ impl<E: StorageEngine + 'static> Session<E> {
         result
     }
 
-    fn run_physical(
-        &self,
-        physical: PhysicalPlan,
-        is_select_shape: bool,
-    ) -> Result<QueryResult> {
+    fn run_physical(&self, physical: PhysicalPlan, is_select_shape: bool) -> Result<QueryResult> {
         match physical {
             PhysicalPlan::Executor(mut exec) => {
                 let schema = exec.schema().clone();
@@ -459,9 +452,9 @@ fn build_equi_width_int_histogram(values: &[i64], num_buckets: usize) -> Vec<u8>
 
 fn is_write(plan: &LogicalPlan) -> bool {
     match plan {
-        LogicalPlan::Insert { .. }
-        | LogicalPlan::Update { .. }
-        | LogicalPlan::Delete { .. } => true,
+        LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => {
+            true
+        }
         // EXPLAIN is read-only at the storage level; it just builds the
         // executor tree for description. Even EXPLAIN INSERT doesn't insert.
         LogicalPlan::Explain(_) => false,

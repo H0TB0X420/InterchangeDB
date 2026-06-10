@@ -293,9 +293,8 @@ fn decode_char(bytes: &[u8], target_len: u16) -> Result<(String, usize)> {
     // Strip trailing 0x00 padding — embedded NULs are forbidden at encode time,
     // so any trailing 0x00s are guaranteed to be padding.
     let end = raw.iter().rposition(|&b| b != 0x00).map_or(0, |i| i + 1);
-    let s = String::from_utf8(raw[..end].to_vec()).map_err(|e| {
-        Error::StorageCorrupted(format!("decode_char: invalid UTF-8: {}", e))
-    })?;
+    let s = String::from_utf8(raw[..end].to_vec())
+        .map_err(|e| Error::StorageCorrupted(format!("decode_char: invalid UTF-8: {}", e)))?;
     Ok((s, n))
 }
 
@@ -535,7 +534,12 @@ mod tests {
     fn boolean_false_sorts_before_true() {
         let f = encode_key_components(&[&Value::Boolean(false)], &[ColumnType::Boolean]).unwrap();
         let t = encode_key_components(&[&Value::Boolean(true)], &[ColumnType::Boolean]).unwrap();
-        assert!(f < t, "Boolean(false)={:?} should sort before Boolean(true)={:?}", f, t);
+        assert!(
+            f < t,
+            "Boolean(false)={:?} should sort before Boolean(true)={:?}",
+            f,
+            t
+        );
     }
 
     /// Decode must reject any byte other than 0x00 or 0x01 under a Boolean
@@ -585,7 +589,13 @@ mod tests {
             let back = decode_key_components(&bytes, &[ColumnType::Int64]).unwrap();
             assert_eq!(back, vec![Value::Int64(n)], "roundtrip failed for {}", n);
             if let Some(prev) = &last_bytes {
-                assert!(prev < &bytes, "byte order broken at {}: {:?} >= {:?}", n, prev, bytes);
+                assert!(
+                    prev < &bytes,
+                    "byte order broken at {}: {:?} >= {:?}",
+                    n,
+                    prev,
+                    bytes
+                );
             }
             last_bytes = Some(bytes);
         }
@@ -595,12 +605,23 @@ mod tests {
     /// Int64's bytes; the type tag makes them distinct in the type system.
     #[test]
     fn timestamp_roundtrip() {
-        let cases = [0_i64, 1_700_000_000_000_000, -1_000_000_000, i64::MAX, i64::MIN];
+        let cases = [
+            0_i64,
+            1_700_000_000_000_000,
+            -1_000_000_000,
+            i64::MAX,
+            i64::MIN,
+        ];
         for t in cases {
             let v = Value::Timestamp(t);
             let bytes = encode_key_components(&[&v], &[ColumnType::Timestamp]).unwrap();
             let back = decode_key_components(&bytes, &[ColumnType::Timestamp]).unwrap();
-            assert_eq!(back, vec![Value::Timestamp(t)], "roundtrip failed for ts={}", t);
+            assert_eq!(
+                back,
+                vec![Value::Timestamp(t)],
+                "roundtrip failed for ts={}",
+                t
+            );
         }
     }
 
@@ -610,18 +631,26 @@ mod tests {
     /// original Value (scale included) when the column scale matches.
     #[test]
     fn decimal_roundtrip_preserves_scale_from_column() {
-        let col = ColumnType::Decimal { precision: 12, scale: 2 };
+        let col = ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        };
         let cases = [
             Value::Decimal(Decimal::from_i64_with_scale(0, 2)),
-            Value::Decimal(Decimal::from_i64_with_scale(12345, 2)),    // 123.45
-            Value::Decimal(Decimal::from_i64_with_scale(-12345, 2)),   // -123.45
+            Value::Decimal(Decimal::from_i64_with_scale(12345, 2)), // 123.45
+            Value::Decimal(Decimal::from_i64_with_scale(-12345, 2)), // -123.45
             Value::Decimal(Decimal::from_i64_with_scale(i64::MAX, 2)),
             Value::Decimal(Decimal::from_i64_with_scale(i64::MIN, 2)),
         ];
         for v in &cases {
             let bytes = encode_key_components(&[v], std::slice::from_ref(&col)).unwrap();
             let back = decode_key_components(&bytes, std::slice::from_ref(&col)).unwrap();
-            assert_eq!(back, vec![v.clone()], "decimal roundtrip failed for {:?}", v);
+            assert_eq!(
+                back,
+                vec![v.clone()],
+                "decimal roundtrip failed for {:?}",
+                v
+            );
         }
     }
 
@@ -629,7 +658,10 @@ mod tests {
     /// must sort before positives. Verifies the trick carries over to Decimal.
     #[test]
     fn decimal_mantissa_order_preserved_across_sign() {
-        let col = ColumnType::Decimal { precision: 18, scale: 4 };
+        let col = ColumnType::Decimal {
+            precision: 18,
+            scale: 4,
+        };
         let mantissas = [i64::MIN, -1_000_000, -1, 0, 1, 1_000_000, i64::MAX];
         let encoded: Vec<Vec<u8>> = mantissas
             .iter()
@@ -642,7 +674,12 @@ mod tests {
             })
             .collect();
         for w in encoded.windows(2) {
-            assert!(w[0] < w[1], "decimal mantissa order broken: {:?} >= {:?}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "decimal mantissa order broken: {:?} >= {:?}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -665,7 +702,12 @@ mod tests {
                 bytes.len()
             );
             let back = decode_key_components(&bytes, std::slice::from_ref(&col)).unwrap();
-            assert_eq!(back, vec![Value::Char(s.to_string())], "char roundtrip failed for {:?}", s);
+            assert_eq!(
+                back,
+                vec![Value::Char(s.to_string())],
+                "char roundtrip failed for {:?}",
+                s
+            );
         }
     }
 
@@ -678,11 +720,8 @@ mod tests {
         let encoded: Vec<Vec<u8>> = strings
             .iter()
             .map(|s| {
-                encode_key_components(
-                    &[&Value::Char(s.to_string())],
-                    std::slice::from_ref(&col),
-                )
-                .unwrap()
+                encode_key_components(&[&Value::Char(s.to_string())], std::slice::from_ref(&col))
+                    .unwrap()
             })
             .collect();
         for w in encoded.windows(2) {
@@ -724,7 +763,12 @@ mod tests {
             let v = Value::Varchar(s.clone());
             let bytes = encode_key_components(&[&v], std::slice::from_ref(&col)).unwrap();
             let back = decode_key_components(&bytes, std::slice::from_ref(&col)).unwrap();
-            assert_eq!(back, vec![Value::Varchar(s.clone())], "varchar roundtrip failed for {:?}", s);
+            assert_eq!(
+                back,
+                vec![Value::Varchar(s.clone())],
+                "varchar roundtrip failed for {:?}",
+                s
+            );
         }
     }
 
@@ -746,7 +790,12 @@ mod tests {
             })
             .collect();
         for w in encoded.windows(2) {
-            assert!(w[0] < w[1], "varchar order broken: {:?} >= {:?}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "varchar order broken: {:?} >= {:?}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -766,7 +815,12 @@ mod tests {
             let v = Value::Bytes(b.clone());
             let bytes = encode_key_components(&[&v], std::slice::from_ref(&col)).unwrap();
             let back = decode_key_components(&bytes, std::slice::from_ref(&col)).unwrap();
-            assert_eq!(back, vec![Value::Bytes(b.clone())], "bytes roundtrip failed for {:?}", b);
+            assert_eq!(
+                back,
+                vec![Value::Bytes(b.clone())],
+                "bytes roundtrip failed for {:?}",
+                b
+            );
         }
     }
 
@@ -826,7 +880,12 @@ mod tests {
             })
             .collect();
         for w in encoded.windows(2) {
-            assert!(w[0] < w[1], "composite order broken: {:?} >= {:?}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "composite order broken: {:?} >= {:?}",
+                w[0],
+                w[1]
+            );
         }
         // And the first row decodes back to the original triple.
         let back = decode_key_components(&encoded[0], &types).unwrap();

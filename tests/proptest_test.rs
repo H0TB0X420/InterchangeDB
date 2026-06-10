@@ -271,8 +271,8 @@ proptest! {
 
 // ---- Q-08: LSM invariants vs. HashMap oracle ----
 
-use std::collections::HashMap;
 use interchangedb::index::lsm::LsmTree;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 enum LsmOp {

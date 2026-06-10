@@ -25,8 +25,7 @@ fn make_bpm_with_writes_failing(pool_size: usize, n_writes_to_fail: usize) -> Bu
 
 #[test]
 fn allocate_failure_propagates_through_new_page() {
-    let dm = FaultInjectionDiskManager::new(MemoryDiskManager::new())
-        .with_allocate_errors(1);
+    let dm = FaultInjectionDiskManager::new(MemoryDiskManager::new()).with_allocate_errors(1);
     let bpm = BufferPoolManager::new(4, dm);
     match bpm.new_page() {
         Err(Error::Io(io)) => {
@@ -40,7 +39,9 @@ fn allocate_failure_propagates_through_new_page() {
         Ok(_) => panic!("expected Error::Io, got Ok"),
     }
     // After the injected count is exhausted, allocation should succeed.
-    let _g = bpm.new_page().expect("post-failure allocation should succeed");
+    let _g = bpm
+        .new_page()
+        .expect("post-failure allocation should succeed");
 }
 
 #[test]
@@ -149,5 +150,7 @@ fn after_injection_exhausted_normal_operations_resume() {
 
     // The pool is still in a usable state. Subsequent allocations
     // succeed once the injected count is exhausted.
-    let _ok = bpm.new_page().expect("post-failure allocation should succeed");
+    let _ok = bpm
+        .new_page()
+        .expect("post-failure allocation should succeed");
 }

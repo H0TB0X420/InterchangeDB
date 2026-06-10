@@ -78,8 +78,17 @@ impl<C: CostModel> PlannerStrategy for SelingerPlanner<C> {
         // into a strictly-cheaper join order, then (P14.13a) lower it,
         // picking each join's algorithm by cost.
         let stats = gather_query_stats(&logical, catalog)?;
-        let logical = maybe_reorder(logical, catalog, &stats, &self.cost_model, self.time_budget_ms)?;
-        let selection = JoinSelection::CostBased { cost_model: &self.cost_model, stats: &stats };
+        let logical = maybe_reorder(
+            logical,
+            catalog,
+            &stats,
+            &self.cost_model,
+            self.time_budget_ms,
+        )?;
+        let selection = JoinSelection::CostBased {
+            cost_model: &self.cost_model,
+            stats: &stats,
+        };
         plan_inner(logical, engine, catalog, &selection)
     }
 
@@ -120,8 +129,10 @@ fn gather_query_stats<CatE: StorageEngine>(
         let column_count = schema.columns.len() as u32;
         requests_owned.push((schema.table_id, (0..column_count).collect()));
     }
-    let requests: Vec<(TableId, &[u32])> =
-        requests_owned.iter().map(|(t, c)| (*t, c.as_slice())).collect();
+    let requests: Vec<(TableId, &[u32])> = requests_owned
+        .iter()
+        .map(|(t, c)| (*t, c.as_slice()))
+        .collect();
     QueryStats::gather(&provider, &requests)
 }
 
@@ -160,7 +171,15 @@ fn maybe_reorder<CatE: StorageEngine>(
             let reordered = maybe_reorder(*inner, catalog, stats, cost_model, time_budget_ms)?;
             Ok(LogicalPlan::Explain(Box::new(reordered)))
         }
-        LogicalPlan::Select { table, joins, projection, aggregates, filter, order_by, limit } => {
+        LogicalPlan::Select {
+            table,
+            joins,
+            projection,
+            aggregates,
+            filter,
+            order_by,
+            limit,
+        } => {
             // No joins, or an `ON` we can't model as a clean equi-join
             // graph → leave textual order for P14.13a to lower.
             let graph = if joins.is_empty() {
@@ -170,14 +189,22 @@ fn maybe_reorder<CatE: StorageEngine>(
             };
             let Some(graph) = graph else {
                 return Ok(LogicalPlan::Select {
-                    table, joins, projection, aggregates, filter, order_by, limit,
+                    table,
+                    joins,
+                    projection,
+                    aggregates,
+                    filter,
+                    order_by,
+                    limit,
                 });
             };
 
             let budget = Some(Duration::from_millis(time_budget_ms));
-            let best = enumerate_join_orders(&graph.relations, &graph.edges, stats, cost_model, budget);
+            let best =
+                enumerate_join_orders(&graph.relations, &graph.edges, stats, cost_model, budget);
             let textual: Vec<RelId> = (0..graph.relations.len()).collect();
-            let textual_cost = cost_of_order(&textual, &graph.relations, &graph.edges, stats, cost_model);
+            let textual_cost =
+                cost_of_order(&textual, &graph.relations, &graph.edges, stats, cost_model);
 
             // Reorder only when the DP found a *strictly* cheaper order;
             // ties (e.g. unanalyzed, all-equal tables) keep textual order.
@@ -187,10 +214,24 @@ fn maybe_reorder<CatE: StorageEngine>(
             };
             if !cheaper {
                 return Ok(LogicalPlan::Select {
-                    table, joins, projection, aggregates, filter, order_by, limit,
+                    table,
+                    joins,
+                    projection,
+                    aggregates,
+                    filter,
+                    order_by,
+                    limit,
                 });
             }
-            Ok(rewrite_select(&graph, &best.order, projection, aggregates, filter, order_by, limit))
+            Ok(rewrite_select(
+                &graph,
+                &best.order,
+                projection,
+                aggregates,
+                filter,
+                order_by,
+                limit,
+            ))
         }
         other => Ok(other),
     }
@@ -220,7 +261,10 @@ fn build_join_graph<CatE: StorageEngine>(
         let schema = catalog.get_table(name)?;
         widths.push(schema.columns.len());
         let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
-        relations.push(JoinRelation { table_id: schema.table_id, local_selectivity: 1.0 });
+        relations.push(JoinRelation {
+            table_id: schema.table_id,
+            local_selectivity: 1.0,
+        });
         indexes_per_rel.push(indexes);
     }
     let mut textual_base = vec![0usize; table_count];
@@ -265,7 +309,14 @@ fn build_join_graph<CatE: StorageEngine>(
         });
     }
 
-    Ok(Some(JoinGraph { relations, edges, widths, textual_base, names, aliases }))
+    Ok(Some(JoinGraph {
+        relations,
+        edges,
+        widths,
+        textual_base,
+        names,
+        aliases,
+    }))
 }
 
 /// True when some index on the table covers exactly `[column]`.
@@ -292,7 +343,9 @@ fn flatten_join_order(order: &JoinOrder) -> (RelId, Vec<(RelId, Vec<usize>)>) {
     let mut node = order;
     loop {
         match node {
-            JoinOrder::Join { left, right, edges, .. } => {
+            JoinOrder::Join {
+                left, right, edges, ..
+            } => {
                 steps.push((*right, edges.clone()));
                 node = left;
             }
@@ -341,10 +394,19 @@ fn rewrite_select(
     LogicalPlan::Select {
         table: graph.names[first_rel].clone(),
         joins: new_joins,
-        projection: projection.into_iter().map(|c| remap.apply_index(c)).collect(),
-        aggregates: aggregates.into_iter().map(|a| remap_aggregate(a, &remap)).collect(),
+        projection: projection
+            .into_iter()
+            .map(|c| remap.apply_index(c))
+            .collect(),
+        aggregates: aggregates
+            .into_iter()
+            .map(|a| remap_aggregate(a, &remap))
+            .collect(),
         filter: filter.map(|f| remap.apply_predicate(f)),
-        order_by: order_by.into_iter().map(|(c, d)| (remap.apply_index(c), d)).collect(),
+        order_by: order_by
+            .into_iter()
+            .map(|(c, d)| (remap.apply_index(c), d))
+            .collect(),
         limit,
     }
 }
@@ -368,7 +430,9 @@ fn build_on_predicate(
             right: Expression::Column(remap.apply_index(gb)),
         }
     });
-    let first = compares.next().expect("a join step has at least one connecting edge");
+    let first = compares
+        .next()
+        .expect("a join step has at least one connecting edge");
     compares.fold(first, |acc, c| Predicate::And(Box::new(acc), Box::new(c)))
 }
 
@@ -376,9 +440,10 @@ fn build_on_predicate(
 fn remap_aggregate(spec: AggregateSpec, remap: &ColumnRemap) -> AggregateSpec {
     match spec {
         AggregateSpec::CountStar => AggregateSpec::CountStar,
-        AggregateSpec::Count { col, distinct } => {
-            AggregateSpec::Count { col: remap.apply_index(col), distinct }
-        }
+        AggregateSpec::Count { col, distinct } => AggregateSpec::Count {
+            col: remap.apply_index(col),
+            distinct,
+        },
         AggregateSpec::Sum(c) => AggregateSpec::Sum(remap.apply_index(c)),
         AggregateSpec::Min(c) => AggregateSpec::Min(remap.apply_index(c)),
         AggregateSpec::Max(c) => AggregateSpec::Max(remap.apply_index(c)),
@@ -417,13 +482,28 @@ mod tests {
             name: "t".into(),
             table_id: TableId(0),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                ColumnDef { name: "v".into(), ty: ColumnType::Int64, nullable: false, default: None },
+                ColumnDef {
+                    name: "id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
             ],
             primary_key: vec![0],
         };
         catalog.create_table("t".into(), schema).unwrap();
-        Env { engine, catalog, binder, _dir: dir }
+        Env {
+            engine,
+            catalog,
+            binder,
+            _dir: dir,
+        }
     }
 
     #[test]
@@ -449,7 +529,10 @@ mod tests {
         // signal we want.
         let env = setup();
         let stmts = parse("SELECT v FROM t WHERE id = 1 LIMIT 2").unwrap();
-        let a = env.binder.bind(stmts.clone().into_iter().next().unwrap()).unwrap();
+        let a = env
+            .binder
+            .bind(stmts.clone().into_iter().next().unwrap())
+            .unwrap();
         let b = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
 
         let p_rule = RuleBasedPlanner

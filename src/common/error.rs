@@ -108,7 +108,10 @@ pub enum Error {
     /// length bound, decimal scale, etc.). The `rule` field carries the
     /// specific violation; `column` identifies which column or "<row>" for
     /// row-level violations like arity mismatch.
-    ConstraintViolation { column: String, rule: ConstraintRule },
+    ConstraintViolation {
+        column: String,
+        rule: ConstraintRule,
+    },
 
     /// Insert with a primary key already present. Layered above the layout's
     /// upsert semantics; raised by `Table::insert` only.
@@ -181,7 +184,9 @@ impl fmt::Display for ConstraintRule {
                 write!(f, "value exceeds Varchar({}) length", max)
             }
             ConstraintRule::CharTooLong { max } => write!(f, "value exceeds Char({}) length", max),
-            ConstraintRule::BytesTooLong { max } => write!(f, "value exceeds Bytes({}) length", max),
+            ConstraintRule::BytesTooLong { max } => {
+                write!(f, "value exceeds Bytes({}) length", max)
+            }
             ConstraintRule::DecimalScaleMismatch { expected, actual } => write!(
                 f,
                 "decimal scale {} doesn't match column scale {}",

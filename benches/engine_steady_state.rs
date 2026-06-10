@@ -130,7 +130,14 @@ fn main() {
     );
     let mut table = MarkdownTable::new(
         &[
-            "Engine", "Workload", "ops/s", "p50 µs", "p99 µs", "p99.9 µs", "p99.99 µs", "max µs",
+            "Engine",
+            "Workload",
+            "ops/s",
+            "p50 µs",
+            "p99 µs",
+            "p99.9 µs",
+            "p99.99 µs",
+            "max µs",
         ],
         &[false, false, true, true, true, true, true, true],
     );
@@ -153,7 +160,14 @@ fn main() {
         // LSM
         eprintln!("[lsm  ] pre-fill...");
         let (lsm_results, lsm_drop) = run_lsm(n_keys, CACHE_BYTES, workload);
-        emit_row(&mut table, &mut csv, "lsm", workload, &lsm_results, lsm_drop);
+        emit_row(
+            &mut table,
+            &mut csv,
+            "lsm",
+            workload,
+            &lsm_results,
+            lsm_drop,
+        );
     }
 
     println!("\n=== engine_steady_state summary ===");
@@ -340,7 +354,11 @@ fn run_lsm(n_keys: usize, memtable_bytes: usize, workload: Workload) -> (CellRes
     }
     eprintln!(
         "    lsm levels: {}",
-        if levels.is_empty() { "empty".into() } else { levels.join(",") }
+        if levels.is_empty() {
+            "empty".into()
+        } else {
+            levels.join(",")
+        }
     );
 
     let dropped = hist.dropped();

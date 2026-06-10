@@ -355,18 +355,14 @@ impl TransactionManager {
     /// Get the last LSN for a transaction (for prev_lsn chain).
     pub fn last_lsn(&self, txn_id: TxnId) -> Result<Lsn> {
         let active = self.active_txns.lock();
-        let txn = active
-            .get(&txn_id)
-            .ok_or(Error::TxnNotActive(txn_id.0))?;
+        let txn = active.get(&txn_id).ok_or(Error::TxnNotActive(txn_id.0))?;
         Ok(txn.last_lsn)
     }
 
     /// Get the mode of a transaction.
     pub fn mode(&self, txn_id: TxnId) -> Result<TxnMode> {
         let active = self.active_txns.lock();
-        let txn = active
-            .get(&txn_id)
-            .ok_or(Error::TxnNotActive(txn_id.0))?;
+        let txn = active.get(&txn_id).ok_or(Error::TxnNotActive(txn_id.0))?;
         Ok(txn.mode)
     }
 
@@ -382,7 +378,11 @@ impl TransactionManager {
 
     /// Get all active snapshot read_ts values (for GC watermark computation).
     pub fn active_read_timestamps(&self) -> Vec<Timestamp> {
-        self.active_txns.lock().values().map(|txn| txn.begin_ts).collect()
+        self.active_txns
+            .lock()
+            .values()
+            .map(|txn| txn.begin_ts)
+            .collect()
     }
 
     /// Peek at the next transaction ID without consuming it.

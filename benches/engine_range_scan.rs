@@ -208,7 +208,11 @@ fn measure_btree_scan<'a>(
     let max_start = n_keys.saturating_sub(length);
 
     for _ in 0..scans {
-        let start = if max_start > 0 { rng.gen_range(max_start) } else { 0 };
+        let start = if max_start > 0 {
+            rng.gen_range(max_start)
+        } else {
+            0
+        };
         let end = start + length;
         let start_key = encode_key_i64(start as i64).to_vec();
         let end_key = encode_key_i64(end as i64).to_vec();
@@ -241,7 +245,11 @@ fn measure_lsm_scan(tree: &LsmTree, n_keys: usize, length: usize, scans: usize) 
     let max_start = n_keys.saturating_sub(length);
 
     for _ in 0..scans {
-        let start = if max_start > 0 { rng.gen_range(max_start) } else { 0 };
+        let start = if max_start > 0 {
+            rng.gen_range(max_start)
+        } else {
+            0
+        };
         let end = start + length;
         let start_key = encode_key_vec(start as i64);
         let end_key = encode_key_vec(end as i64);

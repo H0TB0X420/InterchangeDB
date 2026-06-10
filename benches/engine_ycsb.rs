@@ -140,7 +140,13 @@ fn main() {
     );
     let mut table = MarkdownTable::new(
         &[
-            "Engine", "Workload", "ops/s", "p50 µs", "p99 µs", "p99.9 µs", "max µs",
+            "Engine",
+            "Workload",
+            "ops/s",
+            "p50 µs",
+            "p99 µs",
+            "p99.9 µs",
+            "max µs",
         ],
         &[false, false, true, true, true, true, true],
     );
@@ -303,7 +309,11 @@ fn run_btree(workload: Ycsb, bpm_frames: usize) -> CellResult {
                 // 95% scan(50), 5% insert
                 if r < 0.95 {
                     let max_start = next_insert_id.saturating_sub(SCAN_LENGTH);
-                    let start_key_id = if max_start > 0 { rng.gen_range(max_start) } else { 0 };
+                    let start_key_id = if max_start > 0 {
+                        rng.gen_range(max_start)
+                    } else {
+                        0
+                    };
                     let end_key_id = start_key_id + SCAN_LENGTH;
                     let start_key = encode_key_i64(start_key_id as i64).to_vec();
                     let end_key = encode_key_i64(end_key_id as i64).to_vec();
@@ -414,7 +424,11 @@ fn run_lsm(workload: Ycsb, memtable_bytes: usize) -> CellResult {
             Ycsb::E => {
                 if r < 0.95 {
                     let max_start = next_insert_id.saturating_sub(SCAN_LENGTH);
-                    let start_key_id = if max_start > 0 { rng.gen_range(max_start) } else { 0 };
+                    let start_key_id = if max_start > 0 {
+                        rng.gen_range(max_start)
+                    } else {
+                        0
+                    };
                     let end_key_id = start_key_id + SCAN_LENGTH;
                     let start_key = encode_key_vec(start_key_id as i64);
                     let end_key = encode_key_vec(end_key_id as i64);

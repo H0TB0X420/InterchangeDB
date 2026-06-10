@@ -24,15 +24,33 @@ fn payments_schema() -> Schema {
         name: "payments".into(),
         table_id: TableId(1),
         columns: vec![
-            ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "amount".into(), ty: ColumnType::Int64, nullable: false, default: None },
             ColumnDef {
-                name: "price".into(),
-                ty: ColumnType::Decimal { precision: 10, scale: 2 },
+                name: "id".into(),
+                ty: ColumnType::Int32,
                 nullable: false,
                 default: None,
             },
-            ColumnDef { name: "maybe_null".into(), ty: ColumnType::Int64, nullable: true, default: None },
+            ColumnDef {
+                name: "amount".into(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "price".into(),
+                ty: ColumnType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "maybe_null".into(),
+                ty: ColumnType::Int64,
+                nullable: true,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -55,7 +73,11 @@ fn row(id: i32, amount: i64, price_mantissa: i64, maybe: Option<i64>) -> Vec<Val
 
 fn collect_one(op: &mut HashAggregate) -> Vec<Value> {
     let row = op.next().unwrap().expect("HashAggregate must emit one row");
-    assert_eq!(op.next().unwrap(), None, "HashAggregate must emit exactly one row");
+    assert_eq!(
+        op.next().unwrap(),
+        None,
+        "HashAggregate must emit exactly one row"
+    );
     row
 }
 
@@ -96,28 +118,25 @@ fn count_sum_min_max_int64() {
     )
     .unwrap();
     let r = collect_one(&mut op);
-    assert_eq!(r[0], Value::Int64(3));   // COUNT(*)
-    assert_eq!(r[1], Value::Int64(60));  // SUM(amount)
-    assert_eq!(r[2], Value::Int64(10));  // MIN
-    assert_eq!(r[3], Value::Int64(30));  // MAX
+    assert_eq!(r[0], Value::Int64(3)); // COUNT(*)
+    assert_eq!(r[1], Value::Int64(60)); // SUM(amount)
+    assert_eq!(r[2], Value::Int64(10)); // MIN
+    assert_eq!(r[3], Value::Int64(30)); // MAX
 }
 
 #[test]
 fn count_col_skips_nulls() {
     let (table, _d) = payments_table();
     table.insert(&row(1, 10, 100, Some(5))).unwrap();
-    table.insert(&row(2, 20, 200, None)).unwrap();      // maybe_null = NULL
+    table.insert(&row(2, 20, 200, None)).unwrap(); // maybe_null = NULL
     table.insert(&row(3, 30, 150, Some(7))).unwrap();
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(
-        child,
-        vec![AggregateFn::CountStar, AggregateFn::Count(3)],
-    )
-    .unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![AggregateFn::CountStar, AggregateFn::Count(3)]).unwrap();
     let r = collect_one(&mut op);
-    assert_eq!(r[0], Value::Int64(3));  // COUNT(*) = all rows
-    assert_eq!(r[1], Value::Int64(2));  // COUNT(maybe_null) = non-NULL only
+    assert_eq!(r[0], Value::Int64(3)); // COUNT(*) = all rows
+    assert_eq!(r[1], Value::Int64(2)); // COUNT(maybe_null) = non-NULL only
 }
 
 #[test]
@@ -130,33 +149,29 @@ fn sum_skips_null_inputs() {
     let child = Box::new(SeqScan::new(&table).unwrap());
     let mut op = HashAggregate::new(child, vec![AggregateFn::Sum(3)]).unwrap();
     let r = collect_one(&mut op);
-    assert_eq!(r[0], Value::Int64(12));  // 5 + 7
+    assert_eq!(r[0], Value::Int64(12)); // 5 + 7
 }
 
 #[test]
 fn min_max_decimal() {
     let (table, _d) = payments_table();
-    table.insert(&row(1, 10, 1234, None)).unwrap();  // 12.34
-    table.insert(&row(2, 20, 999, None)).unwrap();   //  9.99
-    table.insert(&row(3, 30, 5000, None)).unwrap();  // 50.00
+    table.insert(&row(1, 10, 1234, None)).unwrap(); // 12.34
+    table.insert(&row(2, 20, 999, None)).unwrap(); //  9.99
+    table.insert(&row(3, 30, 5000, None)).unwrap(); // 50.00
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(
-        child,
-        vec![AggregateFn::Min(2), AggregateFn::Max(2)],
-    )
-    .unwrap();
+    let mut op = HashAggregate::new(child, vec![AggregateFn::Min(2), AggregateFn::Max(2)]).unwrap();
     let r = collect_one(&mut op);
-    assert_eq!(r[0], Value::Decimal(Decimal::from_i64_with_scale(999, 2)));  // 9.99
+    assert_eq!(r[0], Value::Decimal(Decimal::from_i64_with_scale(999, 2))); // 9.99
     assert_eq!(r[1], Value::Decimal(Decimal::from_i64_with_scale(5000, 2))); // 50.00
 }
 
 #[test]
 fn sum_decimal_preserves_scale() {
     let (table, _d) = payments_table();
-    table.insert(&row(1, 10, 100, None)).unwrap();   // 1.00
-    table.insert(&row(2, 20, 250, None)).unwrap();   // 2.50
-    table.insert(&row(3, 30, 175, None)).unwrap();   // 1.75
+    table.insert(&row(1, 10, 100, None)).unwrap(); // 1.00
+    table.insert(&row(2, 20, 250, None)).unwrap(); // 2.50
+    table.insert(&row(3, 30, 175, None)).unwrap(); // 1.75
 
     let child = Box::new(SeqScan::new(&table).unwrap());
     let mut op = HashAggregate::new(child, vec![AggregateFn::Sum(2)]).unwrap();
@@ -176,7 +191,10 @@ fn avg_int_yields_decimal_scale_4() {
     let mut op = HashAggregate::new(child, vec![AggregateFn::Avg(1)]).unwrap();
     let r = collect_one(&mut op);
     // (10 + 30) / 2 = 20 → 20.0000 in scale-4 decimal → mantissa 200000.
-    assert_eq!(r[0], Value::Decimal(Decimal::from_i64_with_scale(200000, 4)));
+    assert_eq!(
+        r[0],
+        Value::Decimal(Decimal::from_i64_with_scale(200000, 4))
+    );
 }
 
 #[test]
@@ -212,9 +230,21 @@ fn output_schema_names_and_types() {
     assert_eq!(s.columns[2].name, "sum_amount");
     assert_eq!(s.columns[2].ty, ColumnType::Int64);
     assert_eq!(s.columns[3].name, "min_price");
-    assert_eq!(s.columns[3].ty, ColumnType::Decimal { precision: 10, scale: 2 });
+    assert_eq!(
+        s.columns[3].ty,
+        ColumnType::Decimal {
+            precision: 10,
+            scale: 2
+        }
+    );
     assert_eq!(s.columns[4].name, "avg_amount");
-    assert_eq!(s.columns[4].ty, ColumnType::Decimal { precision: 18, scale: 4 });
+    assert_eq!(
+        s.columns[4].ty,
+        ColumnType::Decimal {
+            precision: 18,
+            scale: 4
+        }
+    );
 }
 
 #[test]
@@ -224,14 +254,26 @@ fn sum_int32_promotes_output_to_int64() {
         name: "small".into(),
         table_id: TableId(2),
         columns: vec![
-            ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "n".into(), ty: ColumnType::Int32, nullable: false, default: None },
+            ColumnDef {
+                name: "id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "n".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     });
     let (engine, _d) = fresh_engine();
     let table = Table::new(engine, schema, RowLayout);
-    table.insert(&[Value::Int32(1), Value::Int32(i32::MAX)]).unwrap();
+    table
+        .insert(&[Value::Int32(1), Value::Int32(i32::MAX)])
+        .unwrap();
     table.insert(&[Value::Int32(2), Value::Int32(1)]).unwrap();
 
     let child = Box::new(SeqScan::new(&table).unwrap());
@@ -330,7 +372,11 @@ fn explain_includes_aggregate_labels() {
     let child = Box::new(SeqScan::new(&table).unwrap());
     let op = HashAggregate::new(
         child,
-        vec![AggregateFn::CountStar, AggregateFn::Sum(1), AggregateFn::Max(1)],
+        vec![
+            AggregateFn::CountStar,
+            AggregateFn::Sum(1),
+            AggregateFn::Max(1),
+        ],
     )
     .unwrap();
     let s = op.explain(0);

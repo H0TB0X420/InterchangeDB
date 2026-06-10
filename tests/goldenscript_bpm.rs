@@ -39,7 +39,11 @@ impl BpmRunner {
         let path = dir.path().join("test.db");
         let dm = FileDiskManager::create(&path).expect("failed to create disk manager");
         let bpm = BufferPoolManager::new(pool_size, dm);
-        Self { bpm, dir, pool_size }
+        Self {
+            bpm,
+            dir,
+            pool_size,
+        }
     }
 
     /// Rebuild the BPM with a new pool size, reusing the same directory and DB file.

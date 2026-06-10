@@ -70,7 +70,10 @@ impl ColumnRemap {
         let mut seen = vec![false; table_count];
         let mut acc = 0usize;
         for &t in physical_order {
-            assert!(t < table_count && !seen[t], "physical_order is not a permutation");
+            assert!(
+                t < table_count && !seen[t],
+                "physical_order is not a permutation"
+            );
             seen[t] = true;
             physical_base[t] = acc;
             acc += widths[t];
@@ -96,7 +99,11 @@ impl ColumnRemap {
     /// Remap one tuple-global index (a projection / order-by / aggregate
     /// column).
     pub fn apply_index(&self, index: usize) -> usize {
-        assert!(index < self.map.len(), "column index {} out of range", index);
+        assert!(
+            index < self.map.len(),
+            "column index {} out of range",
+            index
+        );
         self.map[index]
     }
 
@@ -144,7 +151,11 @@ mod tests {
         Expression::Column(i)
     }
     fn eq(l: Expression, r: Expression) -> Predicate {
-        Predicate::Compare { op: CompareOp::Eq, left: l, right: r }
+        Predicate::Compare {
+            op: CompareOp::Eq,
+            left: l,
+            right: r,
+        }
     }
 
     #[test]
@@ -180,7 +191,11 @@ mod tests {
         let pred = eq(col(0), col(2));
         let remapped = remap.apply_predicate(pred);
         match remapped {
-            Predicate::Compare { left: Expression::Column(l), right: Expression::Column(r), .. } => {
+            Predicate::Compare {
+                left: Expression::Column(l),
+                right: Expression::Column(r),
+                ..
+            } => {
                 assert_eq!(l, 3);
                 assert_eq!(r, 0);
             }

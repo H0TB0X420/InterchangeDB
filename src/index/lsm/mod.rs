@@ -21,17 +21,17 @@ pub use engine::LsmEngine;
 /// A key-value entry where `None` value indicates a tombstone.
 pub(crate) type Entry = (Vec<u8>, Option<Vec<u8>>);
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use parking_lot::Mutex;
 
 use crate::common::error::Result;
 use config::DEFAULT_MEMTABLE_SIZE_BYTES;
 use manifest::{LevelState, Manifest};
 use memtable::Memtable;
 use merge_iterator::MergeIterator;
-use sstable::{SSTableReader, write_sstable};
+use sstable::{write_sstable, SSTableReader};
 
 /// Mutable state grouped behind a single Mutex for interior mutability.
 struct LsmInner {
@@ -195,10 +195,7 @@ impl LsmTree {
     }
 
     /// Scan a range of keys. Returns entries in sorted order, excluding tombstones.
-    pub fn scan<R: RangeBounds<Vec<u8>>>(
-        &self,
-        range: R,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // Lock inner to snapshot memtable state.
         let inner = self.inner.lock();
 
@@ -215,10 +212,7 @@ impl LsmTree {
 
         // 2. Immutable memtables (newest first).
         for imm in inner.immutable_memtables.iter().rev() {
-            let entries: Vec<Entry> = imm
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let entries: Vec<Entry> = imm.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             sources.push(entries);
         }
 

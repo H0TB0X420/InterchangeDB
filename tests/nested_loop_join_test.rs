@@ -27,8 +27,18 @@ fn warehouse_schema(id: u32) -> Schema {
         name: format!("warehouse_{}", id),
         table_id: TableId(id),
         columns: vec![
-            ColumnDef { name: "w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "w_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+            ColumnDef {
+                name: "w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "w_name".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -39,9 +49,24 @@ fn district_schema(id: u32) -> Schema {
         name: format!("district_{}", id),
         table_id: TableId(id),
         columns: vec![
-            ColumnDef { name: "d_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "d_w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "d_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+            ColumnDef {
+                name: "d_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "d_w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "d_name".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -55,17 +80,33 @@ fn join_returns_pairs_satisfying_predicate() {
     let w_table = Table::new(engine.clone(), w_schema.clone(), RowLayout);
     let d_table = Table::new(engine.clone(), d_schema.clone(), RowLayout);
 
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
-    w_table.insert(&[Value::Int32(2), Value::Varchar("DC2".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
+    w_table
+        .insert(&[Value::Int32(2), Value::Varchar("DC2".into())])
+        .unwrap();
 
     d_table
-        .insert(&[Value::Int32(10), Value::Int32(1), Value::Varchar("d-east".into())])
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(1),
+            Value::Varchar("d-east".into()),
+        ])
         .unwrap();
     d_table
-        .insert(&[Value::Int32(11), Value::Int32(1), Value::Varchar("d-west".into())])
+        .insert(&[
+            Value::Int32(11),
+            Value::Int32(1),
+            Value::Varchar("d-west".into()),
+        ])
         .unwrap();
     d_table
-        .insert(&[Value::Int32(20), Value::Int32(2), Value::Varchar("d-only".into())])
+        .insert(&[
+            Value::Int32(20),
+            Value::Int32(2),
+            Value::Varchar("d-only".into()),
+        ])
         .unwrap();
 
     // Join condition: w.w_id == d.d_w_id (outer cols: [0,1], inner cols: [0,1,2])
@@ -86,8 +127,14 @@ fn join_returns_pairs_satisfying_predicate() {
     assert_eq!(join.schema().columns.len(), 5);
     // Each joined row carries outer || inner contents.
     for row in &joined {
-        let w_id = match row[0] { Value::Int32(i) => i, _ => panic!() };
-        let d_w_id = match row[3] { Value::Int32(i) => i, _ => panic!() };
+        let w_id = match row[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        };
+        let d_w_id = match row[3] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        };
         assert_eq!(w_id, d_w_id, "join predicate violated: {:?}", row);
     }
 }
@@ -99,9 +146,15 @@ fn join_with_no_matches_yields_nothing() {
     let d_schema = Arc::new(district_schema(2));
     let w_table = Table::new(engine.clone(), w_schema, RowLayout);
     let d_table = Table::new(engine.clone(), d_schema, RowLayout);
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
     d_table
-        .insert(&[Value::Int32(10), Value::Int32(99), Value::Varchar("orphan".into())])
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(99),
+            Value::Varchar("orphan".into()),
+        ])
         .unwrap();
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
@@ -121,7 +174,11 @@ fn join_with_empty_outer_yields_nothing() {
     let d_table = Table::new(engine.clone(), d_schema, RowLayout);
     // Outer empty, inner non-empty.
     d_table
-        .insert(&[Value::Int32(10), Value::Int32(1), Value::Varchar("d".into())])
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(1),
+            Value::Varchar("d".into()),
+        ])
         .unwrap();
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
@@ -138,7 +195,9 @@ fn join_with_empty_inner_yields_nothing() {
     let d_schema = Arc::new(district_schema(2));
     let w_table = Table::new(engine.clone(), w_schema, RowLayout);
     let d_table = Table::new(engine.clone(), d_schema, RowLayout);
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
     // Inner empty.
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
@@ -156,10 +215,14 @@ fn cartesian_product_when_predicate_is_constant_true() {
     let w_table = Table::new(engine.clone(), w_schema, RowLayout);
     let d_table = Table::new(engine.clone(), d_schema, RowLayout);
     for i in 1..=3 {
-        w_table.insert(&[Value::Int32(i), Value::Varchar("w".into())]).unwrap();
+        w_table
+            .insert(&[Value::Int32(i), Value::Varchar("w".into())])
+            .unwrap();
     }
     for i in 1..=4 {
-        d_table.insert(&[Value::Int32(i), Value::Int32(i), Value::Varchar("d".into())]).unwrap();
+        d_table
+            .insert(&[Value::Int32(i), Value::Int32(i), Value::Varchar("d".into())])
+            .unwrap();
     }
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
@@ -207,11 +270,18 @@ fn join_disambiguates_duplicate_column_names_via_table_prefix() {
     let predicate: interchangedb::execution::JoinPredicate = Box::new(|_, _| false);
     let join = NestedLoopJoin::new(outer, inner, predicate).unwrap();
 
-    let names: Vec<&str> = join.schema().columns.iter().map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = join
+        .schema()
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     // Outer "common" stays; inner "common" gets prefixed.
     assert_eq!(names[0], "common");
     assert!(
-        names.iter().any(|n| n.ends_with(".common") && n.contains("district")),
+        names
+            .iter()
+            .any(|n| n.ends_with(".common") && n.contains("district")),
         "expected disambiguated inner column, got names: {:?}",
         names
     );

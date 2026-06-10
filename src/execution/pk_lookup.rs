@@ -30,10 +30,7 @@ pub struct PkLookup {
 impl PkLookup {
     /// Construct a PkLookup. Performs the get_by_pk eagerly so any
     /// constraint or engine error surfaces at construction.
-    pub fn new<E: StorageEngine, L: DataLayout>(
-        table: &Table<E, L>,
-        pk: &[Value],
-    ) -> Result<Self> {
+    pub fn new<E: StorageEngine, L: DataLayout>(table: &Table<E, L>, pk: &[Value]) -> Result<Self> {
         let row = table.get_by_pk(pk)?;
         let schema = Arc::new(table.schema().clone());
         Ok(Self {
@@ -83,8 +80,18 @@ mod tests {
             name: "account".into(),
             table_id: TableId(1),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                ColumnDef { name: "balance".into(), ty: ColumnType::Int64, nullable: false, default: None },
+                ColumnDef {
+                    name: "id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "balance".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
             ],
             primary_key: vec![0],
         });

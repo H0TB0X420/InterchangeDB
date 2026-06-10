@@ -222,14 +222,18 @@ fn decode_value(ty: &ColumnType, bytes: &[u8]) -> Result<(Value, usize)> {
     match ty {
         ColumnType::Int32 => {
             if bytes.len() < 4 {
-                return Err(Error::StorageCorrupted("tuple::decode Int32: need 4 bytes".into()));
+                return Err(Error::StorageCorrupted(
+                    "tuple::decode Int32: need 4 bytes".into(),
+                ));
             }
             let n = i32::from_le_bytes(bytes[..4].try_into().unwrap());
             Ok((Value::Int32(n), 4))
         }
         ColumnType::Int64 => {
             if bytes.len() < 8 {
-                return Err(Error::StorageCorrupted("tuple::decode Int64: need 8 bytes".into()));
+                return Err(Error::StorageCorrupted(
+                    "tuple::decode Int64: need 8 bytes".into(),
+                ));
             }
             let n = i64::from_le_bytes(bytes[..8].try_into().unwrap());
             Ok((Value::Int64(n), 8))
@@ -494,7 +498,11 @@ mod tests {
     fn decode_column_after_varlen() {
         // Schema: Int32, Varchar, Boolean. Want column 2 (Boolean) — must skip
         // Int32 (fixed 4 bytes) and Varchar (length-prefixed) without copying.
-        let types = vec![ColumnType::Int32, ColumnType::Varchar(64), ColumnType::Boolean];
+        let types = vec![
+            ColumnType::Int32,
+            ColumnType::Varchar(64),
+            ColumnType::Boolean,
+        ];
         let values = vec![
             Value::Int32(42),
             Value::Varchar("hello".into()),
@@ -509,7 +517,11 @@ mod tests {
     /// return `Value::Null` without touching value bytes.
     #[test]
     fn decode_column_null_returns_null() {
-        let types = vec![ColumnType::Int32, ColumnType::Varchar(64), ColumnType::Boolean];
+        let types = vec![
+            ColumnType::Int32,
+            ColumnType::Varchar(64),
+            ColumnType::Boolean,
+        ];
         let values = vec![Value::Int32(42), Value::Null, Value::Boolean(true)];
         let bytes = encode(&types, &values).unwrap();
         let v = decode_column(&types, &bytes, 1).unwrap();
@@ -523,8 +535,7 @@ mod tests {
         let types = vec![ColumnType::Int32];
         let values = vec![Value::Int32(0)];
         let bytes = encode(&types, &values).unwrap();
-        let err = decode_column(&types, &bytes, 5)
-            .expect_err("out-of-range col_idx should error");
+        let err = decode_column(&types, &bytes, 5).expect_err("out-of-range col_idx should error");
         assert!(matches!(err, Error::StorageCorrupted(ref m) if m.contains("out of range")));
     }
 

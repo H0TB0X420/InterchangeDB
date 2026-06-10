@@ -228,7 +228,11 @@ fn format_levels(ls: &interchangedb::index::lsm::manifest::LevelState) -> String
             parts.push(format!("L{}={}B", i, bytes));
         }
     }
-    if parts.is_empty() { "empty".into() } else { parts.join(",") }
+    if parts.is_empty() {
+        "empty".into()
+    } else {
+        parts.join(",")
+    }
 }
 
 criterion_group!(benches, bench_lsm_insert, bench_lsm_read, bench_lsm_write);

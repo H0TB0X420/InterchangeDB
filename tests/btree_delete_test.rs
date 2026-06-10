@@ -148,7 +148,10 @@ fn test_delete_no_iterator() {
     // Remove the last key — tree should become empty.
     let k = encode_key(2);
     tree.delete(&k).unwrap();
-    assert!(tree.is_empty().unwrap(), "Tree should be empty after deleting all keys");
+    assert!(
+        tree.is_empty().unwrap(),
+        "Tree should be empty after deleting all keys"
+    );
 }
 
 /// BusTub: OptimisticDeleteTest (adapted)
@@ -193,7 +196,10 @@ fn test_optimistic_delete() {
     tree.delete(&k).unwrap();
 
     // Verify deleted key is gone.
-    assert!(tree.get(&k).unwrap().is_none(), "Deleted key should be gone");
+    assert!(
+        tree.get(&k).unwrap().is_none(),
+        "Deleted key should be gone"
+    );
 
     // Verify all other keys still present.
     for i in 0..num_keys {
@@ -263,6 +269,10 @@ fn test_sequential_edge_mix() {
         }
 
         // Tree should be empty.
-        assert!(tree.is_empty().unwrap(), "Tree should be empty for leaf_max_size={}", leaf_max_size);
+        assert!(
+            tree.is_empty().unwrap(),
+            "Tree should be empty for leaf_max_size={}",
+            leaf_max_size
+        );
     }
 }

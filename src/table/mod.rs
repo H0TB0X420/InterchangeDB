@@ -88,12 +88,7 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
     /// suffix lets non-unique indexes hold multiple entries per
     /// secondary key value (distinguished by the pk-tiebreak suffix).
     fn build_index_key(&self, ix: &IndexHandle, row_values: &[Value]) -> Result<Vec<u8>> {
-        let mut components: Vec<&Value> = ix
-            .def
-            .columns
-            .iter()
-            .map(|&i| &row_values[i])
-            .collect();
+        let mut components: Vec<&Value> = ix.def.columns.iter().map(|&i| &row_values[i]).collect();
         for &pk_col in &self.schema.primary_key {
             components.push(&row_values[pk_col]);
         }
@@ -132,7 +127,11 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
             column_types: &column_types,
             table_id: self.schema.table_id,
         };
-        if self.layout.get_row(&*self.engine, ctx, &pk_encoded)?.is_some() {
+        if self
+            .layout
+            .get_row(&*self.engine, ctx, &pk_encoded)?
+            .is_some()
+        {
             return Err(Error::DuplicateKey {
                 table: self.schema.name.clone(),
             });
@@ -201,11 +200,7 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
     /// Update specific columns at the given PK. Per-column type/bounds
     /// validation runs first; nullability is *not* re-checked (the existing
     /// row already passed it; partial update doesn't reset that invariant).
-    pub fn update_columns(
-        &self,
-        pk_values: &[Value],
-        changes: &[(usize, Value)],
-    ) -> Result<()> {
+    pub fn update_columns(&self, pk_values: &[Value], changes: &[(usize, Value)]) -> Result<()> {
         for (col_idx, new_val) in changes {
             check_type_compat_one(&self.schema, *col_idx, new_val)?;
             check_value_bounds_one(&self.schema, *col_idx, new_val)?;
@@ -288,11 +283,7 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
     }
 
     /// Range scan over PKs in `[pk_start, pk_end)`. Half-open.
-    pub fn scan_range(
-        &self,
-        pk_start: &[Value],
-        pk_end: &[Value],
-    ) -> Result<Vec<Vec<Value>>> {
+    pub fn scan_range(&self, pk_start: &[Value], pk_end: &[Value]) -> Result<Vec<Vec<Value>>> {
         let start_encoded = self.encode_pk_components(pk_start)?;
         let end_encoded = self.encode_pk_components(pk_end)?;
         let column_types = self.column_types_vec();
@@ -418,7 +409,8 @@ mod tests {
     fn row(id: i32, name: Option<&str>, balance_cents: i64) -> Vec<Value> {
         vec![
             Value::Int32(id),
-            name.map(|s| Value::Varchar(s.into())).unwrap_or(Value::Null),
+            name.map(|s| Value::Varchar(s.into()))
+                .unwrap_or(Value::Null),
             Value::Decimal(Decimal::from_i64_with_scale(balance_cents, 2)),
         ]
     }
@@ -451,7 +443,13 @@ mod tests {
         let err = table
             .insert(&[Value::Int32(1)])
             .expect_err("arity mismatch should error");
-        assert!(matches!(err, Error::ConstraintViolation { rule: ConstraintRule::Arity { .. }, .. }));
+        assert!(matches!(
+            err,
+            Error::ConstraintViolation {
+                rule: ConstraintRule::Arity { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -526,12 +524,18 @@ mod tests {
         let (table, _dir) = account_table();
         table.insert(&row(1, Some("alice"), 100)).unwrap();
         table
-            .update_columns(&[Value::Int32(1)], &[(2, Value::Decimal(Decimal::from_i64_with_scale(500, 2)))])
+            .update_columns(
+                &[Value::Int32(1)],
+                &[(2, Value::Decimal(Decimal::from_i64_with_scale(500, 2)))],
+            )
             .unwrap();
 
         let back = table.get_by_pk(&[Value::Int32(1)]).unwrap().unwrap();
         assert_eq!(back[1], Value::Varchar("alice".into())); // unchanged
-        assert_eq!(back[2], Value::Decimal(Decimal::from_i64_with_scale(500, 2)));
+        assert_eq!(
+            back[2],
+            Value::Decimal(Decimal::from_i64_with_scale(500, 2))
+        );
     }
 
     #[test]

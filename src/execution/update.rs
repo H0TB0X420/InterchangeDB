@@ -37,11 +37,7 @@ pub struct Update<E: StorageEngine, L: DataLayout> {
 }
 
 impl<E: StorageEngine, L: DataLayout> Update<E, L> {
-    pub fn new(
-        table: Arc<Table<E, L>>,
-        child: Box<dyn Executor>,
-        set_exprs: Vec<SetExpr>,
-    ) -> Self {
+    pub fn new(table: Arc<Table<E, L>>, child: Box<dyn Executor>, set_exprs: Vec<SetExpr>) -> Self {
         Self {
             table,
             child,
@@ -65,8 +61,7 @@ impl<E: StorageEngine + 'static, L: DataLayout> Executor for Update<E, L> {
         let pk_indices = self.table.schema().primary_key.clone();
         let mut count: i64 = 0;
         while let Some(row) = self.child.next()? {
-            let pk_values: Vec<Value> =
-                pk_indices.iter().map(|&i| row[i].clone()).collect();
+            let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
             let changes: Vec<(usize, Value)> = self
                 .set_exprs
                 .iter()
@@ -101,8 +96,8 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{ColumnDef, TableId};
-    use crate::execution::seq_scan::SeqScan;
     use crate::execution::filter::Filter;
+    use crate::execution::seq_scan::SeqScan;
     use crate::index::btree::BTreeEngine;
     use crate::layout::RowLayout;
     use crate::storage::FileDiskManager;
@@ -119,8 +114,18 @@ mod tests {
             name: "account".into(),
             table_id: TableId(1),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                ColumnDef { name: "balance".into(), ty: ColumnType::Int64, nullable: false, default: None },
+                ColumnDef {
+                    name: "id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "balance".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
             ],
             primary_key: vec![0],
         });

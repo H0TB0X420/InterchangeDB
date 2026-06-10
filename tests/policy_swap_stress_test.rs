@@ -48,7 +48,6 @@ fn fresh_policy(i: usize) -> Box<dyn EvictionPolicy> {
     }
 }
 
-
 fn build_bpm() -> Arc<BufferPoolManager> {
     Arc::new(BufferPoolManager::new(POOL_SIZE, MemoryDiskManager::new()))
 }
@@ -138,7 +137,11 @@ fn marquee_hot_swap_storm_all_six_policies_both_modes() {
             let mut issued = 0usize;
             while Instant::now() < storm_until {
                 let policy = fresh_policy(i);
-                let mode = if i % 2 == 0 { SwapMode::Cold } else { SwapMode::Warm };
+                let mode = if i % 2 == 0 {
+                    SwapMode::Cold
+                } else {
+                    SwapMode::Warm
+                };
                 let result = bpm.swap_policy(policy, mode);
                 assert!(
                     !result.old_policy.is_empty(),
@@ -182,9 +185,9 @@ fn marquee_hot_swap_storm_all_six_policies_both_modes() {
     // matching the seeded marker. Writes may have stamped byte 2048; we
     // don't require byte 0/4095 to have changed.
     for (pid, marker) in &seeded {
-        let guard = bpm.fetch_page_read(*pid).unwrap_or_else(|e| {
-            panic!("post-storm read of {:?} failed: {:?}", pid, e)
-        });
+        let guard = bpm
+            .fetch_page_read(*pid)
+            .unwrap_or_else(|e| panic!("post-storm read of {:?} failed: {:?}", pid, e));
         let data = guard.as_slice();
         assert_eq!(
             data[0], *marker,

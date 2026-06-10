@@ -229,7 +229,11 @@ fn run_lsm(n_keys: usize, memtable_bytes: usize) -> (f64, f64) {
     }
     eprintln!(
         "    lsm   levels: {}",
-        if levels.is_empty() { "empty".into() } else { levels.join(",") }
+        if levels.is_empty() {
+            "empty".into()
+        } else {
+            levels.join(",")
+        }
     );
 
     (insert_ops, read_ops)

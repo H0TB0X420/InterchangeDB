@@ -221,7 +221,11 @@ fn test_concurrent_delete() {
                 let end = start + keys_per_thread as i64;
                 for i in start..end {
                     let key = encode_key(i);
-                    assert!(tree.delete(&key).unwrap(), "Key {} should exist for delete", i);
+                    assert!(
+                        tree.delete(&key).unwrap(),
+                        "Key {} should exist for delete",
+                        i
+                    );
                 }
             });
         }
@@ -380,7 +384,12 @@ fn test_concurrent_insert_delete_mix() {
     for (k, _v) in &all {
         let key_val = decode_key(k);
         if let Some(p) = prev {
-            assert!(key_val > p, "Keys not in sorted order: {} after {}", key_val, p);
+            assert!(
+                key_val > p,
+                "Keys not in sorted order: {} after {}",
+                key_val,
+                p
+            );
         }
         prev = Some(key_val);
         present_keys.insert(key_val);
@@ -393,11 +402,19 @@ fn test_concurrent_insert_delete_mix() {
 
     // Even keys [50, 52, ..., 98] should still be present (not deleted).
     for i in (key_count / 2..key_count).step_by(2) {
-        assert!(present_keys.contains(&i), "Even key {} (not deleted) should be present", i);
+        assert!(
+            present_keys.contains(&i),
+            "Even key {} (not deleted) should be present",
+            i
+        );
     }
 
     // Even keys [0, 2, ..., 48] should be deleted.
     for i in (0..key_count / 2).step_by(2) {
-        assert!(!present_keys.contains(&i), "Even key {} should have been deleted", i);
+        assert!(
+            !present_keys.contains(&i),
+            "Even key {} should have been deleted",
+            i
+        );
     }
 }

@@ -244,10 +244,7 @@ mod tests {
             writer.set_max_segment_size(100);
 
             for i in 0..20 {
-                let mut record = LogRecord::put(
-                    format!("k{:04}", i).into_bytes(),
-                    b"v".to_vec(),
-                );
+                let mut record = LogRecord::put(format!("k{:04}", i).into_bytes(), b"v".to_vec());
                 writer.append(&mut record).unwrap();
             }
             writer.sync().unwrap();
@@ -283,10 +280,7 @@ mod tests {
             writer.set_max_segment_size(100);
 
             for i in 0..20 {
-                let mut record = LogRecord::put(
-                    format!("k{:04}", i).into_bytes(),
-                    b"v".to_vec(),
-                );
+                let mut record = LogRecord::put(format!("k{:04}", i).into_bytes(), b"v".to_vec());
                 writer.append(&mut record).unwrap();
             }
             writer.sync().unwrap();

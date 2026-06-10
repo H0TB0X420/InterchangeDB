@@ -81,10 +81,7 @@ pub fn gc_collect<E: StorageEngine>(
 
     // Phase 1: Scan all versions, identify reclaimable ones.
     // Collect into Vec first — can't mutate engine during scan.
-    let all_entries: Vec<(Vec<u8>, Vec<u8>)> = engine
-        .scan(..)
-        .filter_map(|r| r.ok())
-        .collect();
+    let all_entries: Vec<(Vec<u8>, Vec<u8>)> = engine.scan(..).filter_map(|r| r.ok()).collect();
 
     let mut current_user_key: Option<Vec<u8>> = None;
     let mut found_keeper = false;
@@ -124,8 +121,7 @@ pub fn gc_collect<E: StorageEngine>(
         // Pre-checkpoint heuristic ("assume committed") is overridden by
         // definitive evidence the writer aborted or never committed.
         let is_committed = !non_committed.contains(&version_txn_id)
-            && (committed_txns.contains_key(&version_txn_id)
-                || version_ts <= checkpoint_ts);
+            && (committed_txns.contains_key(&version_txn_id) || version_ts <= checkpoint_ts);
 
         // Uncommitted/aborted version below watermark — always remove.
         if !is_committed {

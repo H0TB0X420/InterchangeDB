@@ -144,8 +144,7 @@ fn concurrent_counter_increments_no_lost_updates() {
             thread::spawn(move || {
                 barrier.wait();
                 for iter in 0..100u16 {
-                    let counter_idx =
-                        ((thread_idx as u16 * 7 + iter * 3) % 10) as u8;
+                    let counter_idx = ((thread_idx as u16 * 7 + iter * 3) % 10) as u8;
                     loop {
                         match increment_counter(&db, &[counter_idx]) {
                             Ok(()) => break,

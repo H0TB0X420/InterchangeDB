@@ -23,8 +23,18 @@ fn warehouse_schema() -> Schema {
         name: "warehouse".into(),
         table_id: TableId(1),
         columns: vec![
-            ColumnDef { name: "w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "w_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+            ColumnDef {
+                name: "w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "w_name".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -35,9 +45,24 @@ fn district_schema() -> Schema {
         name: "district".into(),
         table_id: TableId(2),
         columns: vec![
-            ColumnDef { name: "d_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "d_w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "d_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+            ColumnDef {
+                name: "d_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "d_w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "d_name".into(),
+                ty: ColumnType::Varchar(20),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
@@ -51,13 +76,37 @@ fn hash_join_returns_matching_pairs() {
     let w_table = Table::new(engine.clone(), w_schema.clone(), RowLayout);
     let d_table = Table::new(engine.clone(), d_schema.clone(), RowLayout);
 
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
-    w_table.insert(&[Value::Int32(2), Value::Varchar("DC2".into())]).unwrap();
-    w_table.insert(&[Value::Int32(3), Value::Varchar("DC3".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
+    w_table
+        .insert(&[Value::Int32(2), Value::Varchar("DC2".into())])
+        .unwrap();
+    w_table
+        .insert(&[Value::Int32(3), Value::Varchar("DC3".into())])
+        .unwrap();
 
-    d_table.insert(&[Value::Int32(10), Value::Int32(1), Value::Varchar("east".into())]).unwrap();
-    d_table.insert(&[Value::Int32(11), Value::Int32(1), Value::Varchar("west".into())]).unwrap();
-    d_table.insert(&[Value::Int32(20), Value::Int32(2), Value::Varchar("only".into())]).unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(1),
+            Value::Varchar("east".into()),
+        ])
+        .unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(11),
+            Value::Int32(1),
+            Value::Varchar("west".into()),
+        ])
+        .unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(20),
+            Value::Int32(2),
+            Value::Varchar("only".into()),
+        ])
+        .unwrap();
     // w_id=3 has no districts.
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
@@ -72,8 +121,14 @@ fn hash_join_returns_matching_pairs() {
     // 3 matching pairs: (w=1,d=10), (w=1,d=11), (w=2,d=20). w=3 → none.
     assert_eq!(rows.len(), 3);
     for row in &rows {
-        let w_id = match row[0] { Value::Int32(i) => i, _ => panic!() };
-        let d_w_id = match row[3] { Value::Int32(i) => i, _ => panic!() };
+        let w_id = match row[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        };
+        let d_w_id = match row[3] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        };
         assert_eq!(w_id, d_w_id);
     }
 }
@@ -83,8 +138,16 @@ fn hash_join_with_no_matches_yields_nothing() {
     let (engine, _d) = fresh_engine();
     let w_table = Table::new(engine.clone(), Arc::new(warehouse_schema()), RowLayout);
     let d_table = Table::new(engine.clone(), Arc::new(district_schema()), RowLayout);
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
-    d_table.insert(&[Value::Int32(10), Value::Int32(99), Value::Varchar("orphan".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(99),
+            Value::Varchar("orphan".into()),
+        ])
+        .unwrap();
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
     let inner = Box::new(SeqScan::new(&d_table).unwrap());
@@ -97,7 +160,9 @@ fn hash_join_with_empty_inner_yields_nothing() {
     let (engine, _d) = fresh_engine();
     let w_table = Table::new(engine.clone(), Arc::new(warehouse_schema()), RowLayout);
     let d_table = Table::new(engine.clone(), Arc::new(district_schema()), RowLayout);
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
     // No inner rows.
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
@@ -111,7 +176,13 @@ fn hash_join_with_empty_outer_yields_nothing() {
     let (engine, _d) = fresh_engine();
     let w_table = Table::new(engine.clone(), Arc::new(warehouse_schema()), RowLayout);
     let d_table = Table::new(engine.clone(), Arc::new(district_schema()), RowLayout);
-    d_table.insert(&[Value::Int32(10), Value::Int32(1), Value::Varchar("d".into())]).unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(1),
+            Value::Varchar("d".into()),
+        ])
+        .unwrap();
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
     let inner = Box::new(SeqScan::new(&d_table).unwrap());
     let mut join = HashJoin::new(outer, inner, 0, 1).unwrap();
@@ -125,10 +196,18 @@ fn hash_join_emits_one_row_per_match_for_many_to_one() {
     let d_table = Table::new(engine.clone(), Arc::new(district_schema()), RowLayout);
     // Five outer rows all pointing at the same inner key.
     for i in 1..=5 {
-        w_table.insert(&[Value::Int32(i), Value::Varchar("w".into())]).unwrap();
+        w_table
+            .insert(&[Value::Int32(i), Value::Varchar("w".into())])
+            .unwrap();
     }
     // One inner row keyed at w_id = 3.
-    d_table.insert(&[Value::Int32(10), Value::Int32(3), Value::Varchar("only_match".into())]).unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(3),
+            Value::Varchar("only_match".into()),
+        ])
+        .unwrap();
 
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
     let inner = Box::new(SeqScan::new(&d_table).unwrap());
@@ -148,10 +227,14 @@ fn hash_join_one_to_many_outputs_cross_product_per_outer_row() {
     let w_table = Table::new(engine.clone(), Arc::new(warehouse_schema()), RowLayout);
     let d_table = Table::new(engine.clone(), Arc::new(district_schema()), RowLayout);
     // One outer row.
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
     // Three inner rows all keyed at w_id = 1.
     for i in 10..13 {
-        d_table.insert(&[Value::Int32(i), Value::Int32(1), Value::Varchar("x".into())]).unwrap();
+        d_table
+            .insert(&[Value::Int32(i), Value::Int32(1), Value::Varchar("x".into())])
+            .unwrap();
     }
     let outer = Box::new(SeqScan::new(&w_table).unwrap());
     let inner = Box::new(SeqScan::new(&d_table).unwrap());
@@ -171,8 +254,18 @@ fn hash_join_skips_null_keys_on_both_sides() {
         name: "ni".into(),
         table_id: TableId(3),
         columns: vec![
-            ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "k".into(), ty: ColumnType::Int32, nullable: true, default: None },
+            ColumnDef {
+                name: "id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "k".into(),
+                ty: ColumnType::Int32,
+                nullable: true,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     });
@@ -180,9 +273,24 @@ fn hash_join_skips_null_keys_on_both_sides() {
         name: "no".into(),
         table_id: TableId(4),
         columns: vec![
-            ColumnDef { name: "id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-            ColumnDef { name: "k".into(), ty: ColumnType::Int32, nullable: true, default: None },
-            ColumnDef { name: "lbl".into(), ty: ColumnType::Varchar(8), nullable: false, default: None },
+            ColumnDef {
+                name: "id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "k".into(),
+                ty: ColumnType::Int32,
+                nullable: true,
+                default: None,
+            },
+            ColumnDef {
+                name: "lbl".into(),
+                ty: ColumnType::Varchar(8),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     });
@@ -190,11 +298,19 @@ fn hash_join_skips_null_keys_on_both_sides() {
     let outer_t = Table::new(engine.clone(), null_outer.clone(), RowLayout);
     let inner_t = Table::new(engine.clone(), null_inner.clone(), RowLayout);
     // Outer: (id=1, k=1, "a"), (id=2, k=NULL, "b"). Inner: (10, 1), (11, NULL), (12, 1).
-    outer_t.insert(&[Value::Int32(1), Value::Int32(1), Value::Varchar("a".into())]).unwrap();
-    outer_t.insert(&[Value::Int32(2), Value::Null, Value::Varchar("b".into())]).unwrap();
-    inner_t.insert(&[Value::Int32(10), Value::Int32(1)]).unwrap();
+    outer_t
+        .insert(&[Value::Int32(1), Value::Int32(1), Value::Varchar("a".into())])
+        .unwrap();
+    outer_t
+        .insert(&[Value::Int32(2), Value::Null, Value::Varchar("b".into())])
+        .unwrap();
+    inner_t
+        .insert(&[Value::Int32(10), Value::Int32(1)])
+        .unwrap();
     inner_t.insert(&[Value::Int32(11), Value::Null]).unwrap();
-    inner_t.insert(&[Value::Int32(12), Value::Int32(1)]).unwrap();
+    inner_t
+        .insert(&[Value::Int32(12), Value::Int32(1)])
+        .unwrap();
 
     let mut join = HashJoin::new(
         Box::new(SeqScan::new(&outer_t).unwrap()),

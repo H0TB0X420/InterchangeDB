@@ -56,7 +56,8 @@ fn crash_restart_loop_100() {
                     got,
                     Some(expected.into_bytes()),
                     "Iteration {}: key_{:04} missing after crash-restart",
-                    i, j
+                    i,
+                    j
                 );
             }
         }
@@ -78,7 +79,8 @@ fn crash_mid_transaction_uncommitted_invisible() {
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for i in 0..5 {
             let key = format!("uncommitted_{}", i);
-            db.txn_put(txn, key.as_bytes(), b"should_not_survive").unwrap();
+            db.txn_put(txn, key.as_bytes(), b"should_not_survive")
+                .unwrap();
         }
         // Crash without commit.
     }
@@ -151,9 +153,21 @@ fn crash_mixed_transaction_states() {
     }
 
     let db = open_btree(dir.path());
-    assert_eq!(db.get(b"t1_key").unwrap(), Some(b"t1_val".to_vec()), "Committed T1 must survive");
-    assert_eq!(db.get(b"t2_key").unwrap(), None, "Aborted T2 must not survive");
-    assert_eq!(db.get(b"t3_key").unwrap(), None, "Uncommitted T3 must not survive");
+    assert_eq!(
+        db.get(b"t1_key").unwrap(),
+        Some(b"t1_val".to_vec()),
+        "Committed T1 must survive"
+    );
+    assert_eq!(
+        db.get(b"t2_key").unwrap(),
+        None,
+        "Aborted T2 must not survive"
+    );
+    assert_eq!(
+        db.get(b"t3_key").unwrap(),
+        None,
+        "Uncommitted T3 must not survive"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -178,19 +192,23 @@ fn recovery_idempotent() {
     // First recovery.
     let state_1: Vec<_> = {
         let db = open_btree(dir.path());
-        (0..10).map(|i| {
-            let key = format!("idem_{}", i);
-            db.get(key.as_bytes()).unwrap()
-        }).collect()
+        (0..10)
+            .map(|i| {
+                let key = format!("idem_{}", i);
+                db.get(key.as_bytes()).unwrap()
+            })
+            .collect()
     };
 
     // Second recovery (from the same WAL state — no new writes between).
     let state_2: Vec<_> = {
         let db = open_btree(dir.path());
-        (0..10).map(|i| {
-            let key = format!("idem_{}", i);
-            db.get(key.as_bytes()).unwrap()
-        }).collect()
+        (0..10)
+            .map(|i| {
+                let key = format!("idem_{}", i);
+                db.get(key.as_bytes()).unwrap()
+            })
+            .collect()
     };
 
     assert_eq!(state_1, state_2, "Recovery must be idempotent");
@@ -262,10 +280,16 @@ fn recovery_after_gc() {
     }
 
     let db = open_btree(dir.path());
-    assert_eq!(db.get(b"new_key").unwrap(), Some(b"new_value".to_vec()),
-        "new_key must survive GC + checkpoint + crash");
-    assert_eq!(db.get(b"gc_key").unwrap(), Some(b"final_value".to_vec()),
-        "gc_key must have final_value after GC + checkpoint + crash");
+    assert_eq!(
+        db.get(b"new_key").unwrap(),
+        Some(b"new_value".to_vec()),
+        "new_key must survive GC + checkpoint + crash"
+    );
+    assert_eq!(
+        db.get(b"gc_key").unwrap(),
+        Some(b"final_value".to_vec()),
+        "gc_key must have final_value after GC + checkpoint + crash"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +342,10 @@ fn atomicity_multi_key_transaction() {
             db.get(key.as_bytes()).unwrap().is_some()
         })
         .count();
-    assert_eq!(count_b, 0, "Uncommitted txn: NONE of 10 keys should be present");
+    assert_eq!(
+        count_b, 0,
+        "Uncommitted txn: NONE of 10 keys should be present"
+    );
 }
 
 // ---------------------------------------------------------------------------

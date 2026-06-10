@@ -80,7 +80,10 @@ impl LevelState {
 
     /// Size of a specific level in bytes.
     pub fn level_size(&self, level: usize) -> u64 {
-        assert!(level < MAX_LEVEL_COUNT, "level {level} >= {MAX_LEVEL_COUNT}");
+        assert!(
+            level < MAX_LEVEL_COUNT,
+            "level {level} >= {MAX_LEVEL_COUNT}"
+        );
         self.levels[level].iter().map(|m| m.file_size).sum()
     }
 }
@@ -124,12 +127,15 @@ impl Manifest {
         }
 
         // Open for append.
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
-        Ok((Self { path: path.to_path_buf(), file }, state))
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                file,
+            },
+            state,
+        ))
     }
 
     /// Record that an SSTable was added to a level.
@@ -192,9 +198,7 @@ fn replay_line(line: &str, state: &mut LevelState, sst_dir: &Path) -> Result<()>
                 .map_err(|_| Error::StorageCorrupted(format!("bad file_size: {}", parts[5])))?;
             let entry_count: u64 = parts[6]
                 .parse()
-                .map_err(|_| {
-                    Error::StorageCorrupted(format!("bad entry_count: {}", parts[6]))
-                })?;
+                .map_err(|_| Error::StorageCorrupted(format!("bad entry_count: {}", parts[6])))?;
 
             assert!(
                 level < MAX_LEVEL_COUNT,

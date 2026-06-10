@@ -47,7 +47,9 @@ fn warehouse_schema() -> Schema {
 fn index_backend_round_trips_through_sys_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let cat = fresh_catalog_in(dir.path());
-    let table_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let table_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
 
     let btree_idx = cat
         .create_index(IndexDef {
@@ -96,7 +98,9 @@ fn index_metadata_survives_catalog_reopen() {
     let idx_id;
     {
         let cat = fresh_catalog_in(dir.path());
-        table_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+        table_id = cat
+            .create_table("warehouse".into(), warehouse_schema())
+            .unwrap();
         idx_id = cat
             .create_index(IndexDef {
                 name: "warehouse_by_name".into(),

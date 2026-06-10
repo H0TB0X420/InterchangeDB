@@ -43,8 +43,18 @@ fn setup_with_indexed_district() -> Setup {
                 name: "warehouse".into(),
                 table_id: TableId(0),
                 columns: vec![
-                    ColumnDef { name: "w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                    ColumnDef { name: "w_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+                    ColumnDef {
+                        name: "w_id".into(),
+                        ty: ColumnType::Int32,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDef {
+                        name: "w_name".into(),
+                        ty: ColumnType::Varchar(20),
+                        nullable: false,
+                        default: None,
+                    },
                 ],
                 primary_key: vec![0],
             },
@@ -59,9 +69,24 @@ fn setup_with_indexed_district() -> Setup {
                 name: "district".into(),
                 table_id: TableId(0),
                 columns: vec![
-                    ColumnDef { name: "d_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                    ColumnDef { name: "d_w_id".into(), ty: ColumnType::Int32, nullable: false, default: None },
-                    ColumnDef { name: "d_name".into(), ty: ColumnType::Varchar(20), nullable: false, default: None },
+                    ColumnDef {
+                        name: "d_id".into(),
+                        ty: ColumnType::Int32,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDef {
+                        name: "d_w_id".into(),
+                        ty: ColumnType::Int32,
+                        nullable: false,
+                        default: None,
+                    },
+                    ColumnDef {
+                        name: "d_name".into(),
+                        ty: ColumnType::Varchar(20),
+                        nullable: false,
+                        default: None,
+                    },
                 ],
                 primary_key: vec![0],
             },
@@ -83,21 +108,49 @@ fn setup_with_indexed_district() -> Setup {
         .indexes_for_table(w_schema.table_id, &w_schema)
         .unwrap();
     let w_table = Table::with_indexes(engine.clone(), w_schema, RowLayout, w_indexes);
-    w_table.insert(&[Value::Int32(1), Value::Varchar("DC1".into())]).unwrap();
-    w_table.insert(&[Value::Int32(2), Value::Varchar("DC2".into())]).unwrap();
-    w_table.insert(&[Value::Int32(3), Value::Varchar("DC3".into())]).unwrap();
+    w_table
+        .insert(&[Value::Int32(1), Value::Varchar("DC1".into())])
+        .unwrap();
+    w_table
+        .insert(&[Value::Int32(2), Value::Varchar("DC2".into())])
+        .unwrap();
+    w_table
+        .insert(&[Value::Int32(3), Value::Varchar("DC3".into())])
+        .unwrap();
 
     let d_schema = catalog.get_table("district").unwrap();
     let d_indexes = catalog
         .indexes_for_table(d_schema.table_id, &d_schema)
         .unwrap();
     let d_table = Table::with_indexes(engine.clone(), d_schema, RowLayout, d_indexes);
-    d_table.insert(&[Value::Int32(10), Value::Int32(1), Value::Varchar("east".into())]).unwrap();
-    d_table.insert(&[Value::Int32(11), Value::Int32(1), Value::Varchar("west".into())]).unwrap();
-    d_table.insert(&[Value::Int32(20), Value::Int32(2), Value::Varchar("only".into())]).unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(10),
+            Value::Int32(1),
+            Value::Varchar("east".into()),
+        ])
+        .unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(11),
+            Value::Int32(1),
+            Value::Varchar("west".into()),
+        ])
+        .unwrap();
+    d_table
+        .insert(&[
+            Value::Int32(20),
+            Value::Int32(2),
+            Value::Varchar("only".into()),
+        ])
+        .unwrap();
     // w_id=3 has no districts → no rows in the inner join output.
 
-    Setup { catalog, engine, _dir: dir }
+    Setup {
+        catalog,
+        engine,
+        _dir: dir,
+    }
 }
 
 fn plan_sql(s: &Setup, sql: &str) -> PhysicalPlan {
@@ -153,8 +206,14 @@ fn explicit_inner_join_executes_to_matching_rows() {
     assert_eq!(rows.len(), 3);
     // Each row carries w.w_id == d.d_w_id.
     for row in &rows {
-        let w_id = match row[0] { Value::Int32(i) => i, _ => panic!() };
-        let d_w_id = match row[3] { Value::Int32(i) => i, _ => panic!() };
+        let w_id = match row[0] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        };
+        let d_w_id = match row[3] {
+            Value::Int32(i) => i,
+            _ => panic!(),
+        };
         assert_eq!(w_id, d_w_id);
     }
 }

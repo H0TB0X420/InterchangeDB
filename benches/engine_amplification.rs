@@ -141,7 +141,12 @@ fn main() {
     );
     let mut table = MarkdownTable::new(
         &[
-            "Engine", "Workload", "WAF", "RAF", "Disk MB written", "Disk MB read",
+            "Engine",
+            "Workload",
+            "WAF",
+            "RAF",
+            "Disk MB written",
+            "Disk MB read",
         ],
         &[false, false, true, true, true, true],
     );
@@ -163,7 +168,10 @@ fn main() {
     println!("\n=== engine_amplification summary ===");
     table.print();
     println!("\nCSV: {}", csv_path.display());
-    println!("\nNote: LSM WAF is a lower bound (poller can miss sub-{:?} flush/compact storms).", POLL_INTERVAL);
+    println!(
+        "\nNote: LSM WAF is a lower bound (poller can miss sub-{:?} flush/compact storms).",
+        POLL_INTERVAL
+    );
     println!("Note: LSM RAF is approximated as level_count + 1; real RAF is lower thanks to bloom filters.");
 }
 
@@ -228,7 +236,10 @@ fn run_btree(workload: Workload, bpm_frames: usize) -> AmpResult {
     let tree = BTree::with_sizes(&bpm, header_id, LEAF_MAX, INTERNAL_MAX);
 
     // --- Pre-fill (for update workloads) ---
-    if matches!(workload, Workload::UniformUpdates | Workload::ZipfianUpdates) {
+    if matches!(
+        workload,
+        Workload::UniformUpdates | Workload::ZipfianUpdates
+    ) {
         for key in 0..UPDATE_PREFILL {
             let k = encode_key_i64(key as i64);
             let v = encode_value_u64(key as u64);
@@ -314,7 +325,10 @@ fn run_lsm(workload: Workload, memtable_bytes: usize) -> AmpResult {
     let tree = LsmTree::open_with_memtable_size(dir.path(), memtable_bytes).unwrap();
 
     // --- Pre-fill (for update workloads) ---
-    if matches!(workload, Workload::UniformUpdates | Workload::ZipfianUpdates) {
+    if matches!(
+        workload,
+        Workload::UniformUpdates | Workload::ZipfianUpdates
+    ) {
         for key in 0..UPDATE_PREFILL {
             let k = encode_key_vec(key as i64);
             let v = encode_value_vec(key as u64);
@@ -369,8 +383,7 @@ fn run_lsm(workload: Workload, memtable_bytes: usize) -> AmpResult {
     // Give the poller a chance to capture the final flush before we stop it.
     std::thread::sleep(POLL_INTERVAL * 3);
     let (deleted_bytes, current_bytes) = poller.finish();
-    let bytes_written_to_disk =
-        (deleted_bytes + current_bytes).saturating_sub(pre_workload_disk);
+    let bytes_written_to_disk = (deleted_bytes + current_bytes).saturating_sub(pre_workload_disk);
 
     // --- Read phase for RAF (approximation: level_count + 1) ---
     let level_state = tree.level_state();
@@ -399,8 +412,7 @@ fn run_lsm(workload: Workload, memtable_bytes: usize) -> AmpResult {
     let user_bytes_read = (READS_FOR_RAF * RECORD_BYTES) as u64;
     // Assume each "page read" equals a 4 KB block worth of I/O for direct
     // comparability with the B+Tree number.
-    let bytes_read_from_disk =
-        approx_pages_per_read * PAGE_SIZE as u64 * READS_FOR_RAF as u64;
+    let bytes_read_from_disk = approx_pages_per_read * PAGE_SIZE as u64 * READS_FOR_RAF as u64;
 
     AmpResult {
         user_bytes_written,

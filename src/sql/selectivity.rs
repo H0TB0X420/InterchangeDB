@@ -53,9 +53,7 @@ pub fn estimate_predicate_selectivity(
     column_stats: &[Option<ColumnStats>],
 ) -> f64 {
     let raw = match pred {
-        Predicate::Compare { op, left, right } => {
-            estimate_compare(*op, left, right, column_stats)
-        }
+        Predicate::Compare { op, left, right } => estimate_compare(*op, left, right, column_stats),
         Predicate::And(a, b) => {
             let sa = estimate_predicate_selectivity(a, column_stats);
             let sb = estimate_predicate_selectivity(b, column_stats);
@@ -298,7 +296,11 @@ mod tests {
     }
 
     fn cmp_pred(op: CompareOp, col: usize, lit: Value) -> Predicate {
-        Predicate::Compare { op, left: Expression::Column(col), right: Expression::Literal(lit) }
+        Predicate::Compare {
+            op,
+            left: Expression::Column(col),
+            right: Expression::Literal(lit),
+        }
     }
 
     #[test]

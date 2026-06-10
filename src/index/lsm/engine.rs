@@ -79,13 +79,16 @@ impl StorageEngine for LsmEngine {
         match old_value {
             Some(old_val) => {
                 // Overwrite: adjust data_size for value change.
-                self.data_size.fetch_sub(old_val.len() as u64, Ordering::Relaxed);
-                self.data_size.fetch_add(value.len() as u64, Ordering::Relaxed);
+                self.data_size
+                    .fetch_sub(old_val.len() as u64, Ordering::Relaxed);
+                self.data_size
+                    .fetch_add(value.len() as u64, Ordering::Relaxed);
             }
             None => {
                 // New key.
                 self.key_count.fetch_add(1, Ordering::Relaxed);
-                self.data_size.fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
+                self.data_size
+                    .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
             }
         }
 

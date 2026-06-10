@@ -151,7 +151,9 @@ struct Rng {
 
 impl Rng {
     fn new(seed: u64) -> Rng {
-        Rng { state: seed.wrapping_mul(2862933555777941757).wrapping_add(1) }
+        Rng {
+            state: seed.wrapping_mul(2862933555777941757).wrapping_add(1),
+        }
     }
     fn next(&mut self) -> u64 {
         self.state = self
@@ -213,7 +215,9 @@ impl IdGen {
 }
 
 fn exec<E: StorageEngine + 'static>(session: &mut Session<E>, sql: &str) {
-    session.execute(sql).unwrap_or_else(|e| panic!("load failed [{}]: {}", sql, e));
+    session
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("load failed [{}]: {}", sql, e));
 }
 
 /// Load all warehouses' smoke-scale data (single-threaded, before the
@@ -223,7 +227,10 @@ fn load<E: StorageEngine + 'static>(session: &mut Session<E>, config: &Config) {
         exec(session, sql);
     }
     for item in 1..=ITEMS {
-        exec(session, &format!("INSERT INTO item VALUES ({}, {})", item, 100 + item));
+        exec(
+            session,
+            &format!("INSERT INTO item VALUES ({}, {})", item, 100 + item),
+        );
     }
 
     let mut seed_order_id = 1_000_000; // below PK_BASE; loader-only
@@ -232,7 +239,11 @@ fn load<E: StorageEngine + 'static>(session: &mut Session<E>, config: &Config) {
         for item in 1..=ITEMS {
             exec(
                 session,
-                &format!("INSERT INTO stock VALUES ({}, {}, 10000)", stock_id(w, item), item),
+                &format!(
+                    "INSERT INTO stock VALUES ({}, {}, 10000)",
+                    stock_id(w, item),
+                    item
+                ),
             );
         }
         for d in 1..=DISTRICTS_PER_W {
@@ -249,17 +260,28 @@ fn load<E: StorageEngine + 'static>(session: &mut Session<E>, config: &Config) {
                 let cid = customer_id(w, d, c);
                 exec(
                     session,
-                    &format!("INSERT INTO customer VALUES ({}, 5000, 'last{}', 'first{}')", cid, c, c),
+                    &format!(
+                        "INSERT INTO customer VALUES ({}, 5000, 'last{}', 'first{}')",
+                        cid, c, c
+                    ),
                 );
             }
             for _ in 0..INITIAL_ORDERS_PER_D {
                 let oid = seed_order_id;
                 seed_order_id += 1;
                 let cid = customer_id(w, d, 1 + (oid % CUSTOMERS_PER_D));
-                exec(session, &format!("INSERT INTO orders VALUES ({}, {}, 0)", oid, cid));
                 exec(
                     session,
-                    &format!("INSERT INTO order_line VALUES ({}, {}, {}, 100)", oid, oid, 1 + (oid % ITEMS)),
+                    &format!("INSERT INTO orders VALUES ({}, {}, 0)", oid, cid),
+                );
+                exec(
+                    session,
+                    &format!(
+                        "INSERT INTO order_line VALUES ({}, {}, {}, 100)",
+                        oid,
+                        oid,
+                        1 + (oid % ITEMS)
+                    ),
                 );
             }
         }
@@ -303,17 +325,26 @@ impl Statements {
         let p = |s: &mut Session<E>, sql: &str| s.prepare(sql).expect("prepare");
         Statements {
             next_o_id: p(s, "SELECT d_next_o_id FROM district WHERE d_id = $1"),
-            bump_o_id: p(s, "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1"),
+            bump_o_id: p(
+                s,
+                "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_id = $1",
+            ),
             insert_order: p(s, "INSERT INTO orders VALUES ($1, $2, 0)"),
             insert_new_order: p(s, "INSERT INTO new_orders VALUES ($1)"),
             item_price: p(s, "SELECT i_price FROM item WHERE i_id = $1"),
-            dec_stock: p(s, "UPDATE stock SET s_quantity = s_quantity - $1 WHERE s_id = $2"),
+            dec_stock: p(
+                s,
+                "UPDATE stock SET s_quantity = s_quantity - $1 WHERE s_id = $2",
+            ),
             insert_order_line: p(s, "INSERT INTO order_line VALUES ($1, $2, $3, $4)"),
 
             bump_w_ytd: p(s, "UPDATE warehouse SET w_ytd = w_ytd + $1 WHERE w_id = $2"),
             bump_d_ytd: p(s, "UPDATE district SET d_ytd = d_ytd + $1 WHERE d_id = $2"),
             cust_balance: p(s, "SELECT c_balance FROM customer WHERE c_id = $1"),
-            debit_cust: p(s, "UPDATE customer SET c_balance = c_balance - $1 WHERE c_id = $2"),
+            debit_cust: p(
+                s,
+                "UPDATE customer SET c_balance = c_balance - $1 WHERE c_id = $2",
+            ),
             insert_history: p(s, "INSERT INTO history VALUES ($1, $2, $3)"),
 
             max_order: p(s, "SELECT MAX(o_id) FROM orders WHERE o_c_id = $1"),
@@ -322,11 +353,20 @@ impl Statements {
                 "SELECT ol_i_id, ol_amount FROM order_line WHERE ol_o_id = $1 ORDER BY ol_id ASC",
             ),
 
-            min_new_order: p(s, "SELECT MIN(no_o_id) FROM new_orders WHERE no_o_id >= $1 AND no_o_id < $2"),
+            min_new_order: p(
+                s,
+                "SELECT MIN(no_o_id) FROM new_orders WHERE no_o_id >= $1 AND no_o_id < $2",
+            ),
             del_new_order: p(s, "DELETE FROM new_orders WHERE no_o_id = $1"),
             order_customer: p(s, "SELECT o_c_id FROM orders WHERE o_id = $1"),
-            sum_lines: p(s, "SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1"),
-            credit_cust: p(s, "UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2"),
+            sum_lines: p(
+                s,
+                "SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = $1",
+            ),
+            credit_cust: p(
+                s,
+                "UPDATE customer SET c_balance = c_balance + $1 WHERE c_id = $2",
+            ),
             set_carrier: p(s, "UPDATE orders SET o_carrier_id = $1 WHERE o_id = $2"),
 
             stock_level: p(
@@ -380,7 +420,11 @@ struct Ctx {
     last_order_id: i32,
 }
 
-fn new_order<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ctx: &mut Ctx) -> DbResult<()> {
+fn new_order<E: StorageEngine + 'static>(
+    s: &mut Session<E>,
+    st: &Statements,
+    ctx: &mut Ctx,
+) -> DbResult<()> {
     let w = ctx.home_w;
     let d = ctx.rng.between(1, DISTRICTS_PER_W);
     let c = ctx.rng.between(1, CUSTOMERS_PER_D);
@@ -403,18 +447,31 @@ fn new_order<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ct
             Some(p) => p,
             None => continue,
         };
-        run(s, &st.dec_stock, &[Value::Int32(1), Value::Int32(stock_id(w, item))])?;
+        run(
+            s,
+            &st.dec_stock,
+            &[Value::Int32(1), Value::Int32(stock_id(w, item))],
+        )?;
         let ol_id = ctx.ids.take();
         run(
             s,
             &st.insert_order_line,
-            &[Value::Int32(ol_id), Value::Int32(oid), Value::Int32(item), Value::Int64(amount)],
+            &[
+                Value::Int32(ol_id),
+                Value::Int32(oid),
+                Value::Int32(item),
+                Value::Int64(amount),
+            ],
         )?;
     }
     Ok(())
 }
 
-fn payment<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ctx: &mut Ctx) -> DbResult<()> {
+fn payment<E: StorageEngine + 'static>(
+    s: &mut Session<E>,
+    st: &Statements,
+    ctx: &mut Ctx,
+) -> DbResult<()> {
     let w = ctx.home_w;
     let d = ctx.rng.between(1, DISTRICTS_PER_W);
     let c = ctx.rng.between(1, CUSTOMERS_PER_D);
@@ -423,15 +480,31 @@ fn payment<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ctx:
     let amount = ctx.rng.between(1, 500) as i64;
 
     run(s, &st.bump_w_ytd, &[Value::Int64(amount), Value::Int32(w)])?;
-    run(s, &st.bump_d_ytd, &[Value::Int64(amount), Value::Int32(did)])?;
+    run(
+        s,
+        &st.bump_d_ytd,
+        &[Value::Int64(amount), Value::Int32(did)],
+    )?;
     let _ = rows_of(run(s, &st.cust_balance, &[Value::Int32(cid)])?);
-    run(s, &st.debit_cust, &[Value::Int64(amount), Value::Int32(cid)])?;
+    run(
+        s,
+        &st.debit_cust,
+        &[Value::Int64(amount), Value::Int32(cid)],
+    )?;
     let hid = ctx.ids.take();
-    run(s, &st.insert_history, &[Value::Int32(hid), Value::Int32(cid), Value::Int64(amount)])?;
+    run(
+        s,
+        &st.insert_history,
+        &[Value::Int32(hid), Value::Int32(cid), Value::Int64(amount)],
+    )?;
     Ok(())
 }
 
-fn order_status<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ctx: &mut Ctx) -> DbResult<()> {
+fn order_status<E: StorageEngine + 'static>(
+    s: &mut Session<E>,
+    st: &Statements,
+    ctx: &mut Ctx,
+) -> DbResult<()> {
     let w = ctx.home_w;
     let d = ctx.rng.between(1, DISTRICTS_PER_W);
     let c = ctx.rng.between(1, CUSTOMERS_PER_D);
@@ -446,8 +519,16 @@ fn order_status<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements,
     Ok(())
 }
 
-fn delivery<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ctx: &mut Ctx) -> DbResult<()> {
-    let min = rows_of(run(s, &st.min_new_order, &[Value::Int32(ctx.id_lo), Value::Int32(ctx.id_hi)])?);
+fn delivery<E: StorageEngine + 'static>(
+    s: &mut Session<E>,
+    st: &Statements,
+    ctx: &mut Ctx,
+) -> DbResult<()> {
+    let min = rows_of(run(
+        s,
+        &st.min_new_order,
+        &[Value::Int32(ctx.id_lo), Value::Int32(ctx.id_hi)],
+    )?);
     let oid = match min.first().and_then(|r| as_i32(&r[0])) {
         Some(o) => o,
         None => return Ok(()),
@@ -461,18 +542,30 @@ fn delivery<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ctx
     };
     let sum = rows_of(run(s, &st.sum_lines, &[Value::Int32(oid)])?);
     if let Some(total) = sum.first().and_then(|r| as_i64(&r[0])) {
-        run(s, &st.credit_cust, &[Value::Int64(total), Value::Int32(cid)])?;
+        run(
+            s,
+            &st.credit_cust,
+            &[Value::Int64(total), Value::Int32(cid)],
+        )?;
     }
     run(s, &st.set_carrier, &[Value::Int32(7), Value::Int32(oid)])?;
     Ok(())
 }
 
-fn stock_level<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ctx: &mut Ctx) -> DbResult<()> {
+fn stock_level<E: StorageEngine + 'static>(
+    s: &mut Session<E>,
+    st: &Statements,
+    ctx: &mut Ctx,
+) -> DbResult<()> {
     if ctx.last_order_id == 0 {
         return Ok(());
     }
     let threshold = ctx.rng.between(10, 9000);
-    let _ = rows_of(run(s, &st.stock_level, &[Value::Int32(ctx.last_order_id), Value::Int32(threshold)])?);
+    let _ = rows_of(run(
+        s,
+        &st.stock_level,
+        &[Value::Int32(ctx.last_order_id), Value::Int32(threshold)],
+    )?);
     Ok(())
 }
 
@@ -533,7 +626,12 @@ impl Counts {
     }
 }
 
-fn dispatch<E: StorageEngine + 'static>(s: &mut Session<E>, st: &Statements, ctx: &mut Ctx, txn: Txn) -> DbResult<()> {
+fn dispatch<E: StorageEngine + 'static>(
+    s: &mut Session<E>,
+    st: &Statements,
+    ctx: &mut Ctx,
+    txn: Txn,
+) -> DbResult<()> {
     match txn {
         Txn::NewOrder => new_order(s, st, ctx),
         Txn::Payment => payment(s, st, ctx),
@@ -575,7 +673,11 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
         }
         // Read-only diagnostic mode runs only OrderStatus (pure MVCC
         // reads, no write locks, read-only commit skips the WAL).
-        let txn = if config.read_only { Txn::OrderStatus } else { pick(ctx.rng.below(100)) };
+        let txn = if config.read_only {
+            Txn::OrderStatus
+        } else {
+            pick(ctx.rng.below(100))
+        };
         session.execute("BEGIN").expect("begin");
         match dispatch(&mut session, &statements, &mut ctx, txn) {
             Ok(()) => match session.execute("COMMIT") {
@@ -606,8 +708,8 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
         println!("loaded in {:.2}s", load_start.elapsed().as_secs_f64());
     }
 
-    let deadline =
-        (config.duration_secs > 0).then(|| Instant::now() + Duration::from_secs(config.duration_secs));
+    let deadline = (config.duration_secs > 0)
+        .then(|| Instant::now() + Duration::from_secs(config.duration_secs));
     let per_terminal_iters = (config.iterations / config.terminals as u64).max(1);
 
     let run_start = Instant::now();
@@ -621,7 +723,10 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("terminal panicked")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("terminal panicked"))
+            .collect()
     });
     let elapsed = run_start.elapsed().as_secs_f64();
 
@@ -632,7 +737,10 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
     let committed = total.committed();
     let attempts = committed + total.aborts;
 
-    println!("\n--- complete: {} committed, {} aborted in {:.2}s ---", committed, total.aborts, elapsed);
+    println!(
+        "\n--- complete: {} committed, {} aborted in {:.2}s ---",
+        committed, total.aborts, elapsed
+    );
     println!("  NewOrder    {}", total.new_order);
     println!("  Payment     {}", total.payment);
     println!("  OrderStatus {}", total.order_status);
@@ -640,11 +748,21 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
     println!("  StockLevel  {}", total.stock_level);
     println!(
         "  abort rate  {:.1}%",
-        if attempts > 0 { total.aborts as f64 / attempts as f64 * 100.0 } else { 0.0 }
+        if attempts > 0 {
+            total.aborts as f64 / attempts as f64 * 100.0
+        } else {
+            0.0
+        }
     );
     println!("  fsyncs      {}", database.wal_fsync_count());
-    println!("  throughput  {:.0} committed txn/s", committed as f64 / elapsed);
-    println!("  tpmC (NewOrder/min) {:.0}", total.new_order as f64 / elapsed * 60.0);
+    println!(
+        "  throughput  {:.0} committed txn/s",
+        committed as f64 / elapsed
+    );
+    println!(
+        "  tpmC (NewOrder/min) {:.0}",
+        total.new_order as f64 / elapsed * 60.0
+    );
 }
 
 fn main() {
@@ -658,7 +776,11 @@ fn main() {
     } else {
         format!("{} iters", config.iterations)
     };
-    let policy_label = if config.engine == "btree" { config.policy.as_str() } else { "n/a" };
+    let policy_label = if config.engine == "btree" {
+        config.policy.as_str()
+    } else {
+        "n/a"
+    };
     println!(
         "TPC-C [{} / {}]: {} warehouse(s), {} terminal(s), {}, seed {}",
         config.engine, policy_label, config.warehouses, config.terminals, mode, config.seed
@@ -670,7 +792,10 @@ fn main() {
             let bpm = BufferPoolManager::new(config.pool_size, dm);
             // Swap in the requested eviction policy (default ARC). Cold mode:
             // the pool is empty at startup, so there's nothing to transfer.
-            let _ = bpm.swap_policy(make_policy(&config.policy, config.pool_size), SwapMode::Cold);
+            let _ = bpm.swap_policy(
+                make_policy(&config.policy, config.pool_size),
+                SwapMode::Cold,
+            );
             let engine = BTreeEngine::new(bpm).expect("engine");
             let database = Arc::new(Database::open(&config.data_dir, engine).expect("open db"));
             let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).expect("catalog"));

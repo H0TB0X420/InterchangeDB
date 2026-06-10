@@ -131,8 +131,7 @@ mod tests {
 
     #[test]
     fn write_error_count_is_consumed_and_then_passes() {
-        let mut dm = FaultInjectionDiskManager::new(MemoryDiskManager::new())
-            .with_write_errors(2);
+        let mut dm = FaultInjectionDiskManager::new(MemoryDiskManager::new()).with_write_errors(2);
         let pid = dm.allocate_page().unwrap();
         let p = Page::new();
         assert!(matches!(dm.write_page(pid, &p), Err(Error::Io(_))));
@@ -143,8 +142,7 @@ mod tests {
 
     #[test]
     fn read_error_count_is_independent_of_writes() {
-        let mut dm = FaultInjectionDiskManager::new(MemoryDiskManager::new())
-            .with_read_errors(1);
+        let mut dm = FaultInjectionDiskManager::new(MemoryDiskManager::new()).with_read_errors(1);
         let pid = dm.allocate_page().unwrap();
         let p = Page::new();
         dm.write_page(pid, &p).unwrap();
@@ -154,16 +152,15 @@ mod tests {
 
     #[test]
     fn allocate_error_blocks_first_call() {
-        let mut dm = FaultInjectionDiskManager::new(MemoryDiskManager::new())
-            .with_allocate_errors(1);
+        let mut dm =
+            FaultInjectionDiskManager::new(MemoryDiskManager::new()).with_allocate_errors(1);
         assert!(matches!(dm.allocate_page(), Err(Error::Io(_))));
         assert!(dm.allocate_page().is_ok());
     }
 
     #[test]
     fn pending_reads_reports_remaining_count() {
-        let dm = FaultInjectionDiskManager::new(MemoryDiskManager::new())
-            .with_read_errors(3);
+        let dm = FaultInjectionDiskManager::new(MemoryDiskManager::new()).with_read_errors(3);
         assert_eq!(dm.pending_reads(), 3);
     }
 }

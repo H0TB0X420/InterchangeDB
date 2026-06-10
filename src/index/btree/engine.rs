@@ -185,13 +185,12 @@ impl StorageEngine for BTreeEngine {
         if inserted {
             // New key (or revived tombstone).
             self.key_count.fetch_add(1, Ordering::Relaxed);
-            self.data_size.fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
+            self.data_size
+                .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
         } else {
             // Key already exists — update by delete + re-insert.
             // Retrieve old value size for data_size tracking.
-            let old_value_size = tree.get(key)?
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let old_value_size = tree.get(key)?.map(|v| v.len()).unwrap_or(0);
 
             tree.delete(key)?;
             let reinserted = tree.insert(key, value)?;
@@ -199,8 +198,10 @@ impl StorageEngine for BTreeEngine {
 
             // key_count unchanged (delete -1, insert +1 cancel out).
             // Adjust data_size for value size change.
-            self.data_size.fetch_sub(old_value_size as u64, Ordering::Relaxed);
-            self.data_size.fetch_add(value.len() as u64, Ordering::Relaxed);
+            self.data_size
+                .fetch_sub(old_value_size as u64, Ordering::Relaxed);
+            self.data_size
+                .fetch_add(value.len() as u64, Ordering::Relaxed);
         }
 
         Ok(())
@@ -210,7 +211,8 @@ impl StorageEngine for BTreeEngine {
         let tree = self.tree();
 
         // Get value size before delete for data_size tracking.
-        let entry_size = tree.get(key)?
+        let entry_size = tree
+            .get(key)?
             .map(|v| (key.len() + v.len()) as u64)
             .unwrap_or(0);
 

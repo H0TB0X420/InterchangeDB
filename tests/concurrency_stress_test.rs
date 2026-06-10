@@ -94,7 +94,10 @@ fn read_heavy_8_threads() {
         h.join().unwrap();
     }
 
-    assert!(!panicked.load(Ordering::Relaxed), "At least one thread encountered an error");
+    assert!(
+        !panicked.load(Ordering::Relaxed),
+        "At least one thread encountered an error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +124,9 @@ fn write_heavy_8_threads() {
                     let val = format!("val_{}_{}", thread_idx, iter);
 
                     match db.put(key.as_bytes(), val.as_bytes()) {
-                        Ok(()) => { committed.fetch_add(1, Ordering::Relaxed); }
+                        Ok(()) => {
+                            committed.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(_) => {} // Deadlock/timeout acceptable under contention.
                     }
                 }
@@ -173,7 +178,10 @@ fn deadlock_storm_8_threads() {
                 for iter in 0..50 {
                     let k1 = (thread_idx * 7 + iter * 3) % 8;
                     let k2 = (thread_idx * 11 + iter * 5) % 8;
-                    if k1 == k2 { completed.fetch_add(1, Ordering::Relaxed); continue; }
+                    if k1 == k2 {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
 
                     let key1 = format!("dl_key_{}", k1);
                     let key2 = format!("dl_key_{}", k2);
@@ -223,7 +231,11 @@ fn deadlock_storm_8_threads() {
     // Contention errors bundle Deadlock + LockTimeout + WriteConflict.
     // SI first-committer-wins makes WriteConflict more frequent than raw
     // deadlocks alone — bound loosened accordingly.
-    assert!(total_deadlocks < 350, "Too many contention errors: {}", total_deadlocks);
+    assert!(
+        total_deadlocks < 350,
+        "Too many contention errors: {}",
+        total_deadlocks
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -268,7 +280,9 @@ fn gc_under_concurrent_writes() {
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(500));
                 match db.gc() {
-                    Ok(stats) => { total_removed += stats.versions_removed; }
+                    Ok(stats) => {
+                        total_removed += stats.versions_removed;
+                    }
                     Err(_) => {}
                 }
             }
@@ -338,9 +352,16 @@ fn snapshot_consistency_under_writes() {
         })
         .collect();
 
-    assert_eq!(first_reads, second_reads, "Snapshot must be frozen — reads shouldn't change");
+    assert_eq!(
+        first_reads, second_reads,
+        "Snapshot must be frozen — reads shouldn't change"
+    );
     for val in &first_reads {
-        assert_eq!(val, &Some(b"original".to_vec()), "Reader should see original values");
+        assert_eq!(
+            val,
+            &Some(b"original".to_vec()),
+            "Reader should see original values"
+        );
     }
 
     db.commit_txn(reader).unwrap();

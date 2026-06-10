@@ -84,8 +84,7 @@ impl<E: StorageEngine> Database<E> {
 
         // Run recovery: replay WAL records into the engine.
         let reader = wal.reader()?;
-        let stats =
-            crate::wal::recovery::recover(&reader, &engine, wal.last_checkpoint_lsn())?;
+        let stats = crate::wal::recovery::recover(&reader, &engine, wal.last_checkpoint_lsn())?;
 
         // Seed the transaction manager with committed_txns from recovery.
         let txn_mgr = TransactionManager::new();
@@ -97,11 +96,8 @@ impl<E: StorageEngine> Database<E> {
         txn_mgr.load_committed_txns(recovered);
 
         // Load uncommitted txn_ids so visibility doesn't assume they're committed.
-        let uncommitted: std::collections::HashSet<TxnId> = stats
-            .uncommitted_txns
-            .into_iter()
-            .map(TxnId::new)
-            .collect();
+        let uncommitted: std::collections::HashSet<TxnId> =
+            stats.uncommitted_txns.into_iter().map(TxnId::new).collect();
         txn_mgr.load_uncommitted_txns(uncommitted);
 
         // Advance the txn-id counter past every id the engine could still
@@ -292,7 +288,10 @@ impl<E: StorageEngine> Database<E> {
         let txn_mgr = self.txn_manager.as_ref().ok_or(Error::TxnNotSupported)?;
 
         let active_timestamps = txn_mgr.active_read_timestamps();
-        let low_water_mark = active_timestamps.iter().min().copied()
+        let low_water_mark = active_timestamps
+            .iter()
+            .min()
+            .copied()
             .unwrap_or(txn_mgr.ts_oracle_peek());
 
         let committed = txn_mgr.committed_txns();
@@ -301,7 +300,11 @@ impl<E: StorageEngine> Database<E> {
         let non_committed = txn_mgr.known_not_committed();
 
         let stats = gc::gc_collect(
-            &*self.engine, low_water_mark, &committed, checkpoint_ts, &non_committed,
+            &*self.engine,
+            low_water_mark,
+            &committed,
+            checkpoint_ts,
+            &non_committed,
         )?;
 
         // Step 2.D: forget any snapshotted aborted txn whose versions are
@@ -314,8 +317,7 @@ impl<E: StorageEngine> Database<E> {
         // own pass. Could be folded into gc_collect to halve scan work —
         // gc_collect would return the safely-forgettable set alongside its
         // stats. Phase-13 maintenance cleanup.
-        let mut still_present: std::collections::HashSet<TxnId> =
-            std::collections::HashSet::new();
+        let mut still_present: std::collections::HashSet<TxnId> = std::collections::HashSet::new();
         for result in self.engine.scan(..) {
             let (encoded_key, encoded_value) = result?;
             if mvcc::decode_mvcc_key(&encoded_key).is_err() {

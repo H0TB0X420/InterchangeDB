@@ -73,7 +73,9 @@ fn test_basic_scale() {
     // Uses a simple Fisher-Yates shuffle with a linear congruential generator.
     let mut rng_state: u64 = 42;
     for i in (1..keys.len()).rev() {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (rng_state >> 33) as usize % (i + 1);
         keys.swap(i, j);
     }
@@ -90,6 +92,11 @@ fn test_basic_scale() {
         let k = encode_key(key);
         let result = tree.get(&k).unwrap();
         assert!(result.is_some(), "Key {} not found after insert", key);
-        assert_eq!(decode_value(&result.unwrap()), key, "Value mismatch for key {}", key);
+        assert_eq!(
+            decode_value(&result.unwrap()),
+            key,
+            "Value mismatch for key {}",
+            key
+        );
     }
 }

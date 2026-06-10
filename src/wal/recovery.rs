@@ -61,9 +61,7 @@ pub fn recover<E: StorageEngine>(
         Lsn::new(0)
     };
 
-    let records: Vec<LogRecord> = reader
-        .scan_forward(start_lsn)
-        .collect::<Result<Vec<_>>>()?;
+    let records: Vec<LogRecord> = reader.scan_forward(start_lsn).collect::<Result<Vec<_>>>()?;
 
     let records_scanned = records.len() as u64;
 
@@ -117,9 +115,7 @@ pub fn recover<E: StorageEngine>(
 /// - last checkpoint's oracle_ts (0 if no checkpoint)
 /// - txn-id high-water mark seeded by the last Checkpoint record
 ///   (covers ids whose original records were truncated by that checkpoint)
-fn analyze_transactions(
-    records: &[LogRecord],
-) -> (HashMap<u64, u64>, HashSet<u64>, u64, u64) {
+fn analyze_transactions(records: &[LogRecord]) -> (HashMap<u64, u64>, HashSet<u64>, u64, u64) {
     let mut committed = HashMap::new();
     let mut aborted = HashSet::new();
     let mut checkpoint_oracle_ts: u64 = 0;
@@ -133,7 +129,11 @@ fn analyze_transactions(
             LogPayload::Abort => {
                 aborted.insert(record.txn_id);
             }
-            LogPayload::Checkpoint { oracle_ts, next_txn_id, active_txn_ids } => {
+            LogPayload::Checkpoint {
+                oracle_ts,
+                next_txn_id,
+                active_txn_ids,
+            } => {
                 checkpoint_oracle_ts = *oracle_ts;
                 // The persisted next_txn_id is the authoritative high-water
                 // mark; active_txn_ids is included as a defensive fallback
@@ -150,7 +150,12 @@ fn analyze_transactions(
         }
     }
 
-    (committed, aborted, checkpoint_oracle_ts, checkpoint_max_txn_id)
+    (
+        committed,
+        aborted,
+        checkpoint_oracle_ts,
+        checkpoint_max_txn_id,
+    )
 }
 
 /// Phase 2: Replay committed transaction writes and auto-commit operations.

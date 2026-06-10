@@ -114,7 +114,11 @@ fn lsm_value_one_byte_over_u16_max_errors_cleanly() {
     match e.put(b"k", &val) {
         Ok(_) => {
             let got = e.get(b"k").unwrap();
-            assert_eq!(got, Some(val), "silent truncation/corruption at u16::MAX + 1");
+            assert_eq!(
+                got,
+                Some(val),
+                "silent truncation/corruption at u16::MAX + 1"
+            );
         }
         Err(_) => {}
     }

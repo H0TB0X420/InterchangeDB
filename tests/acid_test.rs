@@ -83,8 +83,10 @@ fn atomicity_uncommitted_none_present() {
     for i in 0..20 {
         let key = format!("ghost_{:03}", i);
         assert_eq!(
-            db.get(key.as_bytes()).unwrap(), None,
-            "Uncommitted key {} must not survive crash", key
+            db.get(key.as_bytes()).unwrap(),
+            None,
+            "Uncommitted key {} must not survive crash",
+            key
         );
     }
 }
@@ -120,9 +122,17 @@ fn atomicity_partial_never_visible() {
                 })
                 .count();
             if r % 2 == 0 {
-                assert_eq!(count, 5, "Round {} (committed): all 5 keys must be present", r);
+                assert_eq!(
+                    count, 5,
+                    "Round {} (committed): all 5 keys must be present",
+                    r
+                );
             } else {
-                assert_eq!(count, 0, "Round {} (uncommitted): no keys should be present", r);
+                assert_eq!(
+                    count, 0,
+                    "Round {} (uncommitted): no keys should be present",
+                    r
+                );
             }
         }
     }
@@ -147,7 +157,8 @@ fn atomicity_no_txn_id_reuse_after_uncommitted() {
         let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for k in 0..5 {
-            db.txn_put(txn, format!("r000_k{}", k).as_bytes(), b"committed").unwrap();
+            db.txn_put(txn, format!("r000_k{}", k).as_bytes(), b"committed")
+                .unwrap();
         }
         db.commit_txn(txn).unwrap();
     }
@@ -156,7 +167,8 @@ fn atomicity_no_txn_id_reuse_after_uncommitted() {
         let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for k in 0..5 {
-            db.txn_put(txn, format!("r001_k{}", k).as_bytes(), b"phantom").unwrap();
+            db.txn_put(txn, format!("r001_k{}", k).as_bytes(), b"phantom")
+                .unwrap();
         }
         // NO commit.
     }
@@ -165,7 +177,8 @@ fn atomicity_no_txn_id_reuse_after_uncommitted() {
         let db = open_btree(dir.path());
         let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
         for k in 0..5 {
-            db.txn_put(txn, format!("r002_k{}", k).as_bytes(), b"committed").unwrap();
+            db.txn_put(txn, format!("r002_k{}", k).as_bytes(), b"committed")
+                .unwrap();
         }
         db.commit_txn(txn).unwrap();
     }
@@ -174,7 +187,9 @@ fn atomicity_no_txn_id_reuse_after_uncommitted() {
     let db = open_btree(dir.path());
     for k in 0..5 {
         assert_eq!(
-            db.get(format!("r000_k{}", k).as_bytes()).unwrap().as_deref(),
+            db.get(format!("r000_k{}", k).as_bytes())
+                .unwrap()
+                .as_deref(),
             Some(&b"committed"[..]),
             "round 0 key {} must be present",
             k
@@ -186,7 +201,9 @@ fn atomicity_no_txn_id_reuse_after_uncommitted() {
             k
         );
         assert_eq!(
-            db.get(format!("r002_k{}", k).as_bytes()).unwrap().as_deref(),
+            db.get(format!("r002_k{}", k).as_bytes())
+                .unwrap()
+                .as_deref(),
             Some(&b"committed"[..]),
             "round 2 key {} must be present",
             k
@@ -212,7 +229,8 @@ fn consistency_transfer_invariant() {
     // Initialize accounts.
     for i in 0..num_accounts {
         let key = format!("acct_{}", i);
-        db.put(key.as_bytes(), &initial_balance.to_le_bytes()).unwrap();
+        db.put(key.as_bytes(), &initial_balance.to_le_bytes())
+            .unwrap();
     }
 
     let expected_sum = num_accounts as u64 * initial_balance;
@@ -222,7 +240,9 @@ fn consistency_transfer_invariant() {
         for iter in 0..25u32 {
             let from = ((worker * 7 + iter * 3) % num_accounts as u32) as usize;
             let to = ((worker * 11 + iter * 5) % num_accounts as u32) as usize;
-            if from == to { continue; }
+            if from == to {
+                continue;
+            }
 
             let amount = 10u64;
 
@@ -246,8 +266,10 @@ fn consistency_transfer_invariant() {
                 u64::from_le_bytes(bytes.try_into().unwrap())
             };
 
-            db.txn_put(txn, from_key.as_bytes(), &(from_bal - amount).to_le_bytes()).unwrap();
-            db.txn_put(txn, to_key.as_bytes(), &(to_bal + amount).to_le_bytes()).unwrap();
+            db.txn_put(txn, from_key.as_bytes(), &(from_bal - amount).to_le_bytes())
+                .unwrap();
+            db.txn_put(txn, to_key.as_bytes(), &(to_bal + amount).to_le_bytes())
+                .unwrap();
             db.commit_txn(txn).unwrap();
         }
     }
@@ -261,7 +283,11 @@ fn consistency_transfer_invariant() {
         sum += bal;
     }
 
-    assert_eq!(sum, expected_sum, "Conservation invariant violated: {} != {}", sum, expected_sum);
+    assert_eq!(
+        sum, expected_sum,
+        "Conservation invariant violated: {} != {}",
+        sum, expected_sum
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +354,15 @@ fn isolation_no_lost_updates() {
         sum += u64::from_le_bytes(bytes.try_into().unwrap());
     }
 
-    assert_eq!(sum, total_increments, "Lost update detected: sum={} != increments={}", sum, total_increments);
-    assert_eq!(total_increments, 200, "Expected 200 total increments (4×50)");
+    assert_eq!(
+        sum, total_increments,
+        "Lost update detected: sum={} != increments={}",
+        sum, total_increments
+    );
+    assert_eq!(
+        total_increments, 200,
+        "Expected 200 total increments (4×50)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -354,8 +387,11 @@ fn durability_100_crash_cycles() {
             let key = format!("dur_{:04}", c);
             let val = db.get(key.as_bytes()).unwrap();
             assert_eq!(
-                val, Some(b"durable".to_vec()),
-                "Cycle {}: key dur_{:04} lost after crash", cycle, c
+                val,
+                Some(b"durable".to_vec()),
+                "Cycle {}: key dur_{:04} lost after crash",
+                cycle,
+                c
             );
         }
     }

@@ -8,13 +8,13 @@ use std::path::Path;
 
 use tempfile::tempdir;
 
+use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::Error;
 use interchangedb::database::Database;
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::index::lsm::LsmEngine;
-use interchangedb::txn::TxnMode;
-use interchangedb::buffer::BufferPoolManager;
 use interchangedb::storage::FileDiskManager;
+use interchangedb::txn::TxnMode;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -169,7 +169,12 @@ fn abort_undoes_all_writes() {
 
     for i in 0..10u32 {
         let key = format!("key_{}", i);
-        assert_eq!(db.get(key.as_bytes()).unwrap(), None, "key_{} should be absent after abort", i);
+        assert_eq!(
+            db.get(key.as_bytes()).unwrap(),
+            None,
+            "key_{} should be absent after abort",
+            i
+        );
     }
 }
 
@@ -380,7 +385,8 @@ fn recovery_mixed_txns() {
 
         // T2: no commit.
         let t2 = db.begin_txn(TxnMode::ReadWrite).unwrap();
-        db.txn_put(t2, b"uncommitted_key", b"uncommitted_val").unwrap();
+        db.txn_put(t2, b"uncommitted_key", b"uncommitted_val")
+            .unwrap();
         // Crash without committing T2.
     }
 

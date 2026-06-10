@@ -79,7 +79,8 @@ fn bench_single_thread_txn(c: &mut Criterion) {
             let txn = db.begin_txn(TxnMode::ReadWrite).unwrap();
             for k in 0..3 {
                 let key = format!("key_{:08}_{}", i, k);
-                db.txn_put(txn, key.as_bytes(), b"value_data_payload_here").unwrap();
+                db.txn_put(txn, key.as_bytes(), b"value_data_payload_here")
+                    .unwrap();
             }
             db.commit_txn(txn).unwrap();
             i += 1;
@@ -192,7 +193,9 @@ fn bench_read_heavy_concurrent(c: &mut Criterion) {
                             let _ = db.get(key.as_bytes());
                             total_ops.fetch_add(1, Ordering::Relaxed);
                             i += 1;
-                            if i > 100 { break; } // Cap per bench iteration.
+                            if i > 100 {
+                                break;
+                            } // Cap per bench iteration.
                         }
                     }));
                 }
@@ -211,7 +214,9 @@ fn bench_read_heavy_concurrent(c: &mut Criterion) {
                             let _ = db.put(key.as_bytes(), b"updated_value");
                             total_ops.fetch_add(1, Ordering::Relaxed);
                             i += 1;
-                            if i > 25 { break; }
+                            if i > 25 {
+                                break;
+                            }
                         }
                     }));
                 }
@@ -265,7 +270,9 @@ fn bench_write_contention(c: &mut Criterion) {
                                 let key = format!("hot_{}", (t + i) % 5);
                                 let val = format!("v_{}_{}", t, i);
                                 match db.put(key.as_bytes(), val.as_bytes()) {
-                                    Ok(()) => { committed.fetch_add(1, Ordering::Relaxed); }
+                                    Ok(()) => {
+                                        committed.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     Err(Error::Deadlock(_)) | Err(Error::LockTimeout) => {
                                         deadlocks.fetch_add(1, Ordering::Relaxed);
                                     }

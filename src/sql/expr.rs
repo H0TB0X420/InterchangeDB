@@ -320,7 +320,11 @@ mod tests {
         Expression::Literal(v)
     }
     fn add(l: Expression, r: Expression) -> Expression {
-        Expression::BinaryOp { op: BinaryOp::Add, left: Box::new(l), right: Box::new(r) }
+        Expression::BinaryOp {
+            op: BinaryOp::Add,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
     }
 
     // ---- Expression ----
@@ -373,7 +377,11 @@ mod tests {
     // ---- Predicate ----
 
     fn compare(op: CompareOp, l: Expression, r: Expression) -> Predicate {
-        Predicate::Compare { op, left: l, right: r }
+        Predicate::Compare {
+            op,
+            left: l,
+            right: r,
+        }
     }
 
     #[test]
@@ -485,7 +493,11 @@ mod tests {
     // ---- Decimal ordering ----
 
     fn cmp_op(op: CompareOp, l: Expression, r: Expression) -> Predicate {
-        Predicate::Compare { op, left: l, right: r }
+        Predicate::Compare {
+            op,
+            left: l,
+            right: r,
+        }
     }
 
     #[test]

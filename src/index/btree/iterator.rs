@@ -8,11 +8,11 @@
 use std::ops::Bound;
 
 use crate::buffer::BufferPoolManager;
-use crate::common::{PageId, Result, Error};
+use crate::common::{Error, PageId, Result};
 
-use crate::storage::page::PageHeader;
 use super::node::NodeType;
 use super::page_layout::decode_leaf_node;
+use crate::storage::page::PageHeader;
 
 /// Safety bound on maximum pages visited during a single scan.
 const MAX_SCAN_PAGES: usize = 10_000;
@@ -74,24 +74,28 @@ impl<'a> BTreeScanIterator<'a> {
         // Safety bound: prevent infinite scans.
         if self.pages_visited >= MAX_SCAN_PAGES {
             self.done = true;
-            return Err(Error::StorageCorrupted(
-                format!("Scan exceeded {} pages", MAX_SCAN_PAGES)
-            ));
+            return Err(Error::StorageCorrupted(format!(
+                "Scan exceeded {} pages",
+                MAX_SCAN_PAGES
+            )));
         }
 
         let guard = self.bpm.fetch_page_read(self.current_page_id)?;
         let data = guard.as_slice();
 
         // Validate node type — return error, not assert (could be BPM issue).
-        let node_type = NodeType::from_u8(data[PageHeader::SIZE])
-            .ok_or_else(|| Error::StorageCorrupted(
-                format!("Invalid node type at page {}", self.current_page_id.0)
-            ))?;
+        let node_type = NodeType::from_u8(data[PageHeader::SIZE]).ok_or_else(|| {
+            Error::StorageCorrupted(format!(
+                "Invalid node type at page {}",
+                self.current_page_id.0
+            ))
+        })?;
 
         if node_type != NodeType::Leaf {
-            return Err(Error::StorageCorrupted(
-                format!("Expected leaf at page {}, got internal", self.current_page_id.0)
-            ));
+            return Err(Error::StorageCorrupted(format!(
+                "Expected leaf at page {}, got internal",
+                self.current_page_id.0
+            )));
         }
 
         let leaf = decode_leaf_node(data);
@@ -105,7 +109,9 @@ impl<'a> BTreeScanIterator<'a> {
             self.done = true;
             return Err(Error::StorageCorrupted(format!(
                 "Leaf {} keys.len()={} != values.len()={}",
-                self.current_page_id.0, leaf.keys.len(), leaf.values.len()
+                self.current_page_id.0,
+                leaf.keys.len(),
+                leaf.values.len()
             )));
         }
         for &idx in &leaf.tombstones {
@@ -113,7 +119,9 @@ impl<'a> BTreeScanIterator<'a> {
                 self.done = true;
                 return Err(Error::StorageCorrupted(format!(
                     "Leaf {} tombstone index {} out of range (keys.len()={})",
-                    self.current_page_id.0, idx, leaf.keys.len()
+                    self.current_page_id.0,
+                    idx,
+                    leaf.keys.len()
                 )));
             }
         }

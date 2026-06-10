@@ -56,8 +56,13 @@ fn warehouse_schema() -> Schema {
 fn make_table_with_name_index(
     cat: Arc<Catalog<BTreeEngine>>,
     backend: IndexBackend,
-) -> (Table<BTreeEngine, RowLayout>, interchangedb::catalog::IndexId) {
-    let table_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+) -> (
+    Table<BTreeEngine, RowLayout>,
+    interchangedb::catalog::IndexId,
+) {
+    let table_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
     let idx_id = cat
         .create_index(IndexDef {
             name: "warehouse_by_name".into(),
@@ -87,9 +92,15 @@ fn insert_writes_one_index_entry_per_row() {
     let cat = open_catalog_at(dir.path());
     let (table, idx_id) = make_table_with_name_index(cat.clone(), IndexBackend::BTree);
 
-    table.insert(&[Value::Int32(1), Value::Varchar("alpha".into())]).unwrap();
-    table.insert(&[Value::Int32(2), Value::Varchar("bravo".into())]).unwrap();
-    table.insert(&[Value::Int32(3), Value::Varchar("charlie".into())]).unwrap();
+    table
+        .insert(&[Value::Int32(1), Value::Varchar("alpha".into())])
+        .unwrap();
+    table
+        .insert(&[Value::Int32(2), Value::Varchar("bravo".into())])
+        .unwrap();
+    table
+        .insert(&[Value::Int32(3), Value::Varchar("charlie".into())])
+        .unwrap();
 
     assert_eq!(index_entry_count(&cat, idx_id), 3);
 }
@@ -100,8 +111,12 @@ fn delete_removes_index_entry() {
     let cat = open_catalog_at(dir.path());
     let (table, idx_id) = make_table_with_name_index(cat.clone(), IndexBackend::BTree);
 
-    table.insert(&[Value::Int32(1), Value::Varchar("alpha".into())]).unwrap();
-    table.insert(&[Value::Int32(2), Value::Varchar("bravo".into())]).unwrap();
+    table
+        .insert(&[Value::Int32(1), Value::Varchar("alpha".into())])
+        .unwrap();
+    table
+        .insert(&[Value::Int32(2), Value::Varchar("bravo".into())])
+        .unwrap();
     assert_eq!(index_entry_count(&cat, idx_id), 2);
 
     table.delete_by_pk(&[Value::Int32(1)]).unwrap();
@@ -117,7 +132,9 @@ fn update_by_pk_rewrites_index_entry_when_indexed_column_changes() {
     let cat = open_catalog_at(dir.path());
     let (table, idx_id) = make_table_with_name_index(cat.clone(), IndexBackend::BTree);
 
-    table.insert(&[Value::Int32(1), Value::Varchar("alpha".into())]).unwrap();
+    table
+        .insert(&[Value::Int32(1), Value::Varchar("alpha".into())])
+        .unwrap();
     assert_eq!(index_entry_count(&cat, idx_id), 1);
 
     // Replace row — new w_name means new index entry.
@@ -137,7 +154,9 @@ fn update_columns_rewrites_index_entry() {
     let cat = open_catalog_at(dir.path());
     let (table, idx_id) = make_table_with_name_index(cat.clone(), IndexBackend::BTree);
 
-    table.insert(&[Value::Int32(1), Value::Varchar("alpha".into())]).unwrap();
+    table
+        .insert(&[Value::Int32(1), Value::Varchar("alpha".into())])
+        .unwrap();
     table
         .update_columns(&[Value::Int32(1)], &[(1, Value::Varchar("renamed".into()))])
         .unwrap();
@@ -150,8 +169,12 @@ fn upsert_replaces_index_entry_on_overwrite() {
     let cat = open_catalog_at(dir.path());
     let (table, idx_id) = make_table_with_name_index(cat.clone(), IndexBackend::BTree);
 
-    table.upsert(&[Value::Int32(1), Value::Varchar("alpha".into())]).unwrap();
-    table.upsert(&[Value::Int32(1), Value::Varchar("alpha2".into())]).unwrap();
+    table
+        .upsert(&[Value::Int32(1), Value::Varchar("alpha".into())])
+        .unwrap();
+    table
+        .upsert(&[Value::Int32(1), Value::Varchar("alpha2".into())])
+        .unwrap();
     // Same PK, new name. Exactly one entry; the old "alpha" entry is gone.
     assert_eq!(index_entry_count(&cat, idx_id), 1);
 }
@@ -165,8 +188,12 @@ fn lsm_backed_index_maintenance_works() {
     let cat = open_catalog_at(dir.path());
     let (table, idx_id) = make_table_with_name_index(cat.clone(), IndexBackend::Lsm);
 
-    table.insert(&[Value::Int32(1), Value::Varchar("alpha".into())]).unwrap();
-    table.insert(&[Value::Int32(2), Value::Varchar("bravo".into())]).unwrap();
+    table
+        .insert(&[Value::Int32(1), Value::Varchar("alpha".into())])
+        .unwrap();
+    table
+        .insert(&[Value::Int32(2), Value::Varchar("bravo".into())])
+        .unwrap();
     table.delete_by_pk(&[Value::Int32(1)]).unwrap();
 
     assert_eq!(index_entry_count(&cat, idx_id), 1);
@@ -178,16 +205,17 @@ fn table_without_indexes_does_not_touch_any_index() {
     // It must continue to work without side effects on any index map.
     let dir = tempfile::tempdir().unwrap();
     let cat = open_catalog_at(dir.path());
-    let table_id = cat.create_table("warehouse".into(), warehouse_schema()).unwrap();
+    let table_id = cat
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
     let schema = cat.get_table("warehouse").unwrap();
     let table = Table::new(cat.engine().clone(), schema, RowLayout);
 
-    table.insert(&[Value::Int32(1), Value::Varchar("alpha".into())]).unwrap();
+    table
+        .insert(&[Value::Int32(1), Value::Varchar("alpha".into())])
+        .unwrap();
     assert_eq!(
-        table
-            .get_by_pk(&[Value::Int32(1)])
-            .unwrap()
-            .unwrap()[1],
+        table.get_by_pk(&[Value::Int32(1)]).unwrap().unwrap()[1],
         Value::Varchar("alpha".into())
     );
     // Sanity: table_id had no indexes registered.

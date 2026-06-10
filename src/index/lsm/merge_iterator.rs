@@ -5,8 +5,8 @@
 //! and duplicates from lower-priority sources are skipped. Tombstones are
 //! included in the output — the caller decides whether to filter them.
 
-use crate::common::error::Result;
 use super::Entry;
+use crate::common::error::Result;
 
 /// K-way merge iterator. Sources must each yield entries in sorted key order.
 ///

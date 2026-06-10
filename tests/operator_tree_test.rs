@@ -44,7 +44,12 @@ fn setup() -> Env {
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
     let txn_mgr = Arc::new(TransactionManager::new());
-    Env { engine, txn_mgr, wal, _dir: dir }
+    Env {
+        engine,
+        txn_mgr,
+        wal,
+        _dir: dir,
+    }
 }
 
 fn handle(env: &Env, txn_id: TxnId) -> Arc<TxnEngine<BTreeEngine>> {
@@ -90,16 +95,35 @@ fn warehouse_schema() -> Schema {
         name: "warehouse".into(),
         table_id: TableId(1),
         columns: vec![
-            ColumnDef { name: "w_id".into(),   ty: ColumnType::Int32,        nullable: false, default: None },
-            ColumnDef { name: "w_ytd".into(),  ty: ColumnType::Int64,        nullable: false, default: None },
-            ColumnDef { name: "w_name".into(), ty: ColumnType::Varchar(10),  nullable: false, default: None },
+            ColumnDef {
+                name: "w_id".into(),
+                ty: ColumnType::Int32,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "w_ytd".into(),
+                ty: ColumnType::Int64,
+                nullable: false,
+                default: None,
+            },
+            ColumnDef {
+                name: "w_name".into(),
+                ty: ColumnType::Varchar(10),
+                nullable: false,
+                default: None,
+            },
         ],
         primary_key: vec![0],
     }
 }
 
 fn wh(id: i32, ytd: i64, name: &str) -> Vec<Value> {
-    vec![Value::Int32(id), Value::Int64(ytd), Value::Varchar(name.into())]
+    vec![
+        Value::Int32(id),
+        Value::Int64(ytd),
+        Value::Varchar(name.into()),
+    ]
 }
 
 fn warehouse_table(env: &Env, txn: TxnId) -> Arc<Table<TxnEngine<BTreeEngine>, RowLayout>> {
@@ -119,10 +143,7 @@ fn update_one_row_via_operator_tree() {
     // Seed: insert two warehouses under txn 1.
     let t_seed = begin_rw(&env);
     let table_seed = warehouse_table(&env, t_seed);
-    let mut seed = Insert::new(
-        table_seed,
-        vec![wh(1, 1000, "north"), wh(2, 2000, "south")],
-    );
+    let mut seed = Insert::new(table_seed, vec![wh(1, 1000, "north"), wh(2, 2000, "south")]);
     assert_eq!(seed.next().unwrap(), Some(vec![Value::Int64(2)]));
     commit(&env, t_seed);
 
@@ -200,9 +221,10 @@ fn delete_via_operator_tree_removes_filtered_rows() {
     let t2 = begin_rw(&env);
     let table = warehouse_table(&env, t2);
     let scan = Box::new(SeqScan::new(&*table).unwrap());
-    let filt = Box::new(Filter::new(scan, |row| {
-        matches!(row[0], Value::Int32(n) if n > 3)
-    }));
+    let filt = Box::new(Filter::new(
+        scan,
+        |row| matches!(row[0], Value::Int32(n) if n > 3),
+    ));
     let mut op = Delete::new(table.clone(), filt);
     assert_eq!(op.next().unwrap(), Some(vec![Value::Int64(2)]));
     commit(&env, t2);
@@ -241,9 +263,10 @@ fn select_path_seq_scan_filter_projection() {
     let t2 = begin_rw(&env);
     let table = warehouse_table(&env, t2);
     let scan = Box::new(SeqScan::new(&*table).unwrap());
-    let filt = Box::new(Filter::new(scan, |row| {
-        matches!(row[1], Value::Int64(n) if n >= 200)
-    }));
+    let filt = Box::new(Filter::new(
+        scan,
+        |row| matches!(row[1], Value::Int64(n) if n >= 200),
+    ));
     // Project w_id (col 0) and w_name (col 2) — drop w_ytd.
     let proj = Projection::new(filt, vec![0, 2]).unwrap();
 

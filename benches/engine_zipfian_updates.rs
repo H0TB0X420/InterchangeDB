@@ -150,7 +150,10 @@ fn main() {
     println!("\n=== engine_zipfian_updates summary ===");
     table.print();
     println!("\nCSV: {}", csv_path.display());
-    println!("\nNote: LSM WAF is a lower bound (poller can miss sub-{:?} flush/compact storms).", POLL_INTERVAL);
+    println!(
+        "\nNote: LSM WAF is a lower bound (poller can miss sub-{:?} flush/compact storms).",
+        POLL_INTERVAL
+    );
 }
 
 fn log_cell(engine: &str, dist: Distribution, r: &CellResult) {
@@ -293,8 +296,7 @@ fn run_lsm(dist: Distribution, memtable_bytes: usize) -> CellResult {
     // Allow the poller to capture the final flush.
     std::thread::sleep(POLL_INTERVAL * 3);
     let (deleted_bytes, current_bytes) = poller.finish();
-    let bytes_written_to_disk =
-        (deleted_bytes + current_bytes).saturating_sub(pre_workload_disk);
+    let bytes_written_to_disk = (deleted_bytes + current_bytes).saturating_sub(pre_workload_disk);
     let user_bytes_written = (UPDATE_OPS * RECORD_BYTES) as u64;
     let disk_bytes = tree.level_state().total_disk_size();
 
