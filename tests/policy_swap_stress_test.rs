@@ -68,12 +68,17 @@ fn seed_pages(bpm: &BufferPoolManager) -> Vec<(PageId, u8)> {
     pages
 }
 
-// Q-30 (FIXED): this once failed ~25% of runs in release — `swap_policy`'s
-// eviction churn exposed a race where eviction removed a dirty page from the
-// page table before flushing it, so a concurrent fetch of that page read the
-// stale disk slot (a lost write surfacing as cross-page corruption). Fixed by
-// flushing the victim while it stays mapped + pinned (see `evict_page`); the
-// deterministic `shuttle` repro lives in `tests/bpm_swap_shuttle.rs`.
+// Q-30 (FIXED): this once failed ~25% of runs in release. Two independent
+// BPM races were behind it, both fixed:
+//   1. Eviction removed a dirty victim from the page table before flushing
+//      it, so a concurrent fetch read the stale disk slot (a lost write).
+//      Fixed by flushing the victim while it stays mapped + pinned (see
+//      `evict_page`); deterministic `shuttle` repro in `tests/bpm_swap_shuttle.rs`.
+//   2. Concurrent misses of the *same* page were not serialized, so the loser
+//      left a "ghost" frame (holds the page, mapped nowhere); evicting a ghost
+//      unmapped a live page and surfaced as cross-page corruption. Fixed by
+//      re-validating under `pt.write` in `handle_cache_miss`; regression guard
+//      is `concurrent_same_page_miss_no_ghost_frames` below.
 #[test]
 fn marquee_hot_swap_storm_all_six_policies_both_modes() {
     let bpm = build_bpm();
@@ -312,5 +317,105 @@ fn warm_swap_preserves_hot_set_under_load() {
     for (pid, marker) in seeded.iter().take(8) {
         let g = bpm.fetch_page_read(*pid).unwrap();
         assert_eq!(g.as_slice()[0], *marker);
+    }
+}
+
+// Q-30 (root cause): concurrent misses of the SAME page must not create a
+// duplicate "ghost" frame.
+//
+// This is the actual defect behind the marquee test's cross-page corruption
+// — independent of any policy swap. `fetch_page_internal` releases the
+// page-table read lock the moment it sees a miss, so two threads can both
+// reach `handle_cache_miss` for the same page, both allocate a frame, both
+// read it from disk, and both insert into the page table. The loser's frame
+// then holds the page but is mapped nowhere: a *ghost*. Ghost frames stay
+// evictable, and evicting one removes a *live* page-table entry (the unmap
+// in `evict_page` is keyed by the victim's `page_id`), freeing a frame the
+// pool still considers resident — corrupting an unrelated page's slot.
+//
+// HOW this test forces the race and detects the ghost:
+//   * A tiny pool (3 frames) over 24 pages means almost every fetch evicts,
+//     and a thundering herd (16 threads, barrier-synchronized each round)
+//     all hammer the same small set — maximizing concurrent same-page misses.
+//   * After each round quiesces (every guard dropped, nothing pinned), every
+//     frame must be either free or mapped. So `free + mapped == pool_size`.
+//     A ghost is neither free nor mapped, so the sum drops below pool_size;
+//     a double-listed frame would push it above. `assert_eq` catches both.
+//   * Finally, every page must still read its seeded marker at byte 0 and
+//     4095 — the cross-page corruption guard.
+#[test]
+fn concurrent_same_page_miss_no_ghost_frames() {
+    use std::sync::Barrier;
+
+    const POOL: usize = 3;
+    const PAGES: u32 = 24;
+    const THREADS: usize = 16;
+    const ROUNDS: usize = 200;
+    const FETCHES_PER_ROUND: usize = 50;
+
+    let bpm = Arc::new(BufferPoolManager::new(POOL, MemoryDiskManager::new()));
+
+    // Seed PAGES distinct pages; byte 0 and 4095 carry a non-zero marker so a
+    // blank or cross-page frame is distinguishable.
+    let mut markers: Vec<(PageId, u8)> = Vec::with_capacity(PAGES as usize);
+    for i in 0..PAGES {
+        let mut g = bpm.new_page().expect("seed allocate");
+        let marker = (i % 251 + 1) as u8;
+        g.as_mut_slice()[0] = marker;
+        g.as_mut_slice()[4095] = marker;
+        let pid = g.page_id();
+        drop(g);
+        markers.push((pid, marker));
+    }
+    let hot: Vec<PageId> = markers.iter().map(|(pid, _)| *pid).collect();
+
+    for round in 0..ROUNDS {
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let bpm = bpm.clone();
+            let barrier = barrier.clone();
+            let hot = hot.clone();
+            handles.push(thread::spawn(move || {
+                // Start together so the same page is missed concurrently.
+                barrier.wait();
+                let mut rng = ((round as u64) * 131 + t as u64) | 1;
+                for _ in 0..FETCHES_PER_ROUND {
+                    rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let pid = hot[(rng as usize) % hot.len()];
+                    // Many fetches fail with NoFreeFrames (pool is 3, threads
+                    // are 16) — that's fine; the ones that succeed still race.
+                    if let Ok(g) = bpm.fetch_page_read(pid) {
+                        let _ = g.as_slice()[0];
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("herd thread panicked");
+        }
+
+        // Quiescent: every frame is free or mapped. A ghost breaks this.
+        let free = bpm.free_frame_count();
+        let mapped = bpm.page_count();
+        assert_eq!(
+            free + mapped,
+            POOL,
+            "round {round}: frame leak — free {free} + mapped {mapped} != pool {POOL} \
+             (a ghost frame is neither free nor mapped)"
+        );
+    }
+
+    // Cross-page corruption guard: every page reads its own marker.
+    for (pid, marker) in &markers {
+        let g = bpm
+            .fetch_page_read(*pid)
+            .unwrap_or_else(|e| panic!("post-herd read of {pid:?} failed: {e:?}"));
+        assert_eq!(g.as_slice()[0], *marker, "byte 0 of {pid:?} corrupted");
+        assert_eq!(
+            g.as_slice()[4095],
+            *marker,
+            "byte 4095 of {pid:?} corrupted"
+        );
     }
 }

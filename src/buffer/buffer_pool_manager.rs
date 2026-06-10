@@ -480,16 +480,46 @@ impl BufferPoolManager {
         frame.set_page_id(Some(page_id));
         frame.pin();
 
-        {
-            let mut pt = self.page_table.write();
-            pt.insert(page_id, frame_id);
-        }
+        // Publish under pt.write, re-checking for a concurrent loader of the
+        // same page. Two threads can pass the fast-path miss check (the read
+        // lock is released before we get here) and both reach this point for
+        // the same page. Without this re-check both would insert, the loser
+        // becomes a "ghost" frame (holds the page, mapped nowhere but still
+        // evictable), and evicting that ghost later corrupts the page table —
+        // surfacing as cross-page data corruption under the swap storm.
+        //
+        // Disk I/O stays above this lock (off the hot path); we only
+        // re-validate at publish time. Lock order matches evict_page /
+        // swap_policy / delete_page: page_table outer, replacer inner.
+        let mut pt = self.page_table.write();
+        if let Some(&winner) = pt.get(&page_id) {
+            // Lost the load race. Adopt the winner as a cache hit — pin it
+            // under pt.write so a racing evictor's pin check abandons it, just
+            // like handle_cache_hit — then return our unused frame to the free
+            // list.
+            self.frames[winner.0].pin();
+            {
+                let mut replacer = self.replacer.lock();
+                replacer.record_access(winner, page_id);
+                replacer.set_evictable(winner, false);
+            }
+            drop(pt);
+            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
 
+            frame.unpin();
+            frame.set_page_id(None);
+            frame.clear_dirty();
+            self.free_list.lock().push(frame_id);
+
+            return Ok(winner);
+        }
+        pt.insert(page_id, frame_id);
         {
             let mut replacer = self.replacer.lock();
             replacer.record_access(frame_id, page_id);
             replacer.set_evictable(frame_id, false);
         }
+        drop(pt);
 
         Ok(frame_id)
     }
