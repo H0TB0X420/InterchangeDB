@@ -125,6 +125,16 @@ pub fn decode_column(types: &[ColumnType], bytes: &[u8], col_idx: usize) -> Resu
         if is_null_bit_set(bitmap, i) {
             continue; // NULL: no bytes to skip
         }
+        // `value_byte_size` returns fixed widths (4/8/1/n) without checking
+        // they actually fit, so skipping preceding columns of a truncated or
+        // corrupt blob can push `cursor` past the end. Guard before slicing:
+        // `decode` / `decode_value` already return StorageCorrupted on short
+        // input, so this keeps `decode_column` consistent instead of panicking.
+        if cursor > bytes.len() {
+            return Err(Error::StorageCorrupted(
+                "tuple::decode_column: column data runs past end of tuple".into(),
+            ));
+        }
         if i == col_idx {
             let (value, _) = decode_value(ty, &bytes[cursor..])?;
             return Ok(value);

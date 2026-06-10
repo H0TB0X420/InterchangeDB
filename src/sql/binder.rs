@@ -1203,11 +1203,32 @@ fn narrow_value(v: Value, target: &ColumnType) -> Value {
 }
 
 fn decimal_args(info: &ast::ExactNumberInfo) -> Result<(u8, u8)> {
-    match info {
-        ast::ExactNumberInfo::None => Ok((18, 0)),
-        ast::ExactNumberInfo::Precision(p) => Ok((*p as u8, 0)),
-        ast::ExactNumberInfo::PrecisionAndScale(p, s) => Ok((*p as u8, *s as u8)),
+    // Keep these as the parser's `u64` until validated — casting to `u8`
+    // first would alias out-of-range values (e.g. `274 as u8 == 18`) past
+    // the bounds check.
+    let (precision, scale): (u64, u64) = match info {
+        ast::ExactNumberInfo::None => (Decimal::MAX_PRECISION as u64, 0),
+        ast::ExactNumberInfo::Precision(p) => (*p, 0),
+        ast::ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),
+    };
+    // The on-disk Decimal is i64-backed (Decimal::MAX_PRECISION / MAX_SCALE).
+    // Validate at the SQL surface so an out-of-range type can never reach
+    // `Decimal::from_i64_with_scale`, whose precondition `assert!` would
+    // otherwise crash the process on a later INSERT or read.
+    if precision < 1 || precision > Decimal::MAX_PRECISION as u64 {
+        return Err(Error::SqlParse(format!(
+            "DECIMAL precision {} out of range 1..={}",
+            precision,
+            Decimal::MAX_PRECISION
+        )));
     }
+    if scale > precision {
+        return Err(Error::SqlParse(format!(
+            "DECIMAL scale {} exceeds precision {}",
+            scale, precision
+        )));
+    }
+    Ok((precision as u8, scale as u8))
 }
 
 #[cfg(test)]
@@ -1289,6 +1310,44 @@ mod tests {
                 assert_eq!(primary_key, vec![0]);
             }
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_decimal_scale_over_max() {
+        // Q-31 regression: DECIMAL with precision/scale > 18 was accepted by
+        // the binder, then panicked `Decimal::from_i64_with_scale`'s assert on
+        // a subsequent INSERT/read. Found by the Q-29 cargo-fuzz targets
+        // (`tuple_decode` / `keyenc_decode`), which fed raw u8 scales.
+        let (binder, _dir) = fresh_catalog();
+        let stmts = parse("CREATE TABLE t (x DECIMAL(30, 25), id INT, PRIMARY KEY (id))").unwrap();
+        let err = binder
+            .bind(stmts.into_iter().next().unwrap())
+            .expect_err("DECIMAL(30,25) must be rejected at bind time");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("DECIMAL"),
+            "expected a DECIMAL range error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_table_accepts_decimal_at_max_scale() {
+        // The boundary (scale == precision == MAX_SCALE) must still bind.
+        let (binder, _dir) = fresh_catalog();
+        let plan = bind_first(
+            &binder,
+            "CREATE TABLE t (x DECIMAL(18, 18) NOT NULL, id INT, PRIMARY KEY (id))",
+        );
+        match plan {
+            LogicalPlan::CreateTable { columns, .. } => assert_eq!(
+                columns[0].ty,
+                ColumnType::Decimal {
+                    precision: 18,
+                    scale: 18
+                }
+            ),
+            other => panic!("expected CreateTable, got {:?}", other),
         }
     }
 

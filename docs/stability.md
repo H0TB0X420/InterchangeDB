@@ -77,6 +77,14 @@ structurally cannot.
 
 ### B1. Fuzzing (`cargo-fuzz` / libFuzzer)
 
+> **Status: DONE — `Q-29` (2026-06-10).** Both halves shipped: a CI-resident
+> proptest suite (`tests/decode_fuzz_test.rs`) over all five decode surfaces,
+> and the coverage-guided `cargo-fuzz` scaffold (`fuzz/`, nightly + manual,
+> off CI). Together they found **three** real bugs — a `tuple::decode_column`
+> cursor overrun, an `SSTableReader::open` short-file `assert!`, and a
+> SQL-reachable `DECIMAL`-scale panic (`Q-31`) — all fixed. See the `Q-29`
+> audit entries in `ISSUES.md`.
+
 The codebase is full of *decode-arbitrary-bytes* surfaces that already have
 round-trip invariants written — textbook fuzz targets, nearly free to wire:
 
@@ -212,8 +220,8 @@ Sequenced for return on the stated goals (FAANG interviews, PhD apps,
 research/learning vehicle):
 
 1. ~~**CI** — a day; unblocks everything.~~ ✅ **DONE** (`Q-28`).
-2. **Fuzz the decode surfaces** — cheap; invariants already exist;
-   immediate bug yield.
+2. ~~**Fuzz the decode surfaces** — cheap; invariants already exist;
+   immediate bug yield.~~ ✅ **DONE** (`Q-29`; found 3 bugs → fixed, incl. `Q-31`).
 3. **Seeded scenario driver over the existing `FaultInjectionDiskManager`**
    (crash-at-every-LSN torture) — the differentiator; the fault injector and
    its tests already exist, so this is coverage extension, not new mechanism.

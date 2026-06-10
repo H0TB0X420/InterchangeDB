@@ -390,10 +390,17 @@ impl SSTableReader {
         let mut file = BufReader::new(File::open(path)?);
         let file_size = file.seek(SeekFrom::End(0))?;
 
-        assert!(
-            file_size >= FOOTER_SIZE as u64,
-            "SSTable file too small: {file_size} < {FOOTER_SIZE}"
-        );
+        // `open` is also the recovery path for files of unknown provenance —
+        // a crash mid-write can leave a short/torn file. A too-small file is
+        // external corruption, not a programmer error, so surface it as
+        // StorageCorrupted (like the footer/index/bloom decodes below) rather
+        // than a process-killing assert.
+        if file_size < FOOTER_SIZE as u64 {
+            return Err(Error::StorageCorrupted(format!(
+                "SSTable {}: file too small: {file_size} < {FOOTER_SIZE}",
+                path.display()
+            )));
+        }
 
         // Read footer.
         file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;

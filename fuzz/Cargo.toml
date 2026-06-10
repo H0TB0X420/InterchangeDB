@@ -1,0 +1,60 @@
+[package]
+name = "interchangedb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: keeps this nightly-only, sanitizer-instrumented crate
+# out of the parent package's build, so `cargo build`/`test`/`clippy` at the
+# repo root never touch it. The fuzzer is manual + local by design (Q-29).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+
+[dependencies.interchangedb]
+path = ".."
+
+[profile.release]
+# Keep symbols so crash backtraces are legible.
+debug = 1
+
+[[bin]]
+name = "keyenc_decode"
+path = "fuzz_targets/keyenc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tuple_decode"
+path = "fuzz_targets/tuple_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_record_decode"
+path = "fuzz_targets/wal_record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sstable_open"
+path = "fuzz_targets/sstable_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest_open"
+path = "fuzz_targets/manifest_open.rs"
+test = false
+doc = false
+bench = false

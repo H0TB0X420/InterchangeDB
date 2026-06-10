@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 48df34925b13e6a1923e94076338b094cadde532850611d12954ac9386985435 # shrinks to bytes = []
+cc 62b137b82f1c07743c90ffc39cdd8cbe1a6eba9c4633d7aeb2bd771c27b387c2 # shrinks to types = [Varchar(0), Int32, Int32, Int32, Int32], bytes = [32, 0, 0], col_idx = 2
