@@ -19,10 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use interchangedb::buffer::replacer::{
-    ArcReplacer, ClockReplacer, EvictionPolicy, FifoReplacer, LruKReplacer, LruReplacer,
-    TwoQReplacer,
-};
+use interchangedb::buffer::replacer::{EvictionPolicy, LruReplacer};
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::common::PageId;
 use interchangedb::storage::MemoryDiskManager;
@@ -34,18 +31,11 @@ const STORM_DURATION_MS: u64 = 1500;
 const N_READER_THREADS: usize = 4;
 const N_WRITER_THREADS: usize = 2;
 
-/// All 6 policies the BPM supports. Each closure produces a fresh `Box<dyn
-/// EvictionPolicy>` — the BPM consumes ownership on swap.
+/// All 6 policies the BPM supports, sourced from the shared `testkit` registry
+/// (`for_each_policy!`) so this storm and the conformance matrix can never
+/// drift on which policies exist. The BPM consumes ownership on swap.
 fn fresh_policy(i: usize) -> Box<dyn EvictionPolicy> {
-    match i % 6 {
-        0 => Box::new(FifoReplacer::new()),
-        1 => Box::new(ClockReplacer::new()),
-        2 => Box::new(LruReplacer::new(POOL_SIZE)),
-        3 => Box::new(LruKReplacer::new(2)),
-        4 => Box::new(TwoQReplacer::new(16)),
-        5 => Box::new(ArcReplacer::new(64)),
-        _ => unreachable!(),
-    }
+    (testkit::policy::makers()[i % 6].1)()
 }
 
 fn build_bpm() -> Arc<BufferPoolManager> {

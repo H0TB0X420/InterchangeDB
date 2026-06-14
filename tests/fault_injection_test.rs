@@ -10,12 +10,10 @@
 //! injection to those subsystems is a separate piece of work (deferred;
 //! not in Q-07's scope).
 
-mod common;
-
-use common::fault_injection::FaultInjectionDiskManager;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::Error;
 use interchangedb::storage::MemoryDiskManager;
+use testkit::faults::FaultInjectionDiskManager;
 
 fn make_bpm_with_writes_failing(pool_size: usize, n_writes_to_fail: usize) -> BufferPoolManager {
     let dm = FaultInjectionDiskManager::new(MemoryDiskManager::new())

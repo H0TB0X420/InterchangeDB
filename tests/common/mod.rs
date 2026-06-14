@@ -11,7 +11,6 @@
 //! - `mock_stats` — synthetic stats provider for cost-model tests. No
 //!   consumers yet; Phase 14 (Selinger / `CostModel`) is the first.
 
-pub mod fault_injection;
 pub mod golden_plan;
 pub mod mock_catalog;
 pub mod mock_stats;

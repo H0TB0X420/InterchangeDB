@@ -10,6 +10,11 @@
 //! return different ordering, or get-after-delete returning the
 //! pre-delete value. The interchange thesis (Phase 16+) loses meaning
 //! if engines diverge.
+//!
+//! Relationship to `config_proptest` (Q-33): this is the *deeper* engine
+//! differential — per-op get/scan comparison against a `BTreeMap` oracle.
+//! `config_proptest` is the *broader*, registry-driven version (final-state
+//! equivalence across every config of every axis). Both kept; complementary.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
