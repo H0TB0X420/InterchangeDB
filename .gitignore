@@ -2,4 +2,6 @@ target/
 Cargo.lock
 CLAUDE.md
 plan.md
+mutants.out/
+mutants.out.old/
 

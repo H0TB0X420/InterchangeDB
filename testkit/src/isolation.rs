@@ -139,8 +139,29 @@ fn write_skew(policy: Arc<dyn IsolationPolicy>) -> Outcome {
     }
 }
 
+/// Dirty read (G1a-ish): a txn reads a key while another holds an *uncommitted*
+/// write to it, then that writer aborts. Both levels must hide the uncommitted
+/// value — "Read Committed" literally promises this. This is the scenario the
+/// visibility predicate exists for; without it a `visible -> true` bug slips
+/// through (caught by mutation testing).
+fn dirty_read(policy: Arc<dyn IsolationPolicy>) -> Outcome {
+    let (db, _dir) = fresh_db(policy);
+    db.put(b"x", b"10").unwrap();
+    let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
+    db.txn_put(t1, b"x", b"99").unwrap(); // uncommitted
+    let t2 = db.begin_txn(TxnMode::ReadOnly).unwrap();
+    let seen = db.txn_get(t2, b"x").unwrap();
+    db.txn_abort(t1).ok();
+    db.commit_txn(t2).ok();
+    if seen == Some(b"10".to_vec()) {
+        Outcome::Prevented // never saw the uncommitted write
+    } else {
+        Outcome::Allowed // saw the dirty 99
+    }
+}
+
 /// The anomaly spectrum each isolation level is required to exhibit.
-fn expected(level: &str) -> [(&'static str, Outcome); 4] {
+fn expected(level: &str) -> [(&'static str, Outcome); 5] {
     use Outcome::{Allowed, Prevented};
     match level {
         "si" => [
@@ -148,12 +169,14 @@ fn expected(level: &str) -> [(&'static str, Outcome); 4] {
             ("non_repeatable_read", Prevented),
             ("lost_update", Prevented),
             ("write_skew", Allowed),
+            ("dirty_read", Prevented),
         ],
         "read-committed" => [
             ("g0_dirty_write", Prevented),
             ("non_repeatable_read", Allowed),
             ("lost_update", Allowed),
             ("write_skew", Allowed),
+            ("dirty_read", Prevented),
         ],
         other => panic!("no anomaly spec for isolation level `{other}`"),
     }
@@ -168,6 +191,7 @@ pub fn assert_isolation_contract(make: IsolationMaker) {
         ("non_repeatable_read", non_repeatable_read(make())),
         ("lost_update", lost_update(make())),
         ("write_skew", write_skew(make())),
+        ("dirty_read", dirty_read(make())),
     ];
     for ((name, got), (ename, want)) in actual.iter().zip(expected(level).iter()) {
         assert_eq!(name, ename, "scenario order mismatch");
