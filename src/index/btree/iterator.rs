@@ -11,7 +11,7 @@ use crate::buffer::BufferPoolManager;
 use crate::common::{Error, PageId, Result};
 
 use super::node::NodeType;
-use super::page_layout::decode_leaf_node;
+use super::page_layout::EncodedLeaf;
 use crate::storage::page::PageHeader;
 
 /// Safety bound on maximum pages visited during a single scan.
@@ -98,74 +98,73 @@ impl<'a> BTreeScanIterator<'a> {
             )));
         }
 
-        let leaf = decode_leaf_node(data);
-        let next_page_id = leaf.next_page_id;
+        // Walk the encoded leaf in place: no per-entry decode allocation, just
+        // the one owned copy of each surviving entry pushed into the buffer.
+        // The `leaf` borrow points into the page guard, so it is scoped to this
+        // block — which yields the owned results — and ends before the guard is
+        // dropped below.
+        let (mut entries, next_page_id, hit_end_bound) = {
+            let leaf = EncodedLeaf::parse(data);
+            let next_page_id = leaf.next_page_id;
 
-        // Validate decoded leaf invariants before trusting it. A corrupt
-        // page on disk could land here with mismatched arrays or a bogus
-        // sibling pointer; without these checks we'd silently yield garbage
-        // or follow next_page_id off the end of the BPM.
-        if leaf.keys.len() != leaf.values.len() {
-            self.done = true;
-            return Err(Error::StorageCorrupted(format!(
-                "Leaf {} keys.len()={} != values.len()={}",
-                self.current_page_id.0,
-                leaf.keys.len(),
-                leaf.values.len()
-            )));
-        }
-        for &idx in &leaf.tombstones {
-            if (idx as usize) >= leaf.keys.len() {
+            // Validate before trusting the page. A page that still passes the
+            // checksum (a writer bug) could carry an out-of-range tombstone
+            // index or a bogus sibling pointer; without these checks we'd skip
+            // the wrong entry or follow next_page_id off the end of the BPM.
+            // (Key and value counts can't disagree when walked in lockstep, so
+            // the decode path's keys==values check is now structural.)
+            if !leaf.tombstones_in_range() {
                 self.done = true;
                 return Err(Error::StorageCorrupted(format!(
-                    "Leaf {} tombstone index {} out of range (keys.len()={})",
-                    self.current_page_id.0,
-                    idx,
-                    leaf.keys.len()
+                    "Leaf {} has an out-of-range tombstone index",
+                    self.current_page_id.0
                 )));
             }
-        }
-        let page_count = self.bpm.disk_page_count();
-        if next_page_id != PageId::INVALID && next_page_id.0 >= page_count {
-            self.done = true;
-            return Err(Error::StorageCorrupted(format!(
-                "Leaf {} next_page_id={} out of range (page_count={})",
-                self.current_page_id.0, next_page_id.0, page_count
-            )));
-        }
+            let page_count = self.bpm.disk_page_count();
+            if next_page_id != PageId::INVALID && next_page_id.0 >= page_count {
+                self.done = true;
+                return Err(Error::StorageCorrupted(format!(
+                    "Leaf {} next_page_id={} out of range (page_count={})",
+                    self.current_page_id.0, next_page_id.0, page_count
+                )));
+            }
 
-        // Collect live entries, filtering by bounds.
-        let mut entries = Vec::new();
-        let mut hit_end_bound = false;
+            // Collect live entries, filtering by bounds.
+            let mut entries = Vec::new();
+            let mut hit_end_bound = false;
 
-        for (key, value) in leaf.live_entries() {
-            // Start bound: skip entries before start key (first page only).
-            if self.first_page {
-                let skip = match &self.start_bound {
-                    Bound::Included(start) => key < start.as_slice(),
-                    Bound::Excluded(start) => key <= start.as_slice(),
+            for (key, value) in leaf.live_entries() {
+                // Start bound: skip entries before start key (first page only).
+                if self.first_page {
+                    let skip = match &self.start_bound {
+                        Bound::Included(start) => key < start.as_slice(),
+                        Bound::Excluded(start) => key <= start.as_slice(),
+                        Bound::Unbounded => false,
+                    };
+                    if skip {
+                        continue;
+                    }
+                }
+
+                // End bound: stop when entries pass end key.
+                let past_end = match &self.end_bound {
+                    Bound::Included(end) => key > end.as_slice(),
+                    Bound::Excluded(end) => key >= end.as_slice(),
                     Bound::Unbounded => false,
                 };
-                if skip {
-                    continue;
+                if past_end {
+                    hit_end_bound = true;
+                    break;
                 }
+
+                entries.push((key.to_vec(), value.to_vec()));
             }
 
-            // End bound: stop when entries pass end key.
-            let past_end = match &self.end_bound {
-                Bound::Included(end) => key > end.as_slice(),
-                Bound::Excluded(end) => key >= end.as_slice(),
-                Bound::Unbounded => false,
-            };
-            if past_end {
-                hit_end_bound = true;
-                break;
-            }
+            (entries, next_page_id, hit_end_bound)
+        };
 
-            entries.push((key.to_vec(), value.to_vec()));
-        }
-
-        // Drop the page guard before updating state.
+        // Drop the page guard before updating state (the `leaf` borrow ended
+        // with the block above).
         drop(guard);
 
         self.first_page = false;

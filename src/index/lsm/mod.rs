@@ -21,10 +21,16 @@ pub use engine::LsmEngine;
 /// A key-value entry where `None` value indicates a tombstone.
 pub(crate) type Entry = (Vec<u8>, Option<Vec<u8>>);
 
+/// A memtable frozen by a flush — the sorted map a memtable freezes to
+/// (`None` value = tombstone). Shared via `Arc` between the reader-visible
+/// immutable list and the off-lock SSTable writer (see `LsmTree::flush`).
+type FrozenMemtable = std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::common::error::Result;
 use config::DEFAULT_MEMTABLE_SIZE_BYTES;
@@ -34,11 +40,17 @@ use merge_iterator::MergeIterator;
 use sstable::{write_sstable, SSTableReader};
 
 /// Mutable state grouped behind a single Mutex for interior mutability.
+///
+/// `immutable_memtables` holds memtables that have been frozen by a flush but
+/// not yet written to disk. The read path consults them between the active
+/// memtable and L0, so a flush can drop the `inner` lock during its disk I/O
+/// without the frozen keys ever becoming invisible. Frozen maps are `Arc`'d so
+/// the off-lock writer can iterate the same map the readers see, with no clone
+/// under the lock.
 struct LsmInner {
     memtable: Memtable,
-    immutable_memtables: Vec<std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    immutable_memtables: Vec<Arc<FrozenMemtable>>,
     level_state: LevelState,
-    manifest: Manifest,
 }
 
 /// LSM-tree data structure.
@@ -48,6 +60,13 @@ struct LsmInner {
 pub struct LsmTree {
     inner: Mutex<LsmInner>,
     readers: Mutex<HashMap<u64, SSTableReader>>,
+    /// The manifest lives outside `inner` so a flush can append + fsync it
+    /// without holding the lock that every read takes.
+    manifest: Mutex<Manifest>,
+    /// Serializes flushes so SSTable ids, manifest records, and L0 order all
+    /// agree, and bounds `immutable_memtables` to a single in-flight entry.
+    /// Reads never take this lock.
+    flush_lock: Mutex<()>,
     #[allow(dead_code)]
     data_dir: PathBuf,
     sst_dir: PathBuf,
@@ -84,12 +103,13 @@ impl LsmTree {
             memtable: Memtable::new(),
             immutable_memtables: Vec::new(),
             level_state,
-            manifest,
         };
 
         Ok(Self {
             inner: Mutex::new(inner),
             readers: Mutex::new(readers),
+            manifest: Mutex::new(manifest),
+            flush_lock: Mutex::new(()),
             data_dir: data_dir.to_path_buf(),
             sst_dir,
             memtable_size_limit,
@@ -98,20 +118,26 @@ impl LsmTree {
 
     /// Insert a key-value pair. Flushes the memtable if it exceeds the size limit.
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        let mut inner = self.inner.lock();
-        inner.memtable.put(key, value);
-        if inner.memtable.size_bytes() >= self.memtable_size_limit {
-            self.flush_inner(&mut inner)?;
+        let over_limit = {
+            let mut inner = self.inner.lock();
+            inner.memtable.put(key, value);
+            inner.memtable.size_bytes() >= self.memtable_size_limit
+        };
+        if over_limit {
+            self.flush(false)?;
         }
         Ok(())
     }
 
     /// Delete a key by inserting a tombstone.
     pub fn delete(&self, key: Vec<u8>) -> Result<()> {
-        let mut inner = self.inner.lock();
-        inner.memtable.delete(key);
-        if inner.memtable.size_bytes() >= self.memtable_size_limit {
-            self.flush_inner(&mut inner)?;
+        let over_limit = {
+            let mut inner = self.inner.lock();
+            inner.memtable.delete(key);
+            inner.memtable.size_bytes() >= self.memtable_size_limit
+        };
+        if over_limit {
+            self.flush(false)?;
         }
         Ok(())
     }
@@ -254,44 +280,88 @@ impl LsmTree {
 
     /// Force-flush the active memtable to an L0 SSTable.
     pub fn flush_memtable(&self) -> Result<()> {
-        let mut inner = self.inner.lock();
-        self.flush_inner(&mut inner)
+        self.flush(true)
     }
 
-    /// Internal flush with inner lock already held.
-    fn flush_inner(&self, inner: &mut LsmInner) -> Result<()> {
-        if inner.memtable.is_empty() {
-            return Ok(());
-        }
+    /// Flush the active memtable to an L0 SSTable without holding `inner` across
+    /// the disk I/O.
+    ///
+    /// Reads (`get`/`scan`) only ever hold `inner` briefly; the slow part of a
+    /// flush — writing the SSTable and fsyncing the manifest — must NOT run
+    /// under `inner`, or every concurrent reader stalls behind it (the cause of
+    /// LSM's negative read scaling under a write-mixed load). The flush runs in
+    /// three phases:
+    ///
+    ///   1. Under `inner`: swap the active memtable into the immutable list and
+    ///      install a fresh one. Reads now serve the frozen data from the
+    ///      immutable list. O(1) — no disk I/O.
+    ///   2. No locks held (serialized by `flush_lock`): write the SSTable and
+    ///      append + fsync the manifest. Reads run concurrently.
+    ///   3. Under `inner`: publish the SSTable into L0 and drop the now-durable
+    ///      frozen memtable from the immutable list, atomically.
+    ///
+    /// `force` flushes a memtable that is below the size limit (explicit
+    /// `flush_memtable`); a put-triggered flush passes `false` so a flush that
+    /// lost the race to drain the memtable becomes a no-op.
+    ///
+    /// NOTE: `maybe_compact` still runs under `inner` in phase 3. Compaction is
+    /// ~4x rarer than flush (L0 trigger) but rewrites whole levels; moving it
+    /// off-lock is a separate, larger change tracked as a follow-up.
+    fn flush(&self, force: bool) -> Result<()> {
+        // Serialize flushes: keeps SSTable id / manifest / L0 order consistent
+        // and bounds the immutable list to a single in-flight entry.
+        let _flush = self.flush_lock.lock();
 
-        // Freeze the active memtable.
-        let frozen = std::mem::take(&mut inner.memtable).freeze();
+        // Phase 1 — swap under `inner` (O(1), no disk I/O).
+        let (frozen, sst_id) = {
+            let mut inner = self.inner.lock();
+            if inner.memtable.is_empty() {
+                return Ok(());
+            }
+            if !force && inner.memtable.size_bytes() < self.memtable_size_limit {
+                // A racing flush already drained it below the limit.
+                return Ok(());
+            }
+            let frozen = Arc::new(std::mem::take(&mut inner.memtable).freeze());
+            inner.immutable_memtables.push(Arc::clone(&frozen));
+            let sst_id = inner.level_state.next_id();
+            (frozen, sst_id)
+        };
 
-        // Write to a new SSTable.
-        let sst_id = inner.level_state.next_id();
+        // Phase 2 — write the SSTable and fsync the manifest, no `inner` held.
+        // The entries are cloned out of the shared frozen map (it must stay
+        // readable in the immutable list until phase 3); the clone is off the
+        // critical section and dwarfed by the disk write it feeds.
         let sst_path = self.sst_dir.join(format!("{sst_id:06}.sst"));
-        let entries = frozen.into_iter();
+        let entries = frozen.iter().map(|(k, v)| (k.clone(), v.clone()));
         let meta = write_sstable(&sst_path, sst_id, entries)?;
 
-        if let Some(meta) = meta {
-            // Record in manifest.
-            inner.manifest.log_add(0, &meta)?;
+        let reader = match &meta {
+            Some(meta) => {
+                self.manifest.lock().log_add(0, meta)?;
+                Some(SSTableReader::open(&meta.path, meta.id)?)
+            }
+            None => None,
+        };
 
-            // Open reader.
-            let reader = SSTableReader::open(&meta.path, meta.id)?;
-            self.readers.lock().insert(meta.id, reader);
-
-            // Add to L0.
-            inner.level_state.levels[0].push(meta);
-
-            // Check if compaction is needed.
-            compaction::maybe_compact(
-                &mut inner.level_state,
-                &mut inner.manifest,
-                &self.readers,
-                &self.sst_dir,
-                self.memtable_size_limit,
-            )?;
+        // Phase 3 — publish into L0 and retire the frozen memtable, under `inner`.
+        {
+            let mut inner = self.inner.lock();
+            if let Some(meta) = meta {
+                // The reader must be visible before the L0 entry that names it.
+                self.readers.lock().insert(meta.id, reader.unwrap());
+                inner.level_state.levels[0].push(meta);
+                compaction::maybe_compact(
+                    &mut inner.level_state,
+                    &mut self.manifest.lock(),
+                    &self.readers,
+                    &self.sst_dir,
+                    self.memtable_size_limit,
+                )?;
+            }
+            inner
+                .immutable_memtables
+                .retain(|m| !Arc::ptr_eq(m, &frozen));
         }
 
         Ok(())

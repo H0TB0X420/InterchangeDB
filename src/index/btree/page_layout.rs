@@ -239,6 +239,149 @@ fn is_tombstoned(
     })
 }
 
+/// A leaf page read in place, without materializing its entries.
+///
+/// `decode_leaf_node` allocates a `Vec` per key AND per value (≈2N heap
+/// allocations for an N-entry leaf) so the caller can walk the entries; a range
+/// scan then clones each surviving entry *again* into its owned buffer — ≈4N
+/// allocations per page. `EncodedLeaf` walks the same bytes in place and yields
+/// each live entry as a pair of slices into the page, so the scan pays only for
+/// the one owned copy it must return (≈2N). It is the range-scan analogue of
+/// `lookup_in_encoded_leaf`, the point-read equivalent.
+pub struct EncodedLeaf<'a> {
+    buf: &'a [u8],
+    size: usize,
+    tombstones_offset: usize,
+    tombstone_count: usize,
+    /// Byte offset where the first entry begins (past the tombstone indices).
+    entries_offset: usize,
+    /// Sibling pointer, for the scan to advance to the next leaf.
+    pub next_page_id: PageId,
+}
+
+impl<'a> EncodedLeaf<'a> {
+    /// Parse a leaf page's header in place — no entry allocation. Verifies the
+    /// page checksum, matching `decode_leaf_node`'s check (a mismatch panics:
+    /// corruption is not recoverable).
+    pub fn parse(buf: &'a [u8]) -> EncodedLeaf<'a> {
+        let stored_checksum = u32::from_le_bytes([
+            buf[PageHeader::OFFSET_CHECKSUM],
+            buf[PageHeader::OFFSET_CHECKSUM + 1],
+            buf[PageHeader::OFFSET_CHECKSUM + 2],
+            buf[PageHeader::OFFSET_CHECKSUM + 3],
+        ]);
+        if stored_checksum != 0 {
+            assert_eq!(
+                stored_checksum,
+                PageHeader::compute_checksum(buf),
+                "leaf node page checksum mismatch"
+            );
+        }
+        debug_assert_eq!(buf[PageHeader::SIZE], NodeType::Leaf as u8);
+
+        // Field order after the PageHeader prefix (see `encode_leaf_node`):
+        // node_type(1) size(2) max_size(2) next(4) prev(4) tombstone_count(2).
+        let size = u16::from_le_bytes([buf[PageHeader::SIZE + 1], buf[PageHeader::SIZE + 2]]) as usize;
+        let next_offset = PageHeader::SIZE + 1 + 2 + 2;
+        let next_page_id = PageId::new(u32::from_le_bytes([
+            buf[next_offset],
+            buf[next_offset + 1],
+            buf[next_offset + 2],
+            buf[next_offset + 3],
+        ]));
+        let tombstone_count_offset = PageHeader::SIZE + 1 + 2 + 2 + 4 + 4;
+        let tombstone_count = u16::from_le_bytes([
+            buf[tombstone_count_offset],
+            buf[tombstone_count_offset + 1],
+        ]) as usize;
+        let tombstones_offset = LEAF_HEADER_SIZE;
+        let entries_offset = tombstones_offset + tombstone_count * 2;
+
+        EncodedLeaf {
+            buf,
+            size,
+            tombstones_offset,
+            tombstone_count,
+            entries_offset,
+            next_page_id,
+        }
+    }
+
+    /// Whether every tombstone index is within `[0, size)`. The checksum already
+    /// guards the bytes, so a violation here means a buggy writer rather than
+    /// disk rot — the scan surfaces it as corruption rather than trusting the
+    /// page. (Replaces the `keys.len() == values.len()` + tombstone-range checks
+    /// the decode path did; key/value counts can't disagree when walked in
+    /// lockstep, so only the tombstone range needs checking.)
+    pub fn tombstones_in_range(&self) -> bool {
+        (0..self.tombstone_count).all(|i| {
+            let off = self.tombstones_offset + i * 2;
+            (u16::from_le_bytes([self.buf[off], self.buf[off + 1]]) as usize) < self.size
+        })
+    }
+
+    /// Iterate live (non-tombstoned) entries as `(key, value)` slices into the
+    /// page buffer, in stored (sorted) order. No allocation. Matches
+    /// `LeafNode::live_entries`.
+    pub fn live_entries(&self) -> EncodedLeafEntries<'a> {
+        EncodedLeafEntries {
+            buf: self.buf,
+            tombstones_offset: self.tombstones_offset,
+            tombstone_count: self.tombstone_count,
+            offset: self.entries_offset,
+            physical_index: 0,
+            size: self.size,
+        }
+    }
+}
+
+/// Iterator over an encoded leaf's live entries — yields slices into the page.
+pub struct EncodedLeafEntries<'a> {
+    buf: &'a [u8],
+    tombstones_offset: usize,
+    tombstone_count: usize,
+    offset: usize,
+    physical_index: usize,
+    size: usize,
+}
+
+impl<'a> Iterator for EncodedLeafEntries<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<(&'a [u8], &'a [u8])> {
+        // Walk physical entries from the current offset, skipping tombstoned
+        // ones. Each entry is `key_len(2) key val_len(2) val`, so the offset
+        // advances by the entry's own length — the same layout the point-read
+        // path walks in `lookup_in_encoded_leaf`.
+        while self.physical_index < self.size {
+            let offset = self.offset;
+            let key_len = u16::from_le_bytes([self.buf[offset], self.buf[offset + 1]]) as usize;
+            let key_start = offset + 2;
+            let val_len_offset = key_start + key_len;
+            let val_len =
+                u16::from_le_bytes([self.buf[val_len_offset], self.buf[val_len_offset + 1]]) as usize;
+            let val_start = val_len_offset + 2;
+
+            let physical_index = self.physical_index;
+            self.physical_index += 1;
+            self.offset = val_start + val_len;
+
+            if is_tombstoned(
+                self.buf,
+                self.tombstones_offset,
+                self.tombstone_count,
+                physical_index,
+            ) {
+                continue;
+            }
+            let key = &self.buf[key_start..key_start + key_len];
+            let value = &self.buf[val_start..val_start + val_len];
+            return Some((key, value));
+        }
+        None
+    }
+}
+
 /// Encode a leaf node to a page buffer.
 ///
 /// Returns the number of bytes written.
@@ -545,6 +688,53 @@ mod tests {
         let mut buf = vec![0u8; PAGE_SIZE];
         encode_leaf_node(&node, &mut buf);
         assert_eq!(lookup_in_encoded_leaf(&buf, &[1]), None);
+    }
+
+    #[test]
+    fn encoded_leaf_live_entries_matches_decode() {
+        // The in-place scan walker must yield exactly the same live entries (in
+        // the same order, tombstones skipped) as `decode_leaf_node(buf)
+        // .live_entries()` — the materializing path it replaces — and must
+        // recover the sibling pointer the scan advances by. Variable-length
+        // keys/values and a tombstoned middle key exercise the offset math.
+        let mut node = LeafNode::new(100);
+        node.insert(vec![1, 2], vec![10, 20, 30]);
+        node.insert(vec![3, 4, 5], vec![40, 50]);
+        node.insert(vec![6], vec![60, 70, 80, 90]);
+        node.delete(&[3, 4, 5], 8); // tombstone the middle key
+        node.next_page_id = PageId::new(7);
+
+        let mut buf = vec![0u8; PAGE_SIZE];
+        encode_leaf_node(&node, &mut buf);
+
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = decode_leaf_node(&buf)
+            .live_entries()
+            .into_iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+
+        let leaf = EncodedLeaf::parse(&buf);
+        let actual: Vec<(Vec<u8>, Vec<u8>)> = leaf
+            .live_entries()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+
+        assert_eq!(actual, expected, "live entries must match the decode path");
+        assert_eq!(actual.len(), 2, "the tombstoned middle key is skipped");
+        assert_eq!(leaf.next_page_id, PageId::new(7));
+        assert!(leaf.tombstones_in_range());
+    }
+
+    #[test]
+    fn encoded_leaf_live_entries_empty() {
+        // An empty leaf yields nothing and has no sibling.
+        let node = LeafNode::new(100);
+        let mut buf = vec![0u8; PAGE_SIZE];
+        encode_leaf_node(&node, &mut buf);
+
+        let leaf = EncodedLeaf::parse(&buf);
+        assert_eq!(leaf.live_entries().count(), 0);
+        assert_eq!(leaf.next_page_id, PageId::INVALID);
     }
 
     #[test]

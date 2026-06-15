@@ -10,6 +10,30 @@ Environment: macOS (APFS, fsync ~11 ms), single node, smoke-scale data.
 The absolute numbers are OS/hardware-bound; the *shape* (what scales, what
 doesn't, and why) is what generalizes.
 
+**Hardware — read before comparing numbers.** Two machines appear in this doc.
+The *development / baseline* box (the "original" column, and all day-to-day
+runs) is a **MacBook Pro (Retina, 13-inch, Early 2015): dual-core 3.1 GHz Intel
+Core i7 (2 physical / 4 logical), 16 GB DDR3-1867, PCIe SSD** — only **2 cores**,
+so it saturates at ~2–4 busy threads. The much faster figures (~168 txn/s, the
+"M2 Pro" column) are from a **Mac mini — Apple M2 Pro, 10 cores** (~2–3.5×
+faster). A low number on the laptop is **not** a regression; compare the *ratio*
+between engines/configs, which is hardware-independent.
+
+Current MacBook Pro baseline (2026-06-15, 8×8, smoke-scale, seed 1, 0% aborts):
+**B-tree/arc ≈ 48–50 txn/s** (tpmC ~1.3 k); **LSM ≈ 18 txn/s** (tpmC ~535).
+B-tree leads LSM ~2.7×, matching the Mac mini's ~3.2× ratio — a uniformly slower
+box, not a regression.
+
+**Scaling characterization (2026-06-15, this laptop, warehouses == terminals):**
+full-mix B-tree plateaus at ~50 txn/s by 4 terminals and stays flat to 16; LSM
+is flat-to-negative (~20–27). But **read-only** (OrderStatus only — no write
+locks, no WAL commits) scales ~4.3× (B-tree 89→386, LSM 86→372 over 1→8
+terminals). Conclusion on this hardware: **the read path scales; the full-mix
+ceiling is the write/commit path** (locks + WAL fsync), consistent with the
+"wait-bound write mix" finding below. On 2 cores + a ~11 ms macOS fsync floor
+with group commit barely batching (~1.2 fsyncs/commit), the full-mix number is
+effectively hardware-capped here.
+
 > **Re-measured 2026-06-06 on an Apple M2 Pro (10 cores, 16 GB, macOS Tahoe
 > 26.1).** Magnitudes came in ~2–3.5× the original numbers (faster machine),
 > but the *shape* reproduced exactly: B-tree peaks early then declines, LSM
@@ -58,10 +82,11 @@ serialization problem.
 
 ---
 
-## Re-measurement (2026-06-06, Apple M2 Pro, 10 cores)
+## Re-measurement (2026-06-06, Mac mini — Apple M2 Pro, 10 cores)
 
-Re-ran the harness on a faster box (Apple M2 Pro, 10 cores, 16 GB, macOS
-Tahoe 26.1). 10 s runs, `warehouses == terminals`, seed 1, arc policy. The
+Re-ran the harness on a faster box (a **Mac mini**: Apple M2 Pro, 10 cores,
+16 GB, macOS Tahoe 26.1) — *not* the development MacBook Pro the "original"
+column was measured on. 10 s runs, `warehouses == terminals`, seed 1, arc policy. The
 absolute throughput is ~2–3.5× higher (faster CPU/SSD), but the scaling
 *shape* is unchanged.
 
@@ -196,12 +221,23 @@ __fcntl           6679
 
 **LSM (8×8):** dominated by `__psynch_cvwait` 41k, from the READ path
 (`LsmTree::scan` 1371, `MergeIterator::collect_all` 660) — NOT `sync_to`
-(16) or `LockManager` (6). LSM's killer is reads, not commit or locks.
+(16) or `LockManager` (6).
 
-**Unified conclusion:** TPC-C is **read-path-bound for both engines**
-(several reads/txn), differently. B-tree pays in page-decode allocation +
-BPM-latch contention; LSM pays in merge-iterator materialization + a
-read-path condvar.
+**Correction (2026-06-15, measured).** The earlier reading — "LSM's killer is
+reads" — was too strong. Those `cvwait` samples are readers *parked* behind
+the memtable flush, which held the global `inner` lock across its SSTable
+write + manifest fsync (two fsyncs + a multi-MB write). Moving the flush
+off-lock (the immutable-memtable handoff, now landed) removes that park — and
+a drift-controlled A/B showed **+0% full-mix throughput** (LSM 22→25 txn/s,
+inside run noise; B-tree control flat). The contention is real but not the
+bottleneck: full-mix is **commit/disk-floored**, so removing a read-side stall
+just leaves readers waiting on the commit path — only the flush's read *tail
+latency* improves (~22 ms → ~0), which the throughput harness doesn't see.
+
+**Unified conclusion:** below the commit/disk floor TPC-C is
+**read-path-bound**, differently per engine — B-tree pays in page-decode
+allocation + BPM-latch contention, LSM in merge-iterator materialization +
+(now removed) the flush-lock read stall.
 
 ---
 
@@ -225,13 +261,21 @@ read-path condvar.
      interchangeability thesis both matter.**
    - Whichever: keep the Q-27 invariant (`handle_cache_hit` holds `pt.read`
      across the pin; `evict_page` re-checks `pin_count` under `pt.write`).
-2. **Scan-path allocation** — once the BPM latch is gone, this is #1
-   (~47k samples). `BTreeScanIterator`/`decode_leaf_node` materialize a
-   `Vec` per row/leaf. Fix: lazy / zero-copy iteration (yield slices into
-   the page guard rather than owned `Vec`s), threaded through `mvcc_scan`
-   and the executor. Harder than the get-path fix (multi-row, lifetimes,
-   MVCC version chain). The committed `lookup_in_encoded_leaf` is the
-   pattern to mirror for the scan path.
+2. **Scan-path allocation — LANDED (2026-06-15).** `BTreeScanIterator`
+   called `decode_leaf_node`, which materialized a `Vec` per key *and* per
+   value per leaf (~2N allocs), then cloned each surviving entry *again* into
+   the iterator's buffer (~4N allocs/page). `EncodedLeaf` (page_layout.rs) now
+   walks the encoded leaf in place — the range-scan analogue of
+   `lookup_in_encoded_leaf` — yielding `(&[u8], &[u8])` slices so the scan
+   pays only its one owned copy per row (~2N). Drift-controlled A/B on
+   `engine_range_scan` (LSM control flat to <1%): **~1.8× faster B-tree range
+   scans** (median latency ≈ halved) for any scan spanning more than one leaf;
+   ~1.1× for a single leaf; the ratio plateaus with length (a constant
+   per-page fraction removed). The iterator's `Item = Result<(Vec, Vec)>` is
+   unchanged, so `mvcc_scan` and the executor were untouched. Full zero-copy
+   to the executor (a lending iterator holding the page guard) is still
+   possible but needs the consumer rewritten — the in-place walk captured the
+   allocation win without it.
 3. **Commit/durability wait** — the `cvwait` cost. On macOS the fsync floor
    (~11 ms) caps it; group commit only helps when commits overlap, which
    TPC-C doesn't do much. Real unlock: Linux/NVMe (fsync ~11 ms→<1 ms), or
@@ -255,12 +299,38 @@ read-path condvar.
 - **The harness** (`src/bin/tpcc.rs`) with engine / policy / pool-size /
   read-only knobs — the durable instrument for re-measuring any future
   change against both engines instantly.
+- **B-tree scan-path zero-copy** (`EncodedLeaf`) — **~1.8× faster range
+  scans** (lever #2 above): an allocation-free in-place leaf walk mirroring
+  `lookup_in_encoded_leaf`, no change to the iterator's interface. It also
+  **lifts B-tree full-mix TPC-C ~+14%** (5-rep drift-controlled A/B mean, 4/5
+  reps up; LSM control flat) — the gain comes from the scan-heavy
+  `StockLevel`/`Delivery` txns, *not* the commit-bound NewOrder/Payment
+  majority. (Read-only TPC-C stays flat: its only txn, OrderStatus, scans a
+  single order's ~10 lines — one leaf — (b)'s weakest case.)
+- **LSM flush off the `inner` lock** (immutable-memtable handoff +
+  `flush_lock` + manifest in its own `Mutex`) — the canonical LSM design;
+  removes a global lock held across two fsyncs + a multi-MB write and wires up
+  the previously-dead `immutable_memtables` read branch. **Full-mix
+  throughput: +0 here** (commit/disk-floored, A/B-confirmed); the win is read
+  tail-latency during flush + correctness on faster-fsync / more-core hardware.
 
 ## What to do first if resuming
 
-Re-profile to confirm nothing drifted, then take lever #1 via the
-**pull-based `EvictionPolicy` refactor** (keeps the thesis), then lever #2
-(scan-path zero-copy). Expect incremental gains; the absolute ceiling
-won't break without Linux/NVMe for the commit path. Always re-measure with
-the harness (`--engine`, `--read-only`) after each change — every
-structural guess in this investigation that *wasn't* measured was wrong.
+Lever #2 (scan-path zero-copy) is **done**. The remaining read-side lever is
+#1 — the BPM replacer latch — via the **pull-based `EvictionPolicy` refactor**
+(keeps the interchangeability thesis). Refined picture from this session's
+A/Bs: the full mix splits into a **commit/disk-floored majority**
+(NewOrder/Payment, ~88%, capped by the ~11 ms fsync) and a **scan-bound
+minority** (StockLevel/Delivery/OrderStatus, ~12%). Read-side levers (#1, #2)
+can't touch the floored majority but *can* move the scan-bound minority — which
+is how (b) lifted B-tree full-mix (the +14% in *What landed*). So a read-side
+lever moves the headline only as far as the mix has scan-bound headroom; the
+floored majority needs the commit path (group commit / faster fsync) or better
+hardware (Linux/NVMe). LSM saw no such lift — its full-mix is the floored
+majority plus its own commit cost, and (a) is commit-neutral. Pick the lever to
+match the metric *and* which part of the mix it bottlenecks. Always re-measure
+with a **drift-controlled A/B** (old vs new binary, back-to-back, with a
+control): single-run baselines here carry ~20–28% thermal drift, and even a
+5-rep mean was needed to pull (b)'s signal out of LSM full-mix's ±35% per-run
+swing. Every structural guess in this investigation that *wasn't* measured that
+way was wrong.
