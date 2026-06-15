@@ -204,6 +204,17 @@ Invariants to assert after each recovery:
 
 ## E. Isolation-level proof
 
+> **Status: trait + matrix LANDED — `Q-34` (2026-06-15).** MVCC isolation is now
+> behind an `IsolationPolicy` trait (`src/txn/isolation/`); `SnapshotIsolation`
+> (default) and `ReadCommitted` are the impls, threaded via
+> `Database::open_with_isolation`. The Hermitage anomalies became a **conformance
+> matrix**: `testkit::isolation` runs the scenarios per level and
+> `tests/isolation_conformance.rs` asserts each level's required anomaly
+> spectrum (SI blocks non-repeatable-read + lost-update where RC allows them;
+> both block dirty-write, allow write-skew). A new level (SSI) is one
+> `for_each_isolation!` line. **Remaining:** SSI impl; the History checker
+> (item 2 below); a fuller Hermitage set (G1a/b/c, OTV, PMP).
+
 We claim Snapshot Isolation today, Serializability (SSI) later. The claims
 should be *demonstrated*, not asserted.
 

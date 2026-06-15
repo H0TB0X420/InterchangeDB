@@ -21,6 +21,7 @@ pub mod engine;
 pub mod equivalence;
 pub mod faults;
 pub mod handles;
+pub mod isolation;
 pub mod matrix;
 pub mod policy;
 pub mod workload;

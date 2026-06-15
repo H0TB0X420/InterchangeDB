@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use crate::common::{Error, Result};
 use crate::storage::{ScanIterator, StorageEngine, StorageStatus};
+use crate::txn::isolation::{VersionRef, VisibilityView};
 use crate::txn::mvcc::{self, MvccValue};
-use crate::txn::{LockMode, Snapshot, Timestamp, TransactionManager, TxnId, TxnMode};
+use crate::txn::{LockMode, Timestamp, TransactionManager, TxnId, TxnMode};
 use crate::wal::{LogRecord, Wal};
 
 /// One transaction's view of the storage engine.
@@ -51,55 +52,49 @@ impl<E: StorageEngine> TxnEngine<E> {
         &self.engine
     }
 
-    /// Snapshot for this handle's bound txn. Explicit txns reuse the
-    /// snapshot captured at `begin()`. `AUTO_COMMIT` constructs a fresh
-    /// snapshot from the current oracle (matches `Database::get` semantics
-    /// for auto-commit reads).
-    fn snapshot_for_read(&self) -> Result<Snapshot> {
-        if self.txn_id == TxnId::AUTO_COMMIT {
-            let oracle_ts = self.txn_mgr.ts_oracle_peek();
-            let ckpt_ts = self.txn_mgr.checkpoint_ts();
-            let read_ts = if ckpt_ts > oracle_ts {
-                ckpt_ts
-            } else {
-                oracle_ts
-            };
-            Ok(Snapshot { read_ts })
-        } else {
-            self.txn_mgr.snapshot(self.txn_id)
-        }
-    }
-
-    /// SI first-committer-wins check. Returns the writer of any committed
-    /// version whose `commit_ts > my_begin_ts`. Caller must hold the X-lock
-    /// on `user_key` so no concurrent writer can race the scan.
-    fn find_conflicting_committed_version(
-        &self,
-        user_key: &[u8],
-        my_begin_ts: Timestamp,
-    ) -> Result<Option<TxnId>> {
-        let committed = self.txn_mgr.committed_txns_read();
+    /// All existing versions of `user_key` in the store as `(txn_id, ts)`
+    /// pairs. The isolation policy's `on_write` consults these for its conflict
+    /// rule — the engine scan (generic over `E`) stays here, the decision lives
+    /// in the policy. Caller must hold the X-lock so no writer races the scan.
+    fn scan_versions(&self, user_key: &[u8]) -> Result<Vec<VersionRef>> {
         let start = mvcc::encode_mvcc_key_start(user_key);
         let end = mvcc::encode_mvcc_key_end(user_key);
 
+        let mut versions = Vec::new();
         for result in self.engine.scan(start..=end) {
             let (encoded_key, encoded_value) = result?;
-            let (found_key, _version_ts) = mvcc::decode_mvcc_key(&encoded_key)?;
+            let (found_key, version_ts) = mvcc::decode_mvcc_key(&encoded_key)?;
             if found_key != user_key {
                 break;
             }
             let mvcc_val = mvcc::decode_mvcc_value(&encoded_value)?;
-            let version_txn_id = match &mvcc_val {
+            let txn_id = match &mvcc_val {
                 MvccValue::Value { txn_id, .. } => *txn_id,
                 MvccValue::Tombstone { txn_id } => *txn_id,
             };
-            if let Some(commit_ts) = committed.get(&version_txn_id) {
-                if *commit_ts > my_begin_ts {
-                    return Ok(Some(version_txn_id));
-                }
-            }
+            versions.push(VersionRef {
+                txn_id,
+                ts: version_ts,
+            });
         }
-        Ok(None)
+        Ok(versions)
+    }
+
+    /// Run the isolation policy's per-write check for `user_key`. Scans the
+    /// key's versions and hands them to `on_write` along with the read-side
+    /// view; the policy decides whether to reject (e.g. SI first-committer-wins).
+    fn check_write(&self, user_key: &[u8], begin_ts: Timestamp) -> Result<()> {
+        let versions = self.scan_versions(user_key)?;
+        let committed = self.txn_mgr.committed_txns_read();
+        let known = self.txn_mgr.known_not_committed();
+        let view = VisibilityView {
+            committed: &committed,
+            known_uncommitted: &known,
+            checkpoint_ts: self.txn_mgr.checkpoint_ts(),
+        };
+        self.txn_mgr
+            .policy()
+            .on_write(self.txn_id, &versions, begin_ts, &view)
     }
 }
 
@@ -120,22 +115,24 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
             .acquire(self.txn_id, key, LockMode::Exclusive)
     }
 
-    /// MVCC get: newest visible version of `key` for this handle's bound txn.
-    /// Honors the SI snapshot, the known-not-committed set (aborts +
-    /// recovery-loaded uncommitted), and the pre-checkpoint heuristic.
+    /// MVCC get: newest version of `key` visible under the active isolation
+    /// policy for this handle's bound txn. The policy supplies the read view and
+    /// the visibility predicate; the read-side state (committed set, known-
+    /// uncommitted, checkpoint watermark) is acquired once and lent via the view.
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let snapshot = self.snapshot_for_read()?;
+        let policy = self.txn_mgr.policy();
+        let snapshot = policy.read_view(self.txn_id, &self.txn_mgr)?;
         let committed = self.txn_mgr.committed_txns_read();
-        let non_committed = self.txn_mgr.known_not_committed();
-        mvcc::mvcc_get(
-            &*self.engine,
-            key,
-            self.txn_id,
-            &snapshot,
-            &committed,
-            self.txn_mgr.checkpoint_ts(),
-            &non_committed,
-        )
+        let known = self.txn_mgr.known_not_committed();
+        let view = VisibilityView {
+            committed: &committed,
+            known_uncommitted: &known,
+            checkpoint_ts: self.txn_mgr.checkpoint_ts(),
+        };
+        let visible = |txn_id: TxnId, ts: Timestamp| {
+            policy.visible(VersionRef { txn_id, ts }, &snapshot, self.txn_id, &view)
+        };
+        mvcc::mvcc_get(&*self.engine, key, &visible)
     }
 
     /// MVCC put: writes a new `Value` version under the bound txn.
@@ -148,9 +145,7 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
             return Err(Error::TxnReadOnly(self.txn_id.0));
         }
         let begin_ts = self.txn_mgr.begin_ts(self.txn_id)?;
-        if let Some(writer) = self.find_conflicting_committed_version(key, begin_ts)? {
-            return Err(Error::WriteConflict { writer: writer.0 });
-        }
+        self.check_write(key, begin_ts)?;
         let mvcc_key = mvcc::encode_mvcc_key(key, begin_ts);
         let mvcc_val = mvcc::encode_mvcc_value(&MvccValue::Value {
             txn_id: self.txn_id,
@@ -176,9 +171,7 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
             return Err(Error::TxnReadOnly(self.txn_id.0));
         }
         let begin_ts = self.txn_mgr.begin_ts(self.txn_id)?;
-        if let Some(writer) = self.find_conflicting_committed_version(key, begin_ts)? {
-            return Err(Error::WriteConflict { writer: writer.0 });
-        }
+        self.check_write(key, begin_ts)?;
         let mvcc_key = mvcc::encode_mvcc_key(key, begin_ts);
         let mvcc_val = mvcc::encode_mvcc_value(&MvccValue::Tombstone {
             txn_id: self.txn_id,
@@ -205,12 +198,19 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
         start_bound: std::ops::Bound<Vec<u8>>,
         end_bound: std::ops::Bound<Vec<u8>>,
     ) -> Box<dyn ScanIterator + '_> {
-        let snapshot = match self.snapshot_for_read() {
+        let policy = self.txn_mgr.policy();
+        let snapshot = match policy.read_view(self.txn_id, &self.txn_mgr) {
             Ok(s) => s,
             Err(e) => return Box::new(std::iter::once(Err(e))),
         };
+        // Clone committed/known so the read lock isn't held during the scan.
         let committed = self.txn_mgr.committed_txns();
-        let non_committed = self.txn_mgr.known_not_committed();
+        let known = self.txn_mgr.known_not_committed();
+        let view = VisibilityView {
+            committed: &committed,
+            known_uncommitted: &known,
+            checkpoint_ts: self.txn_mgr.checkpoint_ts(),
+        };
 
         let start = match &start_bound {
             std::ops::Bound::Included(k) => k.clone(),
@@ -226,16 +226,10 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
             std::ops::Bound::Unbounded => vec![0xFF; 32],
         };
 
-        match mvcc::mvcc_scan(
-            &*self.engine,
-            &start,
-            &end,
-            self.txn_id,
-            &snapshot,
-            &committed,
-            self.txn_mgr.checkpoint_ts(),
-            &non_committed,
-        ) {
+        let visible = |txn_id: TxnId, ts: Timestamp| {
+            policy.visible(VersionRef { txn_id, ts }, &snapshot, self.txn_id, &view)
+        };
+        match mvcc::mvcc_scan(&*self.engine, &start, &end, &visible) {
             Ok(pairs) => Box::new(pairs.into_iter().map(Ok)),
             Err(e) => Box::new(std::iter::once(Err(e))),
         }

@@ -31,6 +31,7 @@ use crate::index::lsm::LsmEngine;
 use crate::storage::{ScanIterator, StorageEngine, StorageStatus};
 use crate::txn::engine::TxnEngine;
 use crate::txn::gc::{self, GcStats};
+use crate::txn::isolation::{IsolationPolicy, SnapshotIsolation};
 use crate::txn::mvcc::{self, MvccValue};
 use crate::txn::{TransactionManager, TxnId, TxnMode};
 use crate::wal::{LogRecord, Wal};
@@ -77,8 +78,19 @@ impl<E: StorageEngine> Database<E> {
     /// Open a WAL-enabled database.
     ///
     /// Creates or resumes the WAL in `data_dir/wal/`, runs crash recovery
-    /// if needed, and returns the ready database.
+    /// if needed, and returns the ready database. Uses Snapshot Isolation; for
+    /// a different isolation level use [`Database::open_with_isolation`].
     pub fn open(data_dir: &Path, engine: E) -> Result<Self> {
+        Self::open_with_isolation(data_dir, engine, Arc::new(SnapshotIsolation))
+    }
+
+    /// Open a WAL-enabled database running a specific concurrency-control
+    /// protocol (isolation level).
+    pub fn open_with_isolation(
+        data_dir: &Path,
+        engine: E,
+        policy: Arc<dyn IsolationPolicy>,
+    ) -> Result<Self> {
         let wal_dir = data_dir.join("wal");
         let wal = Wal::open(&wal_dir)?;
 
@@ -87,7 +99,7 @@ impl<E: StorageEngine> Database<E> {
         let stats = crate::wal::recovery::recover(&reader, &engine, wal.last_checkpoint_lsn())?;
 
         // Seed the transaction manager with committed_txns from recovery.
-        let txn_mgr = TransactionManager::new();
+        let txn_mgr = TransactionManager::with_policy(policy);
         let recovered: std::collections::HashMap<TxnId, crate::txn::Timestamp> = stats
             .committed_txns
             .into_iter()
@@ -398,8 +410,9 @@ impl<E: StorageEngine> Database<E> {
         let prev_lsn = txn_mgr.last_lsn(txn_id)?;
         let is_read_write = txn_mgr.mode(txn_id)? == TxnMode::ReadWrite;
 
-        // Assign commit_ts from oracle — this is when our writes become visible.
-        let commit_ts = txn_mgr.assign_commit_ts(txn_id)?;
+        // Validate at commit and assign commit_ts via the isolation policy
+        // (SI: just assigns from the oracle; SSI would validate first).
+        let commit_ts = txn_mgr.policy().validate_commit(txn_id, txn_mgr)?;
 
         if is_read_write {
             // Group commit: append the Commit record, then wait for durability.

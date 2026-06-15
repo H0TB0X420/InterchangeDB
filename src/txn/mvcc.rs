@@ -204,11 +204,7 @@ pub fn is_visible(
 pub fn mvcc_get<E: StorageEngine>(
     engine: &E,
     user_key: &[u8],
-    my_txn_id: TxnId,
-    snapshot: &Snapshot,
-    committed_txns: &HashMap<TxnId, Timestamp>,
-    checkpoint_ts: Timestamp,
-    known_uncommitted: &HashSet<TxnId>,
+    visible: &dyn Fn(TxnId, Timestamp) -> bool,
 ) -> Result<Option<Vec<u8>>> {
     let start = encode_mvcc_key_start(user_key);
     let end = encode_mvcc_key_end(user_key);
@@ -234,15 +230,7 @@ pub fn mvcc_get<E: StorageEngine>(
         };
 
         // Check visibility.
-        if !is_visible(
-            version_txn_id,
-            version_ts,
-            my_txn_id,
-            snapshot,
-            committed_txns,
-            checkpoint_ts,
-            known_uncommitted,
-        ) {
+        if !visible(version_txn_id, version_ts) {
             continue;
         }
 
@@ -356,11 +344,7 @@ pub fn mvcc_scan<E: StorageEngine>(
     engine: &E,
     start_key: &[u8],
     end_key: &[u8],
-    my_txn_id: TxnId,
-    snapshot: &Snapshot,
-    committed_txns: &HashMap<TxnId, Timestamp>,
-    checkpoint_ts: Timestamp,
-    known_uncommitted: &HashSet<TxnId>,
+    visible: &dyn Fn(TxnId, Timestamp) -> bool,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
@@ -432,15 +416,7 @@ pub fn mvcc_scan<E: StorageEngine>(
                         MvccValue::Tombstone { txn_id } => *txn_id,
                     };
 
-                    if !is_visible(
-                        version_txn_id,
-                        version_ts,
-                        my_txn_id,
-                        snapshot,
-                        committed_txns,
-                        checkpoint_ts,
-                        known_uncommitted,
-                    ) {
+                    if !visible(version_txn_id, version_ts) {
                         continue;
                     }
 

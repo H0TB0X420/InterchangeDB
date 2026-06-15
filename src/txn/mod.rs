@@ -22,6 +22,7 @@
 
 pub mod engine;
 pub mod gc;
+pub mod isolation;
 pub mod lock_manager;
 pub mod mvcc;
 
@@ -29,11 +30,13 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::common::{Error, Result};
+use crate::txn::isolation::{IsolationPolicy, SnapshotIsolation};
 use crate::wal::Lsn;
 pub use lock_manager::{LockManager, LockMode};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Timestamp — monotonic counter for MVCC version ordering
@@ -268,6 +271,8 @@ pub struct TransactionManager {
     aborted_txns: RwLock<HashSet<TxnId>>,
     /// Watermark: versions written before this timestamp are assumed committed.
     checkpoint_ts: AtomicU64,
+    /// The concurrency-control protocol (isolation level). Default: SI.
+    policy: Arc<dyn IsolationPolicy>,
 }
 
 impl Default for TransactionManager {
@@ -277,8 +282,15 @@ impl Default for TransactionManager {
 }
 
 impl TransactionManager {
-    /// Create a new transaction manager.
+    /// Create a new transaction manager at the default isolation level
+    /// (Snapshot Isolation).
     pub fn new() -> Self {
+        Self::with_policy(Arc::new(SnapshotIsolation))
+    }
+
+    /// Create a transaction manager running the given concurrency-control
+    /// protocol (isolation level).
+    pub fn with_policy(policy: Arc<dyn IsolationPolicy>) -> Self {
         Self {
             next_txn_id: AtomicU64::new(1),
             active_txns: Mutex::new(HashMap::new()),
@@ -288,12 +300,18 @@ impl TransactionManager {
             uncommitted_txns: RwLock::new(HashSet::new()),
             aborted_txns: RwLock::new(HashSet::new()),
             checkpoint_ts: AtomicU64::new(Timestamp::ZERO.0),
+            policy,
         }
     }
 
     /// Access the lock manager (for Database to acquire/release locks).
     pub fn lock_manager(&self) -> &LockManager {
         &self.lock_manager
+    }
+
+    /// The concurrency-control protocol in force (isolation level).
+    pub fn policy(&self) -> &dyn IsolationPolicy {
+        self.policy.as_ref()
     }
 
     /// Begin a new transaction, returning its assigned ID.

@@ -36,6 +36,18 @@ macro_rules! for_each_disk {
     };
 }
 
+/// Invoke `$cb!(name, ctor)` once per isolation level, where `ctor` returns an
+/// `Arc<dyn IsolationPolicy>` from [`crate::isolation`]. Unlike the other axes
+/// this is a *conformance* registry (each level meets its anomaly spectrum),
+/// not an equivalence one — levels differ by design.
+#[macro_export]
+macro_rules! for_each_isolation {
+    ($cb:ident) => {
+        $cb!(si, $crate::isolation::si);
+        $cb!(read_committed, $crate::isolation::read_committed);
+    };
+}
+
 /// Invoke `$cb!(name, ConcreteType, ctor)` once per storage engine, where
 /// `ctor` returns a `Built<ConcreteType>` from [`crate::engine`]. The type
 /// token lets compile-time consumers (e.g. the durability sweep, which needs
