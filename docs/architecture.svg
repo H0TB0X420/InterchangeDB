@@ -1,263 +1,161 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1480 1120" font-family="-apple-system, 
-  BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
-    <defs>
-      <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" 
-  markerHeight="7" orient="auto-start-reverse">
-        <path d="M0 0 L10 5 L0 10 z" fill="#8a8a8a"/>
-      </marker>
-      <marker id="arrowOrange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" 
-  markerHeight="7" orient="auto-start-reverse">
-        <path d="M0 0 L10 5 L0 10 z" fill="#c47a2c"/>
-      </marker>
-      <marker id="arrowFb" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" 
-  markerHeight="7" orient="auto-start-reverse">
-        <path d="M0 0 L10 5 L0 10 z" fill="#777777"/>
-      </marker>
-    </defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1480 1120" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8a8a8a"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#c47a2c"/>
+    </marker>
+    <marker id="arrowFb" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#777777"/>
+    </marker>
+  </defs>
 
-    <!-- background -->
-    <rect x="0" y="0" width="1480" height="1120" fill="#050505"/>
+  <!-- background -->
+  <rect x="0" y="0" width="1480" height="1120" fill="#050505"/>
 
-    <!-- title -->
-    <text x="740" y="48" text-anchor="middle" fill="#ffffff" font-size="30" 
-  font-weight="700">InterchangeDB — the interchangeable skeleton (ideal state)</text>
-    <text x="740" y="82" text-anchor="middle" fill="#9a9a9a" font-size="19">every layer is a
-  trait; every chip is one implementation that satisfies it</text>
+  <!-- title -->
+  <text x="740" y="48" text-anchor="middle" fill="#ffffff" font-size="30" font-weight="700">InterchangeDB — the interchangeable skeleton (ideal state)</text>
+  <text x="740" y="82" text-anchor="middle" fill="#9a9a9a" font-size="19">every layer is a trait; every chip is one implementation that satisfies it</text>
 
-    <!-- vertical connectors between layer boxes -->
-    <g stroke="#8a8a8a" stroke-width="2.5" fill="none" marker-end="url(#arrow)">
-      <line x1="245" y1="193" x2="245" y2="245"/>
-      <line x1="245" y1="316" x2="245" y2="368"/>
-      <line x1="245" y1="439" x2="245" y2="491"/>
-      <line x1="245" y1="562" x2="245" y2="614"/>
-      <line x1="245" y1="685" x2="245" y2="737"/>
-      <line x1="245" y1="808" x2="245" y2="860"/>
-    </g>
+  <!-- vertical connectors between layer boxes -->
+  <g stroke="#8a8a8a" stroke-width="2.5" fill="none" marker-end="url(#arrow)">
+    <line x1="245" y1="193" x2="245" y2="245"/>
+    <line x1="245" y1="316" x2="245" y2="368"/>
+    <line x1="245" y1="439" x2="245" y2="491"/>
+    <line x1="245" y1="562" x2="245" y2="614"/>
+    <line x1="245" y1="685" x2="245" y2="737"/>
+    <line x1="245" y1="808" x2="245" y2="860"/>
+  </g>
 
-    <!-- left feedback loop (workload feeds optimizer) -->
-    <path d="M70 651 L36 651 L36 282 L66 282" stroke="#777777" stroke-width="2" fill="none" 
-  stroke-dasharray="7 5" marker-end="url(#arrowFb)"/>
+  <!-- left feedback loop (workload feeds optimizer) -->
+  <path d="M70 651 L36 651 L36 282 L66 282" stroke="#777777" stroke-width="2" fill="none" stroke-dasharray="7 5" marker-end="url(#arrowFb)"/>
 
-    <!-- dashed connectors layer->chips -->
-    <g stroke="#666666" stroke-width="2" stroke-dasharray="6 5">
-      <line x1="421" y1="159" x2="446" y2="159"/>
-      <line x1="421" y1="282" x2="446" y2="282"/>
-      <line x1="421" y1="405" x2="446" y2="405"/>
-      <line x1="421" y1="528" x2="446" y2="528"/>
-      <line x1="421" y1="651" x2="446" y2="651"/>
-      <line x1="421" y1="774" x2="446" y2="774"/>
-      <line x1="421" y1="897" x2="446" y2="897"/>
-    </g>
+  <!-- dashed connectors layer->chips -->
+  <g stroke="#666666" stroke-width="2" stroke-dasharray="6 5">
+    <line x1="421" y1="159" x2="446" y2="159"/>
+    <line x1="421" y1="282" x2="446" y2="282"/>
+    <line x1="421" y1="405" x2="446" y2="405"/>
+    <line x1="421" y1="528" x2="446" y2="528"/>
+    <line x1="421" y1="651" x2="446" y2="651"/>
+    <line x1="421" y1="774" x2="446" y2="774"/>
+    <line x1="421" y1="897" x2="446" y2="897"/>
+  </g>
 
-    <!-- ============ LAYER BOXES (left column) ============ -->
-    <!-- SQL front-end (gray) -->
-    <rect x="70" y="125" width="350" height="68" rx="12" fill="#3a3a3a" stroke="#5a5a5a" 
-  stroke-width="2.5"/>
-    <text x="245" y="158" text-anchor="middle" fill="#ffffff" font-size="23" 
-  font-weight="700">SQL front-end</text>
-    <text x="245" y="181" text-anchor="middle" fill="#bdbdbd" font-size="15">parse · bind ·
-  IR</text>
+  <!-- ============ LAYER BOXES (left column) ============ -->
+  <!-- SQL front-end (gray) -->
+  <rect x="70" y="125" width="350" height="68" rx="12" fill="#3a3a3a" stroke="#5a5a5a" stroke-width="2.5"/>
+  <text x="245" y="158" text-anchor="middle" fill="#ffffff" font-size="23" font-weight="700">SQL front-end</text>
+  <text x="245" y="181" text-anchor="middle" fill="#bdbdbd" font-size="15">parse · bind · IR</text>
 
-    <!-- Query optimizer (teal) -->
-    <rect x="70" y="248" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" 
-  stroke-width="2.5"/>
-    <text x="245" y="281" text-anchor="middle" fill="#ffffff" font-size="23" 
-  font-weight="700">Query optimizer</text>
-    <text x="245" y="304" text-anchor="middle" fill="#7fe7c6" font-size="15">trait:
-  Optimizer</text>
+  <!-- Query optimizer (teal) -->
+  <rect x="70" y="248" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" stroke-width="2.5"/>
+  <text x="245" y="281" text-anchor="middle" fill="#ffffff" font-size="23" font-weight="700">Query optimizer</text>
+  <text x="245" y="304" text-anchor="middle" fill="#7fe7c6" font-size="15">trait: Optimizer</text>
 
-    <!-- Execution (teal) -->
-    <rect x="70" y="371" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" 
-  stroke-width="2.5"/>
-    <text x="245" y="404" text-anchor="middle" fill="#ffffff" font-size="23" 
-  font-weight="700">Execution</text>
-    <text x="245" y="427" text-anchor="middle" fill="#7fe7c6" font-size="15">trait:
-  Executor</text>
+  <!-- Execution (teal) -->
+  <rect x="70" y="371" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" stroke-width="2.5"/>
+  <text x="245" y="404" text-anchor="middle" fill="#ffffff" font-size="23" font-weight="700">Execution</text>
+  <text x="245" y="427" text-anchor="middle" fill="#7fe7c6" font-size="15">trait: Executor</text>
 
-    <!-- Transactions (gray) -->
-    <rect x="70" y="494" width="350" height="68" rx="12" fill="#3a3a3a" stroke="#5a5a5a" 
-  stroke-width="2.5"/>
-    <text x="245" y="527" text-anchor="middle" fill="#ffffff" font-size="23" 
-  font-weight="700">Transactions</text>
-    <text x="245" y="550" text-anchor="middle" fill="#bdbdbd" font-size="15">TxnEngine ·
-  MVCC</text>
+  <!-- Transactions (teal — now a validated seam via IsolationPolicy) -->
+  <rect x="70" y="494" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" stroke-width="2.5"/>
+  <text x="245" y="527" text-anchor="middle" fill="#ffffff" font-size="23" font-weight="700">Transactions</text>
+  <text x="245" y="550" text-anchor="middle" fill="#7fe7c6" font-size="15">trait: IsolationPolicy</text>
 
-    <!-- Storage engine (teal) -->
-    <rect x="70" y="617" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" 
-  stroke-width="2.5"/>
-    <text x="245" y="650" text-anchor="middle" fill="#ffffff" font-size="23" 
-  font-weight="700">Storage engine</text>
-    <text x="245" y="673" text-anchor="middle" fill="#7fe7c6" font-size="15">trait:
-  StorageEngine</text>
+  <!-- Storage engine (teal) -->
+  <rect x="70" y="617" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" stroke-width="2.5"/>
+  <text x="245" y="650" text-anchor="middle" fill="#ffffff" font-size="23" font-weight="700">Storage engine</text>
+  <text x="245" y="673" text-anchor="middle" fill="#7fe7c6" font-size="15">trait: StorageEngine</text>
 
-    <!-- Buffer pool (teal) -->
-    <rect x="70" y="740" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" 
-  stroke-width="2.5"/>
-    <text x="245" y="773" text-anchor="middle" fill="#ffffff" font-size="23" 
-  font-weight="700">Buffer pool</text>
-    <text x="245" y="796" text-anchor="middle" fill="#7fe7c6" font-size="15">trait:
-  EvictionPolicy</text>
+  <!-- Buffer pool (teal) -->
+  <rect x="70" y="740" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" stroke-width="2.5"/>
+  <text x="245" y="773" text-anchor="middle" fill="#ffffff" font-size="23" font-weight="700">Buffer pool</text>
+  <text x="245" y="796" text-anchor="middle" fill="#7fe7c6" font-size="15">trait: EvictionPolicy</text>
 
-    <!-- Disk manager (teal — validated seam, 3 impls) -->
-    <rect x="70" y="863" width="350" height="68" rx="12" fill="#0e5a47" stroke="#1f9e7a" 
-  stroke-width="2.5"/>
-    <text x="245" y="896" text-anchor="middle" fill="#ffffff" font-size="23" 
-  font-weight="700">Disk manager</text>
-    <text x="245" y="919" text-anchor="middle" fill="#7fe7c6" font-size="15">trait:
-  DiskManager</text>
+  <!-- Disk manager (gray) -->
+  <rect x="70" y="863" width="350" height="68" rx="12" fill="#3a3a3a" stroke="#5a5a5a" stroke-width="2.5"/>
+  <text x="245" y="896" text-anchor="middle" fill="#ffffff" font-size="23" font-weight="700">Disk manager</text>
+  <text x="245" y="919" text-anchor="middle" fill="#bdbdbd" font-size="15">trait: DiskManager</text>
 
-    <!-- ============ CHIPS ============ -->
-    <!-- SQL chips -->
-    <g>
-      <rect x="450" y="137" width="240" height="44" rx="10" fill="#333333" stroke="#555555" 
-  stroke-width="2"/>
-      <text x="570" y="166" text-anchor="middle" fill="#e2e2e2" 
-  font-size="20">sqlparser-rs</text>
-    </g>
+  <!-- ============ CHIPS ============ -->
+  <!-- SQL chips -->
+  <rect x="450" y="137" width="240" height="44" rx="10" fill="#333333" stroke="#555555" stroke-width="2"/>
+  <text x="570" y="166" text-anchor="middle" fill="#e2e2e2" font-size="20">sqlparser-rs</text>
 
-    <!-- Optimizer chips -->
-    <g>
-      <rect x="450" y="260" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="530" y="289" text-anchor="middle" fill="#5fd9b4" 
-  font-size="20">Heuristic</text>
+  <!-- Optimizer chips -->
+  <rect x="450" y="260" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="530" y="289" text-anchor="middle" fill="#5fd9b4" font-size="20">Heuristic</text>
+  <rect x="635" y="260" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="715" y="289" text-anchor="middle" fill="#5fd9b4" font-size="20">Selinger</text>
+  <rect x="820" y="260" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="900" y="289" text-anchor="middle" fill="#5fd9b4" font-size="20">Volcano</text>
+  <rect x="1005" y="260" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="1085" y="289" text-anchor="middle" fill="#5fd9b4" font-size="20">Cascades</text>
+  <rect x="1180" y="260" width="185" height="44" rx="10" fill="#7a4414" stroke="#c47a2c" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="1272" y="289" text-anchor="middle" fill="#eab26a" font-size="20">Learned (RL)</text>
 
-      <rect x="635" y="260" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="715" y="289" text-anchor="middle" fill="#5fd9b4" font-size="20">Selinger</text>
+  <!-- Execution chips -->
+  <rect x="450" y="383" width="240" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="570" y="412" text-anchor="middle" fill="#5fd9b4" font-size="20">Volcano / iterator</text>
+  <rect x="710" y="383" width="200" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="810" y="412" text-anchor="middle" fill="#5fd9b4" font-size="20">Vectorized</text>
 
-      <rect x="820" y="260" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2" stroke-dasharray="7 5"/>
-      <text x="900" y="289" text-anchor="middle" fill="#5fd9b4" font-size="20">Volcano</text>
+  <!-- workload_log + train arrow (planned) -->
+  <path d="M1272 378 C 1268 348, 1256 326, 1251 308" stroke="#c47a2c" stroke-width="2.5" fill="none" stroke-dasharray="7 5" marker-end="url(#arrowOrange)"/>
+  <text x="1180" y="350" text-anchor="middle" fill="#eab26a" font-size="19">train ↑</text>
+  <rect x="1122" y="378" width="300" height="54" rx="12" fill="#7a4414" stroke="#c47a2c" stroke-width="2.5" stroke-dasharray="7 5"/>
+  <text x="1272" y="412" text-anchor="middle" fill="#eab26a" font-size="21" font-weight="600">workload_log</text>
 
-      <rect x="1005" y="260" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2" stroke-dasharray="7 5"/>
-      <text x="1085" y="289" text-anchor="middle" fill="#5fd9b4" 
-  font-size="20">Cascades</text>
+  <!-- Transactions chips (teal; SI + Read Committed built, SSI planned) -->
+  <rect x="450" y="506" width="215" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="557" y="535" text-anchor="middle" fill="#5fd9b4" font-size="20">Snapshot Iso</text>
+  <rect x="685" y="506" width="240" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="805" y="535" text-anchor="middle" fill="#5fd9b4" font-size="20">Read Committed</text>
+  <rect x="945" y="506" width="265" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="1077" y="535" text-anchor="middle" fill="#5fd9b4" font-size="20">Serializable (SSI)</text>
 
-      <rect x="1180" y="260" width="185" height="44" rx="10" fill="#7a4414" stroke="#c47a2c" 
-  stroke-width="2" stroke-dasharray="7 5"/>
-      <text x="1272" y="289" text-anchor="middle" fill="#eab26a" font-size="20">Learned
-  (RL)</text>
-    </g>
+  <!-- Storage chips -->
+  <rect x="450" y="629" width="165" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="532" y="658" text-anchor="middle" fill="#5fd9b4" font-size="20">B+Tree</text>
+  <rect x="640" y="629" width="200" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="740" y="658" text-anchor="middle" fill="#5fd9b4" font-size="20">LSM-tree</text>
+  <rect x="865" y="629" width="215" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="972" y="658" text-anchor="middle" fill="#5fd9b4" font-size="20">Fractal tree</text>
 
-    <!-- Execution chips -->
-    <g>
-      <rect x="450" y="383" width="160" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="530" y="412" text-anchor="middle" fill="#5fd9b4" font-size="20">Volcano</text>
+  <!-- Buffer pool chips -->
+  <rect x="450" y="752" width="130" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="515" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">FIFO</text>
+  <rect x="605" y="752" width="140" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="675" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">Clock</text>
+  <rect x="770" y="752" width="125" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="832" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">LRU</text>
+  <rect x="920" y="752" width="145" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="992" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">LRU-K</text>
+  <rect x="1090" y="752" width="110" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="1145" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">2Q</text>
+  <rect x="1225" y="752" width="130" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="1290" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">ARC</text>
 
-      <rect x="635" y="383" width="200" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2" stroke-dasharray="7 5"/>
-      <text x="735" y="412" text-anchor="middle" fill="#5fd9b4" 
-  font-size="20">Vectorized</text>
-    </g>
+  <!-- Disk chips -->
+  <rect x="450" y="875" width="165" height="44" rx="10" fill="#333333" stroke="#555555" stroke-width="2"/>
+  <text x="532" y="904" text-anchor="middle" fill="#e2e2e2" font-size="20">File</text>
+  <rect x="640" y="875" width="195" height="44" rx="10" fill="#333333" stroke="#555555" stroke-width="2"/>
+  <text x="737" y="904" text-anchor="middle" fill="#e2e2e2" font-size="20">Memory</text>
+  <rect x="860" y="875" width="235" height="44" rx="10" fill="#333333" stroke="#555555" stroke-width="2"/>
+  <text x="977" y="904" text-anchor="middle" fill="#e2e2e2" font-size="20">Fault-inject</text>
 
-    <!-- workload_log + train arrow -->
-    <path d="M1272 378 C 1268 348, 1256 326, 1251 308" stroke="#c47a2c" stroke-width="2.5" 
-  fill="none" stroke-dasharray="7 5" marker-end="url(#arrowOrange)"/>
-    <text x="1180" y="350" text-anchor="middle" fill="#eab26a" font-size="19">train ↑</text>
-    <rect x="1122" y="378" width="300" height="54" rx="12" fill="#7a4414" stroke="#c47a2c" 
-  stroke-width="2.5"/>
-    <text x="1272" y="412" text-anchor="middle" fill="#eab26a" font-size="21" 
-  font-weight="600">workload_log</text>
+  <!-- WAL cross-cutting bar (built — solid) -->
+  <rect x="70" y="965" width="1350" height="52" rx="14" fill="#3a3a3a" stroke="#6a6a6a" stroke-width="2"/>
+  <text x="745" y="997" text-anchor="middle" fill="#dcdcdc" font-size="19" font-weight="600">WAL + crash recovery</text>
 
-    <!-- Transactions chips -->
-    <g>
-      <rect x="450" y="506" width="240" height="44" rx="10" fill="#333333" stroke="#555555" 
-  stroke-width="2"/>
-      <text x="570" y="535" text-anchor="middle" fill="#e2e2e2" font-size="20">Snapshot
-  Iso</text>
-
-      <rect x="715" y="506" width="300" height="44" rx="10" fill="#333333" stroke="#555555" 
-  stroke-width="2" stroke-dasharray="7 5"/>
-      <text x="865" y="535" text-anchor="middle" fill="#e2e2e2" font-size="20">Serializable
-  (SSI)</text>
-    </g>
-
-    <!-- Storage chips -->
-    <g>
-      <rect x="450" y="629" width="165" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="532" y="658" text-anchor="middle" fill="#5fd9b4" font-size="20">B+Tree</text>
-
-      <rect x="640" y="629" width="200" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="740" y="658" text-anchor="middle" fill="#5fd9b4" font-size="20">LSM-tree</text>
-
-      <rect x="865" y="629" width="215" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2" stroke-dasharray="7 5"/>
-      <text x="972" y="658" text-anchor="middle" fill="#5fd9b4" font-size="20">Fractal
-  tree</text>
-    </g>
-
-    <!-- Buffer pool chips -->
-    <g>
-      <rect x="450" y="752" width="130" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="515" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">FIFO</text>
-
-      <rect x="605" y="752" width="140" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="675" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">Clock</text>
-
-      <rect x="770" y="752" width="125" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="832" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">LRU</text>
-
-      <rect x="920" y="752" width="145" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="992" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">LRU-K</text>
-
-      <rect x="1090" y="752" width="110" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="1145" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">2Q</text>
-
-      <rect x="1225" y="752" width="130" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="1290" y="781" text-anchor="middle" fill="#5fd9b4" font-size="20">ARC</text>
-    </g>
-
-    <!-- Disk chips (teal — all three built) -->
-    <g>
-      <rect x="450" y="875" width="165" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="532" y="904" text-anchor="middle" fill="#5fd9b4" font-size="20">File</text>
-
-      <rect x="640" y="875" width="195" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="737" y="904" text-anchor="middle" fill="#5fd9b4" font-size="20">Memory</text>
-
-      <rect x="860" y="875" width="235" height="44" rx="10" fill="#0c4d3d" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="977" y="904" text-anchor="middle" fill="#5fd9b4" 
-  font-size="20">Fault-inject</text>
-    </g>
-
-    <!-- WAL cross-cutting bar (built — solid outline) -->
-    <rect x="70" y="965" width="1350" height="52" rx="14" fill="#3a3a3a" stroke="#6a6a6a" 
-  stroke-width="2"/>
-    <text x="745" y="997" text-anchor="middle" fill="#dcdcdc" font-size="19" 
-  font-weight="600">WAL + crash recovery — write-ahead log &amp; crash recovery beneath every
-  mutation (cross-cutting)</text>
-
-    <!-- ============ LEGEND ============ -->
-    <g>
-      <rect x="70" y="1058" width="26" height="26" rx="6" fill="#0e5a47" stroke="#1f9e7a" 
-  stroke-width="2"/>
-      <text x="106" y="1078" fill="#cfcfcf" font-size="19">interchangeable seam</text>
-
-      <rect x="375" y="1058" width="26" height="26" rx="6" fill="#3a3a3a" stroke="#5a5a5a" 
-  stroke-width="2"/>
-      <text x="411" y="1078" fill="#cfcfcf" font-size="19">fixed scaffolding</text>
-
-      <rect x="630" y="1058" width="26" height="26" rx="6" fill="#7a4414" stroke="#c47a2c" 
-  stroke-width="2"/>
-      <text x="666" y="1078" fill="#cfcfcf" font-size="19">trainable / cost-aware</text>
-
-      <rect x="935" y="1058" width="26" height="26" rx="6" fill="none" stroke="#cccccc" 
-  stroke-width="2" stroke-dasharray="5 4"/>
-      <text x="971" y="1078" fill="#cfcfcf" font-size="19">planned (dashed)</text>
-    </g>
-  </svg>
-
+  <!-- ============ LEGEND ============ -->
+  <rect x="70" y="1058" width="26" height="26" rx="6" fill="#0e5a47" stroke="#1f9e7a" stroke-width="2"/>
+  <text x="106" y="1078" fill="#cfcfcf" font-size="19">interchangeable seam</text>
+  <rect x="375" y="1058" width="26" height="26" rx="6" fill="#3a3a3a" stroke="#5a5a5a" stroke-width="2"/>
+  <text x="411" y="1078" fill="#cfcfcf" font-size="19">fixed scaffolding</text>
+  <rect x="630" y="1058" width="26" height="26" rx="6" fill="#7a4414" stroke="#c47a2c" stroke-width="2"/>
+  <text x="666" y="1078" fill="#cfcfcf" font-size="19">trainable / cost-aware</text>
+  <rect x="935" y="1058" width="26" height="26" rx="6" fill="none" stroke="#cccccc" stroke-width="2" stroke-dasharray="5 4"/>
+  <text x="971" y="1078" fill="#cfcfcf" font-size="19">planned (dashed)</text>
+</svg>
