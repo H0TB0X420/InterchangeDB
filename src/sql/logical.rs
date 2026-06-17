@@ -16,6 +16,8 @@
 //!   operate on `LogicalPlan`, not on parser AST. The shape is ours to
 //!   evolve as the optimizer needs.
 
+use serde::{Deserialize, Serialize};
+
 use crate::catalog::ColumnDef;
 use crate::sql::expr::{Expression, Predicate};
 use crate::types::Value;
@@ -123,7 +125,7 @@ pub struct JoinClause {
 /// variant into the corresponding `execution::AggregateFn`. Column
 /// references are tuple-global indices (same convention as
 /// `Predicate`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AggregateSpec {
     CountStar,
     Count { col: usize, distinct: bool },
@@ -136,7 +138,7 @@ pub enum AggregateSpec {
 /// SQL-level sort direction. Separate from `execution::SortDir` so the
 /// SQL IR has no executor dependency; the planner translates between
 /// them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderDir {
     Asc,
     Desc,

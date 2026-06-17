@@ -34,7 +34,7 @@ fn render_once(sql: &str) -> String {
     let stmts = parse(sql).unwrap();
     let binder = Binder::new(mc.catalog.clone());
     let logical = binder.bind(stmts.into_iter().next().unwrap()).unwrap();
-    let p: PhysicalPlan = plan(logical, mc.engine.clone(), &mc.catalog).unwrap();
+    let p: PhysicalPlan = plan(logical, &mc.catalog).unwrap();
     pretty_plan(&p)
 }
 

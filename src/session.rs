@@ -35,7 +35,7 @@ use std::sync::Arc;
 use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::{Error, Result};
 use crate::database::Database;
-use crate::execution::Tuple;
+use crate::execution::{ExecutionModel, Tuple, Volcano};
 use crate::sql::binder::Binder;
 use crate::sql::frontend::parse;
 use crate::sql::logical::LogicalPlan;
@@ -211,7 +211,7 @@ impl<E: StorageEngine + 'static> Session<E> {
             }
         };
 
-        let physical = match self.planner.plan(logical, engine_handle, &self.catalog) {
+        let physical = match self.planner.plan(logical, &self.catalog) {
             Ok(p) => p,
             Err(e) => {
                 if implicit {
@@ -221,7 +221,7 @@ impl<E: StorageEngine + 'static> Session<E> {
             }
         };
 
-        let result = self.run_physical(physical, is_select_shape);
+        let result = self.run_physical(physical, is_select_shape, &engine_handle);
 
         if implicit {
             match &result {
@@ -234,14 +234,18 @@ impl<E: StorageEngine + 'static> Session<E> {
         result
     }
 
-    fn run_physical(&self, physical: PhysicalPlan, is_select_shape: bool) -> Result<QueryResult> {
+    fn run_physical<H>(
+        &self,
+        physical: PhysicalPlan,
+        is_select_shape: bool,
+        engine: &Arc<H>,
+    ) -> Result<QueryResult>
+    where
+        H: StorageEngine + 'static,
+    {
         match physical {
-            PhysicalPlan::Executor(mut exec) => {
-                let schema = exec.schema().clone();
-                let mut rows: Vec<Tuple> = Vec::new();
-                while let Some(t) = exec.next()? {
-                    rows.push(t);
-                }
+            PhysicalPlan::Query(physop) => {
+                let (schema, rows) = Volcano.execute(&physop, engine, &self.catalog)?;
                 if is_select_shape {
                     Ok(QueryResult::Rows { schema, rows })
                 } else {
@@ -482,7 +486,7 @@ fn extract_count(rows: Vec<Tuple>) -> Result<u64> {
 
 fn kind_name(p: &PhysicalPlan) -> &'static str {
     match p {
-        PhysicalPlan::Executor(_) => "Executor",
+        PhysicalPlan::Query(_) => "Query",
         PhysicalPlan::CreateTable { .. } => "CreateTable",
         PhysicalPlan::Analyze { .. } => "Analyze",
         PhysicalPlan::BeginTxn => "BeginTxn",

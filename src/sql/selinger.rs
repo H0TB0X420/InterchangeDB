@@ -28,7 +28,6 @@
 //! not a single `col = col` equi-join (composite / non-equi / cross →
 //! can't be a clean graph edge); and orders the DP doesn't find cheaper.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::catalog::{Catalog, TableId};
@@ -64,14 +63,8 @@ impl Default for SelingerPlanner<DefaultCostModel> {
 }
 
 impl<C: CostModel> PlannerStrategy for SelingerPlanner<C> {
-    fn plan<TblE, CatE>(
-        &self,
-        logical: LogicalPlan,
-        engine: Arc<TblE>,
-        catalog: &Catalog<CatE>,
-    ) -> Result<PhysicalPlan>
+    fn plan<CatE>(&self, logical: LogicalPlan, catalog: &Catalog<CatE>) -> Result<PhysicalPlan>
     where
-        TblE: StorageEngine + 'static,
         CatE: StorageEngine,
     {
         // Snapshot stats once, then (P14.13b) optionally rewrite the plan
@@ -89,7 +82,7 @@ impl<C: CostModel> PlannerStrategy for SelingerPlanner<C> {
             cost_model: &self.cost_model,
             stats: &stats,
         };
-        plan_inner(logical, engine, catalog, &selection)
+        plan_inner(logical, catalog, &selection)
     }
 
     fn name(&self) -> &'static str {
@@ -453,6 +446,8 @@ fn remap_aggregate(spec: AggregateSpec, remap: &ColumnRemap) -> AggregateSpec {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{Catalog, ColumnDef, Schema, TableId};
@@ -465,7 +460,6 @@ mod tests {
     use tempfile::TempDir;
 
     struct Env {
-        engine: Arc<BTreeEngine>,
         catalog: Arc<Catalog<BTreeEngine>>,
         binder: Binder<BTreeEngine>,
         _dir: TempDir,
@@ -499,7 +493,6 @@ mod tests {
         };
         catalog.create_table("t".into(), schema).unwrap();
         Env {
-            engine,
             catalog,
             binder,
             _dir: dir,
@@ -535,16 +528,14 @@ mod tests {
             .unwrap();
         let b = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
 
-        let p_rule = RuleBasedPlanner
-            .plan(a, env.engine.clone(), &env.catalog)
-            .unwrap();
+        let p_rule = RuleBasedPlanner.plan(a, &env.catalog).unwrap();
         let p_sel = SelingerPlanner::<DefaultCostModel>::default()
-            .plan(b, env.engine.clone(), &env.catalog)
+            .plan(b, &env.catalog)
             .unwrap();
 
         let (t_rule, t_sel) = match (p_rule, p_sel) {
-            (PhysicalPlan::Executor(a), PhysicalPlan::Executor(b)) => (a.explain(0), b.explain(0)),
-            _ => panic!("expected executor trees"),
+            (PhysicalPlan::Query(a), PhysicalPlan::Query(b)) => (a.explain(0), b.explain(0)),
+            _ => panic!("expected query plans"),
         };
         assert_eq!(t_rule, t_sel);
     }

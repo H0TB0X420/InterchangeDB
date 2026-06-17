@@ -1,8 +1,9 @@
 //! Physical planner — `LogicalPlan` → `PhysicalPlan`.
 //!
 //! Rule-based: each LogicalPlan variant maps deterministically to one
-//! shape of executor tree (or to a non-executable descriptor for DDL /
-//! transaction control). No cost model, no statistics, no choice
+//! shape of `PhysOp` plan (or to a non-executable descriptor for DDL /
+//! transaction control); an `ExecutionModel` later builds the `PhysOp`
+//! into a runnable operator tree. No cost model, no statistics, no choice
 //! between alternative plans. Phase 14 (Selinger) and Phase 17/18
 //! (Cascades) will replace this with cost-based selection.
 //!
@@ -16,24 +17,17 @@
 //! `[ … ]` brackets indicate optional wrappers — emitted only when the
 //! corresponding clause is present in the logical plan.
 
-use std::sync::Arc;
-
 use crate::catalog::{Catalog, ColumnDef};
 use crate::common::Result;
-use crate::execution::{
-    Delete, Executor, Filter, HashJoin, IndexNestedLoopJoin, IndexScan, Insert, Limit,
-    NestedLoopJoin, Projection, SeqScan, SetExpr, Update,
-};
-use crate::layout::RowLayout;
 use crate::sql::cost::{CostModel, DefaultCostModel};
 use crate::sql::expr::Predicate;
 use crate::sql::join_order::JoinAlgorithm;
 use crate::sql::logical::LogicalPlan;
+use crate::sql::physical::PhysOp;
 use crate::sql::selectivity::join_selectivity;
 use crate::sql::selinger::SelingerPlanner;
 use crate::sql::stats::QueryStats;
 use crate::storage::StorageEngine;
-use crate::table::Table;
 
 /// How a `SELECT`'s joins pick their algorithm. The difference between
 /// the rule-based and Selinger planners is *only* this choice — both
@@ -54,7 +48,7 @@ pub(crate) enum JoinSelection<'a> {
 /// Output of the planner: either an executable operator tree, a
 /// descriptor for a side-effect-only plan, or an EXPLAIN string.
 pub enum PhysicalPlan {
-    Executor(Box<dyn Executor>),
+    Query(PhysOp),
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
@@ -77,41 +71,29 @@ pub enum PhysicalPlan {
 /// V1 has one impl (`RuleBasedPlanner`); Selinger (P14.7) will add a
 /// second. The trait exists so the session — and tests — can swap
 /// planners without touching call sites. It is intentionally NOT
-/// dyn-compatible: each impl is picked at compile time at the session
-/// level, and the generic engine params would force erasure that buys
-/// nothing.
+/// dyn-compatible: `plan` is generic over the catalog's storage engine, so a
+/// trait object would force erasure that buys nothing. The planner set is
+/// closed (rule-based, Selinger), so the `Planner` enum dispatches instead.
 pub trait PlannerStrategy {
     /// Plan a single logical statement.
-    fn plan<TblE, CatE>(
-        &self,
-        logical: LogicalPlan,
-        engine: Arc<TblE>,
-        catalog: &Catalog<CatE>,
-    ) -> Result<PhysicalPlan>
+    fn plan<CatE>(&self, logical: LogicalPlan, catalog: &Catalog<CatE>) -> Result<PhysicalPlan>
     where
-        TblE: StorageEngine + 'static,
         CatE: StorageEngine;
 
     /// Short identifier for logging / EXPLAIN headers.
     fn name(&self) -> &'static str;
 }
 
-/// V1 planner: each LogicalPlan variant maps to one shape of executor
-/// tree. No cost model, no statistics. See module docs for tree shapes.
+/// V1 planner: each LogicalPlan variant maps to one shape of `PhysOp` plan.
+/// No cost model, no statistics. See module docs for tree shapes.
 pub struct RuleBasedPlanner;
 
 impl PlannerStrategy for RuleBasedPlanner {
-    fn plan<TblE, CatE>(
-        &self,
-        logical: LogicalPlan,
-        engine: Arc<TblE>,
-        catalog: &Catalog<CatE>,
-    ) -> Result<PhysicalPlan>
+    fn plan<CatE>(&self, logical: LogicalPlan, catalog: &Catalog<CatE>) -> Result<PhysicalPlan>
     where
-        TblE: StorageEngine + 'static,
         CatE: StorageEngine,
     {
-        plan(logical, engine, catalog)
+        plan(logical, catalog)
     }
 
     fn name(&self) -> &'static str {
@@ -122,8 +104,8 @@ impl PlannerStrategy for RuleBasedPlanner {
 /// Runtime-selectable planner held by a `Session` (P14.14).
 ///
 /// Enum dispatch rather than `Box<dyn PlannerStrategy>` because
-/// `PlannerStrategy::plan` is generic over the engine types, so the trait
-/// isn't object-safe. The planner set is closed and known (rule-based,
+/// `PlannerStrategy::plan` is generic over the catalog's storage engine, so
+/// the trait isn't object-safe. The planner set is closed and known (rule-based,
 /// Selinger now; Volcano, Cascades later), so an enum is the right
 /// pragmatic swap. See plan.md P14.14 for the Option-C refactor (rework
 /// the trait to be object-safe) if an *open* set is ever needed.
@@ -142,19 +124,13 @@ impl Default for Planner {
 
 impl Planner {
     /// Plan one statement with the selected strategy.
-    pub fn plan<TblE, CatE>(
-        &self,
-        logical: LogicalPlan,
-        engine: Arc<TblE>,
-        catalog: &Catalog<CatE>,
-    ) -> Result<PhysicalPlan>
+    pub fn plan<CatE>(&self, logical: LogicalPlan, catalog: &Catalog<CatE>) -> Result<PhysicalPlan>
     where
-        TblE: StorageEngine + 'static,
         CatE: StorageEngine,
     {
         match self {
-            Planner::RuleBased(p) => p.plan(logical, engine, catalog),
-            Planner::Selinger(p) => p.plan(logical, engine, catalog),
+            Planner::RuleBased(p) => p.plan(logical, catalog),
+            Planner::Selinger(p) => p.plan(logical, catalog),
         }
     }
 
@@ -169,35 +145,29 @@ impl Planner {
 
 /// Plan a single logical statement.
 ///
-/// `engine` is the storage handle DML operators read/write through —
-/// in production this is `Arc<TxnEngine<E>>` so MVCC + locking apply.
-/// `catalog` is the schema lookup source. They're independent generic
-/// params: the catalog uses raw storage (DDL is non-transactional in
-/// V2), while DML wraps that same raw storage in a TxnEngine handle.
-pub fn plan<TblE, CatE>(
-    logical: LogicalPlan,
-    engine: Arc<TblE>,
-    catalog: &Catalog<CatE>,
-) -> Result<PhysicalPlan>
+/// `catalog` is the schema-lookup + index/stats source. Planning is
+/// engine-free: it emits a `PhysOp` IR that an `ExecutionModel` later builds
+/// against a storage engine.
+pub fn plan<CatE>(logical: LogicalPlan, catalog: &Catalog<CatE>) -> Result<PhysicalPlan>
 where
-    TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
-    plan_inner(logical, engine, catalog, &JoinSelection::Heuristic)
+    plan_inner(logical, catalog, &JoinSelection::Heuristic)
 }
 
 /// Plan with an explicit join-selection strategy. `plan()` is the
 /// rule-based entry (`Heuristic`); `SelingerPlanner` (P14.13a) calls this
 /// with `CostBased`. Only `SELECT` join lowering reads `selection`; every
 /// other arm is identical across planners.
-pub(crate) fn plan_inner<TblE, CatE>(
+///
+/// Planning is engine-free — it produces a `PhysOp` IR; building it into a
+/// runnable tree is the `ExecutionModel`'s job.
+pub(crate) fn plan_inner<CatE>(
     logical: LogicalPlan,
-    engine: Arc<TblE>,
     catalog: &Catalog<CatE>,
     selection: &JoinSelection,
 ) -> Result<PhysicalPlan>
 where
-    TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
     match logical {
@@ -215,7 +185,7 @@ where
         LogicalPlan::CommitTxn => Ok(PhysicalPlan::CommitTxn),
         LogicalPlan::AbortTxn => Ok(PhysicalPlan::AbortTxn),
         LogicalPlan::Explain(inner) => {
-            let inner_phys = plan_inner(*inner, engine, catalog, selection)?;
+            let inner_phys = plan_inner(*inner, catalog, selection)?;
             Ok(PhysicalPlan::Explain(render_explain(&inner_phys)))
         }
         LogicalPlan::Select {
@@ -227,36 +197,35 @@ where
             order_by,
             limit,
         } => {
-            let exec = plan_select(
-                table, joins, projection, aggregates, filter, order_by, limit, engine, catalog,
-                selection,
+            let physop = plan_select(
+                table, joins, projection, aggregates, filter, order_by, limit, catalog, selection,
             )?;
-            Ok(PhysicalPlan::Executor(exec))
+            Ok(PhysicalPlan::Query(physop))
         }
         LogicalPlan::Insert { table, rows } => {
-            let exec = plan_insert(table, rows, engine, catalog)?;
-            Ok(PhysicalPlan::Executor(exec))
+            let physop = plan_insert(table, rows, catalog)?;
+            Ok(PhysicalPlan::Query(physop))
         }
         LogicalPlan::Update {
             table,
             set_clauses,
             filter,
         } => {
-            let exec = plan_update(table, set_clauses, filter, engine, catalog)?;
-            Ok(PhysicalPlan::Executor(exec))
+            let physop = plan_update(table, set_clauses, filter, catalog)?;
+            Ok(PhysicalPlan::Query(physop))
         }
         LogicalPlan::Delete { table, filter } => {
-            let exec = plan_delete(table, filter, engine, catalog)?;
-            Ok(PhysicalPlan::Executor(exec))
+            let physop = plan_delete(table, filter, catalog)?;
+            Ok(PhysicalPlan::Query(physop))
         }
     }
 }
 
 // CLIPPY-ALLOW(too_many_arguments): a SELECT carries table/joins/projection/
-// aggregates/filter/order/limit plus engine + catalog + join selection; a
-// params struct would just rename the same fields without simplifying callers.
+// aggregates/filter/order/limit plus catalog + join selection; a params
+// struct would just rename the same fields without simplifying callers.
 #[allow(clippy::too_many_arguments)]
-fn plan_select<TblE, CatE>(
+fn plan_select<CatE>(
     table_name: String,
     joins: Vec<crate::sql::logical::JoinClause>,
     projection: Vec<usize>,
@@ -264,56 +233,57 @@ fn plan_select<TblE, CatE>(
     filter: Option<Predicate>,
     order_by: Vec<(usize, crate::sql::logical::OrderDir)>,
     limit: Option<usize>,
-    engine: Arc<TblE>,
     catalog: &Catalog<CatE>,
     selection: &JoinSelection,
-) -> Result<Box<dyn Executor>>
+) -> Result<PhysOp>
 where
-    TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
     let left_schema = catalog.get_table(&table_name)?;
     let left_table_id = left_schema.table_id;
     let left_indexes = catalog.indexes_for_table(left_schema.table_id, &left_schema)?;
-    let left_table = Arc::new(Table::with_indexes(
-        engine.clone(),
-        left_schema,
-        RowLayout,
-        left_indexes.clone(),
-    ));
 
     // Build the leaf scan for the left side. We only attempt IndexScan
     // lowering on the LEFT side when there are NO joins — once joins
     // enter, predicate scoping spans multiple tables and column indices
     // shift, so the lowering rule (column index == table column index)
     // no longer holds. Index-driven joins use IndexNestedLoopJoin below.
-    let mut current: Box<dyn Executor>;
+    let mut current: PhysOp;
     let mut residual_filter: Option<Predicate> = filter;
     if joins.is_empty() {
         if let Some(pred) = residual_filter {
             match try_lower_index_predicate(pred, &left_indexes) {
                 IndexLowering::Matched { handle, prefix } => {
-                    current = Box::new(IndexScan::new(&*left_table, &handle, &prefix)?);
+                    current = PhysOp::IndexScan {
+                        table: table_name.clone(),
+                        index: handle.def.name.clone(),
+                        prefix,
+                    };
                     residual_filter = None;
                 }
                 IndexLowering::Unmatched(pred) => {
-                    current = Box::new(SeqScan::new(&*left_table)?);
+                    current = PhysOp::SeqScan {
+                        table: table_name.clone(),
+                    };
                     residual_filter = Some(pred);
                 }
             }
         } else {
-            current = Box::new(SeqScan::new(&*left_table)?);
+            current = PhysOp::SeqScan {
+                table: table_name.clone(),
+            };
         }
     } else {
-        current = Box::new(SeqScan::new(&*left_table)?);
+        current = PhysOp::SeqScan {
+            table: table_name.clone(),
+        };
     }
 
     // P13.1: chain joins onto the left side. For each join, pick
     // IndexNestedLoopJoin when the ON predicate is `left.col = right.idx_col`
     // and the right side has a matching single-column index; fall back to
-    // NestedLoopJoin with the compiled ON predicate (or trivially-true for
-    // cross joins).
-    let mut outer_offset = current.schema().columns.len();
+    // NestedLoopJoin with the ON predicate (or trivially-true for cross joins).
+    let mut outer_offset = left_schema.columns.len();
     // Running output-cardinality estimate — used only in cost mode to pick
     // join algorithms. Seeded from the left table's base row count. NOTE
     // (P14.13a): this ignores any narrowing from the left's index scan /
@@ -327,15 +297,10 @@ where
     for join in joins {
         let right_schema = catalog.get_table(&join.right_table)?;
         let right_indexes = catalog.indexes_for_table(right_schema.table_id, &right_schema)?;
-        let right_table = Arc::new(Table::with_indexes(
-            engine.clone(),
-            right_schema.clone(),
-            RowLayout,
-            right_indexes.clone(),
-        ));
         let right_cols = right_schema.columns.len();
+        let right_table = join.right_table.clone();
 
-        let next: Box<dyn Executor> = match selection {
+        let next: PhysOp = match selection {
             // Phase 11 heuristic: INLJ when the inner is indexed, else NLJ.
             JoinSelection::Heuristic => {
                 let inlj_choice = join
@@ -343,14 +308,18 @@ where
                     .as_ref()
                     .and_then(|pred| try_match_inlj(pred, outer_offset, &right_indexes));
                 if let Some((outer_col, handle)) = inlj_choice {
-                    Box::new(IndexNestedLoopJoin::new(
-                        current,
-                        right_table,
-                        handle,
-                        vec![outer_col],
-                    )?)
+                    PhysOp::IndexNestedLoopJoin {
+                        outer: Box::new(current),
+                        inner_table: right_table,
+                        inner_index: handle.def.name.clone(),
+                        outer_key_cols: vec![outer_col],
+                    }
                 } else {
-                    build_nested_loop_join(current, right_table, join.on)?
+                    PhysOp::NestedLoopJoin {
+                        outer: Box::new(current),
+                        inner: Box::new(PhysOp::SeqScan { table: right_table }),
+                        on: join.on,
+                    }
                 }
             }
             // P14.13a cost-based: cheapest of NLJ / Hash / INLJ, textual
@@ -389,22 +358,28 @@ where
                 match algorithm {
                     JoinAlgorithm::IndexNestedLoop => {
                         let (outer_col, handle) = inlj.expect("INLJ chosen only when available");
-                        Box::new(IndexNestedLoopJoin::new(
-                            current,
-                            right_table,
-                            handle,
-                            vec![outer_col],
-                        )?)
+                        PhysOp::IndexNestedLoopJoin {
+                            outer: Box::new(current),
+                            inner_table: right_table,
+                            inner_index: handle.def.name.clone(),
+                            outer_key_cols: vec![outer_col],
+                        }
                     }
                     JoinAlgorithm::Hash => {
                         let (outer_col, inner_col) =
                             keys.expect("Hash chosen only when equi-keys exist");
-                        let right_seq = Box::new(SeqScan::new(&*right_table)?);
-                        Box::new(HashJoin::new(current, right_seq, outer_col, inner_col)?)
+                        PhysOp::HashJoin {
+                            outer: Box::new(current),
+                            inner: Box::new(PhysOp::SeqScan { table: right_table }),
+                            outer_key_col: outer_col,
+                            inner_key_col: inner_col,
+                        }
                     }
-                    JoinAlgorithm::NestedLoop => {
-                        build_nested_loop_join(current, right_table, join.on)?
-                    }
+                    JoinAlgorithm::NestedLoop => PhysOp::NestedLoopJoin {
+                        outer: Box::new(current),
+                        inner: Box::new(PhysOp::SeqScan { table: right_table }),
+                        on: join.on,
+                    },
                 }
             }
         };
@@ -413,38 +388,39 @@ where
     }
 
     if let Some(pred) = residual_filter {
-        current = Box::new(Filter::from_boxed(current, pred.compile()));
+        current = PhysOp::Filter {
+            input: Box::new(current),
+            predicate: pred,
+        };
     }
     if !aggregates.is_empty() {
         // P13.4: HashAggregate before Projection (aggregates ARE the
         // output; binder enforces projection empty alongside aggregates).
-        let agg_fns: Vec<crate::execution::AggregateFn> = aggregates
-            .into_iter()
-            .map(translate_aggregate_spec)
-            .collect();
-        current = Box::new(crate::execution::HashAggregate::new(current, agg_fns)?);
+        current = PhysOp::HashAggregate {
+            input: Box::new(current),
+            aggregates,
+        };
     }
     // P13.6: Sort BEFORE Projection so sort keys can reference columns
     // even if they're not in the projection (TPC-C Payment does this).
     // Binder resolves ORDER BY indices against the pre-projection scope.
     if !order_by.is_empty() {
-        let keys: Vec<(usize, crate::execution::SortDir)> = order_by
-            .into_iter()
-            .map(|(c, d)| {
-                let dir = match d {
-                    crate::sql::logical::OrderDir::Asc => crate::execution::SortDir::Asc,
-                    crate::sql::logical::OrderDir::Desc => crate::execution::SortDir::Desc,
-                };
-                (c, dir)
-            })
-            .collect();
-        current = Box::new(crate::execution::Sort::new(current, keys)?);
+        current = PhysOp::Sort {
+            input: Box::new(current),
+            keys: order_by,
+        };
     }
     if aggregates_was_empty_marker(&projection) && !projection.is_empty() {
-        current = Box::new(Projection::new(current, projection)?);
+        current = PhysOp::Projection {
+            input: Box::new(current),
+            cols: projection,
+        };
     }
     if let Some(n) = limit {
-        current = Box::new(Limit::new(current, n));
+        current = PhysOp::Limit {
+            input: Box::new(current),
+            max_rows: n,
+        };
     }
     Ok(current)
 }
@@ -458,55 +434,6 @@ where
 fn aggregates_was_empty_marker(projection: &[usize]) -> bool {
     let _ = projection;
     true
-}
-
-fn translate_aggregate_spec(
-    spec: crate::sql::logical::AggregateSpec,
-) -> crate::execution::AggregateFn {
-    use crate::execution::AggregateFn;
-    use crate::sql::logical::AggregateSpec;
-    match spec {
-        AggregateSpec::CountStar => AggregateFn::CountStar,
-        AggregateSpec::Count {
-            col,
-            distinct: false,
-        } => AggregateFn::Count(col),
-        AggregateSpec::Count {
-            col,
-            distinct: true,
-        } => AggregateFn::CountDistinct(col),
-        AggregateSpec::Sum(col) => AggregateFn::Sum(col),
-        AggregateSpec::Min(col) => AggregateFn::Min(col),
-        AggregateSpec::Max(col) => AggregateFn::Max(col),
-        AggregateSpec::Avg(col) => AggregateFn::Avg(col),
-    }
-}
-
-/// Build a `NestedLoopJoin` of `outer` with a fresh scan of `right_table`,
-/// compiling the ON predicate (or constant-true for a cross product). The
-/// predicate's column indices are tuple-global over `outer || inner`,
-/// which holds because joins are lowered in textual order.
-fn build_nested_loop_join<TblE>(
-    outer: Box<dyn Executor>,
-    right_table: Arc<Table<TblE, RowLayout>>,
-    on: Option<Predicate>,
-) -> Result<Box<dyn Executor>>
-where
-    TblE: StorageEngine + 'static,
-{
-    let pred_fn: crate::execution::JoinPredicate = match on {
-        Some(p) => {
-            let f = p.compile();
-            Box::new(move |outer, inner| {
-                let mut combined = outer.clone();
-                combined.extend_from_slice(inner);
-                f(&combined)
-            })
-        }
-        None => Box::new(|_, _| true),
-    };
-    let right_seq = Box::new(SeqScan::new(&*right_table)?);
-    Ok(Box::new(NestedLoopJoin::new(outer, right_seq, pred_fn)?))
 }
 
 /// Extract `(outer_col_global, inner_col_local)` from an equi-join ON
@@ -659,14 +586,12 @@ fn try_lower_index_predicate(
     IndexLowering::Unmatched(pred)
 }
 
-fn plan_insert<TblE, CatE>(
+fn plan_insert<CatE>(
     table_name: String,
     rows: Vec<Vec<crate::sql::expr::Expression>>,
-    engine: Arc<TblE>,
     catalog: &Catalog<CatE>,
-) -> Result<Box<dyn Executor>>
+) -> Result<PhysOp>
 where
-    TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
     // Evaluate each expression against an empty tuple — INSERT VALUES
@@ -678,109 +603,121 @@ where
         .into_iter()
         .map(|row| row.into_iter().map(|e| e.compile()(&Vec::new())).collect())
         .collect();
-    let schema = catalog.get_table(&table_name)?;
-    let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
-    let table = Arc::new(Table::with_indexes(engine, schema, RowLayout, indexes));
-    Ok(Box::new(Insert::new(table, rows)))
+    // Validate the table exists at plan time (the builder would also catch a
+    // missing table, but this preserves the plan-time error the prior
+    // table-construction had).
+    catalog.get_table(&table_name)?;
+    Ok(PhysOp::Insert {
+        table: table_name,
+        rows,
+    })
 }
 
-fn plan_update<TblE, CatE>(
+fn plan_update<CatE>(
     table_name: String,
     set_clauses: Vec<(usize, crate::sql::expr::Expression)>,
     filter: Option<Predicate>,
-    engine: Arc<TblE>,
     catalog: &Catalog<CatE>,
-) -> Result<Box<dyn Executor>>
+) -> Result<PhysOp>
 where
-    TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
     let schema = catalog.get_table(&table_name)?;
     let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
-    let table = Arc::new(Table::with_indexes(
-        engine,
-        schema,
-        RowLayout,
-        indexes.clone(),
-    ));
 
     // Same IndexScan lowering as plan_select. Index-driven updates are
     // common in OLTP: `UPDATE customer SET … WHERE c_id = ?`.
-    let mut child: Box<dyn Executor>;
+    let mut child: PhysOp;
     let mut residual_filter: Option<Predicate> = filter;
     if let Some(pred) = residual_filter {
         match try_lower_index_predicate(pred, &indexes) {
             IndexLowering::Matched { handle, prefix } => {
-                child = Box::new(IndexScan::new(&*table, &handle, &prefix)?);
+                child = PhysOp::IndexScan {
+                    table: table_name.clone(),
+                    index: handle.def.name.clone(),
+                    prefix,
+                };
                 residual_filter = None;
             }
             IndexLowering::Unmatched(pred) => {
-                child = Box::new(SeqScan::new(&*table)?);
+                child = PhysOp::SeqScan {
+                    table: table_name.clone(),
+                };
                 residual_filter = Some(pred);
             }
         }
     } else {
-        child = Box::new(SeqScan::new(&*table)?);
+        child = PhysOp::SeqScan {
+            table: table_name.clone(),
+        };
     }
     if let Some(pred) = residual_filter {
-        child = Box::new(Filter::from_boxed(child, pred.compile()));
+        child = PhysOp::Filter {
+            input: Box::new(child),
+            predicate: pred,
+        };
     }
 
-    let set_exprs: Vec<SetExpr> = set_clauses
-        .into_iter()
-        .map(|(idx, expr)| (idx, expr.compile()))
-        .collect();
-
-    Ok(Box::new(Update::new(table, child, set_exprs)))
+    Ok(PhysOp::Update {
+        table: table_name,
+        input: Box::new(child),
+        set: set_clauses,
+    })
 }
 
-fn plan_delete<TblE, CatE>(
+fn plan_delete<CatE>(
     table_name: String,
     filter: Option<Predicate>,
-    engine: Arc<TblE>,
     catalog: &Catalog<CatE>,
-) -> Result<Box<dyn Executor>>
+) -> Result<PhysOp>
 where
-    TblE: StorageEngine + 'static,
     CatE: StorageEngine,
 {
     let schema = catalog.get_table(&table_name)?;
     let indexes = catalog.indexes_for_table(schema.table_id, &schema)?;
-    let table = Arc::new(Table::with_indexes(
-        engine,
-        schema,
-        RowLayout,
-        indexes.clone(),
-    ));
 
-    let mut child: Box<dyn Executor>;
+    let mut child: PhysOp;
     let mut residual_filter: Option<Predicate> = filter;
     if let Some(pred) = residual_filter {
         match try_lower_index_predicate(pred, &indexes) {
             IndexLowering::Matched { handle, prefix } => {
-                child = Box::new(IndexScan::new(&*table, &handle, &prefix)?);
+                child = PhysOp::IndexScan {
+                    table: table_name.clone(),
+                    index: handle.def.name.clone(),
+                    prefix,
+                };
                 residual_filter = None;
             }
             IndexLowering::Unmatched(pred) => {
-                child = Box::new(SeqScan::new(&*table)?);
+                child = PhysOp::SeqScan {
+                    table: table_name.clone(),
+                };
                 residual_filter = Some(pred);
             }
         }
     } else {
-        child = Box::new(SeqScan::new(&*table)?);
+        child = PhysOp::SeqScan {
+            table: table_name.clone(),
+        };
     }
     if let Some(pred) = residual_filter {
-        child = Box::new(Filter::from_boxed(child, pred.compile()));
+        child = PhysOp::Filter {
+            input: Box::new(child),
+            predicate: pred,
+        };
     }
-    Ok(Box::new(Delete::new(table, child)))
+    Ok(PhysOp::Delete {
+        table: table_name,
+        input: Box::new(child),
+    })
 }
 
-/// Render an EXPLAIN string for a `PhysicalPlan`. For executor trees this
-/// delegates to the operator's own `explain`; for descriptors it emits a
-/// one-line summary.
+/// Render an EXPLAIN string for a `PhysicalPlan`. For query plans this walks
+/// the `PhysOp` IR directly (engine-free — no build, no scan); for descriptors
+/// it emits a one-line summary.
 fn render_explain(plan: &PhysicalPlan) -> String {
     match plan {
-        PhysicalPlan::Executor(exec) => exec.explain(0),
+        PhysicalPlan::Query(physop) => physop.explain(0),
         PhysicalPlan::CreateTable { name, .. } => format!("CreateTable({})\n", name),
         PhysicalPlan::Analyze { table } => format!("Analyze({})\n", table),
         PhysicalPlan::BeginTxn => "BeginTxn\n".to_string(),
@@ -797,10 +734,13 @@ fn render_explain(plan: &PhysicalPlan) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{Schema, TableId};
     use crate::common::Error;
+    use crate::execution::build::build_executor;
     use crate::index::btree::BTreeEngine;
     use crate::sql::binder::Binder;
     use crate::sql::frontend::parse;
@@ -859,7 +799,7 @@ mod tests {
     fn plan_sql(env: &TestEnv, sql: &str) -> PhysicalPlan {
         let stmts = parse(sql).unwrap();
         let logical = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
-        plan(logical, env.engine.clone(), &env.catalog).unwrap()
+        plan(logical, &env.catalog).unwrap()
     }
 
     // ---- DDL / TC variants ----
@@ -887,8 +827,8 @@ mod tests {
         create_warehouse(&env);
         let p = plan_sql(&env, "SELECT * FROM warehouse");
         match p {
-            PhysicalPlan::Executor(exec) => {
-                let tree = exec.explain(0);
+            PhysicalPlan::Query(physop) => {
+                let tree = physop.explain(0);
                 assert_eq!(tree, "SeqScan(warehouse)\n");
             }
             _ => panic!(),
@@ -901,8 +841,8 @@ mod tests {
         create_warehouse(&env);
         let p = plan_sql(&env, "SELECT w_id FROM warehouse WHERE w_id = 1");
         match p {
-            PhysicalPlan::Executor(exec) => {
-                let tree = exec.explain(0);
+            PhysicalPlan::Query(physop) => {
+                let tree = physop.explain(0);
                 let expected = "\
 Projection([0])
   Filter
@@ -920,8 +860,8 @@ Projection([0])
         create_warehouse(&env);
         let p = plan_sql(&env, "SELECT w_id FROM warehouse WHERE w_id = 1 LIMIT 3");
         match p {
-            PhysicalPlan::Executor(exec) => {
-                let tree = exec.explain(0);
+            PhysicalPlan::Query(physop) => {
+                let tree = physop.explain(0);
                 // Order is: SeqScan → Filter → Projection → Limit (outermost wraps inward)
                 let expected = "\
 Limit(3)
@@ -943,7 +883,8 @@ Limit(3)
         create_warehouse(&env);
         let p = plan_sql(&env, "INSERT INTO warehouse VALUES (1, 1000), (2, 2000)");
         match p {
-            PhysicalPlan::Executor(mut exec) => {
+            PhysicalPlan::Query(physop) => {
+                let mut exec = build_executor(&physop, &env.engine, &env.catalog).unwrap();
                 assert_eq!(exec.next().unwrap(), Some(vec![Value::Int64(2)]));
                 assert_eq!(exec.next().unwrap(), None);
             }
@@ -957,19 +898,23 @@ Limit(3)
         create_warehouse(&env);
         // Seed: 1, 1000; 2, 2000.
         let seed = plan_sql(&env, "INSERT INTO warehouse VALUES (1, 1000), (2, 2000)");
-        if let PhysicalPlan::Executor(mut e) = seed {
-            e.next().unwrap();
+        if let PhysicalPlan::Query(physop) = seed {
+            build_executor(&physop, &env.engine, &env.catalog)
+                .unwrap()
+                .next()
+                .unwrap();
         }
         // UPDATE w_ytd to 9999 WHERE w_id = 1.
         let p = plan_sql(&env, "UPDATE warehouse SET w_ytd = 9999 WHERE w_id = 1");
         match p {
-            PhysicalPlan::Executor(mut exec) => {
-                assert_eq!(exec.next().unwrap(), Some(vec![Value::Int64(1)]));
-                // Verify the explain has the right shape.
-                let tree = exec.explain(0);
+            PhysicalPlan::Query(physop) => {
+                // Verify the explain shape (engine-free, off the IR).
+                let tree = physop.explain(0);
                 assert!(tree.starts_with("Update(warehouse, set_cols=[1])"));
                 assert!(tree.contains("Filter"));
                 assert!(tree.contains("SeqScan(warehouse)"));
+                let mut exec = build_executor(&physop, &env.engine, &env.catalog).unwrap();
+                assert_eq!(exec.next().unwrap(), Some(vec![Value::Int64(1)]));
             }
             _ => panic!(),
         }
@@ -981,8 +926,8 @@ Limit(3)
         create_warehouse(&env);
         let p = plan_sql(&env, "DELETE FROM warehouse WHERE w_id = 99");
         match p {
-            PhysicalPlan::Executor(exec) => {
-                let tree = exec.explain(0);
+            PhysicalPlan::Query(physop) => {
+                let tree = physop.explain(0);
                 assert!(tree.starts_with("Delete(warehouse)"));
                 assert!(tree.contains("Filter"));
                 assert!(tree.contains("SeqScan(warehouse)"));
@@ -1034,7 +979,7 @@ Limit(3)
         let stmts = parse("EXPLAIN SELECT w_id FROM warehouse WHERE w_id = 1").unwrap();
         let inner_logical = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
         let nested = LogicalPlan::Explain(Box::new(inner_logical));
-        let p = plan(nested, env.engine.clone(), &env.catalog).unwrap();
+        let p = plan(nested, &env.catalog).unwrap();
         match p {
             PhysicalPlan::Explain(text) => {
                 assert!(text.starts_with("Explain\n"), "got: {}", text);
@@ -1068,14 +1013,12 @@ Limit(3)
             .unwrap();
         let logical_b = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
 
-        let free = plan(logical_a, env.engine.clone(), &env.catalog).unwrap();
-        let via_strategy = RuleBasedPlanner
-            .plan(logical_b, env.engine.clone(), &env.catalog)
-            .unwrap();
+        let free = plan(logical_a, &env.catalog).unwrap();
+        let via_strategy = RuleBasedPlanner.plan(logical_b, &env.catalog).unwrap();
 
         let (free_tree, strat_tree) = match (free, via_strategy) {
-            (PhysicalPlan::Executor(a), PhysicalPlan::Executor(b)) => (a.explain(0), b.explain(0)),
-            _ => panic!("expected two executor trees"),
+            (PhysicalPlan::Query(a), PhysicalPlan::Query(b)) => (a.explain(0), b.explain(0)),
+            _ => panic!("expected two query plans"),
         };
         assert_eq!(free_tree, strat_tree);
         assert_eq!(RuleBasedPlanner.name(), "rule-based");
@@ -1096,7 +1039,7 @@ Limit(3)
             order_by: vec![],
             limit: None,
         };
-        match plan(logical, env.engine.clone(), &env.catalog) {
+        match plan(logical, &env.catalog) {
             Err(Error::TableNotFound { name }) => assert_eq!(name, "nonexistent"),
             other => panic!("expected TableNotFound, got {:?}", other.err()),
         }

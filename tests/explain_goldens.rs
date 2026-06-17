@@ -25,7 +25,7 @@ fn plan_sql(mc: &MockCatalog, sql: &str) -> PhysicalPlan {
     let logical = binder
         .bind(stmts.into_iter().next().expect("empty parse result"))
         .expect("bind failed");
-    plan(logical, mc.engine.clone(), &mc.catalog).expect("plan failed")
+    plan(logical, &mc.catalog).expect("plan failed")
 }
 
 fn fresh_catalog() -> MockCatalog {

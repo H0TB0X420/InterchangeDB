@@ -1,0 +1,268 @@
+//! `PhysOp` — the model-neutral physical plan IR.
+//!
+//! A planner emits a `PhysOp` tree; an `ExecutionModel` compiles it into its
+//! own runnable form (`Volcano` → a pull operator tree, `Push` → a push
+//! pipeline). It is the seam that makes execution-model interchange *real*:
+//! both models read the same neutral plan and build differently.
+//!
+//! ## Data-only by design
+//!
+//! `PhysOp` carries **names, ASTs, and column indices** — never `Arc<Table>`
+//! handles, never closures, never engine generics. Runtime handles are
+//! re-resolved against the catalog/engine by the builder; the `Predicate` /
+//! `Expression` ASTs are re-compiled to closures at build time (see
+//! `Predicate::compile`). That keeps the IR a pure value: cloneable,
+//! inspectable, and serde-clean (the Phase-19 plan-store / workload-log
+//! prerequisite).
+//!
+//! ## What the planner decides vs. what the builder does
+//!
+//! The planner keeps all its intelligence — cost-based join-algorithm choice,
+//! index selection — and *records the decision in the variant it emits*
+//! (`NestedLoopJoin` vs `HashJoin` vs `IndexNestedLoopJoin`). The builder is
+//! mechanical: it constructs exactly the operator the variant names.
+//!
+//! ## Omissions (faithful to current emission)
+//!
+//! `PkLookup` is intentionally absent: the planner never emits it today (PK
+//! equality falls to `SeqScan + Filter` — no PK-point-lookup lowering rule
+//! exists yet). When that rule lands, add a `PkLookup` variant here.
+//!
+//! Wiring status (Phase 15, Increment 2a): this type is defined here (2a.1)
+//! but not yet produced or consumed — the builder (2a.2) and the planner
+//! retarget (2a.3) come next.
+
+use serde::{Deserialize, Serialize};
+
+use crate::sql::expr::{Expression, Predicate};
+use crate::sql::logical::{AggregateSpec, OrderDir};
+use crate::types::Value;
+
+/// One node of a physical plan. Children are owned `Box<PhysOp>`, so a plan
+/// is a self-contained value tree. Tables and indexes are referenced by name
+/// and resolved against the catalog when an `ExecutionModel` builds the node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PhysOp {
+    /// Full-table scan in PK order.
+    SeqScan { table: String },
+
+    /// Range scan over a secondary index whose leading columns equal `prefix`.
+    IndexScan {
+        table: String,
+        index: String,
+        prefix: Vec<Value>,
+    },
+
+    /// Row-wise selection: keep rows where `predicate` holds.
+    Filter {
+        input: Box<PhysOp>,
+        predicate: Predicate,
+    },
+
+    /// Narrow / reorder columns. `cols` indexes into the input's schema.
+    Projection {
+        input: Box<PhysOp>,
+        cols: Vec<usize>,
+    },
+
+    /// Block nested-loop join. `inner` is the materialized side (today always
+    /// a `SeqScan` of the right table). `on` is the ON predicate over the
+    /// concatenated `outer || inner` tuple; `None` is a cross join.
+    NestedLoopJoin {
+        outer: Box<PhysOp>,
+        inner: Box<PhysOp>,
+        on: Option<Predicate>,
+    },
+
+    /// Index nested-loop join: probe `inner_index` on `inner_table` once per
+    /// outer row, keyed by the outer columns `outer_key_cols`.
+    IndexNestedLoopJoin {
+        outer: Box<PhysOp>,
+        inner_table: String,
+        inner_index: String,
+        outer_key_cols: Vec<usize>,
+    },
+
+    /// Hash equi-join: build a hash table on `inner` keyed by `inner_key_col`,
+    /// probe with `outer_key_col`. NULL keys never match (SQL equi-join).
+    HashJoin {
+        outer: Box<PhysOp>,
+        inner: Box<PhysOp>,
+        outer_key_col: usize,
+        inner_key_col: usize,
+    },
+
+    /// Whole-relation aggregation (no GROUP BY yet). One output row.
+    HashAggregate {
+        input: Box<PhysOp>,
+        aggregates: Vec<AggregateSpec>,
+    },
+
+    /// In-memory sort by `keys` (column index + direction), major-to-minor.
+    Sort {
+        input: Box<PhysOp>,
+        keys: Vec<(usize, OrderDir)>,
+    },
+
+    /// Pass through at most `max_rows` rows, then stop.
+    Limit { input: Box<PhysOp>, max_rows: usize },
+
+    /// Insert pre-evaluated literal rows (INSERT VALUES). Yields a row count.
+    Insert {
+        table: String,
+        rows: Vec<Vec<Value>>,
+    },
+
+    /// Update columns of rows produced by `input`. Each `(col, expr)` computes
+    /// the new value of `col` from the input row. Yields a row count.
+    Update {
+        table: String,
+        input: Box<PhysOp>,
+        set: Vec<(usize, Expression)>,
+    },
+
+    /// Delete rows produced by `input` (by their PK). Yields a row count.
+    Delete { table: String, input: Box<PhysOp> },
+}
+
+impl PhysOp {
+    /// Render this plan as an indented tree, one operator per line, each line
+    /// terminated by `\n`. Engine-free — reads only the IR — so EXPLAIN and
+    /// plan-shape tests never have to build or scan.
+    ///
+    /// Line formats mirror the operators' own `Executor::explain` so existing
+    /// goldens are unchanged, with two exceptions: `NestedLoopJoin` and
+    /// `HashJoin` operators print a *runtime* count of their materialized inner
+    /// (`<materialized inner: N rows>`) that the IR cannot know — here they
+    /// render the inner subtree instead, which is strictly more informative.
+    pub fn explain(&self, indent: usize) -> String {
+        let pad = "  ".repeat(indent);
+        let inner_pad = "  ".repeat(indent + 1);
+        match self {
+            PhysOp::SeqScan { table } => format!("{pad}SeqScan({table})\n"),
+            PhysOp::IndexScan { table, index, .. } => {
+                format!("{pad}IndexScan({table}, on {index})\n")
+            }
+            PhysOp::Filter { input, .. } => {
+                format!("{pad}Filter\n{}", input.explain(indent + 1))
+            }
+            PhysOp::Projection { input, cols } => {
+                format!("{pad}Projection({cols:?})\n{}", input.explain(indent + 1))
+            }
+            PhysOp::NestedLoopJoin { outer, inner, .. } => format!(
+                "{pad}NestedLoopJoin\n{}{}",
+                outer.explain(indent + 1),
+                inner.explain(indent + 1)
+            ),
+            PhysOp::IndexNestedLoopJoin {
+                outer, inner_index, ..
+            } => format!(
+                "{pad}IndexNestedLoopJoin(probe via {inner_index})\n{}{inner_pad}<inner: IndexScan on {inner_index}>\n",
+                outer.explain(indent + 1)
+            ),
+            PhysOp::HashJoin {
+                outer,
+                inner,
+                outer_key_col,
+                inner_key_col,
+            } => format!(
+                "{pad}HashJoin(outer_key={outer_key_col}, inner_key={inner_key_col})\n{}{}",
+                outer.explain(indent + 1),
+                inner.explain(indent + 1)
+            ),
+            PhysOp::HashAggregate { input, aggregates } => {
+                let labels: Vec<String> = aggregates.iter().map(agg_label).collect();
+                format!(
+                    "{pad}HashAggregate[{}]\n{}",
+                    labels.join(", "),
+                    input.explain(indent + 1)
+                )
+            }
+            PhysOp::Sort { input, keys } => {
+                let keys: Vec<String> = keys
+                    .iter()
+                    .map(|(col, dir)| {
+                        let dir = match dir {
+                            OrderDir::Asc => " ASC",
+                            OrderDir::Desc => " DESC",
+                        };
+                        format!("{col}{dir}")
+                    })
+                    .collect();
+                format!(
+                    "{pad}Sort[{}]\n{}",
+                    keys.join(", "),
+                    input.explain(indent + 1)
+                )
+            }
+            PhysOp::Limit { input, max_rows } => {
+                format!("{pad}Limit({max_rows})\n{}", input.explain(indent + 1))
+            }
+            PhysOp::Insert { table, rows } => {
+                format!("{pad}Insert({} rows → {table})\n", rows.len())
+            }
+            PhysOp::Update { table, input, set } => {
+                let cols: Vec<usize> = set.iter().map(|(i, _)| *i).collect();
+                format!(
+                    "{pad}Update({table}, set_cols={cols:?})\n{}",
+                    input.explain(indent + 1)
+                )
+            }
+            PhysOp::Delete { table, input } => {
+                format!("{pad}Delete({table})\n{}", input.explain(indent + 1))
+            }
+        }
+    }
+}
+
+/// Aggregate label for EXPLAIN, mirroring `HashAggregate`'s operator labels.
+fn agg_label(spec: &AggregateSpec) -> String {
+    match spec {
+        AggregateSpec::CountStar => "COUNT(*)".to_string(),
+        AggregateSpec::Count {
+            col,
+            distinct: false,
+        } => format!("COUNT({col})"),
+        AggregateSpec::Count {
+            col,
+            distinct: true,
+        } => format!("COUNT(DISTINCT {col})"),
+        AggregateSpec::Sum(col) => format!("SUM({col})"),
+        AggregateSpec::Min(col) => format!("MIN({col})"),
+        AggregateSpec::Max(col) => format!("MAX({col})"),
+        AggregateSpec::Avg(col) => format!("AVG({col})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::expr::{CompareOp, Expression, Predicate};
+    use crate::types::Value;
+
+    // Proves the IR is serde-clean end to end: a tree carrying a `Predicate`
+    // and an `Expression` AST round-trips through JSON unchanged. `PhysOp`
+    // has no `PartialEq` (its AST leaves don't), so equality is checked by
+    // re-serializing the decoded value and comparing the wire forms.
+    #[test]
+    fn phys_op_tree_round_trips_through_serde() {
+        let plan = PhysOp::Update {
+            table: "warehouse".into(),
+            set: vec![(1, Expression::Literal(Value::Int64(9999)))],
+            input: Box::new(PhysOp::Filter {
+                predicate: Predicate::Compare {
+                    op: CompareOp::Eq,
+                    left: Expression::Column(0),
+                    right: Expression::Literal(Value::Int32(1)),
+                },
+                input: Box::new(PhysOp::SeqScan {
+                    table: "warehouse".into(),
+                }),
+            }),
+        };
+
+        let encoded = serde_json::to_string(&plan).unwrap();
+        let decoded: PhysOp = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+    }
+}

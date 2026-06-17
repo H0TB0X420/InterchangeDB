@@ -16,7 +16,6 @@ use interchangedb::types::ColumnType;
 
 struct Setup {
     catalog: Arc<Catalog<BTreeEngine>>,
-    engine: Arc<BTreeEngine>,
     _dir: tempfile::TempDir,
 }
 
@@ -62,25 +61,21 @@ fn setup_with_name_index() -> Setup {
         })
         .unwrap();
 
-    Setup {
-        catalog,
-        engine,
-        _dir: dir,
-    }
+    Setup { catalog, _dir: dir }
 }
 
 fn plan_sql(s: &Setup, sql: &str) -> PhysicalPlan {
     let stmts = parse(sql).unwrap();
     let binder = Binder::new(s.catalog.clone());
     let logical = binder.bind(stmts.into_iter().next().unwrap()).unwrap();
-    plan(logical, s.engine.clone(), &s.catalog).unwrap()
+    plan(logical, &s.catalog).unwrap()
 }
 
 fn explain_of(p: PhysicalPlan) -> String {
     match p {
-        PhysicalPlan::Executor(exec) => exec.explain(0),
+        PhysicalPlan::Query(physop) => physop.explain(0),
         other => panic!(
-            "expected Executor plan, got: {:?}",
+            "expected Query plan, got: {:?}",
             std::mem::discriminant(&other)
         ),
     }

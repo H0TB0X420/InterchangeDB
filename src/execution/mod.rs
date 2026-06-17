@@ -17,10 +17,12 @@
 //! Single-tuple-at-a-time iteration is the simplest model that handles
 //! arbitrary operator trees correctly. Push-based / vectorized executors
 //! (HyPer, DuckDB) outperform Volcano on analytical workloads but add
-//! significant complexity to operator state management. Phase 15 will add
-//! a second `ExecutionModel` for benchmarking — the interchangeability
-//! promise — but TPC-C is OLTP, where Volcano is competitive.
+//! significant complexity to operator state management. The [`ExecutionModel`]
+//! trait (`model.rs`) names this choice: [`Volcano`] is the pull-based first
+//! impl; a push-based second impl is the Phase 15 work in progress — the
+//! interchangeability promise. TPC-C is OLTP, where Volcano is competitive.
 
+pub mod build;
 pub mod delete;
 pub mod filter;
 pub mod hash_aggregate;
@@ -28,6 +30,7 @@ pub mod index_scan;
 pub mod insert;
 pub mod join;
 pub mod limit;
+pub mod model;
 pub mod pk_lookup;
 pub mod projection;
 pub mod seq_scan;
@@ -44,6 +47,7 @@ pub use index_scan::IndexScan;
 pub use insert::Insert;
 pub use join::{HashJoin, IndexNestedLoopJoin, JoinPredicate, JoinStrategy, NestedLoopJoin};
 pub use limit::Limit;
+pub use model::{ExecutionModel, Volcano};
 pub use pk_lookup::PkLookup;
 pub use projection::Projection;
 pub use seq_scan::SeqScan;

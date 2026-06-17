@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema, TableId};
+use interchangedb::execution::{ExecutionModel, Volcano};
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::layout::RowLayout;
 use interchangedb::sql::{parse, plan, Binder, PhysicalPlan};
@@ -157,26 +158,21 @@ fn plan_sql(s: &Setup, sql: &str) -> PhysicalPlan {
     let stmts = parse(sql).unwrap();
     let binder = Binder::new(s.catalog.clone());
     let logical = binder.bind(stmts.into_iter().next().unwrap()).unwrap();
-    plan(logical, s.engine.clone(), &s.catalog).unwrap()
+    plan(logical, &s.catalog).unwrap()
 }
 
 fn run_select(s: &Setup, sql: &str) -> Vec<Vec<Value>> {
-    let p = plan_sql(s, sql);
-    let mut exec = match p {
-        PhysicalPlan::Executor(e) => e,
-        _ => panic!("expected Executor plan"),
+    let physop = match plan_sql(s, sql) {
+        PhysicalPlan::Query(physop) => physop,
+        _ => panic!("expected Query plan"),
     };
-    let mut out = Vec::new();
-    while let Some(t) = exec.next().unwrap() {
-        out.push(t);
-    }
-    out
+    let (_schema, rows) = Volcano.execute(&physop, &s.engine, &s.catalog).unwrap();
+    rows
 }
 
 fn explain_of(s: &Setup, sql: &str) -> String {
-    let p = plan_sql(s, sql);
-    match p {
-        PhysicalPlan::Executor(e) => e.explain(0),
+    match plan_sql(s, sql) {
+        PhysicalPlan::Query(physop) => physop.explain(0),
         _ => panic!(),
     }
 }

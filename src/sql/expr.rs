@@ -20,11 +20,13 @@
 //! - Type mismatch → `Value::Null` for arithmetic, `false` for compare.
 //! - Division by zero → `Value::Null`.
 
+use serde::{Deserialize, Serialize};
+
 use crate::execution::Tuple;
 use crate::types::{Decimal, Value};
 
 /// An expression that evaluates to a `Value` against an input tuple.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expression {
     /// A constant value embedded in the plan (e.g., `42`, `'alice'`).
     Literal(Value),
@@ -44,7 +46,7 @@ pub enum Expression {
 }
 
 /// Arithmetic operator for `Expression::BinaryOp`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -53,7 +55,7 @@ pub enum BinaryOp {
 }
 
 /// A boolean predicate that evaluates against an input tuple.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Predicate {
     /// Comparison between two expressions.
     Compare {
@@ -70,7 +72,7 @@ pub enum Predicate {
 }
 
 /// Comparison operator for `Predicate::Compare`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompareOp {
     Eq,
     Neq,

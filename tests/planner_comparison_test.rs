@@ -24,7 +24,6 @@ use interchangedb::storage::FileDiskManager;
 use interchangedb::types::ColumnType;
 
 struct Env {
-    engine: Arc<BTreeEngine>,
     catalog: Arc<Catalog<BTreeEngine>>,
     binder: Binder<BTreeEngine>,
     _dir: tempfile::TempDir,
@@ -89,7 +88,6 @@ fn setup() -> Env {
     catalog.create_table("district".into(), district).unwrap();
 
     Env {
-        engine,
         catalog,
         binder,
         _dir: dir,
@@ -107,19 +105,15 @@ fn plans_match(env: &Env, sql: &str) -> (String, String) {
         .unwrap();
     let b = env.binder.bind(stmts.into_iter().next().unwrap()).unwrap();
 
-    let p_rule = RuleBasedPlanner
-        .plan(a, env.engine.clone(), &env.catalog)
-        .unwrap();
-    let p_sel = SelingerPlanner::default()
-        .plan(b, env.engine.clone(), &env.catalog)
-        .unwrap();
+    let p_rule = RuleBasedPlanner.plan(a, &env.catalog).unwrap();
+    let p_sel = SelingerPlanner::default().plan(b, &env.catalog).unwrap();
 
     (render(&p_rule), render(&p_sel))
 }
 
 fn render(p: &PhysicalPlan) -> String {
     match p {
-        PhysicalPlan::Executor(e) => e.explain(0),
+        PhysicalPlan::Query(physop) => physop.explain(0),
         PhysicalPlan::CreateTable { name, .. } => format!("CreateTable({})", name),
         PhysicalPlan::Analyze { table } => format!("Analyze({})", table),
         PhysicalPlan::BeginTxn => "BeginTxn".into(),
