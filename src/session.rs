@@ -35,7 +35,7 @@ use std::sync::Arc;
 use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::{Error, Result};
 use crate::database::Database;
-use crate::execution::{ExecutionModel, Tuple, Volcano};
+use crate::execution::{ExecModel, Tuple};
 use crate::sql::binder::Binder;
 use crate::sql::frontend::parse;
 use crate::sql::logical::LogicalPlan;
@@ -72,6 +72,7 @@ pub struct Session<E: StorageEngine + 'static> {
     current_txn: Option<TxnId>,
     log: Option<Arc<WorkloadLog>>,
     planner: Planner,
+    execution_model: ExecModel,
 }
 
 impl<E: StorageEngine + 'static> Session<E> {
@@ -84,6 +85,7 @@ impl<E: StorageEngine + 'static> Session<E> {
             current_txn: None,
             log: None,
             planner: Planner::default(),
+            execution_model: ExecModel::default(),
         }
     }
 
@@ -98,6 +100,18 @@ impl<E: StorageEngine + 'static> Session<E> {
     /// Name of the active planner strategy.
     pub fn planner_name(&self) -> &'static str {
         self.planner.name()
+    }
+
+    /// Swap the execution model (Volcano pull vs. push) for subsequent
+    /// statements. Defaults to Volcano. Both produce identical results; the
+    /// Phase 16 harness uses this to benchmark the two.
+    pub fn set_execution_model(&mut self, model: ExecModel) {
+        self.execution_model = model;
+    }
+
+    /// Name of the active execution model.
+    pub fn execution_model_name(&self) -> &'static str {
+        self.execution_model.name()
     }
 
     /// Attach a workload log. Each subsequent `execute` call appends one
@@ -245,7 +259,9 @@ impl<E: StorageEngine + 'static> Session<E> {
     {
         match physical {
             PhysicalPlan::Query(physop) => {
-                let (schema, rows) = Volcano.execute(&physop, engine, &self.catalog)?;
+                let (schema, rows) =
+                    self.execution_model
+                        .execute(&physop, engine, &self.catalog)?;
                 if is_select_shape {
                     Ok(QueryResult::Rows { schema, rows })
                 } else {

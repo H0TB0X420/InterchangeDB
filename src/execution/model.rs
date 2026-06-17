@@ -72,15 +72,58 @@ impl ExecutionModel for Volcano {
     }
 }
 
+/// Runtime-selectable execution model held by a `Session`.
+///
+/// Enum dispatch (like the `Planner` enum) rather than `Box<dyn ExecutionModel>`
+/// because `execute` is generic over the storage engine — so the trait isn't
+/// object-safe — and the model set is closed (`Volcano`, `Push`). The session
+/// swaps this to change evaluation strategy at runtime.
+#[derive(Default)]
+pub enum ExecModel {
+    #[default]
+    Volcano,
+    Push,
+}
+
+impl ExecModel {
+    /// Execute `plan` with the selected model, returning its output schema and
+    /// rows.
+    pub fn execute<E, CatE>(
+        &self,
+        plan: &PhysOp,
+        engine: &Arc<E>,
+        catalog: &Catalog<CatE>,
+    ) -> Result<(Schema, Vec<Tuple>)>
+    where
+        E: StorageEngine + 'static,
+        CatE: StorageEngine,
+    {
+        match self {
+            ExecModel::Volcano => Volcano.execute(plan, engine, catalog),
+            ExecModel::Push => crate::execution::push::Push.execute(plan, engine, catalog),
+        }
+    }
+
+    /// Identifier of the active model, for logging / introspection.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ExecModel::Volcano => Volcano.name(),
+            ExecModel::Push => crate::execution::push::Push.name(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // `execute` (build + drive) is exercised end-to-end by every SELECT/DML in
     // the e2e suite, and its build half by the `execution::build` tests; here
-    // we just pin the model's identity.
+    // we just pin the models' identities.
     #[test]
-    fn volcano_name_is_volcano() {
+    fn model_names() {
         assert_eq!(Volcano.name(), "volcano");
+        assert_eq!(ExecModel::default().name(), "volcano");
+        assert_eq!(ExecModel::Push.name(), "push");
     }
 }

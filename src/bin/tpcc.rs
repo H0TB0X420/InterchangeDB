@@ -48,8 +48,10 @@ use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::catalog::Catalog;
 use interchangedb::common::Result as DbResult;
 use interchangedb::database::Database;
+use interchangedb::execution::ExecModel;
 use interchangedb::index::btree::BTreeEngine;
 use interchangedb::session::{PreparedStatement, QueryResult, Session};
+use interchangedb::sql::{Planner, RuleBasedPlanner, SelingerPlanner};
 use interchangedb::storage::FileDiskManager;
 use interchangedb::types::Value;
 use interchangedb::{LsmEngine, StorageEngine};
@@ -58,6 +60,7 @@ use interchangedb::{LsmEngine, StorageEngine};
 // Config
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Config {
     engine: String,
     /// Buffer-pool eviction policy (B+Tree engine only): fifo|lru|lruk|clock|2q|arc.
@@ -75,6 +78,13 @@ struct Config {
     /// write locks, no WAL commits. Lets us see whether the read path
     /// alone scales, isolating read- vs write-path bottlenecks.
     read_only: bool,
+    /// Execution model for the worker sessions: volcano (pull) | push.
+    exec_model: String,
+    /// Planner strategy for the worker sessions: rule-based | selinger.
+    planner: String,
+    /// Sweep mode: ignore --engine/--exec-model/--planner and run the full
+    /// engine × exec-model × planner matrix, printing a comparison table.
+    sweep: bool,
 }
 
 impl Config {
@@ -90,6 +100,9 @@ impl Config {
             seed: 1,
             data_dir: std::env::temp_dir().join("interchangedb_tpcc"),
             read_only: false,
+            exec_model: "volcano".to_string(),
+            planner: "rule-based".to_string(),
+            sweep: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -105,6 +118,9 @@ impl Config {
                 "--seed" => c.seed = value().parse().expect("int"),
                 "--data-dir" => c.data_dir = PathBuf::from(value()),
                 "--read-only" => c.read_only = true,
+                "--exec-model" => c.exec_model = value(),
+                "--planner" => c.planner = value(),
+                "--sweep" => c.sweep = true,
                 other => panic!("unknown flag: {}", other),
             }
         }
@@ -641,6 +657,24 @@ fn dispatch<E: StorageEngine + 'static>(
     }
 }
 
+/// Map the `--exec-model` flag to the execution model the session swaps to.
+fn parse_exec_model(name: &str) -> ExecModel {
+    match name {
+        "volcano" => ExecModel::Volcano,
+        "push" => ExecModel::Push,
+        other => panic!("unknown exec-model: {} (volcano|push)", other),
+    }
+}
+
+/// Map the `--planner` flag to the planner strategy the session swaps to.
+fn parse_planner(name: &str) -> Planner {
+    match name {
+        "rule-based" => Planner::RuleBased(RuleBasedPlanner),
+        "selinger" => Planner::Selinger(SelingerPlanner::default()),
+        other => panic!("unknown planner: {} (rule-based|selinger)", other),
+    }
+}
+
 /// One terminal: its own session, pinned home warehouse and id range,
 /// looping until the deadline (or its iteration budget).
 fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
@@ -652,6 +686,8 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
     iters: u64,
 ) -> Counts {
     let mut session = Session::new(database, catalog);
+    session.set_execution_model(parse_exec_model(&config.exec_model));
+    session.set_planner(parse_planner(&config.planner));
     let statements = Statements::prepare(&mut session);
     let base = PK_BASE + terminal * PK_STRIDE;
     let mut ctx = Ctx {
@@ -694,13 +730,38 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
     counts
 }
 
-/// Load + run the concurrent terminals against an already-opened
-/// database, then report. Generic over the storage engine.
+/// Aggregated outcome of one workload run, for the single-run report and the
+/// sweep comparison table.
+struct RunMetrics {
+    total: Counts,
+    elapsed_s: f64,
+    fsyncs: u64,
+}
+
+impl RunMetrics {
+    fn committed_per_s(&self) -> f64 {
+        self.total.committed() as f64 / self.elapsed_s
+    }
+    fn tpmc(&self) -> f64 {
+        self.total.new_order as f64 / self.elapsed_s * 60.0
+    }
+    fn abort_pct(&self) -> f64 {
+        let attempts = self.total.committed() + self.total.aborts;
+        if attempts > 0 {
+            self.total.aborts as f64 / attempts as f64 * 100.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Load + run the concurrent terminals against an already-opened database,
+/// returning the run's metrics. Generic over the storage engine.
 fn run_workload<E: StorageEngine + Send + Sync + 'static>(
     database: Arc<Database<E>>,
     catalog: Arc<Catalog<E>>,
     config: &Config,
-) {
+) -> RunMetrics {
     {
         let mut loader = Session::new(database.clone(), catalog.clone());
         let load_start = Instant::now();
@@ -734,58 +795,35 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
     for c in &per_terminal {
         total.add(c);
     }
-    let committed = total.committed();
-    let attempts = committed + total.aborts;
-
-    println!(
-        "\n--- complete: {} committed, {} aborted in {:.2}s ---",
-        committed, total.aborts, elapsed
-    );
-    println!("  NewOrder    {}", total.new_order);
-    println!("  Payment     {}", total.payment);
-    println!("  OrderStatus {}", total.order_status);
-    println!("  Delivery    {}", total.delivery);
-    println!("  StockLevel  {}", total.stock_level);
-    println!(
-        "  abort rate  {:.1}%",
-        if attempts > 0 {
-            total.aborts as f64 / attempts as f64 * 100.0
-        } else {
-            0.0
-        }
-    );
-    println!("  fsyncs      {}", database.wal_fsync_count());
-    println!(
-        "  throughput  {:.0} committed txn/s",
-        committed as f64 / elapsed
-    );
-    println!(
-        "  tpmC (NewOrder/min) {:.0}",
-        total.new_order as f64 / elapsed * 60.0
-    );
+    RunMetrics {
+        total,
+        elapsed_s: elapsed,
+        fsyncs: database.wal_fsync_count(),
+    }
 }
 
-fn main() {
-    let config = Config::from_args();
-
-    let _ = std::fs::remove_dir_all(&config.data_dir);
-    std::fs::create_dir_all(&config.data_dir).expect("create data dir");
-
-    let mode = if config.duration_secs > 0 {
-        format!("{}s", config.duration_secs)
-    } else {
-        format!("{} iters", config.iterations)
-    };
-    let policy_label = if config.engine == "btree" {
-        config.policy.as_str()
-    } else {
-        "n/a"
-    };
+/// Detailed single-run report (the per-transaction breakdown + headline rates).
+fn print_report(label: &str, m: &RunMetrics) {
+    let t = &m.total;
+    let committed = t.committed();
     println!(
-        "TPC-C [{} / {}]: {} warehouse(s), {} terminal(s), {}, seed {}",
-        config.engine, policy_label, config.warehouses, config.terminals, mode, config.seed
+        "\n--- {}: {} committed, {} aborted in {:.2}s ---",
+        label, committed, t.aborts, m.elapsed_s
     );
+    println!("  NewOrder    {}", t.new_order);
+    println!("  Payment     {}", t.payment);
+    println!("  OrderStatus {}", t.order_status);
+    println!("  Delivery    {}", t.delivery);
+    println!("  StockLevel  {}", t.stock_level);
+    println!("  abort rate  {:.1}%", m.abort_pct());
+    println!("  fsyncs      {}", m.fsyncs);
+    println!("  throughput  {:.0} committed txn/s", m.committed_per_s());
+    println!("  tpmC (NewOrder/min) {:.0}", m.tpmc());
+}
 
+/// Build the requested engine for `config`, run the workload, and return its
+/// metrics. Shared by the single-run and sweep paths.
+fn run_one_config(config: &Config) -> RunMetrics {
     match config.engine.as_str() {
         "btree" => {
             let dm = FileDiskManager::create(config.data_dir.join("tpcc.db")).expect("db file");
@@ -799,7 +837,7 @@ fn main() {
             let engine = BTreeEngine::new(bpm).expect("engine");
             let database = Arc::new(Database::open(&config.data_dir, engine).expect("open db"));
             let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).expect("catalog"));
-            run_workload(database, catalog, &config);
+            run_workload(database, catalog, config)
         }
         "lsm" => {
             let lsm_dir = config.data_dir.join("lsm");
@@ -807,8 +845,93 @@ fn main() {
             let engine = LsmEngine::new(&lsm_dir).expect("engine");
             let database = Arc::new(Database::open(&config.data_dir, engine).expect("open db"));
             let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).expect("catalog"));
-            run_workload(database, catalog, &config);
+            run_workload(database, catalog, config)
         }
         other => panic!("unknown engine: {} (use btree|lsm)", other),
     }
+}
+
+/// Run the engine × exec-model × planner matrix, each in its own fresh data
+/// dir, and print a comparison table sorted by tpmC.
+fn run_sweep(base: &Config) {
+    let mode = if base.duration_secs > 0 {
+        format!("{}s", base.duration_secs)
+    } else {
+        format!("{} iters", base.iterations)
+    };
+    println!(
+        "TPC-C sweep: {} warehouse(s), {} terminal(s), {}, seed {}",
+        base.warehouses, base.terminals, mode, base.seed
+    );
+
+    let mut results: Vec<(String, RunMetrics)> = Vec::new();
+    for engine in ["btree", "lsm"] {
+        for exec_model in ["volcano", "push"] {
+            for planner in ["rule-based", "selinger"] {
+                let mut cfg = base.clone();
+                cfg.engine = engine.to_string();
+                cfg.exec_model = exec_model.to_string();
+                cfg.planner = planner.to_string();
+                cfg.data_dir = base
+                    .data_dir
+                    .join(format!("{engine}-{exec_model}-{planner}"));
+                let _ = std::fs::remove_dir_all(&cfg.data_dir);
+                std::fs::create_dir_all(&cfg.data_dir).expect("cell dir");
+                eprintln!("  running {engine} / {exec_model} / {planner} ...");
+                let label = format!("{engine:<6} {exec_model:<8} {planner}");
+                results.push((label, run_one_config(&cfg)));
+            }
+        }
+    }
+    results.sort_by(|a, b| b.1.tpmc().partial_cmp(&a.1.tpmc()).unwrap());
+
+    println!("\n=== TPC-C config bake-off (sorted by tpmC) ===");
+    println!(
+        "{:<24} {:>8} {:>10} {:>8} {:>8}",
+        "engine exec     planner", "tpmC", "txn/s", "abort%", "fsyncs"
+    );
+    for (label, m) in &results {
+        println!(
+            "{:<24} {:>8.0} {:>10.0} {:>7.1}% {:>8}",
+            label,
+            m.tpmc(),
+            m.committed_per_s(),
+            m.abort_pct(),
+            m.fsyncs
+        );
+    }
+}
+
+fn main() {
+    let config = Config::from_args();
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+    std::fs::create_dir_all(&config.data_dir).expect("create data dir");
+
+    if config.sweep {
+        run_sweep(&config);
+        return;
+    }
+
+    let mode = if config.duration_secs > 0 {
+        format!("{}s", config.duration_secs)
+    } else {
+        format!("{} iters", config.iterations)
+    };
+    let policy_label = if config.engine == "btree" {
+        config.policy.as_str()
+    } else {
+        "n/a"
+    };
+    println!(
+        "TPC-C [{} / {} / {} / {}]: {} warehouse(s), {} terminal(s), {}, seed {}",
+        config.engine,
+        policy_label,
+        config.exec_model,
+        config.planner,
+        config.warehouses,
+        config.terminals,
+        mode,
+        config.seed
+    );
+    print_report("complete", &run_one_config(&config));
 }
