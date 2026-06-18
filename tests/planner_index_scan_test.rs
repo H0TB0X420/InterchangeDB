@@ -104,20 +104,22 @@ fn select_with_equality_on_indexed_column_lowers_to_indexscan() {
 }
 
 #[test]
-fn select_with_equality_on_non_indexed_column_uses_seqscan() {
+fn select_with_pk_equality_lowers_to_pk_lookup() {
     let s = setup_with_name_index();
+    // id is the PK → a point lookup, ahead of both the scan and the secondary
+    // index on `name`.
     let text = explain_of(plan_sql(&s, "SELECT name FROM t WHERE id = 1"));
     assert!(
-        text.contains("SeqScan"),
-        "expected SeqScan in plan:\n{}",
+        text.contains("PkLookup"),
+        "expected PkLookup in plan:\n{}",
         text
     );
+    assert!(!text.contains("SeqScan"), "PK lookup, not scan:\n{}", text);
     assert!(
-        text.contains("Filter"),
-        "expected Filter in plan:\n{}",
+        !text.contains("IndexScan"),
+        "id is the PK, not a secondary index:\n{}",
         text
     );
-    assert!(!text.contains("IndexScan"), "id is not indexed:\n{}", text);
 }
 
 #[test]

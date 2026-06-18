@@ -100,7 +100,8 @@ fn golden_select_projection_wraps_seqscan() {
 #[test]
 fn golden_select_filter_then_projection() {
     let mc = fresh_catalog();
-    let p = plan_sql(&mc, "SELECT id FROM t WHERE id = 1");
+    // Non-PK predicate (age) keeps the scan + filter shape.
+    let p = plan_sql(&mc, "SELECT id FROM t WHERE age = 1");
     assert_plan_matches(
         &p,
         r#"
@@ -112,9 +113,23 @@ fn golden_select_filter_then_projection() {
 }
 
 #[test]
+fn golden_select_pk_equality_is_pk_lookup() {
+    let mc = fresh_catalog();
+    // id is the PK → a point lookup replaces scan + filter.
+    let p = plan_sql(&mc, "SELECT id FROM t WHERE id = 1");
+    assert_plan_matches(
+        &p,
+        r#"
+            Projection([0])
+              PkLookup(t)
+        "#,
+    );
+}
+
+#[test]
 fn golden_select_full_chain_limit_projection_filter_scan() {
     let mc = fresh_catalog();
-    let p = plan_sql(&mc, "SELECT id FROM t WHERE id = 1 LIMIT 3");
+    let p = plan_sql(&mc, "SELECT id FROM t WHERE age = 1 LIMIT 3");
     assert_plan_matches(
         &p,
         r#"
@@ -160,7 +175,7 @@ fn golden_insert_multi_row() {
 #[test]
 fn golden_update_with_filter() {
     let mc = fresh_catalog();
-    let p = plan_sql(&mc, "UPDATE t SET name = 'x' WHERE id = 1");
+    let p = plan_sql(&mc, "UPDATE t SET name = 'x' WHERE age = 1");
     assert_plan_matches(
         &p,
         r#"
@@ -189,7 +204,7 @@ fn golden_update_without_filter() {
 #[test]
 fn golden_delete_with_filter() {
     let mc = fresh_catalog();
-    let p = plan_sql(&mc, "DELETE FROM t WHERE id = 1");
+    let p = plan_sql(&mc, "DELETE FROM t WHERE age = 1");
     assert_plan_matches(
         &p,
         r#"
@@ -222,7 +237,7 @@ fn golden_delete_without_filter() {
 #[test]
 fn golden_explain_wraps_select_chain() {
     let mc = fresh_catalog();
-    let p = plan_sql(&mc, "EXPLAIN SELECT id FROM t WHERE id = 1");
+    let p = plan_sql(&mc, "EXPLAIN SELECT id FROM t WHERE age = 1");
     assert_plan_matches(
         &p,
         r#"

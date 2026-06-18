@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::common::{Error, Result};
-use crate::storage::StorageEngine;
+use crate::storage::{ScanIterator, StorageEngine};
 use crate::txn::{Snapshot, Timestamp, TxnId};
 
 // ---------------------------------------------------------------------------
@@ -319,131 +319,243 @@ fn max_user_key_at_length_le(end: &[u8], l: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// Scan a range of user keys, returning the newest visible version of each.
+/// Lazy, streaming scan over a user-key range, yielding the newest visible
+/// version of each key as it goes — the iterator behind [`mvcc_scan`].
 ///
 /// Iterates length-buckets of the MVCC keyspace using probe-then-scan: each
 /// `engine.scan(probe..).next()` is an O(log n) seek that returns the next
 /// occupied bucket's first entry. From its length-prefix we compute the
 /// sub-range of that bucket that intersects `[start_key, end_key]` and scan
-/// it directly. After processing, advance the probe past the bucket.
+/// it directly, then advance the probe past the bucket.
 ///
-/// For fixed-length-PK tables (TPC-C warehouse/district/customer) this is
-/// one seek + one targeted scan. For variable-length PKs it's K seeks where
-/// K = number of distinct row-key lengths actually present in the engine.
+/// For fixed-length-PK tables (TPC-C warehouse/district/customer) this is one
+/// seek + one targeted scan. For variable-length PKs it's K seeks where K =
+/// number of distinct row-key lengths present in the engine.
+///
+/// Streaming (vs the previous `Vec`-buffered version) matters because the
+/// underlying engine scan is now lazy too: a consumer that stops early (LIMIT,
+/// first-match) stops the storage read, and a full scan never holds the whole
+/// range resident. The visibility decision `F` is **owned** so the iterator
+/// can outlive the call that built it.
 ///
 /// `start_key` and `end_key` define an INCLUSIVE user-key range.
+pub struct MvccScan<'a, E: StorageEngine, F: Fn(TxnId, Timestamp) -> bool> {
+    engine: &'a E,
+    start_key: Vec<u8>,
+    end_key: Vec<u8>,
+    visible: F,
+    /// Lowest MVCC key the next bucket-probe seeks from. Starts at the lowest
+    /// possible key (length-prefix 0, empty user_key, ts inverted to 0).
+    probe_pos: Vec<u8>,
+    /// Active bucket's version scan, if one is in progress.
+    inner: Option<Box<dyn ScanIterator + 'a>>,
+    /// Dedup state within the active bucket: the user key currently being
+    /// resolved and whether its newest version has already been decided.
+    current_user_key: Option<Vec<u8>>,
+    found_visible_for_current: bool,
+    /// The active bucket is the last possible one (probe length overflowed).
+    last_bucket: bool,
+    /// Terminal state — an error surfaced or the keyspace is exhausted.
+    done: bool,
+}
+
+impl<'a, E: StorageEngine, F: Fn(TxnId, Timestamp) -> bool> MvccScan<'a, E, F> {
+    pub fn new(engine: &'a E, start_key: Vec<u8>, end_key: Vec<u8>, visible: F) -> Self {
+        Self {
+            engine,
+            start_key,
+            end_key,
+            visible,
+            probe_pos: vec![0; 4 + 8],
+            inner: None,
+            current_user_key: None,
+            found_visible_for_current: false,
+            last_bucket: false,
+            done: false,
+        }
+    }
+
+    /// Find the next occupied length-bucket at/after `probe_pos` and arm
+    /// `inner` with its intersection against `[start_key, end_key]`. Skips
+    /// buckets that don't intersect. Returns `Ok(true)` once a bucket scan is
+    /// armed, `Ok(false)` when the keyspace is exhausted. Advances `probe_pos`
+    /// past each bucket it inspects and sets `last_bucket` on u32 overflow.
+    fn arm_next_bucket(&mut self) -> Result<bool> {
+        loop {
+            let probe_key = {
+                let mut iter = self.engine.scan(self.probe_pos.clone()..);
+                match iter.next() {
+                    None => return Ok(false),
+                    Some(Err(e)) => return Err(e),
+                    Some(Ok((k, _))) => k,
+                }
+            };
+
+            // The first 4 bytes of a well-formed MVCC key are the user_key
+            // length prefix; anything shorter isn't an MVCC entry.
+            if probe_key.len() < 4 {
+                return Ok(false);
+            }
+            let bucket_len =
+                u32::from_be_bytes([probe_key[0], probe_key[1], probe_key[2], probe_key[3]])
+                    as usize;
+
+            // Validate MVCC encoding. When the engine is shared between
+            // TxnEngine (MVCC entries) and Catalog (raw entries), a non-MVCC
+            // entry's first 4 bytes are arbitrary — interpreting them as a
+            // length yields huge values. MVCC entries always satisfy
+            // `total_len == 4 + bucket_len + 8`. Use u64 to avoid usize
+            // overflow when `bucket_len` is huge.
+            let expected_total = 4u64 + bucket_len as u64 + 8u64;
+            if probe_key.len() as u64 != expected_total {
+                // Crossed into a non-MVCC region of the keyspace — done.
+                return Ok(false);
+            }
+
+            // Advance the probe to the next length bucket now. If
+            // `bucket_len + 1` overflows u32, this is the last possible bucket.
+            match (bucket_len as u32).checked_add(1) {
+                Some(n) => self.probe_pos = n.to_be_bytes().to_vec(),
+                None => self.last_bucket = true,
+            }
+
+            // Compute the bucket's intersection with [start_key, end_key].
+            let bucket_min = min_user_key_at_length_ge(&self.start_key, bucket_len);
+            let bucket_max = max_user_key_at_length_le(&self.end_key, bucket_len);
+            if let (Some(min_uk), Some(max_uk)) = (bucket_min, bucket_max) {
+                if min_uk <= max_uk {
+                    let scan_start = encode_mvcc_key_start(&min_uk);
+                    let scan_end = encode_mvcc_key_end(&max_uk);
+                    self.inner = Some(self.engine.scan(scan_start..=scan_end));
+                    self.current_user_key = None;
+                    self.found_visible_for_current = false;
+                    return Ok(true);
+                }
+            }
+
+            // Empty intersection: this bucket contributes nothing. Stop if it
+            // was the last one, otherwise probe the next bucket.
+            if self.last_bucket {
+                return Ok(false);
+            }
+        }
+    }
+}
+
+impl<'a, E: StorageEngine, F: Fn(TxnId, Timestamp) -> bool> Iterator for MvccScan<'a, E, F> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Pull one entry from the active bucket scan, if any. The
+            // `self.inner` borrow is released as the match expression yields
+            // the owned `Option`, so the body below can touch other fields.
+            let pulled = match self.inner.as_mut() {
+                Some(inner) => inner.next(),
+                None => None,
+            };
+
+            match pulled {
+                Some(Ok((encoded_key, encoded_value))) => {
+                    let (user_key, version_ts) = match decode_mvcc_key(&encoded_key) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.done = true;
+                            self.inner = None;
+                            return Some(Err(e));
+                        }
+                    };
+
+                    // New user key → reset the newest-version decision.
+                    if self.current_user_key.as_ref() != Some(&user_key) {
+                        self.current_user_key = Some(user_key.clone());
+                        self.found_visible_for_current = false;
+                    }
+                    if self.found_visible_for_current {
+                        continue;
+                    }
+
+                    let mvcc_val = match decode_mvcc_value(&encoded_value) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.done = true;
+                            self.inner = None;
+                            return Some(Err(e));
+                        }
+                    };
+                    let version_txn_id = match &mvcc_val {
+                        MvccValue::Value { txn_id, .. } => *txn_id,
+                        MvccValue::Tombstone { txn_id } => *txn_id,
+                    };
+                    if !(self.visible)(version_txn_id, version_ts) {
+                        continue;
+                    }
+
+                    // First visible version of this key wins. A live value is
+                    // emitted; a tombstone means "deleted" — emit nothing but
+                    // still skip the key's older versions.
+                    self.found_visible_for_current = true;
+                    if let MvccValue::Value { data, .. } = mvcc_val {
+                        return Some(Ok((user_key, data)));
+                    }
+                }
+                Some(Err(e)) => {
+                    self.done = true;
+                    self.inner = None;
+                    return Some(Err(e));
+                }
+                None => {
+                    // `pulled == None` either because there's no active bucket
+                    // or because the active one is exhausted.
+                    if self.inner.is_some() {
+                        self.inner = None;
+                        if self.last_bucket {
+                            self.done = true;
+                        }
+                    }
+                    if self.done {
+                        return None;
+                    }
+                    match self.arm_next_bucket() {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            self.done = true;
+                            return None;
+                        }
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(e));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Scan a range of user keys, returning the newest visible version of each as
+/// an eagerly-collected `Vec`. Thin wrapper over [`MvccScan`] — every caller
+/// and test of `mvcc_scan` exercises the same streaming iterator, just
+/// collected. Streaming callers use `MvccScan` directly.
 ///
-/// NOTE (perf): still buffers into a `Vec` rather than streaming. The Vec
-/// is the next bottleneck for analytical workloads — Phase 11 streaming
-/// refactor.
-// CLIPPY-ALLOW(too_many_arguments): MVCC scan needs the engine, key range,
-// snapshot, and txn-manager handles all at once; bundling them into a struct
-// would only relocate the same parameters with no clarity gain.
-#[allow(clippy::too_many_arguments)]
+/// `start_key` and `end_key` define an INCLUSIVE user-key range.
 pub fn mvcc_scan<E: StorageEngine>(
     engine: &E,
     start_key: &[u8],
     end_key: &[u8],
     visible: &dyn Fn(TxnId, Timestamp) -> bool,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-    // Probe starts at the lowest possible MVCC key: length-prefix 0,
-    // empty user_key, ts=u64::MAX (inverted to 0). Equivalent to
-    // `[0,0,0,0, 0*8]`.
-    let mut probe_pos: Vec<u8> = vec![0; 4 + 8];
-
-    loop {
-        let probe_key = {
-            let mut iter = engine.scan(probe_pos.clone()..);
-            match iter.next() {
-                None => break,
-                Some(Err(e)) => return Err(e),
-                Some(Ok((k, _))) => k,
-            }
-        };
-
-        // The first 4 bytes of any well-formed MVCC key are the user_key
-        // length prefix. Anything shorter is a non-MVCC engine entry —
-        // shouldn't happen in practice, but guard against it.
-        if probe_key.len() < 4 {
-            break;
-        }
-        let bucket_len =
-            u32::from_be_bytes([probe_key[0], probe_key[1], probe_key[2], probe_key[3]]) as usize;
-
-        // Validate that this probe key is actually MVCC-encoded. When the
-        // engine is shared between TxnEngine (MVCC entries) and Catalog
-        // (raw entries like system tables), the first non-MVCC entry's
-        // first 4 bytes are arbitrary bytes — interpreting them as a
-        // length yields huge values that would trigger giant allocations
-        // in the bucket math. MVCC entries always satisfy
-        // `total_len == 4 + bucket_len + 8`. Use u64 to avoid usize
-        // overflow when `bucket_len` is huge.
-        let expected_total = 4u64 + bucket_len as u64 + 8u64;
-        if probe_key.len() as u64 != expected_total {
-            // Crossed into a non-MVCC region of the keyspace — done.
-            break;
-        }
-
-        // Compute the bucket's intersection with [start_key, end_key].
-        let bucket_min = min_user_key_at_length_ge(start_key, bucket_len);
-        let bucket_max = max_user_key_at_length_le(end_key, bucket_len);
-        if let (Some(min_uk), Some(max_uk)) = (bucket_min, bucket_max) {
-            if min_uk <= max_uk {
-                let scan_start = encode_mvcc_key_start(&min_uk);
-                let scan_end = encode_mvcc_key_end(&max_uk);
-
-                let mut current_user_key: Option<Vec<u8>> = None;
-                let mut found_visible_for_current = false;
-
-                for result in engine.scan(scan_start..=scan_end) {
-                    let (encoded_key, encoded_value) = result?;
-                    let (user_key, version_ts) = decode_mvcc_key(&encoded_key)?;
-
-                    if current_user_key.as_ref() != Some(&user_key) {
-                        current_user_key = Some(user_key.clone());
-                        found_visible_for_current = false;
-                    }
-
-                    if found_visible_for_current {
-                        continue;
-                    }
-
-                    let mvcc_val = decode_mvcc_value(&encoded_value)?;
-                    let version_txn_id = match &mvcc_val {
-                        MvccValue::Value { txn_id, .. } => *txn_id,
-                        MvccValue::Tombstone { txn_id } => *txn_id,
-                    };
-
-                    if !visible(version_txn_id, version_ts) {
-                        continue;
-                    }
-
-                    found_visible_for_current = true;
-                    if let MvccValue::Value { data, .. } = mvcc_val {
-                        results.push((user_key, data));
-                    }
-                }
-            }
-        }
-
-        // Advance probe past bucket `bucket_len`: seek to start of the
-        // next length bucket. If `bucket_len + 1` overflows u32, we've
-        // covered every possible bucket — terminate.
-        let next_len = match (bucket_len as u32).checked_add(1) {
-            Some(n) => n,
-            None => break,
-        };
-        probe_pos = next_len.to_be_bytes().to_vec();
-    }
-
-    Ok(results)
+    MvccScan::new(engine, start_key.to_vec(), end_key.to_vec(), visible).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::buffer::BufferPoolManager;
+    use crate::index::btree::BTreeEngine;
+    use crate::storage::FileDiskManager;
+    use tempfile::TempDir;
 
     // ---- min_user_key_at_length_ge ----
 
@@ -551,5 +663,182 @@ mod tests {
         assert_eq!(min, vec![0, 0, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(max, vec![0, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(min <= max, "bucket should be non-empty for this range");
+    }
+
+    // ---- MvccScan (streaming scan + visibility/dedup state machine) ----
+    //
+    // These drive `MvccScan` directly against a real `BTreeEngine` holding
+    // raw MVCC-encoded entries. They lock down the parts the iterator
+    // refactor could break: newest-visible-wins dedup per key, tombstone
+    // omission, falling through an invisible newest to an older visible
+    // version, multi-length-bucket ordering, range filtering, and incremental
+    // (early-terminable) yielding.
+
+    fn fresh_engine() -> (BTreeEngine, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = FileDiskManager::create(dir.path().join("t.db")).unwrap();
+        let bpm = BufferPoolManager::new(256, dm);
+        (BTreeEngine::new(bpm).unwrap(), dir)
+    }
+
+    /// Write one live version of `user_key` at `ts`, authored by `txn`.
+    fn put_version(engine: &BTreeEngine, user_key: &[u8], ts: u64, txn: u64, data: &[u8]) {
+        let key = encode_mvcc_key(user_key, Timestamp(ts));
+        let val = encode_mvcc_value(&MvccValue::Value {
+            txn_id: TxnId(txn),
+            data: data.to_vec(),
+        });
+        engine.put(&key, &val).unwrap();
+    }
+
+    /// Write one tombstone version of `user_key` at `ts`, authored by `txn`.
+    fn put_tombstone(engine: &BTreeEngine, user_key: &[u8], ts: u64, txn: u64) {
+        let key = encode_mvcc_key(user_key, Timestamp(ts));
+        let val = encode_mvcc_value(&MvccValue::Tombstone { txn_id: TxnId(txn) });
+        engine.put(&key, &val).unwrap();
+    }
+
+    /// Full user-key range `[empty, 0xFF*32]` — the same bounds `scan_range`
+    /// uses for an unbounded scan; covers any test key of length <= 32.
+    fn full_range() -> (Vec<u8>, Vec<u8>) {
+        (vec![], vec![0xFF; 32])
+    }
+
+    /// Collect an `MvccScan` over the whole keyspace with the given visibility.
+    fn scan_all<F: Fn(TxnId, Timestamp) -> bool>(
+        engine: &BTreeEngine,
+        visible: F,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let (start, end) = full_range();
+        MvccScan::new(engine, start, end, visible)
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn newest_visible_version_wins() {
+        // Two visible versions of "a": the newer (ts=2) must shadow the older.
+        let (engine, _dir) = fresh_engine();
+        put_version(&engine, b"a", 1, 1, b"v1");
+        put_version(&engine, b"a", 2, 2, b"v2");
+
+        let rows = scan_all(&engine, |_txn, _ts| true);
+        assert_eq!(rows, vec![(b"a".to_vec(), b"v2".to_vec())]);
+    }
+
+    #[test]
+    fn invisible_newest_falls_through_to_older_visible() {
+        // Newest version (txn 2) is invisible; the scan must surface the older
+        // visible version (txn 1) instead of skipping the key entirely.
+        let (engine, _dir) = fresh_engine();
+        put_version(&engine, b"a", 1, 1, b"v1");
+        put_version(&engine, b"a", 2, 2, b"v2");
+
+        let rows = scan_all(&engine, |txn, _ts| txn != TxnId(2));
+        assert_eq!(rows, vec![(b"a".to_vec(), b"v1".to_vec())]);
+    }
+
+    #[test]
+    fn tombstone_as_newest_visible_omits_key() {
+        // Newest visible version is a delete marker → the key is absent, even
+        // though an older live version exists.
+        let (engine, _dir) = fresh_engine();
+        put_version(&engine, b"a", 1, 1, b"v1");
+        put_tombstone(&engine, b"a", 2, 2);
+
+        let rows = scan_all(&engine, |_txn, _ts| true);
+        assert!(
+            rows.is_empty(),
+            "tombstoned key should not appear: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn no_visible_version_omits_key() {
+        // Every version of "a" is invisible → key absent; "b" still shows.
+        let (engine, _dir) = fresh_engine();
+        put_version(&engine, b"a", 1, 9, b"hidden");
+        put_version(&engine, b"b", 1, 1, b"shown");
+
+        let rows = scan_all(&engine, |txn, _ts| txn != TxnId(9));
+        assert_eq!(rows, vec![(b"b".to_vec(), b"shown".to_vec())]);
+    }
+
+    #[test]
+    fn yields_keys_across_length_buckets_in_bucket_order() {
+        // Keys of different lengths live in different length-buckets. The scan
+        // visits buckets by ascending length, so order is by length first,
+        // then lexicographic within a length — exercising the probe-then-scan
+        // bucket walk. "z" (len 1) precedes "aa" (len 2) despite 'z' > 'a'.
+        let (engine, _dir) = fresh_engine();
+        put_version(&engine, b"z", 1, 1, b"1");
+        put_version(&engine, b"aa", 1, 1, b"2");
+        put_version(&engine, b"mmm", 1, 1, b"3");
+
+        let rows = scan_all(&engine, |_txn, _ts| true);
+        let keys: Vec<Vec<u8>> = rows.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"z".to_vec(), b"aa".to_vec(), b"mmm".to_vec()]);
+    }
+
+    #[test]
+    fn range_bounds_are_inclusive_and_exclude_outside() {
+        // Scan [b, d] inclusive over a..e: yields b, c, d only.
+        let (engine, _dir) = fresh_engine();
+        for k in [b"a", b"b", b"c", b"d", b"e"] {
+            put_version(&engine, k, 1, 1, b"x");
+        }
+        let rows = MvccScan::new(&engine, b"b".to_vec(), b"d".to_vec(), |_t, _s| true)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let keys: Vec<Vec<u8>> = rows.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+    }
+
+    #[test]
+    fn empty_engine_yields_nothing() {
+        let (engine, _dir) = fresh_engine();
+        assert!(scan_all(&engine, |_t, _s| true).is_empty());
+    }
+
+    #[test]
+    fn yields_incrementally_so_consumers_can_stop_early() {
+        // The scan is a real iterator: `take(2)` pulls exactly the first two
+        // keys and stops, never visiting the rest. This is what lets a LIMIT
+        // or first-match consumer halt the storage read.
+        let (engine, _dir) = fresh_engine();
+        for k in [b"a", b"b", b"c", b"d"] {
+            put_version(&engine, k, 1, 1, b"x");
+        }
+        let (start, end) = full_range();
+        let first_two: Vec<Vec<u8>> = MvccScan::new(&engine, start, end, |_t, _s| true)
+            .take(2)
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(first_two, vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn streaming_matches_a_mixed_dataset_reference() {
+        // End-to-end equivalence on a dataset mixing multiple versions,
+        // tombstones, partial visibility, and multiple length buckets.
+        let (engine, _dir) = fresh_engine();
+        put_version(&engine, b"a", 1, 1, b"a-old");
+        put_version(&engine, b"a", 3, 3, b"a-new"); // newest visible wins
+        put_version(&engine, b"b", 2, 2, b"b-only");
+        put_version(&engine, b"c", 1, 1, b"c-old");
+        put_tombstone(&engine, b"c", 4, 4); // c deleted
+        put_version(&engine, b"dd", 1, 1, b"dd-len2"); // separate bucket
+
+        let rows = scan_all(&engine, |_txn, _ts| true);
+        assert_eq!(
+            rows,
+            vec![
+                (b"a".to_vec(), b"a-new".to_vec()),
+                (b"b".to_vec(), b"b-only".to_vec()),
+                // c omitted (tombstoned)
+                (b"dd".to_vec(), b"dd-len2".to_vec()),
+            ]
+        );
     }
 }

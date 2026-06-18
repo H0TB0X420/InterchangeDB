@@ -22,7 +22,9 @@ between engines/configs, which is hardware-independent.
 Current MacBook Pro baseline (2026-06-15, 8×8, smoke-scale, seed 1, 0% aborts):
 **B-tree/arc ≈ 48–50 txn/s** (tpmC ~1.3 k); **LSM ≈ 18 txn/s** (tpmC ~535).
 B-tree leads LSM ~2.7×, matching the Mac mini's ~3.2× ratio — a uniformly slower
-box, not a regression.
+box, not a regression. **Superseded 2026-06-17: B-tree/arc now ≈ 116 txn/s
+(tpmC ~3.2 k) at 8×8 — the lazy-scan lever nearly doubled the full mix via
+commit clustering. See "Lazy scan nearly doubles full-mix TPC-C" below.**
 
 **Scaling characterization (2026-06-15, this laptop, warehouses == terminals):**
 full-mix B-tree plateaus at ~50 txn/s by 4 terminals and stays flat to 16; LSM
@@ -42,6 +44,94 @@ effectively hardware-capped here.
 
 ---
 
+## Lazy scan nearly doubles full-mix TPC-C (2026-06-17, this laptop)
+
+**Headline: a read-path change lifted full-mix B-tree TPC-C ~1.9× (8×8: ~60 →
+~116 txn/s, tpmC ~1650 → ~3180) — a new high score on this box.**
+Drift-controlled A/B, HEAD (`dad1876`) vs the working tree, 2 reps each,
+back-to-back, same machine, smoke-scale, seed 1, 0% aborts:
+
+| build | throughput | tpmC | fsyncs/commit |
+|---|---|---|---|
+| HEAD (before) | 59, 61 txn/s | 1622, 1684 | 1.18, 1.16 |
+| this session | 112, 119 txn/s | 3048, 3227 | 0.45, 0.43 |
+
+**Why it worked — and why it's surprising.** The change is purely *read-path*
+(lazy scans, below), yet it moved the **commit-floored** full mix that this
+investigation said read-side levers can't touch. The mechanism is in the fsync
+column: **commit clustering**. The full mix is gated by the ~11 ms fsync, and
+group commit only batches when commits *overlap in time* — which TPC-C "doesn't
+do much" (the §1 finding) *because each transaction first spends ~15 ms on its
+own work, spreading the commits out*. The lazy scan cuts that per-transaction
+read/scan work, so transactions reach COMMIT sooner and **bunch up**, and group
+commit finally engages: batching went **1.17 → 0.44 fsyncs/commit (~2.6× fewer
+fsyncs per commit)** and throughput rose in lockstep. So a read-side lever moved
+the headline *indirectly*, by feeding the commit path more overlap. This is the
+missing half of the "wait-bound write mix" story: the mix is fsync-floored, but
+*how close to the floor you run* depends on how tightly commits pack — which the
+read path controls. (Caveat: the two builds were ~3 min apart across a rebuild,
+not interleaved; but 1.9× is far outside this box's ~20–28% thermal drift, and
+the fsync-ratio shift is a mechanism, not just a number.)
+
+### The lever: lazy, streaming scans (root cause was a vestigial trait bound)
+
+`ScanIterator: DoubleEndedIterator` forced eager `Vec` materialization at *two*
+layers. Nothing ever calls `next_back()`/`rev()` on an engine scan
+(grep-verified), but the bound made `BTreeEngine::scan_range` `collect()` its
+whole range "to satisfy DoubleEndedIterator" (its own comment), and `mvcc_scan`
+buffer the whole visible range into a `Vec`. Worse, `mvcc_scan`'s probe
+(`engine.scan(probe..).next()` — just to peek the first key) collected the
+*entire* range first → **O(n) per probe**; a single OrderStatus scan
+materialized its range ~3×. Fixed in three increments, full suite green at each
+(1286 tests + 9 new `MvccScan` unit tests):
+- Relax `ScanIterator` → `Iterator` (the whole suite is the proof nothing used
+  reverse).
+- `BTreeEngine::scan_range` returns the lazy `BTreeScanIterator` directly — one
+  lifetime change (`BTree::scan` returns `'a`, not `'_`, since the iterator
+  borrows only `&bpm`, not the temporary tree handle).
+- New streaming `mvcc::MvccScan` iterator that *owns* its visibility snapshot
+  (so it outlives the `scan_range` call); `mvcc_scan` is now a thin `.collect()`
+  wrapper, so every existing caller/test still covers it.
+
+This is the engine-/MVCC-layer analogue of lever #2 (the `EncodedLeaf` in-place
+leaf walk): #2 removed the *per-row* leaf-decode allocation; this removes the
+*per-scan* outer `Vec` materialization and the O(n) probe, and makes early
+termination (LIMIT, first-match) reach the storage layer.
+
+### Read-path diagnostics (where the lever shows directly)
+
+Measured at `--scale big` (cardinalities 100× larger so the read path is
+scan-bound — see "Cardinality scale" below):
+- **Read-only (OrderStatus, full-consumption scan): 33 → 85 txn/s (2.6×)** —
+  removes the O(n) probe + triple-buffering.
+- **Push `SELECT … LIMIT 10` over 20k rows: 20 ms → 73 µs (~270×)** —
+  `LimitSink.Stop` now propagates through lazy MVCC + lazy BTree all the way to
+  the engine, reading ~10 rows not 20k. (Volcano same query 24 → 17 ms: its
+  `SeqScan` still eagerly collects — making *it* lazy is the self-referential
+  iterator problem, a separate lever. `benches/push_vs_volcano.rs`.)
+- **PK point-lookup (`WHERE c_id = $1` over 8000 customers): 148 → 359 txn/s
+  (2.4×)** — the PK-lookup lever (`PkLookup` vs `SeqScan+Filter`), A/B'd via
+  `--pk-probe`: O(log n) get vs scanning 8000 rows.
+
+### Cardinality scale: `--scale {smoke|big}`
+
+Harness cardinalities are now a runtime flag. `smoke` (default; 2 districts / 10
+customers / 20 items / 5 orders per warehouse) is the realistic fsync-bound
+full-mix regime and the tpmC baseline. `big` (10 / 100 / 100 / 100) grows
+customer/orders/order_line to ~8000 rows so the read-path levers cost enough to
+measure — pair with `--read-only` / `--pk-probe`. **Caveat: the full mix is
+scan/join-bound at `big`** — StockLevel's `FROM order_line, stock` nested-loop
+join is ~O(|order_line| × |stock|), so one StockLevel over 32k×3.2k rows runs
+*tens of seconds*; high-concurrency full-mix runs at `big` overshoot the
+deadline by minutes (the terminal loop only checks the deadline between txns).
+`big` is for read-path diagnostics, `smoke` for tpmC — and that nested-loop
+join is itself a future lever (hash join / push the `ol_o_id` filter under it).
+The loader also now bulk-loads in one transaction per warehouse (was one fsync
+per INSERT → smoke load 6.2 s → 0.48 s), and the id-encoding digit budgets are
+asserted at compile time.
+
+---
+
 ## Tooling built for this (kept in the repo)
 
 - **`src/bin/tpcc.rs`** — standalone harness. Flags:
@@ -52,6 +142,14 @@ effectively hardware-capped here.
   - `--read-only` — diagnostic: runs only OrderStatus (pure MVCC reads, no
     write locks, read-only commit skips the WAL). Isolates read- vs
     write-path scaling.
+  - `--pk-probe` — diagnostic (read-only): runs only a single-row PK point
+    lookup (`WHERE c_id = $1`) on the customer table. Isolates the PK-lookup
+    lever (`PkLookup` vs `SeqScan+Filter`), which `--read-only` can't (its
+    reads are non-PK).
+  - `--scale smoke|big` — table cardinality preset. `smoke` (default) = the
+    fsync-bound full-mix / tpmC regime; `big` = 100× larger read-path tables so
+    the scan/lookup levers are measurable. (Full mix is scan/join-bound at
+    `big` — use it with `--read-only`/`--pk-probe`.)
   - `--warehouses M --terminals N --duration-secs D --iterations I --seed S`.
   - Prints committed/aborted, per-txn counts, abort rate, **fsync count**,
     throughput, tpmC (NewOrder/min).
@@ -285,6 +383,35 @@ allocation + BPM-latch contention, LSM in merge-iterator materialization +
    checkpoint. Touches MVCC visibility — do carefully. (The read *latency*
    from cloning it was already fixed: `committed_txns_read` returns the
    guard instead of deep-cloning; see `TransactionManager`.)
+5. **Predicate pushdown / join-key promotion — no logical optimizer yet.**
+   Surfaced by the `--scale big` full mix: **StockLevel** (`SELECT
+   COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_o_id = $1 AND s_i_id =
+   ol_i_id AND s_quantity < $2`) plans as a **cross-product NLJ then Filter**.
+   Comma joins bind to `on: None` (`logical.rs`), so the equi-condition
+   `s_i_id = ol_i_id` lands in the residual WHERE, and `plan_select` dumps the
+   whole conjunction as one `Filter` *on top of* the join (`planner.rs`,
+   `if let Some(pred) = residual_filter`). Result: it materializes
+   |order_line|×|stock| tuples (~32k×3.2k = 100M at `big`, *tens of seconds*)
+   then keeps a handful. The fix is two layers, in order of value:
+   - **(a) Predicate pushdown — the real win, currently ABSENT, planner-
+     agnostic.** Split the conjunctive `filter` in `plan_select`
+     (`src/sql/planner.rs`): route single-table conjuncts to the base scan
+     (`ol_o_id = $1` onto order_line → shrinks the outer from 32k to ~5 rows;
+     `s_quantity < $2` onto stock) and **promote equi conjuncts to the join
+     `on`** (`s_i_id = ol_i_id` becomes the join key). Both planners share this
+     — it's structure, not algorithm. Canonically a `LogicalPlan→LogicalPlan`
+     pass before physical planning (the optimizer that doesn't exist yet; the
+     Cascades home, Phase 17/18). The narrowing also fixes the `outer_card`
+     under-estimate (`planner.rs` NOTE at the join loop) that biases the cost
+     model.
+   - **(b) HashJoin selection — secondary, partly done.** Once (a) makes
+     `s_i_id = ol_i_id` the join `on`, `JoinSelection::CostBased` (Selinger)
+     *already* picks `HashJoin` via `choose_join_algorithm`
+     (`src/sql/join_order.rs`) — today it can't, because `extract_equi_join_keys`
+     sees `on: None`. `JoinSelection::Heuristic` says "never HashJoin"
+     (`planner.rs`), so it needs one rule: equi-`on` + no usable inner index →
+     `HashJoin` instead of `NestedLoopJoin`. The `HashJoin` *operator* already
+     exists (`src/execution/join.rs`, built in `build.rs`) — no new operator.
 
 ---
 
@@ -307,6 +434,15 @@ allocation + BPM-latch contention, LSM in merge-iterator materialization +
   `StockLevel`/`Delivery` txns, *not* the commit-bound NewOrder/Payment
   majority. (Read-only TPC-C stays flat: its only txn, OrderStatus, scans a
   single order's ~10 lines — one leaf — (b)'s weakest case.)
+- **Lazy streaming scans** (2026-06-17, uncommitted at time of writing) —
+  relaxed the vestigial `ScanIterator: DoubleEndedIterator` bound, so
+  `BTreeEngine::scan_range` returns its lazy iterator directly (no eager
+  `collect()`, O(n) probe gone) and a new streaming `MvccScan` owns its
+  snapshot. **Full-mix B-tree TPC-C ~1.9× (8×8: ~60 → ~116 txn/s) via commit
+  clustering** (drift-controlled HEAD-vs-current A/B); read-only scan path 2.6×,
+  push `LIMIT` early-stop ~270×, PK point-lookup 2.4×. See the headline section
+  at the top. Plus `--scale {smoke|big}` and `--pk-probe` harness knobs and a
+  transactional bulk loader.
 - **LSM flush off the `inner` lock** (immutable-memtable handoff +
   `flush_lock` + manifest in its own `Mutex`) — the canonical LSM design;
   removes a global lock held across two fsyncs + a multi-MB write and wires up

@@ -3,14 +3,19 @@
 //! `SELECT * FROM t LIMIT 10` over a large table. Pull's `SeqScan` eagerly
 //! builds a `Vec` of every row at construction, then `Limit` discards all but
 //! 10. Push's `LimitSink` returns `Stop` after 10, which halts `ScanSource`'s
-//! loop — so it materializes ~10 downstream tuples, not 20k.
+//! loop — and now that the storage read is lazy end-to-end (lazy
+//! `MvccScan` + lazy `BTreeScanIterator`, after the `ScanIterator:
+//! DoubleEndedIterator` bound was relaxed), that `Stop` propagates all the way
+//! to the engine: push reads ~10 rows, not 20k.
 //!
-//! Measured (~20k rows, this machine): Volcano ≈ 24 ms, Push ≈ 20 ms — a real
-//! ~20% win, but NOT the order-of-magnitude one streaming could give. The
-//! reason: through the session's MVCC layer the underlying range scan still
-//! materializes the whole range before the iterator yields, so the early
-//! `Stop` saves only the *executor-level* tuple building, not the engine read.
-//! A lazy MVCC scan would unlock the rest — a future lever, noted not done.
+//! Measured (~20k rows, this machine): **Push ≈ 73 µs** (early `Stop` reaches
+//! the engine, ~10 rows read) vs **Volcano ≈ 17 ms** (`SeqScan` still eagerly
+//! collects all 20k — making it lazy is a separate lever; the iterator would
+//! be self-referential with the table handle, see `seq_scan.rs`). So push is
+//! ~235× faster *because* it early-terminates the scan. Before the lazy-scan
+//! lever this was Volcano ≈ 24 ms / Push ≈ 20 ms (~20%): the MVCC layer
+//! buffered the whole range up front, so `Stop` saved only executor-level
+//! tuple building, never the engine read. The lever unlocked the rest.
 //!
 //! Run: `cargo bench --bench push_vs_volcano`
 

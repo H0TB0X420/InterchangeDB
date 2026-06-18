@@ -189,10 +189,11 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
         self.engine.put(&mvcc_key, &mvcc_val)
     }
 
-    /// MVCC scan: newest visible version per user-key across the given
-    /// bound pair. Buffers via `mvcc_scan`'s `Vec` return and re-emits as
-    /// a streaming iterator. Streaming-native refactor is a Phase-11 perf
-    /// todo — for TPC-C table sizes the buffer is fine.
+    /// MVCC scan: newest visible version per user-key across the given bound
+    /// pair, streamed lazily. Returns an `MvccScan` iterator that owns its
+    /// visibility snapshot, so the read stops as soon as the consumer stops
+    /// pulling (early termination reaches the storage layer) and a full scan
+    /// never holds the whole range resident.
     fn scan_range(
         &self,
         start_bound: std::ops::Bound<Vec<u8>>,
@@ -203,14 +204,12 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
             Ok(s) => s,
             Err(e) => return Box::new(std::iter::once(Err(e))),
         };
-        // Clone committed/known so the read lock isn't held during the scan.
+        // Own committed/known/snapshot so the iterator can outlive this call
+        // (and the read lock isn't held during the scan).
         let committed = self.txn_mgr.committed_txns();
         let known = self.txn_mgr.known_not_committed();
-        let view = VisibilityView {
-            committed: &committed,
-            known_uncommitted: &known,
-            checkpoint_ts: self.txn_mgr.checkpoint_ts(),
-        };
+        let checkpoint_ts = self.txn_mgr.checkpoint_ts();
+        let my_txn_id = self.txn_id;
 
         let start = match &start_bound {
             std::ops::Bound::Included(k) => k.clone(),
@@ -226,13 +225,18 @@ impl<E: StorageEngine> StorageEngine for TxnEngine<E> {
             std::ops::Bound::Unbounded => vec![0xFF; 32],
         };
 
-        let visible = |txn_id: TxnId, ts: Timestamp| {
-            policy.visible(VersionRef { txn_id, ts }, &snapshot, self.txn_id, &view)
+        // `policy` is borrowed from `*self`; the closure captures it plus the
+        // owned snapshot/committed/known and rebuilds the (cheap, borrow-only)
+        // view per call. `move` so the closure owns its captures.
+        let visible = move |txn_id: TxnId, ts: Timestamp| {
+            let view = VisibilityView {
+                committed: &committed,
+                known_uncommitted: &known,
+                checkpoint_ts,
+            };
+            policy.visible(VersionRef { txn_id, ts }, &snapshot, my_txn_id, &view)
         };
-        match mvcc::mvcc_scan(&*self.engine, &start, &end, &visible) {
-            Ok(pairs) => Box::new(pairs.into_iter().map(Ok)),
-            Err(e) => Box::new(std::iter::once(Err(e))),
-        }
+        Box::new(mvcc::MvccScan::new(&*self.engine, start, end, visible))
     }
 
     fn status(&self) -> StorageStatus {

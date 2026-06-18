@@ -16,8 +16,8 @@ use crate::catalog::Catalog;
 use crate::common::{Error, Result};
 use crate::execution::{
     AggregateFn, Delete, Executor, Filter, HashAggregate, HashJoin, IndexNestedLoopJoin, IndexScan,
-    Insert, JoinPredicate, Limit, NestedLoopJoin, Projection, SeqScan, SetExpr, Sort, SortDir,
-    Update,
+    Insert, JoinPredicate, Limit, NestedLoopJoin, PkLookup, Projection, SeqScan, SetExpr, Sort,
+    SortDir, Update,
 };
 use crate::layout::RowLayout;
 use crate::sql::logical::{AggregateSpec, OrderDir};
@@ -53,6 +53,10 @@ where
             let (tbl, indexes) = resolve_table(table, engine, catalog)?;
             let handle = find_index(&indexes, index)?;
             Ok(Box::new(IndexScan::new(&*tbl, &handle, prefix)?))
+        }
+        PhysOp::PkLookup { table, pk } => {
+            let (tbl, _indexes) = resolve_table(table, engine, catalog)?;
+            Ok(Box::new(PkLookup::new(&*tbl, pk)?))
         }
         PhysOp::Filter { input, predicate } => {
             let child = build_executor(input, engine, catalog)?;

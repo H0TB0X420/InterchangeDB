@@ -1199,7 +1199,13 @@ impl<'a> BTree<'a> {
     ///
     /// The iterator fetches one leaf page at a time, yielding entries in
     /// sorted order. Pages are not held across `next()` calls.
-    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<BTreeScanIterator<'_>> {
+    ///
+    /// Returns `BTreeScanIterator<'a>` — the lifetime of the borrowed buffer
+    /// pool, **not** of `&self`. The iterator captures only `self.bpm` (a
+    /// `&'a` reference, `Copy`), so it can outlive the `BTree` handle it was
+    /// created from. That lets `BTreeEngine::scan_range` hand back the lazy
+    /// iterator built off a temporary `tree()` handle instead of collecting.
+    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<BTreeScanIterator<'a>> {
         let start_bound = match range.start_bound() {
             Bound::Included(k) => Bound::Included(k.clone()),
             Bound::Excluded(k) => Bound::Excluded(k.clone()),

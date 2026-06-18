@@ -231,13 +231,15 @@ impl StorageEngine for BTreeEngine {
         start: std::ops::Bound<Vec<u8>>,
         end: std::ops::Bound<Vec<u8>>,
     ) -> Box<dyn ScanIterator + '_> {
-        // Collect into Vec to satisfy DoubleEndedIterator requirement.
-        // A true reverse iterator would need prev_page_id traversal (deferred).
-        let results: Vec<Result<(Vec<u8>, Vec<u8>)>> = match self.tree().scan((start, end)) {
-            Ok(iter) => iter.collect(),
-            Err(e) => vec![Err(e)],
-        };
-        Box::new(results.into_iter())
+        // Stream the lazy page-at-a-time iterator straight through — no eager
+        // `collect()`. The iterator borrows the buffer pool (`&self.bpm`), not
+        // the temporary `tree()` handle, so it outlives that handle. `next()`
+        // fetches one leaf at a time and stops when the consumer stops, so a
+        // bounded or early-terminated scan no longer walks the whole range.
+        match self.tree().scan((start, end)) {
+            Ok(iter) => Box::new(iter),
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        }
     }
 
     fn status(&self) -> StorageStatus {

@@ -17,7 +17,7 @@
 //! `[ … ]` brackets indicate optional wrappers — emitted only when the
 //! corresponding clause is present in the logical plan.
 
-use crate::catalog::{Catalog, ColumnDef};
+use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::Result;
 use crate::sql::cost::{CostModel, DefaultCostModel};
 use crate::sql::expr::Predicate;
@@ -252,20 +252,28 @@ where
     let mut residual_filter: Option<Predicate> = filter;
     if joins.is_empty() {
         if let Some(pred) = residual_filter {
-            match try_lower_index_predicate(pred, &left_indexes) {
-                IndexLowering::Matched { handle, prefix } => {
-                    current = PhysOp::IndexScan {
-                        table: table_name.clone(),
-                        index: handle.def.name.clone(),
-                        prefix,
-                    };
-                    residual_filter = None;
-                }
-                IndexLowering::Unmatched(pred) => {
-                    current = PhysOp::SeqScan {
-                        table: table_name.clone(),
-                    };
-                    residual_filter = Some(pred);
+            if let Some(pk) = try_lower_pk_lookup(&pred, &left_schema) {
+                current = PhysOp::PkLookup {
+                    table: table_name.clone(),
+                    pk,
+                };
+                residual_filter = None;
+            } else {
+                match try_lower_index_predicate(pred, &left_indexes) {
+                    IndexLowering::Matched { handle, prefix } => {
+                        current = PhysOp::IndexScan {
+                            table: table_name.clone(),
+                            index: handle.def.name.clone(),
+                            prefix,
+                        };
+                        residual_filter = None;
+                    }
+                    IndexLowering::Unmatched(pred) => {
+                        current = PhysOp::SeqScan {
+                            table: table_name.clone(),
+                        };
+                        residual_filter = Some(pred);
+                    }
                 }
             }
         } else {
@@ -533,6 +541,53 @@ fn try_match_inlj(
     None
 }
 
+/// Try to lower a `WHERE` clause into a primary-key point lookup. Recognized
+/// shape: a single-column PK pinned by `Column(pk) = Literal(v)` (or the
+/// mirror). Returns the (PK-typed) key on match. Composite PKs and non-equality
+/// predicates fall through to the index / scan paths. This is the strongest
+/// access path for `WHERE pk = …`, so callers try it first.
+fn try_lower_pk_lookup(pred: &Predicate, schema: &Schema) -> Option<Vec<crate::types::Value>> {
+    // First cut: single-column primary keys only.
+    if schema.primary_key.len() != 1 {
+        return None;
+    }
+    let pk_col = schema.primary_key[0];
+    let value = match pred {
+        Predicate::Compare {
+            op: crate::sql::expr::CompareOp::Eq,
+            left: crate::sql::expr::Expression::Column(i),
+            right: crate::sql::expr::Expression::Literal(v),
+        }
+        | Predicate::Compare {
+            op: crate::sql::expr::CompareOp::Eq,
+            left: crate::sql::expr::Expression::Literal(v),
+            right: crate::sql::expr::Expression::Column(i),
+        } if *i == pk_col => v,
+        _ => return None,
+    };
+    // The key encoder demands the value's type match the PK column exactly
+    // (e.g. an unconstrained `1` literal binds as Int64 but a w_id PK is Int32),
+    // so coerce; bail to scan+filter if the value can't be represented.
+    let coerced = coerce_pk_value(value, &schema.columns[pk_col].ty)?;
+    Some(vec![coerced])
+}
+
+/// Coerce a literal to a PK column's type for key encoding. Handles the
+/// int-width cross-binding (`Int64` literal vs `Int32`/`Int64` PK) and exact
+/// matches; anything else returns `None` so the caller falls back to a scan.
+fn coerce_pk_value(
+    value: &crate::types::Value,
+    ty: &crate::types::ColumnType,
+) -> Option<crate::types::Value> {
+    use crate::types::{ColumnType, Value};
+    match (value, ty) {
+        (Value::Int64(n), ColumnType::Int32) => i32::try_from(*n).ok().map(Value::Int32),
+        (Value::Int32(n), ColumnType::Int64) => Some(Value::Int64(*n as i64)),
+        (v, _) if v.matches(ty) => Some(v.clone()),
+        _ => None,
+    }
+}
+
 /// Result of attempting to lower a `WHERE` clause into an IndexScan.
 enum IndexLowering {
     /// A single-column equality predicate matched a single-column index.
@@ -630,20 +685,28 @@ where
     let mut child: PhysOp;
     let mut residual_filter: Option<Predicate> = filter;
     if let Some(pred) = residual_filter {
-        match try_lower_index_predicate(pred, &indexes) {
-            IndexLowering::Matched { handle, prefix } => {
-                child = PhysOp::IndexScan {
-                    table: table_name.clone(),
-                    index: handle.def.name.clone(),
-                    prefix,
-                };
-                residual_filter = None;
-            }
-            IndexLowering::Unmatched(pred) => {
-                child = PhysOp::SeqScan {
-                    table: table_name.clone(),
-                };
-                residual_filter = Some(pred);
+        if let Some(pk) = try_lower_pk_lookup(&pred, &schema) {
+            child = PhysOp::PkLookup {
+                table: table_name.clone(),
+                pk,
+            };
+            residual_filter = None;
+        } else {
+            match try_lower_index_predicate(pred, &indexes) {
+                IndexLowering::Matched { handle, prefix } => {
+                    child = PhysOp::IndexScan {
+                        table: table_name.clone(),
+                        index: handle.def.name.clone(),
+                        prefix,
+                    };
+                    residual_filter = None;
+                }
+                IndexLowering::Unmatched(pred) => {
+                    child = PhysOp::SeqScan {
+                        table: table_name.clone(),
+                    };
+                    residual_filter = Some(pred);
+                }
             }
         }
     } else {
@@ -679,20 +742,28 @@ where
     let mut child: PhysOp;
     let mut residual_filter: Option<Predicate> = filter;
     if let Some(pred) = residual_filter {
-        match try_lower_index_predicate(pred, &indexes) {
-            IndexLowering::Matched { handle, prefix } => {
-                child = PhysOp::IndexScan {
-                    table: table_name.clone(),
-                    index: handle.def.name.clone(),
-                    prefix,
-                };
-                residual_filter = None;
-            }
-            IndexLowering::Unmatched(pred) => {
-                child = PhysOp::SeqScan {
-                    table: table_name.clone(),
-                };
-                residual_filter = Some(pred);
+        if let Some(pk) = try_lower_pk_lookup(&pred, &schema) {
+            child = PhysOp::PkLookup {
+                table: table_name.clone(),
+                pk,
+            };
+            residual_filter = None;
+        } else {
+            match try_lower_index_predicate(pred, &indexes) {
+                IndexLowering::Matched { handle, prefix } => {
+                    child = PhysOp::IndexScan {
+                        table: table_name.clone(),
+                        index: handle.def.name.clone(),
+                        prefix,
+                    };
+                    residual_filter = None;
+                }
+                IndexLowering::Unmatched(pred) => {
+                    child = PhysOp::SeqScan {
+                        table: table_name.clone(),
+                    };
+                    residual_filter = Some(pred);
+                }
             }
         }
     } else {
@@ -839,7 +910,8 @@ mod tests {
     fn plans_select_with_where_to_filter_chain() {
         let env = setup();
         create_warehouse(&env);
-        let p = plan_sql(&env, "SELECT w_id FROM warehouse WHERE w_id = 1");
+        // Non-PK predicate (w_ytd is column 1, not the PK) → scan + filter.
+        let p = plan_sql(&env, "SELECT w_id FROM warehouse WHERE w_ytd = 100");
         match p {
             PhysicalPlan::Query(physop) => {
                 let tree = physop.explain(0);
@@ -855,10 +927,30 @@ Projection([0])
     }
 
     #[test]
+    fn plans_select_with_pk_equality_lowers_to_pk_lookup() {
+        let env = setup();
+        create_warehouse(&env);
+        // w_id is the PK → a point lookup, not scan + filter.
+        let p = plan_sql(&env, "SELECT w_id FROM warehouse WHERE w_id = 1");
+        match p {
+            PhysicalPlan::Query(physop) => {
+                let tree = physop.explain(0);
+                let expected = "\
+Projection([0])
+  PkLookup(warehouse)
+";
+                assert_eq!(tree, expected);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
     fn plans_select_with_full_chain() {
         let env = setup();
         create_warehouse(&env);
-        let p = plan_sql(&env, "SELECT w_id FROM warehouse WHERE w_id = 1 LIMIT 3");
+        // Non-PK predicate keeps the full scan + filter chain under the wrappers.
+        let p = plan_sql(&env, "SELECT w_id FROM warehouse WHERE w_ytd = 100 LIMIT 3");
         match p {
             PhysicalPlan::Query(physop) => {
                 let tree = physop.explain(0);
@@ -911,8 +1003,7 @@ Limit(3)
                 // Verify the explain shape (engine-free, off the IR).
                 let tree = physop.explain(0);
                 assert!(tree.starts_with("Update(warehouse, set_cols=[1])"));
-                assert!(tree.contains("Filter"));
-                assert!(tree.contains("SeqScan(warehouse)"));
+                assert!(tree.contains("PkLookup(warehouse)"));
                 let mut exec = build_executor(&physop, &env.engine, &env.catalog).unwrap();
                 assert_eq!(exec.next().unwrap(), Some(vec![Value::Int64(1)]));
             }
@@ -929,8 +1020,7 @@ Limit(3)
             PhysicalPlan::Query(physop) => {
                 let tree = physop.explain(0);
                 assert!(tree.starts_with("Delete(warehouse)"));
-                assert!(tree.contains("Filter"));
-                assert!(tree.contains("SeqScan(warehouse)"));
+                assert!(tree.contains("PkLookup(warehouse)"));
             }
             _ => panic!(),
         }
@@ -946,8 +1036,7 @@ Limit(3)
         match p {
             PhysicalPlan::Explain(text) => {
                 assert!(text.contains("Projection"));
-                assert!(text.contains("Filter"));
-                assert!(text.contains("SeqScan(warehouse)"));
+                assert!(text.contains("PkLookup(warehouse)"));
             }
             _ => panic!(),
         }
@@ -989,7 +1078,7 @@ Limit(3)
                     text
                 );
                 assert!(text.contains("  Projection"), "got: {}", text);
-                assert!(text.contains("SeqScan(warehouse)"), "got: {}", text);
+                assert!(text.contains("PkLookup(warehouse)"), "got: {}", text);
                 for line in text.lines().skip(1).filter(|l| !l.is_empty()) {
                     assert!(line.starts_with("  "), "unindented inner line: {:?}", line);
                 }

@@ -22,15 +22,11 @@
 //! (`NestedLoopJoin` vs `HashJoin` vs `IndexNestedLoopJoin`). The builder is
 //! mechanical: it constructs exactly the operator the variant names.
 //!
-//! ## Omissions (faithful to current emission)
+//! ## PK lookup
 //!
-//! `PkLookup` is intentionally absent: the planner never emits it today (PK
-//! equality falls to `SeqScan + Filter` — no PK-point-lookup lowering rule
-//! exists yet). When that rule lands, add a `PkLookup` variant here.
-//!
-//! Wiring status (Phase 15, Increment 2a): this type is defined here (2a.1)
-//! but not yet produced or consumed — the builder (2a.2) and the planner
-//! retarget (2a.3) come next.
+//! `PkLookup` is a single-row primary-key access — the planner emits it when a
+//! `WHERE` pins a single-column PK by equality (`WHERE pk = lit`), in place of
+//! `SeqScan + Filter`. Composite PKs fall back to scan+filter for now.
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +48,10 @@ pub enum PhysOp {
         index: String,
         prefix: Vec<Value>,
     },
+
+    /// Single-row lookup by primary key. `pk` holds the PK column values,
+    /// coerced to the PK column types.
+    PkLookup { table: String, pk: Vec<Value> },
 
     /// Row-wise selection: keep rows where `predicate` holds.
     Filter {
@@ -143,6 +143,7 @@ impl PhysOp {
             PhysOp::IndexScan { table, index, .. } => {
                 format!("{pad}IndexScan({table}, on {index})\n")
             }
+            PhysOp::PkLookup { table, .. } => format!("{pad}PkLookup({table})\n"),
             PhysOp::Filter { input, .. } => {
                 format!("{pad}Filter\n{}", input.explain(indent + 1))
             }

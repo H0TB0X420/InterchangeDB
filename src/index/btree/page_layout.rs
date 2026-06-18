@@ -281,7 +281,8 @@ impl<'a> EncodedLeaf<'a> {
 
         // Field order after the PageHeader prefix (see `encode_leaf_node`):
         // node_type(1) size(2) max_size(2) next(4) prev(4) tombstone_count(2).
-        let size = u16::from_le_bytes([buf[PageHeader::SIZE + 1], buf[PageHeader::SIZE + 2]]) as usize;
+        let size =
+            u16::from_le_bytes([buf[PageHeader::SIZE + 1], buf[PageHeader::SIZE + 2]]) as usize;
         let next_offset = PageHeader::SIZE + 1 + 2 + 2;
         let next_page_id = PageId::new(u32::from_le_bytes([
             buf[next_offset],
@@ -290,10 +291,9 @@ impl<'a> EncodedLeaf<'a> {
             buf[next_offset + 3],
         ]));
         let tombstone_count_offset = PageHeader::SIZE + 1 + 2 + 2 + 4 + 4;
-        let tombstone_count = u16::from_le_bytes([
-            buf[tombstone_count_offset],
-            buf[tombstone_count_offset + 1],
-        ]) as usize;
+        let tombstone_count =
+            u16::from_le_bytes([buf[tombstone_count_offset], buf[tombstone_count_offset + 1]])
+                as usize;
         let tombstones_offset = LEAF_HEADER_SIZE;
         let entries_offset = tombstones_offset + tombstone_count * 2;
 
@@ -359,7 +359,8 @@ impl<'a> Iterator for EncodedLeafEntries<'a> {
             let key_start = offset + 2;
             let val_len_offset = key_start + key_len;
             let val_len =
-                u16::from_le_bytes([self.buf[val_len_offset], self.buf[val_len_offset + 1]]) as usize;
+                u16::from_le_bytes([self.buf[val_len_offset], self.buf[val_len_offset + 1]])
+                    as usize;
             let val_start = val_len_offset + 2;
 
             let physical_index = self.physical_index;

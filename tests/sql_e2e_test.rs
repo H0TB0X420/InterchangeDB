@@ -362,7 +362,9 @@ fn explain_select_with_where_renders_tree() {
         .unwrap();
     let r = env
         .session
-        .execute("EXPLAIN SELECT n FROM t WHERE id = 1")
+        // Non-PK predicate (n) keeps the scan + filter tree; PK equality would
+        // lower to a PkLookup (covered in the planner tests).
+        .execute("EXPLAIN SELECT n FROM t WHERE n = 1")
         .unwrap();
     match r {
         QueryResult::Explain(tree) => {

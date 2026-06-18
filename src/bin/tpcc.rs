@@ -85,6 +85,13 @@ struct Config {
     /// Sweep mode: ignore --engine/--exec-model/--planner and run the full
     /// engine × exec-model × planner matrix, printing a comparison table.
     sweep: bool,
+    /// PK-lookup probe mode (read-only): run only a single-row `WHERE c_id = $1`
+    /// point lookup on the large customer table — the access the PK-lookup
+    /// lever optimizes. Isolates that lever (PkLookup vs SeqScan+Filter), which
+    /// the OrderStatus read-only mode can't (its reads are non-PK).
+    pk_probe: bool,
+    /// Table cardinality preset (`--scale smoke|big`). Default `smoke`.
+    cardinality: Cardinality,
 }
 
 impl Config {
@@ -103,6 +110,8 @@ impl Config {
             exec_model: "volcano".to_string(),
             planner: "rule-based".to_string(),
             sweep: false,
+            pk_probe: false,
+            cardinality: SMOKE,
         };
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -121,24 +130,83 @@ impl Config {
                 "--exec-model" => c.exec_model = value(),
                 "--planner" => c.planner = value(),
                 "--sweep" => c.sweep = true,
+                "--pk-probe" => c.pk_probe = true,
+                "--scale" => c.cardinality = parse_scale(&value()),
                 other => panic!("unknown flag: {}", other),
             }
         }
         assert!(c.warehouses >= 1 && c.terminals >= 1);
+        // The loader numbers seed orders [SEED_ORDER_BASE, SEED_ORDER_BASE +
+        // warehouses*districts*orders); that span must not reach PK_BASE, or
+        // seed orders would collide with run-time-minted order PKs.
+        let seed_order_span = c.warehouses as i64
+            * c.cardinality.districts_per_w as i64
+            * c.cardinality.initial_orders_per_d as i64;
+        assert!(
+            SEED_ORDER_BASE as i64 + seed_order_span < PK_BASE as i64,
+            "seed orders ({} warehouses) overflow into the minted-PK range",
+            c.warehouses
+        );
         c
     }
 }
 
-// Smoke-scale cardinalities (NOT TPC-C spec scale — enough to exercise
-// every transaction's code path).
-const DISTRICTS_PER_W: i32 = 2;
-const CUSTOMERS_PER_D: i32 = 10;
-const ITEMS: i32 = 20;
-const INITIAL_ORDERS_PER_D: i32 = 5;
+/// Per-warehouse table cardinalities, chosen at runtime via `--scale`.
+#[derive(Clone, Copy)]
+struct Cardinality {
+    districts_per_w: i32,
+    customers_per_d: i32,
+    items: i32,
+    initial_orders_per_d: i32,
+}
+
+// `smoke` keeps the read-path tables tiny — the realistic fsync-bound full-mix
+// regime (and the historical tpmC baseline). `big` grows customer/orders/
+// order_line to thousands of rows so the read-path levers (PK lookup, lazy MVCC
+// scan) cost enough to measure (pair with `--read-only` / `--pk-probe`). Both
+// stay far below TPC-C spec scale (3000 customers/district, 100K items). NOTE:
+// the full mix is scan/join-bound at `big` (StockLevel's nested-loop join over
+// order_line × stock is super-linear), so high-concurrency full-mix runs there
+// are slow — `big` is for the read-path diagnostics, `smoke` for tpmC.
+const SMOKE: Cardinality = Cardinality {
+    districts_per_w: 2,
+    customers_per_d: 10,
+    items: 20,
+    initial_orders_per_d: 5,
+};
+const BIG: Cardinality = Cardinality {
+    districts_per_w: 10,
+    customers_per_d: 100,
+    items: 100,
+    initial_orders_per_d: 100,
+};
+
+// Id-encoding invariants (see `district_id`/`customer_id`/`stock_id`): the
+// digit budgets the synthetic-PK packing depends on. Checked on the larger
+// preset at compile time — a scale-up that violates one silently collides PKs.
+const _: () = assert!(BIG.districts_per_w < 100, "district_id packs d in 2 digits");
+const _: () = assert!(
+    BIG.customers_per_d < 1000,
+    "customer_id packs c in 3 digits"
+);
+const _: () = assert!(BIG.items < 100_000, "stock_id packs item in 5 digits");
+
+/// Map the `--scale` flag to a cardinality preset.
+fn parse_scale(name: &str) -> Cardinality {
+    match name {
+        "smoke" => SMOKE,
+        "big" => BIG,
+        other => panic!("unknown scale: {} (smoke|big)", other),
+    }
+}
 
 // Per-terminal unique-PK range: terminal t owns `[BASE + t*STRIDE, …)`.
 const PK_BASE: i32 = 2_000_000;
 const PK_STRIDE: i32 = 10_000_000;
+
+// Loader seed orders number from 1_000_000 upward; they must stay below
+// PK_BASE so they never collide with the PKs terminals mint at run time.
+const SEED_ORDER_BASE: i32 = 1_000_000;
 
 // Buffer pool frames (B+Tree engine).
 const POOL_SIZE: usize = 8192;
@@ -239,20 +307,29 @@ fn exec<E: StorageEngine + 'static>(session: &mut Session<E>, sql: &str) {
 /// Load all warehouses' smoke-scale data (single-threaded, before the
 /// terminals start).
 fn load<E: StorageEngine + 'static>(session: &mut Session<E>, config: &Config) {
+    let card = config.cardinality;
     for sql in SCHEMA {
         exec(session, sql);
     }
-    for item in 1..=ITEMS {
+    // Bulk-load in transactions, not auto-commit: every auto-commit INSERT
+    // costs one WAL fsync (~12ms here), so a row-at-a-time load is fsync-bound
+    // and scales linearly with cardinality. Batching collapses it to one fsync
+    // per batch. The `item` table is one batch; each warehouse is its own batch
+    // (a natural bound on the open write set — one warehouse's rows, not all).
+    exec(session, "BEGIN");
+    for item in 1..=card.items {
         exec(
             session,
             &format!("INSERT INTO item VALUES ({}, {})", item, 100 + item),
         );
     }
+    exec(session, "COMMIT");
 
-    let mut seed_order_id = 1_000_000; // below PK_BASE; loader-only
+    let mut seed_order_id = SEED_ORDER_BASE; // below PK_BASE; loader-only
     for w in 1..=config.warehouses {
+        exec(session, "BEGIN");
         exec(session, &format!("INSERT INTO warehouse VALUES ({}, 0)", w));
-        for item in 1..=ITEMS {
+        for item in 1..=card.items {
             exec(
                 session,
                 &format!(
@@ -262,17 +339,17 @@ fn load<E: StorageEngine + 'static>(session: &mut Session<E>, config: &Config) {
                 ),
             );
         }
-        for d in 1..=DISTRICTS_PER_W {
+        for d in 1..=card.districts_per_w {
             exec(
                 session,
                 &format!(
                     "INSERT INTO district VALUES ({}, {}, 0, {})",
                     district_id(w, d),
                     w,
-                    INITIAL_ORDERS_PER_D + 1
+                    card.initial_orders_per_d + 1
                 ),
             );
-            for c in 1..=CUSTOMERS_PER_D {
+            for c in 1..=card.customers_per_d {
                 let cid = customer_id(w, d, c);
                 exec(
                     session,
@@ -282,10 +359,10 @@ fn load<E: StorageEngine + 'static>(session: &mut Session<E>, config: &Config) {
                     ),
                 );
             }
-            for _ in 0..INITIAL_ORDERS_PER_D {
+            for _ in 0..card.initial_orders_per_d {
                 let oid = seed_order_id;
                 seed_order_id += 1;
-                let cid = customer_id(w, d, 1 + (oid % CUSTOMERS_PER_D));
+                let cid = customer_id(w, d, 1 + (oid % card.customers_per_d));
                 exec(
                     session,
                     &format!("INSERT INTO orders VALUES ({}, {}, 0)", oid, cid),
@@ -296,11 +373,12 @@ fn load<E: StorageEngine + 'static>(session: &mut Session<E>, config: &Config) {
                         "INSERT INTO order_line VALUES ({}, {}, {}, 100)",
                         oid,
                         oid,
-                        1 + (oid % ITEMS)
+                        1 + (oid % card.items)
                     ),
                 );
             }
         }
+        exec(session, "COMMIT");
     }
 }
 
@@ -434,6 +512,7 @@ struct Ctx {
     id_hi: i32,
     rng: Rng,
     last_order_id: i32,
+    card: Cardinality,
 }
 
 fn new_order<E: StorageEngine + 'static>(
@@ -442,8 +521,8 @@ fn new_order<E: StorageEngine + 'static>(
     ctx: &mut Ctx,
 ) -> DbResult<()> {
     let w = ctx.home_w;
-    let d = ctx.rng.between(1, DISTRICTS_PER_W);
-    let c = ctx.rng.between(1, CUSTOMERS_PER_D);
+    let d = ctx.rng.between(1, ctx.card.districts_per_w);
+    let c = ctx.rng.between(1, ctx.card.customers_per_d);
     let did = district_id(w, d);
     let cid = customer_id(w, d, c);
 
@@ -457,7 +536,7 @@ fn new_order<E: StorageEngine + 'static>(
 
     let line_count = ctx.rng.between(3, 6);
     for _ in 0..line_count {
-        let item = ctx.rng.between(1, ITEMS);
+        let item = ctx.rng.between(1, ctx.card.items);
         let price = rows_of(run(s, &st.item_price, &[Value::Int32(item)])?);
         let amount = match price.first().and_then(|r| as_i64(&r[0])) {
             Some(p) => p,
@@ -489,8 +568,8 @@ fn payment<E: StorageEngine + 'static>(
     ctx: &mut Ctx,
 ) -> DbResult<()> {
     let w = ctx.home_w;
-    let d = ctx.rng.between(1, DISTRICTS_PER_W);
-    let c = ctx.rng.between(1, CUSTOMERS_PER_D);
+    let d = ctx.rng.between(1, ctx.card.districts_per_w);
+    let c = ctx.rng.between(1, ctx.card.customers_per_d);
     let did = district_id(w, d);
     let cid = customer_id(w, d, c);
     let amount = ctx.rng.between(1, 500) as i64;
@@ -522,8 +601,8 @@ fn order_status<E: StorageEngine + 'static>(
     ctx: &mut Ctx,
 ) -> DbResult<()> {
     let w = ctx.home_w;
-    let d = ctx.rng.between(1, DISTRICTS_PER_W);
-    let c = ctx.rng.between(1, CUSTOMERS_PER_D);
+    let d = ctx.rng.between(1, ctx.card.districts_per_w);
+    let c = ctx.rng.between(1, ctx.card.customers_per_d);
     let cid = customer_id(w, d, c);
 
     let max = rows_of(run(s, &st.max_order, &[Value::Int32(cid)])?);
@@ -585,6 +664,26 @@ fn stock_level<E: StorageEngine + 'static>(
     Ok(())
 }
 
+/// PK-lookup probe: a single-row read of the customer table by primary key
+/// (`SELECT c_balance FROM customer WHERE c_id = $1`). This is the exact
+/// access the PK-lookup planner lever turns from a SeqScan+Filter into a
+/// PkLookup. Run alone (`--pk-probe`, read-only, no WAL) over the large
+/// customer table, it isolates the lever's effect — the OrderStatus
+/// read-only mode can't, since its reads are non-PK (MAX over o_c_id,
+/// filter+sort over ol_o_id).
+fn customer_lookup<E: StorageEngine + 'static>(
+    s: &mut Session<E>,
+    st: &Statements,
+    ctx: &mut Ctx,
+) -> DbResult<()> {
+    let w = ctx.home_w;
+    let d = ctx.rng.between(1, ctx.card.districts_per_w);
+    let c = ctx.rng.between(1, ctx.card.customers_per_d);
+    let cid = customer_id(w, d, c);
+    let _ = rows_of(run(s, &st.cust_balance, &[Value::Int32(cid)])?);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
@@ -596,6 +695,9 @@ enum Txn {
     OrderStatus,
     Delivery,
     StockLevel,
+    /// Not part of the standard mix — only run in `--pk-probe` mode to
+    /// isolate the PK-lookup lever (a single-row read by primary key).
+    CustomerLookup,
 }
 
 /// Standard TPC-C mix: NewOrder ~45%, Payment ~43%, the rest ~4% each.
@@ -616,6 +718,7 @@ struct Counts {
     order_status: u64,
     delivery: u64,
     stock_level: u64,
+    customer_lookup: u64,
     aborts: u64,
 }
 
@@ -627,10 +730,16 @@ impl Counts {
             Txn::OrderStatus => self.order_status += 1,
             Txn::Delivery => self.delivery += 1,
             Txn::StockLevel => self.stock_level += 1,
+            Txn::CustomerLookup => self.customer_lookup += 1,
         }
     }
     fn committed(&self) -> u64 {
-        self.new_order + self.payment + self.order_status + self.delivery + self.stock_level
+        self.new_order
+            + self.payment
+            + self.order_status
+            + self.delivery
+            + self.stock_level
+            + self.customer_lookup
     }
     fn add(&mut self, o: &Counts) {
         self.new_order += o.new_order;
@@ -638,6 +747,7 @@ impl Counts {
         self.order_status += o.order_status;
         self.delivery += o.delivery;
         self.stock_level += o.stock_level;
+        self.customer_lookup += o.customer_lookup;
         self.aborts += o.aborts;
     }
 }
@@ -654,6 +764,7 @@ fn dispatch<E: StorageEngine + 'static>(
         Txn::OrderStatus => order_status(s, st, ctx),
         Txn::Delivery => delivery(s, st, ctx),
         Txn::StockLevel => stock_level(s, st, ctx),
+        Txn::CustomerLookup => customer_lookup(s, st, ctx),
     }
 }
 
@@ -697,6 +808,7 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
         id_hi: base + PK_STRIDE,
         rng: Rng::new(config.seed.wrapping_add(terminal as u64)),
         last_order_id: 0,
+        card: config.cardinality,
     };
     let mut counts = Counts::default();
 
@@ -707,9 +819,13 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
             None if done >= iters => break,
             _ => {}
         }
-        // Read-only diagnostic mode runs only OrderStatus (pure MVCC
-        // reads, no write locks, read-only commit skips the WAL).
-        let txn = if config.read_only {
+        // Diagnostic modes (both read-only — no write locks, read-only commit
+        // skips the WAL): `--pk-probe` runs only the PK point-lookup (isolates
+        // the PK-lookup lever); `--read-only` runs only OrderStatus (scan-heavy
+        // read path). Otherwise the standard weighted mix.
+        let txn = if config.pk_probe {
+            Txn::CustomerLookup
+        } else if config.read_only {
             Txn::OrderStatus
         } else {
             pick(ctx.rng.below(100))
@@ -815,6 +931,7 @@ fn print_report(label: &str, m: &RunMetrics) {
     println!("  OrderStatus {}", t.order_status);
     println!("  Delivery    {}", t.delivery);
     println!("  StockLevel  {}", t.stock_level);
+    println!("  CustLookup  {}", t.customer_lookup);
     println!("  abort rate  {:.1}%", m.abort_pct());
     println!("  fsyncs      {}", m.fsyncs);
     println!("  throughput  {:.0} committed txn/s", m.committed_per_s());

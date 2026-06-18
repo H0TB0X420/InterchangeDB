@@ -44,9 +44,17 @@ use crate::common::Result;
 
 /// Iterator for scanning key-value pairs.
 ///
-/// This trait follows the ToyDB pattern: a double-ended iterator that yields
-/// `Result<(key, value)>` pairs. The `DoubleEndedIterator` bound enables
-/// both forward and reverse scans.
+/// A forward iterator yielding `Result<(key, value)>` pairs in ascending key
+/// order. Forward-only by design: every engine scan is consumed front-to-back
+/// (SeqScan, MVCC version resolution, index scans), and **no caller ever calls
+/// `next_back()`/`rev()`**. The bound was once `DoubleEndedIterator`, but that
+/// is more than any consumer needs — and it was actively harmful: a forward
+/// streaming scan (e.g. `BTreeScanIterator`) isn't double-ended, so engines had
+/// to `collect()` their whole range into a `Vec` just to satisfy the bound.
+/// That eager buffer defeated laziness at the engine layer (and made even a
+/// "peek the first key" probe O(n)). Relaxing to `Iterator` lets engines return
+/// their native lazy iterators, so early termination and streaming reach the
+/// storage layer.
 ///
 /// ## Blanket Implementation
 ///
@@ -57,21 +65,14 @@ use crate::common::Result;
 ///
 /// ```ignore
 /// let mut iter = engine.scan(b"a".to_vec()..b"z".to_vec());
-///
-/// // Forward scan
 /// while let Some(Ok((key, value))) = iter.next() {
 ///     println!("{:?} = {:?}", key, value);
 /// }
-///
-/// // Reverse scan
-/// while let Some(Ok((key, value))) = iter.next_back() {
-///     println!("{:?} = {:?}", key, value);
-/// }
 /// ```
-pub trait ScanIterator: DoubleEndedIterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}
+pub trait ScanIterator: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}
 
 // Blanket implementation: any qualifying iterator is a ScanIterator
-impl<T> ScanIterator for T where T: DoubleEndedIterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}
+impl<T> ScanIterator for T where T: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {}
 
 /// Core storage engine interface.
 ///

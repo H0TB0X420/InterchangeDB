@@ -698,8 +698,7 @@ mod tests {
             .unwrap();
         match r {
             QueryResult::Explain(text) => {
-                assert!(text.contains("SeqScan(t)"));
-                assert!(text.contains("Filter"));
+                assert!(text.contains("PkLookup(t)"));
             }
             other => panic!("expected Explain, got {:?}", other),
         }
