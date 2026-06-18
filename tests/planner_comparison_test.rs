@@ -166,22 +166,23 @@ fn select_with_aggregate_matches() {
 }
 
 #[test]
-fn selinger_picks_hash_join_where_rule_based_picks_nested_loop() {
-    // P14.13a: the two planners legitimately diverge on join *algorithm*.
-    // The join is on `d_w_id`, which has no index, so the rule-based
-    // planner falls back to NestedLoopJoin; the Selinger planner costs the
-    // alternatives and picks HashJoin (linear vs quadratic). Same textual
-    // order, same column layout, same Projection — only the join operator
-    // differs. This is the contract P14.8 used to assert as "identical";
-    // it is now intentionally a divergence.
+fn both_planners_pick_hashjoin_for_unindexed_equijoin() {
+    // The join is on `d_w_id`, which has no index. Selinger costs the
+    // alternatives and picks HashJoin (linear vs quadratic). As of Phase D
+    // (predicate-pushdown plan) the rule-based planner ALSO emits HashJoin for
+    // an unindexed equi-key — it used to fall back to NestedLoopJoin (this test
+    // formerly asserted that divergence). So the two planners now *converge*
+    // here: same algorithm, same textual order, same Projection layout. They
+    // can still diverge on cost-sensitive cases (a tiny inner where Selinger
+    // prefers NestedLoop); this query is no longer one of them.
     let env = setup();
     let (rule_tree, selinger_tree) = plans_match(
         &env,
         "SELECT w_id, d_id FROM warehouse JOIN district ON w_id = d_w_id",
     );
     assert!(
-        rule_tree.contains("NestedLoopJoin"),
-        "rule-based should use NestedLoopJoin, got:\n{}",
+        rule_tree.contains("HashJoin"),
+        "rule-based should now use HashJoin (Phase D), got:\n{}",
         rule_tree
     );
     assert!(

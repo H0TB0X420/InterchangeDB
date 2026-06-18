@@ -69,6 +69,12 @@ fn seed_pages(bpm: &BufferPoolManager) -> Vec<(PageId, u8)> {
 //      unmapped a live page and surfaced as cross-page corruption. Fixed by
 //      re-validating under `pt.write` in `handle_cache_miss`; regression guard
 //      is `concurrent_same_page_miss_no_ghost_frames` below.
+//
+// Q-35 (2026-06-18, OPEN, TOP PRIORITY): this RECURRED — a rare *third*
+// interleaving (`byte 0 of PageId(12) == 23`, page 22's marker in page 12's
+// slot). ~rare (15/15 local), both shuttle models still pass → the failing
+// schedule is unmodeled. Fix via a shuttle model that composes the dirty-writer
+// path + swap + same-page contention (not inspection). See ISSUES.md Q-35.
 #[test]
 fn marquee_hot_swap_storm_all_six_policies_both_modes() {
     let bpm = build_bpm();

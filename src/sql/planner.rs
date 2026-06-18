@@ -22,7 +22,7 @@
 use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::Result;
 use crate::sql::cost::{CostModel, DefaultCostModel};
-use crate::sql::expr::Predicate;
+use crate::sql::expr::{Expression, Predicate};
 use crate::sql::join_order::JoinAlgorithm;
 use crate::sql::logical::LogicalPlan;
 use crate::sql::physical::PhysOp;
@@ -35,8 +35,9 @@ use crate::storage::StorageEngine;
 /// the rule-based and Selinger planners is *only* this choice — both
 /// build the same textual-order, same-layout tree (P14.13a).
 pub(crate) enum JoinSelection<'a> {
-    /// Phase 11 rule-based: `IndexNestedLoopJoin` when the inner side is
-    /// indexed on the join column, else `NestedLoopJoin`. Never `HashJoin`.
+    /// Rule-based: `IndexNestedLoopJoin` when the inner side is indexed on the
+    /// join column, `HashJoin` for an equi-key with no usable index (Phase D),
+    /// else `NestedLoopJoin`. No cost model — purely shape-driven.
     Heuristic,
     /// P14.13a cost-based: the cheapest of NLJ / Hash / INLJ under the
     /// model, with join order left textual (no layout change). `stats` is
@@ -245,21 +246,25 @@ where
     let left_table_id = left_schema.table_id;
     let left_indexes = catalog.indexes_for_table(left_schema.table_id, &left_schema)?;
 
-    // Build the leaf scan for the left side. We only attempt IndexScan
-    // lowering on the LEFT side when there are NO joins — once joins
-    // enter, predicate scoping spans multiple tables and column indices
-    // shift, so the lowering rule (column index == table column index)
-    // no longer holds. Index-driven joins use IndexNestedLoopJoin below.
+    // Per-table column ranges (left = index 0, then each join's right table) —
+    // used to route each WHERE conjunct to the table it constrains.
+    let ranges = table_ranges(&left_schema, &joins, catalog)?;
+
+    // Build the left leaf and collect the conjuncts we can't place on it into
+    // `residual`. With no joins the whole WHERE scopes to the one table. With
+    // joins (Phase B) we push the left-table-only conjuncts onto the left leaf
+    // and leave the rest in `residual` — which the join loop then drains
+    // (promoting an equi-key, pushing right-table predicates), and whatever
+    // survives becomes a Filter on top.
     let mut current: PhysOp;
-    let mut residual_filter: Option<Predicate> = filter;
+    let mut residual: Vec<Predicate> = Vec::new();
     if joins.is_empty() {
-        if let Some(pred) = residual_filter {
+        if let Some(pred) = filter {
             if let Some(pk) = try_lower_pk_lookup(&pred, &left_schema) {
                 current = PhysOp::PkLookup {
                     table: table_name.clone(),
                     pk,
                 };
-                residual_filter = None;
             } else {
                 match try_lower_index_predicate(pred, &left_indexes) {
                     IndexLowering::Matched { handle, prefix } => {
@@ -268,13 +273,12 @@ where
                             index: handle.def.name.clone(),
                             prefix,
                         };
-                        residual_filter = None;
                     }
                     IndexLowering::Unmatched(pred) => {
                         current = PhysOp::SeqScan {
                             table: table_name.clone(),
                         };
-                        residual_filter = Some(pred);
+                        residual.push(pred);
                     }
                 }
             }
@@ -284,70 +288,134 @@ where
             };
         }
     } else {
-        current = PhysOp::SeqScan {
-            table: table_name.clone(),
-        };
+        let mut left_preds = Vec::new();
+        for conjunct in filter.map(flatten_conjuncts).unwrap_or_default() {
+            let mut cols = Vec::new();
+            referenced_columns(&conjunct, &mut cols);
+            match bucket_of(&cols, &ranges) {
+                Bucket::SingleTable(0) => left_preds.push(conjunct),
+                _ => residual.push(conjunct),
+            }
+        }
+        current = build_left_leaf(left_preds, &left_schema, &table_name, &left_indexes);
     }
 
-    // P13.1: chain joins onto the left side. For each join, pick
-    // IndexNestedLoopJoin when the ON predicate is `left.col = right.idx_col`
-    // and the right side has a matching single-column index; fall back to
-    // NestedLoopJoin with the ON predicate (or trivially-true for cross joins).
+    // P13.1 + Phase C: chain joins onto the left side. For each join we first
+    // promote a residual equi-predicate into the join's ON (so a comma join
+    // `FROM a, b WHERE … a.k = b.k …` gets a real join key) and push that
+    // table's single-table predicates onto its inner leaf; then pick the
+    // algorithm — INLJ when the inner is indexed on the key, HashJoin for an
+    // equi-key with no usable index (Phase D), else NestedLoopJoin.
     let mut outer_offset = left_schema.columns.len();
-    // Running output-cardinality estimate — used only in cost mode to pick
-    // join algorithms. Seeded from the left table's base row count. NOTE
-    // (P14.13a): this ignores any narrowing from the left's index scan /
-    // local filter; an over-estimate of the outer only biases toward Hash,
-    // which is the safe direction. The exact figure arrives with the
-    // P14.12 table-relative refactor.
+    // Running output-cardinality estimate — used only in cost mode. Seeded from
+    // the left table's base row count. NOTE (P14.13a): ignores narrowing from
+    // the left's filter; an over-estimate only biases toward Hash (the safe
+    // direction). Exact figure arrives with the P14.12 table-relative refactor.
     let mut outer_card: f64 = match selection {
         JoinSelection::CostBased { stats, .. } => stats.row_count(left_table_id),
         JoinSelection::Heuristic => 0.0,
     };
-    for join in joins {
+    for (i, join) in joins.into_iter().enumerate() {
+        let right_range = &ranges[i + 1];
         let right_schema = catalog.get_table(&join.right_table)?;
         let right_indexes = catalog.indexes_for_table(right_schema.table_id, &right_schema)?;
         let right_cols = right_schema.columns.len();
         let right_table = join.right_table.clone();
 
+        // Phase C.1: promote a residual equi-predicate connecting the outer to
+        // this right table into the join's ON — only when the join has no
+        // explicit ON (a comma/cross join).
+        let mut on = join.on;
+        if on.is_none() {
+            if let Some(pos) = residual.iter().position(|c| {
+                extract_equi_join_keys(c, outer_offset).is_some()
+                    && predicate_touches_range(c, right_range)
+            }) {
+                on = Some(residual.remove(pos));
+            }
+        }
+
+        // Phase C.2: pull this right table's single-table predicates out of the
+        // residual to push onto its inner leaf. They carry global join-tuple
+        // indices; `build_right_leaf` rebases them to the table's local columns.
+        let mut right_preds = Vec::new();
+        let mut keep = Vec::new();
+        for c in residual.drain(..) {
+            let mut cols = Vec::new();
+            referenced_columns(&c, &mut cols);
+            let right_only = !cols.is_empty()
+                && cols
+                    .iter()
+                    .all(|&col| col >= right_range.start && col < right_range.end);
+            if right_only {
+                right_preds.push(c);
+            } else {
+                keep.push(c);
+            }
+        }
+        residual = keep;
+
         let next: PhysOp = match selection {
-            // Phase 11 heuristic: INLJ when the inner is indexed, else NLJ.
+            // Phase 11 heuristic + Phase D: INLJ when the inner is indexed on
+            // the key, HashJoin for an equi-key without a usable index, else NLJ.
             JoinSelection::Heuristic => {
-                let inlj_choice = join
-                    .on
+                let inlj = on
                     .as_ref()
-                    .and_then(|pred| try_match_inlj(pred, outer_offset, &right_indexes));
-                if let Some((outer_col, handle)) = inlj_choice {
+                    .and_then(|p| try_match_inlj(p, outer_offset, &right_indexes));
+                if let Some((outer_col, handle)) = inlj {
+                    // INLJ probes the index; its right predicates can't ride the
+                    // probe, so they return to the residual (a Filter on top).
+                    residual.extend(right_preds);
                     PhysOp::IndexNestedLoopJoin {
                         outer: Box::new(current),
                         inner_table: right_table,
                         inner_index: handle.def.name.clone(),
                         outer_key_cols: vec![outer_col],
                     }
+                } else if let Some((outer_col, inner_col)) = on
+                    .as_ref()
+                    .and_then(|p| extract_equi_join_keys(p, outer_offset))
+                {
+                    PhysOp::HashJoin {
+                        outer: Box::new(current),
+                        inner: Box::new(build_right_leaf(
+                            right_preds,
+                            &right_schema,
+                            &right_table,
+                            &right_indexes,
+                            right_range.start,
+                        )),
+                        outer_key_col: outer_col,
+                        inner_key_col: inner_col,
+                    }
                 } else {
                     PhysOp::NestedLoopJoin {
                         outer: Box::new(current),
-                        inner: Box::new(PhysOp::SeqScan { table: right_table }),
-                        on: join.on,
+                        inner: Box::new(build_right_leaf(
+                            right_preds,
+                            &right_schema,
+                            &right_table,
+                            &right_indexes,
+                            right_range.start,
+                        )),
+                        on,
                     }
                 }
             }
-            // P14.13a cost-based: cheapest of NLJ / Hash / INLJ, textual
-            // order preserved (so column layout is unchanged).
+            // P14.13a cost-based: cheapest of NLJ / Hash / INLJ, textual order
+            // preserved. Now reads the promoted `on` and pushes right predicates.
             JoinSelection::CostBased { cost_model, stats } => {
-                let keys = join
-                    .on
+                let keys = on
                     .as_ref()
                     .and_then(|p| extract_equi_join_keys(p, outer_offset));
-                let inlj = join
-                    .on
+                let inlj = on
                     .as_ref()
                     .and_then(|p| try_match_inlj(p, outer_offset, &right_indexes));
                 let inner_card = stats.row_count(right_schema.table_id);
-                // NOTE (P14.13a): the outer join key can't be mapped back to
-                // a (table, col) for its NDV until P14.12, so selectivity
-                // uses the inner key's NDV only. Adequate for algorithm
-                // choice (Hash-vs-NLJ is cardinality-driven).
+                // NOTE (P14.13a): the outer join key can't be mapped back to a
+                // (table, col) for its NDV until P14.12, so selectivity uses the
+                // inner key's NDV only — adequate for Hash-vs-NLJ (cardinality-
+                // driven).
                 let inner_ndv = keys
                     .map(|(_, ic)| stats.ndv(right_schema.table_id, ic as u32))
                     .unwrap_or(0);
@@ -368,6 +436,7 @@ where
                 match algorithm {
                     JoinAlgorithm::IndexNestedLoop => {
                         let (outer_col, handle) = inlj.expect("INLJ chosen only when available");
+                        residual.extend(right_preds);
                         PhysOp::IndexNestedLoopJoin {
                             outer: Box::new(current),
                             inner_table: right_table,
@@ -380,15 +449,27 @@ where
                             keys.expect("Hash chosen only when equi-keys exist");
                         PhysOp::HashJoin {
                             outer: Box::new(current),
-                            inner: Box::new(PhysOp::SeqScan { table: right_table }),
+                            inner: Box::new(build_right_leaf(
+                                right_preds,
+                                &right_schema,
+                                &right_table,
+                                &right_indexes,
+                                right_range.start,
+                            )),
                             outer_key_col: outer_col,
                             inner_key_col: inner_col,
                         }
                     }
                     JoinAlgorithm::NestedLoop => PhysOp::NestedLoopJoin {
                         outer: Box::new(current),
-                        inner: Box::new(PhysOp::SeqScan { table: right_table }),
-                        on: join.on,
+                        inner: Box::new(build_right_leaf(
+                            right_preds,
+                            &right_schema,
+                            &right_table,
+                            &right_indexes,
+                            right_range.start,
+                        )),
+                        on,
                     },
                 }
             }
@@ -397,7 +478,7 @@ where
         current = next;
     }
 
-    if let Some(pred) = residual_filter {
+    if let Some(pred) = and_all(residual) {
         current = PhysOp::Filter {
             input: Box::new(current),
             predicate: pred,
@@ -641,6 +722,238 @@ fn try_lower_index_predicate(
         }
     }
     IndexLowering::Unmatched(pred)
+}
+
+// ---------------------------------------------------------------------------
+// Predicate pushdown (Phase A helpers + Phase B left-leaf lowering).
+//
+// `plan_select` used to drop the whole `WHERE` as one `Filter` on top of the
+// joins — for `FROM a, b WHERE a.x = $1 AND …` that means the join runs over
+// the *unfiltered* left table. These helpers split the conjunction and route
+// each conjunct to the table it constrains, so a single-table predicate
+// shrinks its base scan before the join sees it. (Right-side pushdown and
+// join-key promotion are Phase C; see `docs/plan-predicate-pushdown.md`.)
+// ---------------------------------------------------------------------------
+
+/// Flatten a predicate's top-level `AND` chain into its conjuncts. `Or`, `Not`,
+/// and `Compare` are leaf conjuncts — an `OR`/`NOT` is one indivisible unit, we
+/// never push half of it. Iterative (an explicit stack) so the recursion depth
+/// is the parsed `WHERE`'s `AND` nesting, not the call stack.
+fn flatten_conjuncts(pred: Predicate) -> Vec<Predicate> {
+    let mut out = Vec::new();
+    let mut stack = vec![pred];
+    while let Some(p) = stack.pop() {
+        match p {
+            Predicate::And(a, b) => {
+                // Push right then left so `pop` yields left-to-right order.
+                stack.push(*b);
+                stack.push(*a);
+            }
+            leaf => out.push(leaf),
+        }
+    }
+    out
+}
+
+/// Collect every column index a predicate references (into the join's running
+/// tuple). `Parameter`s and `Literal`s contribute nothing; by plan time
+/// parameters are substituted to literals anyway. Duplicates are allowed — the
+/// caller only checks each index against a range.
+fn referenced_columns(pred: &Predicate, out: &mut Vec<usize>) {
+    match pred {
+        Predicate::Compare { left, right, .. } => {
+            columns_in_expr(left, out);
+            columns_in_expr(right, out);
+        }
+        Predicate::And(a, b) | Predicate::Or(a, b) => {
+            referenced_columns(a, out);
+            referenced_columns(b, out);
+        }
+        Predicate::Not(p) => referenced_columns(p, out),
+    }
+}
+
+/// Column indices referenced by an expression (recursing through arithmetic).
+fn columns_in_expr(expr: &Expression, out: &mut Vec<usize>) {
+    match expr {
+        Expression::Column(i) => out.push(*i),
+        Expression::Literal(_) | Expression::Parameter(_) => {}
+        Expression::BinaryOp { left, right, .. } => {
+            columns_in_expr(left, out);
+            columns_in_expr(right, out);
+        }
+    }
+}
+
+/// A table's column range `[start, end)` in the join's running output tuple.
+struct TableRange {
+    start: usize,
+    end: usize,
+}
+
+/// Column ranges for the left table (index 0) then each joined right table, in
+/// textual order — mirroring how `plan_select` grows `outer_offset`.
+fn table_ranges<CatE>(
+    left: &Schema,
+    joins: &[crate::sql::logical::JoinClause],
+    catalog: &Catalog<CatE>,
+) -> Result<Vec<TableRange>>
+where
+    CatE: StorageEngine,
+{
+    let mut ranges = Vec::with_capacity(1 + joins.len());
+    let mut end = left.columns.len();
+    ranges.push(TableRange { start: 0, end });
+    for join in joins {
+        let right = catalog.get_table(&join.right_table)?;
+        let start = end;
+        end = start + right.columns.len();
+        ranges.push(TableRange { start, end });
+    }
+    Ok(ranges)
+}
+
+/// Where a conjunct's columns fall. `SingleTable(k)` iff *every* referenced
+/// column is within table `k`'s range; `Spans` if they cross tables (a join or
+/// otherwise un-pushable predicate); `NoColumns` for a constant predicate.
+enum Bucket {
+    SingleTable(usize),
+    Spans,
+    NoColumns,
+}
+
+fn bucket_of(cols: &[usize], ranges: &[TableRange]) -> Bucket {
+    let first = match cols.first() {
+        Some(&c) => c,
+        None => return Bucket::NoColumns,
+    };
+    let table = match ranges
+        .iter()
+        .position(|r| first >= r.start && first < r.end)
+    {
+        Some(t) => t,
+        None => return Bucket::Spans,
+    };
+    let r = &ranges[table];
+    if cols.iter().all(|&c| c >= r.start && c < r.end) {
+        Bucket::SingleTable(table)
+    } else {
+        Bucket::Spans
+    }
+}
+
+/// Re-combine conjuncts into one left-associative `AND`, or `None` if empty.
+fn and_all(preds: Vec<Predicate>) -> Option<Predicate> {
+    preds
+        .into_iter()
+        .reduce(|acc, p| Predicate::And(Box::new(acc), Box::new(p)))
+}
+
+/// Build the left leaf scan from the predicates that reference only the left
+/// table: lower one to a `PkLookup`/`IndexScan` access path when possible, and
+/// drop the rest onto a leaf `Filter`. Left columns sit at offset 0, so the
+/// global column indices are already local — no rebasing needed.
+fn build_left_leaf(
+    left_preds: Vec<Predicate>,
+    schema: &Schema,
+    table_name: &str,
+    indexes: &[crate::table::IndexHandle],
+) -> PhysOp {
+    let mut access: Option<PhysOp> = None;
+    let mut leftover: Vec<Predicate> = Vec::new();
+    for pred in left_preds {
+        if access.is_some() {
+            leftover.push(pred);
+            continue;
+        }
+        if let Some(pk) = try_lower_pk_lookup(&pred, schema) {
+            access = Some(PhysOp::PkLookup {
+                table: table_name.to_string(),
+                pk,
+            });
+            continue;
+        }
+        match try_lower_index_predicate(pred, indexes) {
+            IndexLowering::Matched { handle, prefix } => {
+                access = Some(PhysOp::IndexScan {
+                    table: table_name.to_string(),
+                    index: handle.def.name.clone(),
+                    prefix,
+                });
+            }
+            IndexLowering::Unmatched(pred) => leftover.push(pred),
+        }
+    }
+    let mut leaf = access.unwrap_or(PhysOp::SeqScan {
+        table: table_name.to_string(),
+    });
+    if let Some(pred) = and_all(leftover) {
+        leaf = PhysOp::Filter {
+            input: Box::new(leaf),
+            predicate: pred,
+        };
+    }
+    leaf
+}
+
+/// Whether any column the predicate references falls in `range`.
+fn predicate_touches_range(pred: &Predicate, range: &TableRange) -> bool {
+    let mut cols = Vec::new();
+    referenced_columns(pred, &mut cols);
+    cols.iter().any(|&c| c >= range.start && c < range.end)
+}
+
+/// Shift every column index in an expression down by `offset` — turning a
+/// global join-tuple index into a right-table-local one.
+fn rebase_expr(expr: Expression, offset: usize) -> Expression {
+    match expr {
+        Expression::Column(i) => Expression::Column(i - offset),
+        lit_or_param @ (Expression::Literal(_) | Expression::Parameter(_)) => lit_or_param,
+        Expression::BinaryOp { op, left, right } => Expression::BinaryOp {
+            op,
+            left: Box::new(rebase_expr(*left, offset)),
+            right: Box::new(rebase_expr(*right, offset)),
+        },
+    }
+}
+
+/// Rebase every column in a predicate down by `offset` (see `rebase_expr`).
+fn rebase_predicate(pred: Predicate, offset: usize) -> Predicate {
+    match pred {
+        Predicate::Compare { op, left, right } => Predicate::Compare {
+            op,
+            left: rebase_expr(left, offset),
+            right: rebase_expr(right, offset),
+        },
+        Predicate::And(a, b) => Predicate::And(
+            Box::new(rebase_predicate(*a, offset)),
+            Box::new(rebase_predicate(*b, offset)),
+        ),
+        Predicate::Or(a, b) => Predicate::Or(
+            Box::new(rebase_predicate(*a, offset)),
+            Box::new(rebase_predicate(*b, offset)),
+        ),
+        Predicate::Not(p) => Predicate::Not(Box::new(rebase_predicate(*p, offset))),
+    }
+}
+
+/// Build a join's right (inner) leaf from the predicates that reference only
+/// that table. The predicates carry *global* join-tuple column indices, so we
+/// rebase them to the table's local indices (`- offset`) before lowering — the
+/// rebasing is what `build_left_leaf` doesn't need (the left table is at
+/// offset 0).
+fn build_right_leaf(
+    global_preds: Vec<Predicate>,
+    schema: &Schema,
+    table_name: &str,
+    indexes: &[crate::table::IndexHandle],
+    offset: usize,
+) -> PhysOp {
+    let local_preds = global_preds
+        .into_iter()
+        .map(|p| rebase_predicate(p, offset))
+        .collect();
+    build_left_leaf(local_preds, schema, table_name, indexes)
 }
 
 fn plan_insert<CatE>(
@@ -1133,6 +1446,184 @@ Limit(3)
         match plan(logical, &env.catalog) {
             Err(Error::TableNotFound { name }) => assert_eq!(name, "nonexistent"),
             other => panic!("expected TableNotFound, got {:?}", other.err()),
+        }
+    }
+
+    // ---- Predicate-pushdown helpers (Phase A) ----
+
+    fn col(i: usize) -> Expression {
+        Expression::Column(i)
+    }
+    fn lit(n: i32) -> Expression {
+        Expression::Literal(Value::Int32(n))
+    }
+    fn eq(l: Expression, r: Expression) -> Predicate {
+        Predicate::Compare {
+            op: crate::sql::expr::CompareOp::Eq,
+            left: l,
+            right: r,
+        }
+    }
+    fn and(a: Predicate, b: Predicate) -> Predicate {
+        Predicate::And(Box::new(a), Box::new(b))
+    }
+
+    #[test]
+    fn flatten_conjuncts_splits_only_top_level_and() {
+        // `A AND B AND C` flattens to three conjuncts...
+        let p = and(
+            and(eq(col(0), lit(1)), eq(col(1), lit(2))),
+            eq(col(2), lit(3)),
+        );
+        assert_eq!(flatten_conjuncts(p).len(), 3);
+        // ...a bare compare is one conjunct...
+        assert_eq!(flatten_conjuncts(eq(col(0), lit(1))).len(), 1);
+        // ...and an `OR` is never split (one indivisible unit).
+        let or = Predicate::Or(Box::new(eq(col(0), lit(1))), Box::new(eq(col(1), lit(2))));
+        assert_eq!(flatten_conjuncts(and(eq(col(2), lit(3)), or)).len(), 2);
+    }
+
+    #[test]
+    fn referenced_columns_walks_arithmetic_and_logic() {
+        // Plain compare.
+        let mut cols = Vec::new();
+        referenced_columns(&eq(col(0), lit(5)), &mut cols);
+        assert_eq!(cols, vec![0]);
+
+        // Arithmetic on a side recurses: `col3 + col4 = col7`.
+        let arith = Expression::BinaryOp {
+            op: crate::sql::expr::BinaryOp::Add,
+            left: Box::new(col(3)),
+            right: Box::new(col(4)),
+        };
+        let mut cols = Vec::new();
+        referenced_columns(&eq(arith, col(7)), &mut cols);
+        cols.sort();
+        assert_eq!(cols, vec![3, 4, 7]);
+
+        // `Not`/`And` recurse into their operands.
+        let mut cols = Vec::new();
+        let p = Predicate::Not(Box::new(and(eq(col(1), lit(0)), eq(col(2), lit(0)))));
+        referenced_columns(&p, &mut cols);
+        cols.sort();
+        assert_eq!(cols, vec![1, 2]);
+    }
+
+    #[test]
+    fn bucket_of_classifies_table_membership() {
+        // Two tables: left = cols [0,2), right = cols [2,5).
+        let ranges = vec![
+            TableRange { start: 0, end: 2 },
+            TableRange { start: 2, end: 5 },
+        ];
+        assert!(matches!(
+            bucket_of(&[0, 1], &ranges),
+            Bucket::SingleTable(0)
+        ));
+        assert!(matches!(
+            bucket_of(&[2, 4], &ranges),
+            Bucket::SingleTable(1)
+        ));
+        // Crosses both tables → a join/residual predicate.
+        assert!(matches!(bucket_of(&[1, 3], &ranges), Bucket::Spans));
+        // No columns → a constant predicate.
+        assert!(matches!(bucket_of(&[], &ranges), Bucket::NoColumns));
+        // Out of range → Spans (un-pushable, the safe default).
+        assert!(matches!(bucket_of(&[9], &ranges), Bucket::Spans));
+    }
+
+    // ---- Phase B: left-table predicate pushdown (end-to-end) ----
+
+    fn create_district(env: &TestEnv) {
+        let schema = Schema {
+            name: "district".into(),
+            table_id: TableId(1),
+            columns: vec![
+                ColumnDef {
+                    name: "d_id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "d_w_id".into(),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: "d_ytd".into(),
+                    ty: ColumnType::Int64,
+                    nullable: false,
+                    default: None,
+                },
+            ],
+            primary_key: vec![0],
+        };
+        env.catalog.create_table("district".into(), schema).unwrap();
+    }
+
+    /// Descend through `Projection`/`Filter` wrappers to the first other op.
+    fn skip_to_join(op: &PhysOp) -> &PhysOp {
+        match op {
+            PhysOp::Projection { input, .. } | PhysOp::Filter { input, .. } => skip_to_join(input),
+            other => other,
+        }
+    }
+
+    #[test]
+    fn join_promotes_equi_key_to_hashjoin_with_left_pushdown() {
+        // `FROM warehouse, district WHERE w_ytd = 100 AND d_w_id = w_id`:
+        //  - `w_ytd = 100` (warehouse-only) is pushed onto the left leaf (a
+        //    `Filter`, since `w_ytd` is neither PK nor indexed) BELOW the join
+        //    (Phase B).
+        //  - `d_w_id = w_id` (an equi-predicate across the two tables) is
+        //    promoted to the join key; with no index on `d_w_id` the join becomes
+        //    a `HashJoin` (Phase C.1 + D). Nothing is left over → no top `Filter`.
+        let env = setup();
+        create_warehouse(&env);
+        create_district(&env);
+        let p = plan_sql(
+            &env,
+            "SELECT w_id FROM warehouse, district WHERE w_ytd = 100 AND d_w_id = w_id",
+        );
+        let physop = match p {
+            PhysicalPlan::Query(op) => op,
+            other => panic!("expected Query, got {:?}", std::mem::discriminant(&other)),
+        };
+        match skip_to_join(&physop) {
+            PhysOp::HashJoin { outer, .. } => assert!(
+                matches!(outer.as_ref(), PhysOp::Filter { .. }),
+                "left predicate not pushed below the join; outer = {:?}",
+                outer
+            ),
+            other => panic!("expected HashJoin (equi-key promoted), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn join_pushes_right_table_predicate_onto_the_inner() {
+        // `d_ytd = 5` touches only `district` (the right table) → pushed onto the
+        // HashJoin's inner leaf (rebased to district-local columns), so the inner
+        // is a `Filter`, not a bare `SeqScan`. `d_w_id = w_id` is the join key.
+        let env = setup();
+        create_warehouse(&env);
+        create_district(&env);
+        let p = plan_sql(
+            &env,
+            "SELECT w_id FROM warehouse, district WHERE d_ytd = 5 AND d_w_id = w_id",
+        );
+        let physop = match p {
+            PhysicalPlan::Query(op) => op,
+            other => panic!("expected Query, got {:?}", std::mem::discriminant(&other)),
+        };
+        match skip_to_join(&physop) {
+            PhysOp::HashJoin { inner, .. } => assert!(
+                matches!(inner.as_ref(), PhysOp::Filter { .. }),
+                "right predicate not pushed onto the inner; inner = {:?}",
+                inner
+            ),
+            other => panic!("expected HashJoin, got {:?}", other),
         }
     }
 }

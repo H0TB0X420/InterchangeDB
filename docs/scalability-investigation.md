@@ -132,6 +132,46 @@ asserted at compile time.
 
 ---
 
+## Predicate pushdown lands — StockLevel blowup fixed (2026-06-18)
+
+**Headline: a planner change (predicate pushdown) eliminated the `--scale big`
+StockLevel cross-product, recovering 7–31× full-mix throughput at the large
+scale.** The `big` preset (customer/orders/order_line ≈ 8k rows) made the read
+path measurable but exposed StockLevel's `FROM order_line, stock WHERE …` as an
+O(|OL|×|S|) cross-product (lever #5). Phases A–D of
+`docs/plan-predicate-pushdown.md`, all row-equivalent (the full suite + the
+StockLevel `COUNT(DISTINCT)` test guard it):
+
+**Phase A+B — left-side pushdown (the dominant win).** Split the WHERE; push
+single-table conjuncts onto their base scan. `ol_o_id=$1` lands on the order_line
+scan *below* the join, so the join's outer is ~5 rows not ~32k — the cross
+product drops 100M → ~16k tuples. `--scale big` full mix, 20s, before→after:
+
+| config | elapsed | throughput | tpmC |
+|---|---|---|---|
+| 8×8 | 23.8s → **20.1s** | 18 → **130 txn/s** (7.2×) | 528 → **3539** |
+| 16×16 | 80.6s → **20.2s** | 5 → **98 txn/s** (~20×) | 140 → **2636** |
+| 32×32 | 144.4s → **20.7s** | 2 → **62 txn/s** (31×) | 53 → **1723** |
+
+The deadline overshoot (one StockLevel txn ran *tens of seconds*) is gone — every
+config finishes at ~20s; the gain grows with concurrency (the blowup was worse at
+higher warehouse counts). `--scale big` 8×8 (tpmC 3539) is back in the
+commit-floored regime, ~the smoke high score.
+
+**Phase C+D — equi-key promotion + HashJoin (completes the lowering, tpmC-
+neutral).** Promote `s_i_id=ol_i_id` to the join key, push `s_quantity<$2` onto
+the stock inner, lower the unindexed equi-join to a `HashJoin` (~16k → ~3.2k:
+build 3.2k + probe ~5). `--scale big` full mix is unchanged within noise (8×8
+130→120, 16×16 98→101, 32×32 62→64 txn/s — <8% vs ~20–28% drift): StockLevel was
+already cheap after Phase B and the mix is commit-floored, so the HashJoin can't
+move the headline. Its value is the correct structural shape (a real equi-join,
+not a filtered cross-product) for analytical/join-heavy workloads. **Side effect:
+the rule-based (Heuristic) planner now picks `HashJoin` for unindexed equi-joins,
+converging with Selinger** (it used to pick NestedLoop) — 3 planner-divergence
+tests were updated to assert the convergence.
+
+---
+
 ## Tooling built for this (kept in the repo)
 
 - **`src/bin/tpcc.rs`** — standalone harness. Flags:
@@ -383,36 +423,26 @@ allocation + BPM-latch contention, LSM in merge-iterator materialization +
    checkpoint. Touches MVCC visibility — do carefully. (The read *latency*
    from cloning it was already fixed: `committed_txns_read` returns the
    guard instead of deep-cloning; see `TransactionManager`.)
-5. **Predicate pushdown / join-key promotion — no logical optimizer yet.**
-   *Plan: `docs/plan-predicate-pushdown.md`.*
-   Surfaced by the `--scale big` full mix: **StockLevel** (`SELECT
+5. **Predicate pushdown / join-key promotion — LANDED 2026-06-18 (Phase A–D).**
+   *Plan: `docs/plan-predicate-pushdown.md`.* See "Predicate pushdown lands"
+   below for the measured before/after; summary here.
+   The problem (surfaced by the `--scale big` full mix): **StockLevel** (`SELECT
    COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_o_id = $1 AND s_i_id =
-   ol_i_id AND s_quantity < $2`) plans as a **cross-product NLJ then Filter**.
-   Comma joins bind to `on: None` (`logical.rs`), so the equi-condition
-   `s_i_id = ol_i_id` lands in the residual WHERE, and `plan_select` dumps the
-   whole conjunction as one `Filter` *on top of* the join (`planner.rs`,
-   `if let Some(pred) = residual_filter`). Result: it materializes
-   |order_line|×|stock| tuples (~32k×3.2k = 100M at `big`, *tens of seconds*)
-   then keeps a handful. The fix is two layers, in order of value:
-   - **(a) Predicate pushdown — the real win, currently ABSENT, planner-
-     agnostic.** Split the conjunctive `filter` in `plan_select`
-     (`src/sql/planner.rs`): route single-table conjuncts to the base scan
-     (`ol_o_id = $1` onto order_line → shrinks the outer from 32k to ~5 rows;
-     `s_quantity < $2` onto stock) and **promote equi conjuncts to the join
-     `on`** (`s_i_id = ol_i_id` becomes the join key). Both planners share this
-     — it's structure, not algorithm. Canonically a `LogicalPlan→LogicalPlan`
-     pass before physical planning (the optimizer that doesn't exist yet; the
-     Cascades home, Phase 17/18). The narrowing also fixes the `outer_card`
-     under-estimate (`planner.rs` NOTE at the join loop) that biases the cost
-     model.
-   - **(b) HashJoin selection — secondary, partly done.** Once (a) makes
-     `s_i_id = ol_i_id` the join `on`, `JoinSelection::CostBased` (Selinger)
-     *already* picks `HashJoin` via `choose_join_algorithm`
-     (`src/sql/join_order.rs`) — today it can't, because `extract_equi_join_keys`
-     sees `on: None`. `JoinSelection::Heuristic` says "never HashJoin"
-     (`planner.rs`), so it needs one rule: equi-`on` + no usable inner index →
-     `HashJoin` instead of `NestedLoopJoin`. The `HashJoin` *operator* already
-     exists (`src/execution/join.rs`, built in `build.rs`) — no new operator.
+   ol_i_id AND s_quantity < $2`) planned as a **cross-product NLJ then Filter** —
+   comma joins bind to `on: None`, the equi-condition stayed in the residual
+   WHERE, and `plan_select` dumped the whole conjunction as one `Filter` *on top
+   of* the join, materializing |order_line|×|stock| (~32k×3.2k = 100M at `big`,
+   *tens of seconds*) then keeping a handful. Fixed in `src/sql/planner.rs`:
+   (a) **predicate pushdown** — split the conjunction, push single-table
+   conjuncts onto their base scan (`ol_o_id=$1` → order_line outer ~32k→~5;
+   `s_quantity<$2` → stock inner, rebased) — the dominant win, planner-agnostic;
+   (b) **equi-key promotion + HashJoin** — promote `s_i_id=ol_i_id` to the join
+   key and lower an unindexed equi-join to `HashJoin` in *both* the Heuristic and
+   the cost-based planner (the `HashJoin` operator already existed). Still a step
+   inside physical planning, not a logical `LogicalPlan→LogicalPlan` pass — that
+   (the Cascades home, Phase 17/18) remains the principled future refactor;
+   the helpers (`flatten_conjuncts`/`referenced_columns`/`table_ranges`) are
+   written to be reusable by it.
 
 ---
 

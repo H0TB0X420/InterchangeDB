@@ -215,28 +215,29 @@ fn explicit_inner_join_executes_to_matching_rows() {
 }
 
 #[test]
-fn join_with_no_usable_index_falls_back_to_nlj() {
-    // Self-join the warehouse on a non-PK projection — no index applies.
+fn join_with_no_usable_index_falls_back_to_hashjoin() {
+    // Self-join the warehouse on its PK. `try_match_inlj` only matches
+    // *secondary* indexes (we registered only districts_by_w_id), so no INLJ
+    // applies. As of Phase D an equi-key with no usable index lowers to a
+    // HashJoin — it used to fall back to NestedLoopJoin.
     let s = setup_with_indexed_district();
     let text = explain_of(
         &s,
         "SELECT w1.w_name, w2.w_name FROM warehouse w1 JOIN warehouse w2 ON w1.w_id = w2.w_id",
     );
-    // Self-join on PK won't find an INLJ-applicable secondary index
-    // (we only registered districts_by_w_id), so this should fall back
-    // to NestedLoopJoin.
     assert!(
-        text.contains("NestedLoopJoin") && !text.contains("IndexNestedLoopJoin"),
-        "expected NLJ fallback in plan:\n{}",
+        text.contains("HashJoin") && !text.contains("IndexNestedLoopJoin"),
+        "expected HashJoin fallback in plan:\n{}",
         text
     );
 }
 
 #[test]
-fn implicit_cross_product_with_where_equijoin() {
-    // `FROM a, b WHERE join_pred` form. Planner emits cross product +
-    // Filter (no INLJ lowering yet — that requires recognizing the join
-    // predicate in WHERE; Phase 14 territory).
+fn implicit_join_with_where_equijoin() {
+    // `FROM a, b WHERE join_pred` form. As of Phase C the planner promotes the
+    // WHERE equi-predicate to the join key (a HashJoin), rather than emitting a
+    // cross product + Filter. The result rows are unchanged — that's what we
+    // assert here.
     let s = setup_with_indexed_district();
     let rows = run_select(
         &s,

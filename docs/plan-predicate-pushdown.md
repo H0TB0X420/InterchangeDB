@@ -1,5 +1,13 @@
 # Plan: Predicate Pushdown & Equi-Join Lowering
 
+> **STATUS: LANDED 2026-06-18 (Phases A–D), uncommitted.** Row-equivalent (full
+> suite green; StockLevel `COUNT(DISTINCT)` test guards the rebasing). Measured:
+> `--scale big` full mix recovered **7–31×** throughput (StockLevel cross-product
+> → filtered HashJoin); see `docs/scalability-investigation.md` → "Predicate
+> pushdown lands". Phase C.2 (right-side pushdown) **was** done (not deferred).
+> Not done: the principled `LogicalPlan→LogicalPlan` pass (still inside
+> `plan_select`); composite/multi-column join keys; outer joins (none exist).
+
 **Motivation.** Lever #5 in `docs/scalability-investigation.md`. At `--scale big`
 the TPC-C **StockLevel** transaction plans as a **cross-product**:
 

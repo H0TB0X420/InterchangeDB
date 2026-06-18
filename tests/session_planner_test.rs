@@ -27,8 +27,9 @@ fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     let database = Arc::new(Database::open(dir.path(), engine).unwrap());
     let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
     let mut session = Session::new(database.clone(), catalog.clone());
-    // Two tables joined on a non-PK column (no index on the join key), so
-    // the planners diverge: rule-based → NestedLoopJoin, Selinger → Hash.
+    // Two tables joined on a non-PK column (no index on the join key). As of
+    // Phase D both planners pick HashJoin for an unindexed equi-key (rule-based
+    // used to pick NestedLoopJoin), so they agree on this query.
     session
         .execute("CREATE TABLE warehouse (w_id INT PRIMARY KEY, w_name VARCHAR(20))")
         .unwrap();
@@ -63,19 +64,22 @@ fn set_planner_switches_active_strategy_name() {
 }
 
 #[test]
-fn swapping_planner_changes_the_join_algorithm() {
+fn swapping_planner_runs_live_and_both_pick_hashjoin() {
     let (mut session, _d) = setup();
     let sql = "EXPLAIN SELECT w_id, d_id FROM warehouse JOIN district ON w_id = d_w_id";
 
-    // Default (rule-based) → NestedLoopJoin.
+    // As of Phase D the rule-based planner also emits HashJoin for an unindexed
+    // equi-key (it used to pick NestedLoopJoin), so it now agrees with Selinger
+    // on this query. The swap is still live per-statement (the *mechanism* is
+    // asserted by `set_planner_switches_active_strategy_name`); here we confirm
+    // both planners run through the live session and produce a HashJoin.
     let rule_plan = explain(&mut session, sql);
     assert!(
-        rule_plan.contains("NestedLoopJoin"),
-        "rule-based should use NestedLoopJoin, got:\n{}",
+        rule_plan.contains("HashJoin"),
+        "rule-based should use HashJoin (Phase D), got:\n{}",
         rule_plan
     );
 
-    // Swap to Selinger on the same live session → HashJoin.
     session.set_planner(Planner::Selinger(
         SelingerPlanner::<DefaultCostModel>::default(),
     ));
@@ -86,10 +90,9 @@ fn swapping_planner_changes_the_join_algorithm() {
         selinger_plan
     );
 
-    // Swap back → NestedLoopJoin again; the choice is per-statement.
     session.set_planner(Planner::default());
     let back = explain(&mut session, sql);
-    assert!(back.contains("NestedLoopJoin"), "got:\n{}", back);
+    assert!(back.contains("HashJoin"), "got:\n{}", back);
 }
 
 #[test]
