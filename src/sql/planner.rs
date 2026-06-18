@@ -9,10 +9,12 @@
 //!
 //! Tree shapes produced:
 //!
+//! ```text
 //!   SELECT → SeqScan → [Filter] → [Projection] → [Limit]
 //!   INSERT → Insert
 //!   UPDATE → Update wrapping (SeqScan → [Filter])
 //!   DELETE → Delete wrapping (SeqScan → [Filter])
+//! ```
 //!
 //! `[ … ]` brackets indicate optional wrappers — emitted only when the
 //! corresponding clause is present in the logical plan.

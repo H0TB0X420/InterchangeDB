@@ -384,6 +384,7 @@ allocation + BPM-latch contention, LSM in merge-iterator materialization +
    from cloning it was already fixed: `committed_txns_read` returns the
    guard instead of deep-cloning; see `TransactionManager`.)
 5. **Predicate pushdown / join-key promotion — no logical optimizer yet.**
+   *Plan: `docs/plan-predicate-pushdown.md`.*
    Surfaced by the `--scale big` full mix: **StockLevel** (`SELECT
    COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_o_id = $1 AND s_i_id =
    ol_i_id AND s_quantity < $2`) plans as a **cross-product NLJ then Filter**.

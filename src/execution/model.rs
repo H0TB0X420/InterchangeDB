@@ -1,10 +1,10 @@
 //! Execution models — *how* a physical plan is evaluated into result rows.
 //!
-//! An [`Executor`] is a single pull operator; an [`ExecutionModel`] is the
+//! An `Executor` is a single pull operator; an [`ExecutionModel`] is the
 //! driver that turns a whole [`PhysOp`] plan into rows. The model owns both
 //! halves: *build* (compile the model-neutral plan into its runnable form) and
 //! *run* (drive that form to completion). [`Volcano`] builds a pull-operator
-//! tree (via [`build_executor`]) and pulls it to exhaustion; a push-based
+//! tree (via `build_executor`) and pulls it to exhaustion; a push-based
 //! second impl will build a push pipeline from the same [`PhysOp`].
 //!
 //! The model takes `&PhysOp` plus the engine + catalog it resolves table

@@ -1,24 +1,24 @@
 //! Push-based execution (Phase 15, Increment 2b) — the second `ExecutionModel`.
 //!
 //! Where `Volcano` *pulls* (a parent calls `child.next()`), a push pipeline
-//! *drives from the leaf*: a [`Source`] iterates rows and pushes each one
-//! downstream through a chain of [`Sink`]s, ending at a [`Collector`]. Control
+//! *drives from the leaf*: a `Source` iterates rows and pushes each one
+//! downstream through a chain of `Sink`s, ending at a `Collector`. Control
 //! flows bottom-up (data-driven) — the inverse of pull. Both models compile
 //! the same [`PhysOp`]; that they can is the whole point of the IR seam.
 //!
 //! ## The interface
 //!
-//! - [`Sink::push`] handles one tuple and returns [`Flow`] — `Continue`, or
+//! - `Sink::push` handles one tuple and returns `Flow` — `Continue`, or
 //!   `Stop` when the downstream has had enough (e.g. `LIMIT` satisfied).
-//! - [`Sink::finish`] signals end-of-input.
-//! - A [`Source`] owns the head of the sink chain and `run()`s it.
+//! - `Sink::finish` signals end-of-input.
+//! - A `Source` owns the head of the sink chain and `run()`s it.
 //!
 //! ## What runs push vs. delegates
 //!
 //! Linear pipeline operators — scan, filter, projection, limit — run as genuine
 //! push sinks. Everything that materializes anyway and has no streaming to gain
 //! (indexed access, joins, `Sort`, `HashAggregate`, and DML) is built by the
-//! shared [`build_executor`] and bridged into the pipeline by [`ExecutorSource`]
+//! shared `build_executor` and bridged into the pipeline by `ExecutorSource`
 //! — reusing one operator set, so Push is trivially equivalent to Volcano there.
 //!
 //! Build threads the downstream sink *up toward the source* (the opposite of
@@ -28,7 +28,7 @@
 //!
 //! ## Streaming scan
 //!
-//! [`ScanSource`] reads the table through the *lazy* [`DataLayout::scan_table`]
+//! `ScanSource` reads the table through the *lazy* [`DataLayout::scan_table`]
 //! iterator (not `Table::scan`, which materializes a `Vec`), so a `Stop` from
 //! downstream halts the iteration early — `SELECT … LIMIT 10` builds ~10
 //! downstream tuples instead of pull's whole-table `Vec`. The win is real
@@ -37,7 +37,7 @@
 //! the range before yielding, so the early `Stop` saves the executor-level
 //! tuple building, not the engine read. A lazy MVCC scan would unlock the rest.
 //!
-//! [`Push`] is the `ExecutionModel` impl; a `Session` swaps to it via
+//! `Push` is the `ExecutionModel` impl; a `Session` swaps to it via
 //! `set_execution_model` (and the `--exec-model push` tpcc flag), so the same
 //! SQL runs through either model at runtime.
 
