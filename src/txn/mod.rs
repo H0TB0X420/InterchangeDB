@@ -438,10 +438,8 @@ impl TransactionManager {
     /// brief duration of one lookup, so a read is O(1) regardless of how
     /// large the map has grown — rather than deep-cloning it every time.
     /// The guard blocks commits (which take the write lock) for just that
-    /// lookup. NOTE (perf, found 2026-06-02): the map is never pruned
-    /// (insert-only until recovery), so it grows unboundedly under
-    /// sustained load — a memory concern to address separately (prune at
-    /// checkpoint); not cloning here removes its effect on read *latency*.
+    /// lookup. Growth is bounded by `prune_committed_below`, called at
+    /// checkpoint time (T16.1).
     pub fn committed_txns_read(
         &self,
     ) -> parking_lot::RwLockReadGuard<'_, HashMap<TxnId, Timestamp>> {
@@ -451,6 +449,33 @@ impl TransactionManager {
     /// Number of tracked committed txns, without cloning the map.
     pub fn committed_txns_len(&self) -> usize {
         self.committed_txns.read().len()
+    }
+
+    /// Prune committed-txn entries with `commit_ts <= bound`. Returns the
+    /// number pruned. Called at checkpoint time with
+    /// `bound = min(checkpoint_ts, oldest_active_read_ts)` (T16.1: the map
+    /// was insert-only, leaking under sustained load).
+    ///
+    /// # Why this is safe (and why that exact bound)
+    ///
+    /// A pruned writer T (commit_ts C ≤ bound) falls to `is_visible`'s
+    /// assumed-committed heuristic, which answers with T's *begin* ts B in
+    /// place of C (B < C, and B ≤ checkpoint_ts so the heuristic applies).
+    /// The exact and heuristic answers can only differ for a reader whose
+    /// `read_ts` lies in `[B, C)` — impossible, because every active reader
+    /// has `read_ts ≥ oldest_active_read_ts ≥ bound ≥ C`, and every future
+    /// reader draws a fresh, larger timestamp. The same argument covers
+    /// first-committer-wins (`on_write`): an active writer's `begin_ts ≥
+    /// bound ≥ C` means a pruned entry could never have produced a
+    /// conflict. This also exactly matches post-recovery state: WAL
+    /// truncation already drops pre-checkpoint Commit records, so a
+    /// restart rebuilds precisely this pruned map — the heuristic exists
+    /// for that case.
+    pub fn prune_committed_below(&self, bound: Timestamp) -> usize {
+        let mut committed = self.committed_txns.write();
+        let before = committed.len();
+        committed.retain(|_, commit_ts| *commit_ts > bound);
+        before - committed.len()
     }
 
     /// Access the known-uncommitted transactions set (for visibility checks).

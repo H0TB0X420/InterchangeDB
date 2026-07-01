@@ -289,7 +289,23 @@ impl<E: StorageEngine> Database<E> {
 
         // Update MVCC checkpoint watermark.
         if let Some(ref txn_mgr) = self.txn_manager {
-            txn_mgr.set_checkpoint_ts(crate::txn::Timestamp(oracle_ts));
+            let checkpoint_ts = crate::txn::Timestamp(oracle_ts);
+            txn_mgr.set_checkpoint_ts(checkpoint_ts);
+
+            // T16.1: bound the committed-txns map. Entries at or below
+            // min(checkpoint_ts, oldest active read_ts) are dead weight —
+            // the assumed-committed heuristic answers for them identically
+            // (see `prune_committed_below` for the proof). Without this the
+            // map is insert-only and leaks under sustained load. A txn
+            // beginning concurrently draws read_ts ≥ oracle_ts ≥ bound, so
+            // the active-set snapshot racing new begins is benign.
+            let oldest_active = txn_mgr
+                .active_read_timestamps()
+                .into_iter()
+                .min()
+                .unwrap_or(checkpoint_ts);
+            let bound = oldest_active.min(checkpoint_ts);
+            txn_mgr.prune_committed_below(bound);
         }
 
         Ok(())

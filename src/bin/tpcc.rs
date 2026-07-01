@@ -722,6 +722,110 @@ struct Counts {
     aborts: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Latency capture (T16.2) — allocation-free log2 histogram.
+// ---------------------------------------------------------------------------
+
+/// Sub-buckets per octave: 16 linear steps within each power of two gives
+/// ~6% value resolution — enough to compare p99s across tuning runs without
+/// per-sample allocation or sorting.
+const LAT_SUB: usize = 16;
+/// Octaves: bucket 0 covers 0..16µs linearly; the last covers ~2^42µs
+/// (~100 days). Anything above saturates into the final bucket.
+const LAT_OCTAVES: usize = 40;
+const LAT_BUCKETS: usize = LAT_OCTAVES * LAT_SUB;
+
+/// Fixed-size latency histogram over microseconds. `record` is two integer
+/// ops + an increment; `percentile` reconstructs the bucket's lower bound.
+struct LatencyHistogram {
+    counts: [u64; LAT_BUCKETS],
+    total: u64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            counts: [0; LAT_BUCKETS],
+            total: 0,
+        }
+    }
+}
+
+impl LatencyHistogram {
+    fn bucket_index(us: u64) -> usize {
+        if us < LAT_SUB as u64 {
+            return us as usize;
+        }
+        let exp = 63 - us.leading_zeros() as usize; // ≥ 4 here
+        let octave = exp - 3;
+        let sub = ((us >> (exp - 4)) & 0xF) as usize;
+        (octave * LAT_SUB + sub).min(LAT_BUCKETS - 1)
+    }
+
+    /// Lower bound (µs) of bucket `idx` — the value `percentile` reports.
+    fn bucket_floor_us(idx: usize) -> u64 {
+        let octave = idx / LAT_SUB;
+        let sub = (idx % LAT_SUB) as u64;
+        if octave == 0 {
+            sub
+        } else {
+            (LAT_SUB as u64 + sub) << (octave - 1)
+        }
+    }
+
+    fn record(&mut self, elapsed: Duration) {
+        self.counts[Self::bucket_index(elapsed.as_micros() as u64)] += 1;
+        self.total += 1;
+    }
+
+    fn merge(&mut self, other: &LatencyHistogram) {
+        for (a, b) in self.counts.iter_mut().zip(other.counts.iter()) {
+            *a += b;
+        }
+        self.total += other.total;
+    }
+
+    /// Value (µs) at quantile `q` in (0, 1]: the lower bound of the bucket
+    /// where the cumulative count crosses `ceil(q · total)`. 0 if empty.
+    fn percentile_us(&self, q: f64) -> u64 {
+        if self.total == 0 {
+            return 0;
+        }
+        let rank = ((q * self.total as f64).ceil() as u64).max(1);
+        let mut seen = 0u64;
+        for (idx, &c) in self.counts.iter().enumerate() {
+            seen += c;
+            if seen >= rank {
+                return Self::bucket_floor_us(idx);
+            }
+        }
+        Self::bucket_floor_us(LAT_BUCKETS - 1)
+    }
+}
+
+/// Per-transaction-type histograms (committed txns only — aborts are
+/// tracked as a rate so a "fix" that trades throughput for aborts is
+/// visible, not averaged in).
+#[derive(Default)]
+struct Latencies {
+    per_txn: [LatencyHistogram; 6],
+    overall: LatencyHistogram,
+}
+
+impl Latencies {
+    fn record(&mut self, txn: Txn, elapsed: Duration) {
+        self.per_txn[txn as usize].record(elapsed);
+        self.overall.record(elapsed);
+    }
+
+    fn merge(&mut self, other: &Latencies) {
+        for (a, b) in self.per_txn.iter_mut().zip(other.per_txn.iter()) {
+            a.merge(b);
+        }
+        self.overall.merge(&other.overall);
+    }
+}
+
 impl Counts {
     fn record(&mut self, txn: Txn) {
         match txn {
@@ -795,7 +899,7 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
     terminal: i32,
     deadline: Option<Instant>,
     iters: u64,
-) -> Counts {
+) -> (Counts, Latencies) {
     let mut session = Session::new(database, catalog);
     session.set_execution_model(parse_exec_model(&config.exec_model));
     session.set_planner(parse_planner(&config.planner));
@@ -811,6 +915,7 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
         card: config.cardinality,
     };
     let mut counts = Counts::default();
+    let mut latencies = Latencies::default();
 
     let mut done = 0u64;
     loop {
@@ -830,10 +935,16 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
         } else {
             pick(ctx.rng.below(100))
         };
+        // Latency = full user-visible transaction: BEGIN through COMMIT
+        // (including the commit's group-fsync wait). Committed only.
+        let txn_start = Instant::now();
         session.execute("BEGIN").expect("begin");
         match dispatch(&mut session, &statements, &mut ctx, txn) {
             Ok(()) => match session.execute("COMMIT") {
-                Ok(_) => counts.record(txn),
+                Ok(_) => {
+                    counts.record(txn);
+                    latencies.record(txn, txn_start.elapsed());
+                }
                 Err(_) => counts.aborts += 1,
             },
             Err(_) => {
@@ -843,13 +954,14 @@ fn run_terminal<E: StorageEngine + Send + Sync + 'static>(
         }
         done += 1;
     }
-    counts
+    (counts, latencies)
 }
 
 /// Aggregated outcome of one workload run, for the single-run report and the
 /// sweep comparison table.
 struct RunMetrics {
     total: Counts,
+    latencies: Latencies,
     elapsed_s: f64,
     fsyncs: u64,
 }
@@ -890,7 +1002,7 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
     let per_terminal_iters = (config.iterations / config.terminals as u64).max(1);
 
     let run_start = Instant::now();
-    let per_terminal: Vec<Counts> = std::thread::scope(|scope| {
+    let per_terminal: Vec<(Counts, Latencies)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..config.terminals)
             .map(|t| {
                 let database = database.clone();
@@ -908,30 +1020,63 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
     let elapsed = run_start.elapsed().as_secs_f64();
 
     let mut total = Counts::default();
-    for c in &per_terminal {
+    let mut latencies = Latencies::default();
+    for (c, l) in &per_terminal {
         total.add(c);
+        latencies.merge(l);
     }
     RunMetrics {
         total,
+        latencies,
         elapsed_s: elapsed,
         fsyncs: database.wal_fsync_count(),
     }
 }
 
+/// One report line: count plus p50/p95/p99 (ms) when any samples exist.
+fn print_txn_line(name: &str, count: u64, h: &LatencyHistogram) {
+    if count == 0 {
+        println!("  {:<11} {:>8}", name, count);
+        return;
+    }
+    println!(
+        "  {:<11} {:>8}   p50 {:>7.2}ms  p95 {:>7.2}ms  p99 {:>7.2}ms",
+        name,
+        count,
+        h.percentile_us(0.50) as f64 / 1000.0,
+        h.percentile_us(0.95) as f64 / 1000.0,
+        h.percentile_us(0.99) as f64 / 1000.0,
+    );
+}
+
 /// Detailed single-run report (the per-transaction breakdown + headline rates).
 fn print_report(label: &str, m: &RunMetrics) {
     let t = &m.total;
+    let l = &m.latencies;
     let committed = t.committed();
     println!(
         "\n--- {}: {} committed, {} aborted in {:.2}s ---",
         label, committed, t.aborts, m.elapsed_s
     );
-    println!("  NewOrder    {}", t.new_order);
-    println!("  Payment     {}", t.payment);
-    println!("  OrderStatus {}", t.order_status);
-    println!("  Delivery    {}", t.delivery);
-    println!("  StockLevel  {}", t.stock_level);
-    println!("  CustLookup  {}", t.customer_lookup);
+    print_txn_line("NewOrder", t.new_order, &l.per_txn[Txn::NewOrder as usize]);
+    print_txn_line("Payment", t.payment, &l.per_txn[Txn::Payment as usize]);
+    print_txn_line(
+        "OrderStatus",
+        t.order_status,
+        &l.per_txn[Txn::OrderStatus as usize],
+    );
+    print_txn_line("Delivery", t.delivery, &l.per_txn[Txn::Delivery as usize]);
+    print_txn_line(
+        "StockLevel",
+        t.stock_level,
+        &l.per_txn[Txn::StockLevel as usize],
+    );
+    print_txn_line(
+        "CustLookup",
+        t.customer_lookup,
+        &l.per_txn[Txn::CustomerLookup as usize],
+    );
+    print_txn_line("ALL", committed, &l.overall);
     println!("  abort rate  {:.1}%", m.abort_pct());
     println!("  fsyncs      {}", m.fsyncs);
     println!("  throughput  {:.0} committed txn/s", m.committed_per_s());
@@ -1004,15 +1149,16 @@ fn run_sweep(base: &Config) {
 
     println!("\n=== TPC-C config bake-off (sorted by tpmC) ===");
     println!(
-        "{:<24} {:>8} {:>10} {:>8} {:>8}",
-        "engine exec     planner", "tpmC", "txn/s", "abort%", "fsyncs"
+        "{:<24} {:>8} {:>10} {:>8} {:>8} {:>8}",
+        "engine exec     planner", "tpmC", "txn/s", "p99 ms", "abort%", "fsyncs"
     );
     for (label, m) in &results {
         println!(
-            "{:<24} {:>8.0} {:>10.0} {:>7.1}% {:>8}",
+            "{:<24} {:>8.0} {:>10.0} {:>8.2} {:>7.1}% {:>8}",
             label,
             m.tpmc(),
             m.committed_per_s(),
+            m.latencies.overall.percentile_us(0.99) as f64 / 1000.0,
             m.abort_pct(),
             m.fsyncs
         );
@@ -1051,4 +1197,77 @@ fn main() {
         config.seed
     );
     print_report("complete", &run_one_config(&config));
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+
+    // Bucketing must be monotone and every bucket's floor must map back
+    // into that bucket — the pair of invariants percentile() relies on.
+    #[test]
+    fn bucket_index_monotone_and_floor_consistent() {
+        let mut prev = 0;
+        for us in [
+            0u64,
+            1,
+            15,
+            16,
+            17,
+            31,
+            32,
+            100,
+            1_000,
+            65_535,
+            1_000_000,
+            1 << 40,
+        ] {
+            let idx = LatencyHistogram::bucket_index(us);
+            assert!(idx >= prev, "bucket index not monotone at {}µs", us);
+            prev = idx;
+            let floor = LatencyHistogram::bucket_floor_us(idx);
+            assert!(floor <= us, "floor {} above value {}", floor, us);
+            assert_eq!(
+                LatencyHistogram::bucket_index(floor),
+                idx,
+                "floor of bucket {} maps elsewhere",
+                idx
+            );
+        }
+    }
+
+    // Known distribution: 99 samples at ~1ms, 1 at ~100ms. p50 ≈ 1ms
+    // (within one bucket's ~6% resolution), p99 must reach the outlier's
+    // bucket. Also proves merge() = record()-on-one.
+    #[test]
+    fn percentiles_split_the_known_outlier() {
+        let mut a = LatencyHistogram::default();
+        let mut b = LatencyHistogram::default();
+        for _ in 0..99 {
+            a.record(Duration::from_micros(1_000));
+        }
+        b.record(Duration::from_micros(100_000));
+        a.merge(&b);
+
+        let p50 = a.percentile_us(0.50);
+        assert!((900..=1_000).contains(&p50), "p50 {}µs not ~1ms", p50);
+        let p99 = a.percentile_us(0.99);
+        assert!(
+            (900..=1_000).contains(&p99),
+            "p99 {}µs should still be ~1ms (rank 99 of 100)",
+            p99
+        );
+        let p999 = a.percentile_us(0.999);
+        assert!(
+            p999 >= 96_000,
+            "p99.9 {}µs must reach the 100ms outlier",
+            p999
+        );
+    }
+
+    #[test]
+    fn empty_histogram_reports_zero() {
+        let h = LatencyHistogram::default();
+        assert_eq!(h.percentile_us(0.99), 0);
+    }
 }
