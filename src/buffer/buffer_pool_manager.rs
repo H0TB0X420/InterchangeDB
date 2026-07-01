@@ -383,6 +383,14 @@ impl BufferPoolManager {
             replacer.record_access(frame_id, page_id);
 
             let evictable = !self.frames[frame_id.0].is_pinned();
+            crate::sync_trace!(
+                "swap {}->{}: re-register f{} (p{}) evictable={}",
+                old_name,
+                new_name,
+                frame_id.0,
+                page_id.0,
+                evictable
+            );
             replacer.set_evictable(frame_id, evictable);
         }
 
@@ -415,10 +423,30 @@ impl BufferPoolManager {
         }
 
         let new_pin_count = frame.unpin();
+        crate::sync_trace!(
+            "unpin f{} -> pin={} dirty={}",
+            frame_id.0,
+            new_pin_count,
+            is_dirty
+        );
 
         if new_pin_count == 0 {
             let mut replacer = self.replacer.lock();
-            replacer.set_evictable(frame_id, true);
+            // Q-35 discipline: derive evictability from a pin-count read
+            // taken INSIDE the replacer lock. Every evictability writer
+            // serializes on this lock; whichever write lands last must
+            // reflect the freshest pin state, or a stale `true` marks a
+            // re-pinned (or re-owned) frame evictable — the eviction/swap
+            // race family. Between our unpin and this lock a fetch may
+            // have pinned the frame; its own set_evictable(false) also
+            // serializes here, so all orders converge to the truth.
+            let evictable = frame.pin_count() == 0;
+            crate::sync_trace!(
+                "unpin f{}: deferred set_evictable({})",
+                frame_id.0,
+                evictable
+            );
+            replacer.set_evictable(frame_id, evictable);
         }
     }
 
@@ -431,10 +459,12 @@ impl BufferPoolManager {
         {
             let pt = self.page_table.read();
             if let Some(&frame_id) = pt.get(&page_id) {
+                crate::sync_trace!("fetch p{}: HIT f{}", page_id.0, frame_id.0);
                 self.handle_cache_hit(frame_id, page_id);
                 return Ok(frame_id);
             }
         }
+        crate::sync_trace!("fetch p{}: MISS", page_id.0);
         // Cache miss
         self.handle_cache_miss(page_id)
     }
@@ -497,6 +527,12 @@ impl BufferPoolManager {
             // under pt.write so a racing evictor's pin check abandons it, just
             // like handle_cache_hit — then return our unused frame to the free
             // list.
+            crate::sync_trace!(
+                "miss p{}: LOST race, adopt f{}, free f{}",
+                page_id.0,
+                winner.0,
+                frame_id.0
+            );
             self.frames[winner.0].pin();
             {
                 let mut replacer = self.replacer.lock();
@@ -513,6 +549,7 @@ impl BufferPoolManager {
 
             return Ok(winner);
         }
+        crate::sync_trace!("miss p{}: publish f{}", page_id.0, frame_id.0);
         pt.insert(page_id, frame_id);
         {
             let mut replacer = self.replacer.lock();
@@ -532,6 +569,11 @@ impl BufferPoolManager {
         {
             let mut fl = self.free_list.lock();
             if let Some(frame_id) = fl.pop() {
+                crate::sync_trace!(
+                    "free_frame for p{}: f{} from free list",
+                    incoming_page.0,
+                    frame_id.0
+                );
                 return Ok(frame_id);
             }
         }
@@ -571,13 +613,26 @@ impl BufferPoolManager {
                     let mut replacer = self.replacer.lock();
                     match replacer.evict_for_page(incoming_page) {
                         Some(fid) => fid,
-                        None => return Err(Error::NoFreeFrames),
+                        None => {
+                            crate::sync_trace!(
+                                "evict for p{}: NO victim ({} size={})",
+                                incoming_page.0,
+                                replacer.name(),
+                                replacer.size()
+                            );
+                            return Err(Error::NoFreeFrames);
+                        }
                     }
                 };
                 let frame = &self.frames[frame_id.0];
                 if frame.pin_count() > 0 {
                     // Cache-hit raced ahead (and re-tracked the frame via
                     // record_access). Abandon and retry.
+                    crate::sync_trace!(
+                        "evict for p{}: f{} pinned, abandon",
+                        incoming_page.0,
+                        frame_id.0
+                    );
                     drop(pt);
                     continue;
                 }
@@ -588,6 +643,12 @@ impl BufferPoolManager {
                 // a cache-hit re-tracks it in the replacer.
                 frame.pin();
                 old_page_id = frame.page_id();
+                crate::sync_trace!(
+                    "evict for p{}: phase1 reserved f{} (old p{:?})",
+                    incoming_page.0,
+                    frame_id.0,
+                    old_page_id.map(|p| p.0)
+                );
             }
 
             // Phase 2: flush the (possibly dirty) victim while it is still
@@ -610,12 +671,43 @@ impl BufferPoolManager {
                 // the flush.
                 frame.unpin();
                 if frame.pin_count() > 0 || frame.is_dirty() {
-                    // Still in use, or re-dirtied during the flush. Whichever
-                    // fetch did so re-tracked the frame in the replacer, so
-                    // abandon and retry.
+                    // Still in use, or re-dirtied during the flush — abandon.
+                    //
+                    // Q-35: restore the replacer state OURSELVES. The racing
+                    // fetch that pinned/re-dirtied the frame did re-track it
+                    // (record_access at hit time), but its unpin ran while our
+                    // reservation pin masked the pin count's zero-crossing, so
+                    // its deferred `set_evictable(true)` never fired — leaving
+                    // a mapped, unpinned frame permanently un-evictable (the
+                    // storm model's NoFreeFrames leak). record_access first so
+                    // the frame is tracked even if the racer's own re-track
+                    // predates our phase-1 removal.
+                    //
+                    // The pin count is read INSIDE the replacer lock (Q-35
+                    // discipline; see unpin_page_internal): guard drops take
+                    // only this lock — not pt — so a pre-lock read races the
+                    // racer's own unpin and whichever evictability write
+                    // lands second would carry stale truth.
+                    crate::sync_trace!(
+                        "evict for p{}: phase3 abandon f{} (pin={} dirty={})",
+                        incoming_page.0,
+                        frame_id.0,
+                        frame.pin_count(),
+                        frame.is_dirty()
+                    );
+                    if let Some(pid) = old_page_id {
+                        let mut replacer = self.replacer.lock();
+                        replacer.record_access(frame_id, pid);
+                        replacer.set_evictable(frame_id, frame.pin_count() == 0);
+                    }
                     drop(pt);
                     continue;
                 }
+                crate::sync_trace!(
+                    "evict for p{}: phase3 commit f{}",
+                    incoming_page.0,
+                    frame_id.0
+                );
                 // Safe to evict. A read-only cache-hit during the flush may
                 // have re-tracked this frame in the replacer (record_access);
                 // remove it again so no other evictor can select it while

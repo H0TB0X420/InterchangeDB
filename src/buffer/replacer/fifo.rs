@@ -95,6 +95,13 @@ impl EvictionPolicy for FifoReplacer {
     }
 
     fn set_evictable(&mut self, frame_id: FrameId, evictable: bool) {
+        // Q-35 contract: `evictable ⊆ tracked`. A stale deferred
+        // set_evictable(true) can target a frame this policy no longer
+        // tracks (evicted and mid-handoff to a new owner); inserting it
+        // anyway resurrects it as an eviction candidate it must not be.
+        if evictable && !self.in_queue.contains(&frame_id) {
+            return;
+        }
         if evictable {
             self.evictable.insert(frame_id);
         } else {

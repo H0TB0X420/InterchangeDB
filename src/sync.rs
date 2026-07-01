@@ -32,7 +32,13 @@ pub use real::*;
 #[macro_export]
 macro_rules! sync_trace {
     ($($arg:tt)*) => {
-        eprintln!("[task {:?}] {}", ::shuttle::current::me(), format_args!($($arg)*))
+        // Guard drops run during panic unwinding, and `current::me()`
+        // borrows shuttle's ExecutionState — which shuttle itself holds
+        // while serializing the failing schedule. Tracing then would
+        // panic-in-panic and destroy the replay diagnostics.
+        if !::std::thread::panicking() {
+            eprintln!("[task {:?}] {}", ::shuttle::current::me(), format_args!($($arg)*))
+        }
     };
 }
 

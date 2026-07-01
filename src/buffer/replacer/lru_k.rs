@@ -174,6 +174,10 @@ impl EvictionPolicy for LruKReplacer {
     }
 
     fn set_evictable(&mut self, frame_id: FrameId, evictable: bool) {
+        // Q-35 contract: `evictable ⊆ tracked` — see FifoReplacer.
+        if evictable && !self.history.contains_key(&frame_id) {
+            return;
+        }
         if evictable {
             self.evictable.insert(frame_id);
         } else {

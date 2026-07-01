@@ -85,6 +85,12 @@ impl EvictionPolicy for LruReplacer {
     }
 
     fn set_evictable(&mut self, frame_id: FrameId, evictable: bool) {
+        // Q-35 contract: `evictable ⊆ tracked` — see FifoReplacer. Doubly
+        // vital here: `evict` scores unknown frames as 0 (coldest), so a
+        // stale untracked insert would become the PREFERRED victim.
+        if evictable && !self.cache.contains(&frame_id) {
+            return;
+        }
         if evictable {
             self.evictable.insert(frame_id);
         } else {

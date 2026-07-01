@@ -133,6 +133,15 @@ pub trait EvictionPolicy: Send {
     /// A frame is evictable when its pin count is 0 (no one is using it).
     /// Pinned frames (pin_count > 0) must never be evicted.
     ///
+    /// # Contract (Q-35): `evictable ⊆ tracked`
+    ///
+    /// `set_evictable(_, true)` for a frame this policy does not currently
+    /// track (never `record_access`ed, or removed by `evict`/`remove`) MUST
+    /// be a no-op. The BPM's deferred unpin path can deliver a stale
+    /// evictability notification for a frame that has since been evicted
+    /// and handed to a new owner; a policy that inserts it anyway
+    /// resurrects a phantom eviction candidate.
+    ///
     /// # Arguments
     /// * `frame_id` - The frame to update
     /// * `evictable` - `true` if the frame can be evicted, `false` if pinned
