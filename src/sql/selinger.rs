@@ -30,6 +30,7 @@
 
 use std::time::Duration;
 
+use crate::catalog::system_tables::ColumnStats;
 use crate::catalog::{Catalog, TableId};
 use crate::common::Result;
 use crate::sql::column_map::ColumnRemap;
@@ -39,7 +40,11 @@ use crate::sql::join_order::{
     cost_of_order, enumerate_join_orders, JoinEdge, JoinOrder, JoinRelation, RelId,
 };
 use crate::sql::logical::{AggregateSpec, JoinClause, LogicalPlan, OrderDir};
-use crate::sql::planner::{plan_inner, JoinSelection, PhysicalPlan, PlannerStrategy};
+use crate::sql::planner::{
+    flatten_conjuncts, plan_inner, rebase_predicate, referenced_columns, JoinSelection,
+    PhysicalPlan, PlannerStrategy,
+};
+use crate::sql::selectivity::estimate_predicate_selectivity;
 use crate::sql::stats::{CatalogStatsProvider, QueryStats};
 use crate::storage::StorageEngine;
 
@@ -178,7 +183,7 @@ fn maybe_reorder<CatE: StorageEngine>(
             let graph = if joins.is_empty() {
                 None
             } else {
-                build_join_graph(&table, &joins, catalog)?
+                build_join_graph(&table, &joins, filter.as_ref(), catalog, stats)?
             };
             let Some(graph) = graph else {
                 return Ok(LogicalPlan::Select {
@@ -237,7 +242,9 @@ fn maybe_reorder<CatE: StorageEngine>(
 fn build_join_graph<CatE: StorageEngine>(
     table: &str,
     joins: &[JoinClause],
+    filter: Option<&Predicate>,
     catalog: &Catalog<CatE>,
+    stats: &QueryStats,
 ) -> Result<Option<JoinGraph>> {
     let mut names = vec![table.to_string()];
     let mut aliases: Vec<Option<String>> = vec![None];
@@ -264,6 +271,12 @@ fn build_join_graph<CatE: StorageEngine>(
     for t in 1..table_count {
         textual_base[t] = textual_base[t - 1] + widths[t - 1];
     }
+
+    // O10: feed single-table WHERE conjuncts into each relation's
+    // `local_selectivity` — without this the DP orders joins blind to
+    // filters (`FROM big JOIN small WHERE big.x = 5` costs `big` at full
+    // size even when the filter makes it tiny).
+    apply_local_selectivities(&mut relations, filter, stats, &textual_base, &widths);
 
     let mut edges = Vec::with_capacity(joins.len());
     for (i, join) in joins.iter().enumerate() {
@@ -315,6 +328,53 @@ fn build_join_graph<CatE: StorageEngine>(
 /// True when some index on the table covers exactly `[column]`.
 fn has_single_col_index(indexes: &[crate::table::IndexHandle], column: usize) -> bool {
     indexes.iter().any(|ix| ix.def.columns == [column])
+}
+
+/// Route each single-table WHERE conjunct to the relation it constrains
+/// and fold its estimated selectivity into that relation's
+/// `local_selectivity` (multiplying across conjuncts — the independence
+/// assumption, O-S1). Conjuncts spanning tables are skipped: join edges
+/// are costed separately by `edge_selectivity`, so nothing double-counts.
+/// Literal-only conjuncts carry no per-relation narrowing and are skipped.
+fn apply_local_selectivities(
+    relations: &mut [JoinRelation],
+    filter: Option<&Predicate>,
+    stats: &QueryStats,
+    textual_base: &[usize],
+    widths: &[usize],
+) {
+    let conjuncts = match filter {
+        Some(f) => flatten_conjuncts(f.clone()),
+        None => return,
+    };
+    for conjunct in conjuncts {
+        let mut cols = Vec::new();
+        referenced_columns(&conjunct, &mut cols);
+        let Some(&first) = cols.first() else {
+            continue;
+        };
+        let Some((rel, _)) = decompose(first, textual_base, widths) else {
+            continue;
+        };
+        let single_table = cols
+            .iter()
+            .all(|&c| matches!(decompose(c, textual_base, widths), Some((r, _)) if r == rel));
+        if !single_table {
+            continue;
+        }
+        // Rebase to table-local column indices — that's how the estimator
+        // indexes its per-column stats slice.
+        let local_pred = rebase_predicate(conjunct, textual_base[rel]);
+        let column_stats: Vec<Option<ColumnStats>> = (0..widths[rel])
+            .map(|c| {
+                stats
+                    .column_stats(relations[rel].table_id, c as u32)
+                    .cloned()
+            })
+            .collect();
+        relations[rel].local_selectivity *=
+            estimate_predicate_selectivity(&local_pred, &column_stats);
+    }
 }
 
 /// Find the `(rel, local)` a tuple-global index belongs to in textual

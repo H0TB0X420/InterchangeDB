@@ -173,3 +173,48 @@ fn selinger_preserves_output_column_order() {
     assert_eq!(row_for_c1[1], Value::Int32(10), "b_val");
     assert_eq!(row_for_c1[2], Value::Int32(100), "a_val");
 }
+
+// O10: join ordering must see WHERE selectivity. The query below lists the
+// tables in the GOOD base-size order (a=2 rows first), so base sizes alone
+// give the DP nothing cheaper and it keeps textual order. But the WHERE
+// filters c (8 rows) down to ~1 row — with per-relation selectivity wired
+// into the DP, starting from the filtered c is strictly cheaper, so the
+// plan must reorder. Without O10 this query never reorders (selinger and
+// rule-based plans are identical), which is exactly the regression signal.
+const FILTERED_QUERY: &str = "SELECT c_val, b_val, a_val FROM a \
+                              JOIN b ON b_a = a_id \
+                              JOIN c ON c_b = b_id \
+                              WHERE c_val = 1";
+
+#[test]
+fn where_selectivity_drives_reordering() {
+    let (mut session, _d) = setup();
+
+    // Rule-based: textual order, small table a is the base scan.
+    let rule_plan = explain(&mut session, FILTERED_QUERY);
+    assert!(
+        rule_plan.contains("SeqScan(a)"),
+        "rule-based should scan a (textual base), got:\n{}",
+        rule_plan
+    );
+    let rule_rows = sorted(rows(&mut session, FILTERED_QUERY));
+    assert!(!rule_rows.is_empty(), "query should return rows");
+
+    session.set_planner(Planner::Selinger(
+        SelingerPlanner::<DefaultCostModel>::default(),
+    ));
+    // The filtered c (8 rows × 1/8 selectivity ≈ 1) is now the cheapest
+    // starting relation — the DP must reorder away from textual.
+    let selinger_plan = explain(&mut session, FILTERED_QUERY);
+    assert_ne!(
+        selinger_plan, rule_plan,
+        "WHERE-driven reorder should fire (O10): plans must differ"
+    );
+
+    // Correctness under the reorder: identical rows, column order kept.
+    let selinger_rows = sorted(rows(&mut session, FILTERED_QUERY));
+    assert_eq!(
+        selinger_rows, rule_rows,
+        "reordered result must equal rule-based result"
+    );
+}

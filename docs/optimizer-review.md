@@ -155,7 +155,10 @@ changed; findings are for the user to triage later.
 ### O10 — Selinger DP ignores single-table WHERE selectivity (`local_selectivity ≡ 1.0`)
 - **Where:** `sql/selinger.rs:259` (`build_join_graph` sets `local_selectivity: 1.0`, the only
   production value anywhere) → consumed but never fed at `join_order.rs:272, 461`.
-- **Priority:** P2 · **Confidence:** high · **Status:** open — **headline optimizer finding**
+- **Priority:** P2 · **Confidence:** high · **Status:** FIXED (2026-07-01) —
+  `apply_local_selectivities` in `selinger.rs` routes single-table WHERE conjuncts into
+  `JoinRelation::local_selectivity` exactly as prescribed below; WHERE-driven reorder
+  test added (red without the wiring). Was the **headline optimizer finding**.
 - **Detail:** The DP is fully wired to use per-table selectivity (`sub_leaf` computes
   `out_card = raw_rows * local_selectivity` + a filter charge), and a correct, tested
   `estimate_predicate_selectivity` exists (Unit 2) — but the driver never calls it. So

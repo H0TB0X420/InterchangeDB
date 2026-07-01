@@ -116,28 +116,30 @@ fn compare_rows(a: &Tuple, b: &Tuple, keys: &[(usize, SortDir)]) -> Ordering {
     Ordering::Equal
 }
 
-/// Per-key comparator. NULL is "infinity" for sort purposes (sorts last
-/// regardless of direction). Non-NULL pairs use the canonical
-/// `Value::compare_sql` — the same ordering predicates and MIN/MAX use,
-/// so a query's ORDER BY can never disagree with its WHERE.
+/// Per-key comparator. NULL is +∞ — larger than every value — and the
+/// direction reversal applies to it like any other value: last under ASC,
+/// FIRST under DESC. This matches the Postgres/Oracle/DB2 default (the
+/// engines the project differential-tests against); MySQL differs
+/// (NULL = −∞). Non-NULL pairs use the canonical `Value::compare_sql` —
+/// the same ordering predicates and MIN/MAX use, so a query's ORDER BY
+/// can never disagree with its WHERE.
 fn compare_key(a: &Value, b: &Value, dir: SortDir) -> Ordering {
-    // NULL handling: NULL > everything (always sorts last).
-    match (a, b) {
-        (Value::Null, Value::Null) => return Ordering::Equal,
-        (Value::Null, _) => return Ordering::Greater,
-        (_, Value::Null) => return Ordering::Less,
-        _ => {}
-    }
-    let raw = match a.compare_sql(b) {
-        Some(ord) => ord,
-        None => {
-            // Incomparable non-NULL pair ⇒ mixed-type data in one sort
-            // column — an upstream constraint bug (the catalog enforces
-            // single-typed columns). Crash in dev; keep the order total
-            // in release rather than mis-order silently.
-            debug_assert!(false, "Sort: incomparable values {:?} vs {:?}", a, b);
-            Ordering::Equal
-        }
+    let raw = match (a, b) {
+        // NULL = +∞: resolved BEFORE direction so DESC flips it too.
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        _ => match a.compare_sql(b) {
+            Some(ord) => ord,
+            None => {
+                // Incomparable non-NULL pair ⇒ mixed-type data in one sort
+                // column — an upstream constraint bug (the catalog enforces
+                // single-typed columns). Crash in dev; keep the order total
+                // in release rather than mis-order silently.
+                debug_assert!(false, "Sort: incomparable values {:?} vs {:?}", a, b);
+                Ordering::Equal
+            }
+        },
     };
     match dir {
         SortDir::Asc => raw,

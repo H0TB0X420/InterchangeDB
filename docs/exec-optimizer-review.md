@@ -108,7 +108,9 @@ comments + `/snipe`) later.
 
 ### E8 — Sort NULL ordering ("always last") diverges from reference engines
 - **Where:** `execution/sort.rs:123-130` (`compare_key` resolves NULL before direction).
-- **Priority:** P2 · **Confidence:** high · **Status:** open (intentional / documented)
+- **Priority:** P2 · **Confidence:** high · **Status:** FIXED (2026-07-01) — adopted the
+  PG/Oracle/DB2 default (NULL = +∞, direction-aware: ASC last, DESC first). The
+  `NULLS FIRST/LAST` syntax option remains future work if per-query control is wanted.
 - **Detail:** NULLs sort **last under both ASC and DESC**. Postgres/Oracle/DB2 default to
   NULL=+∞ (ASC→last, DESC→**first**); MySQL to NULL=−∞ (ASC→first, DESC→last). This impl
   matches none consistently (matches PG for ASC, not DESC). Documented as an intentional

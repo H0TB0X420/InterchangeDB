@@ -750,7 +750,9 @@ fn try_lower_index_predicate(
 /// and `Compare` are leaf conjuncts — an `OR`/`NOT` is one indivisible unit, we
 /// never push half of it. Iterative (an explicit stack) so the recursion depth
 /// is the parsed `WHERE`'s `AND` nesting, not the call stack.
-fn flatten_conjuncts(pred: Predicate) -> Vec<Predicate> {
+/// `pub(crate)`: also used by `selinger.rs` to route WHERE conjuncts into
+/// per-relation selectivities (O10).
+pub(crate) fn flatten_conjuncts(pred: Predicate) -> Vec<Predicate> {
     let mut out = Vec::new();
     let mut stack = vec![pred];
     while let Some(p) = stack.pop() {
@@ -770,7 +772,7 @@ fn flatten_conjuncts(pred: Predicate) -> Vec<Predicate> {
 /// tuple). `Parameter`s and `Literal`s contribute nothing; by plan time
 /// parameters are substituted to literals anyway. Duplicates are allowed — the
 /// caller only checks each index against a range.
-fn referenced_columns(pred: &Predicate, out: &mut Vec<usize>) {
+pub(crate) fn referenced_columns(pred: &Predicate, out: &mut Vec<usize>) {
     match pred {
         Predicate::Compare { left, right, .. } => {
             columns_in_expr(left, out);
@@ -936,7 +938,7 @@ fn rebase_expr(expr: Expression, offset: usize) -> Expression {
 }
 
 /// Rebase every column in a predicate down by `offset` (see `rebase_expr`).
-fn rebase_predicate(pred: Predicate, offset: usize) -> Predicate {
+pub(crate) fn rebase_predicate(pred: Predicate, offset: usize) -> Predicate {
     match pred {
         Predicate::Compare { op, left, right } => Predicate::Compare {
             op,

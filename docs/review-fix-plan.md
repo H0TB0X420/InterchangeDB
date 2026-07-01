@@ -7,13 +7,14 @@ Cross-cutting, prioritized fix list distilled from the two findings logs:
 
 Ranked by severity × reachability. Report-only origin — nothing has been changed yet.
 
-> **2026-07-01 — implemented.** Sections 0 and 1 (all correctness fixes) plus the E9
-> hardening are DONE; see the per-item ✅ marks below and the flipped `Status: fixed`
-> lines in the findings logs. Section 2 (O10 selectivity wire-up, E8 NULL sort order)
-> and the remaining Section-3 cleanups are still open. New tests:
-> `tests/index_mvcc_recheck_test.rs`, `tests/join_strategy_equivalence_test.rs`,
-> `tests/binder_predicate_coercion_test.rs`, plus operator/unit tests in
-> `update.rs`, `delete.rs`, `hash_aggregate_test.rs`, `expr.rs`, `value.rs`.
+> **2026-07-01 — implemented.** Sections 0, 1 (all correctness fixes) AND 2 (O10
+> selectivity wire-up, E8 NULL sort order) are DONE; see the per-item ✅ marks below
+> and the flipped `Status: fixed` lines in the findings logs. Remaining: the
+> Section-3 cleanups and the versioned-index architecture decision (§0 verdict).
+> New tests: `tests/index_mvcc_recheck_test.rs`, `tests/join_strategy_equivalence_test.rs`,
+> `tests/binder_predicate_coercion_test.rs`, `where_selectivity_drives_reordering`
+> (selinger_reorder_test), plus operator/unit tests in `update.rs`, `delete.rs`,
+> `hash_aggregate_test.rs`, `expr.rs`, `value.rs`, `sort_operator_test.rs`.
 
 ---
 
@@ -57,8 +58,8 @@ Ranked by severity × reachability. Report-only origin — nothing has been chan
 
 | Fix | Findings | Notes |
 |---|---|---|
-| **Wire `local_selectivity` into the DP** (split WHERE per table via existing `flatten_conjuncts`/`referenced_columns`, call `estimate_predicate_selectivity`) | O10 | Highest-value optimizer improvement; activates machinery already built. Add a WHERE-driven reorder test. |
-| **Match reference-engine NULL sort order** (or add `NULLS FIRST/LAST`) | E8 | Differential fidelity vs PG/Oracle/DB2. |
+| ✅ **Wire `local_selectivity` into the DP** (split WHERE per table via existing `flatten_conjuncts`/`referenced_columns`, call `estimate_predicate_selectivity`) | O10 | DONE 2026-07-01 — `apply_local_selectivities` in `selinger.rs::build_join_graph`; `where_selectivity_drives_reordering` test (verified red pre-fix). |
+| ✅ **Match reference-engine NULL sort order** (or add `NULLS FIRST/LAST`) | E8 | DONE 2026-07-01 — NULL = +∞ direction-aware in `sort.rs::compare_key` (ASC last, DESC first, PG/Oracle/DB2 default). |
 
 ---
 

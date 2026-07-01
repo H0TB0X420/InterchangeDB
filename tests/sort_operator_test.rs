@@ -159,7 +159,9 @@ fn nulls_sort_last_under_asc() {
 }
 
 #[test]
-fn nulls_sort_last_under_desc() {
+fn nulls_sort_first_under_desc() {
+    // E8: NULL = +∞, so DESC puts NULLs FIRST — the Postgres/Oracle/DB2
+    // default, which the differential tests compare against.
     let (t, _d) = customer_table();
     t.insert(&row(1, "kim", Some("a"))).unwrap();
     t.insert(&row(2, "kim", None)).unwrap();
@@ -174,8 +176,8 @@ fn nulls_sort_last_under_desc() {
             _ => panic!(),
         })
         .collect();
-    // DESC: 'b', 'a', then NULL (still last — convention).
-    assert_eq!(ids, vec![3, 1, 2]);
+    // DESC: NULL first, then 'b', 'a'.
+    assert_eq!(ids, vec![2, 3, 1]);
 }
 
 #[test]
