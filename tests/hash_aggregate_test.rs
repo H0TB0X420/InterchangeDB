@@ -231,6 +231,22 @@ fn avg_int_yields_decimal_scale_4() {
     );
 }
 
+// E14: AVG rounds half away from zero instead of truncating —
+// AVG([1, 2, 2]) = 1.6667 at scale 4, not the truncated 1.6666.
+#[test]
+fn avg_int_rounds_instead_of_truncating() {
+    let (table, _d) = payments_table();
+    table.insert(&row(1, 1, 100, None)).unwrap();
+    table.insert(&row(2, 2, 100, None)).unwrap();
+    table.insert(&row(3, 2, 100, None)).unwrap();
+
+    let child = Box::new(SeqScan::new(&table).unwrap());
+    let mut op = HashAggregate::new(child, vec![AggregateFn::Avg(1)]).unwrap();
+    let r = collect_one(&mut op);
+    // 5/3 = 1.66666… → mantissa round(50000/3) = 16667.
+    assert_eq!(r[0], Value::Decimal(Decimal::from_i64_with_scale(16667, 4)));
+}
+
 #[test]
 fn avg_on_empty_input_returns_null() {
     let (table, _d) = payments_table();

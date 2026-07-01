@@ -414,10 +414,15 @@ fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Result
                 Value::Null
             } else {
                 // Promote to Decimal with scale 4 for fractional result.
-                // mantissa = (sum * 10_000) / count — computed in i128, but
-                // the Decimal mantissa is i64, so the narrowing must be
-                // checked (a near-i64::MAX sum over few rows overflows).
-                let mantissa = (s as i128 * 10_000) / count as i128;
+                // mantissa = round(sum·10_000 / count), half away from zero
+                // (E14 — SQL rounds: AVG([1,2,2]) = 1.6667, not the
+                // truncated 1.6666). Computed in i128; the i64 narrowing
+                // must be checked (a near-i64::MAX sum over few rows
+                // overflows the scale-4 mantissa).
+                let mantissa = crate::types::decimal::div_i128_round_half_away(
+                    s as i128 * 10_000,
+                    count as i128,
+                );
                 let mantissa = i64::try_from(mantissa).map_err(|_| {
                     crate::common::Error::NumericOverflow(format!(
                         "AVG result mantissa {} exceeds i64",
@@ -438,9 +443,18 @@ fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Result
             if count == 0 {
                 Value::Null
             } else {
-                // Decimal AVG: divide mantissa by count, preserve scale.
-                let mantissa = d.mantissa() / count as i64;
-                Value::Decimal(Decimal::from_i64_with_scale(mantissa, d.scale()))
+                // Decimal AVG: round(sum / count), half away from zero,
+                // preserving the input scale (E14 — was truncating).
+                // NOTE (plan deviation): reference engines also WIDEN the
+                // result scale; we keep the column's scale — the rounding
+                // fix lands now, scale-widening waits for a typed-AVG
+                // output-schema story.
+                let mantissa = crate::types::decimal::div_i128_round_half_away(
+                    d.mantissa() as i128,
+                    count as i128,
+                );
+                // |round(m/c)| ≤ |m| for c ≥ 1, so the i64 cast is exact.
+                Value::Decimal(Decimal::from_i64_with_scale(mantissa as i64, d.scale()))
             }
         }
         _ => unreachable!("finalize agg/state mismatch"),

@@ -21,10 +21,10 @@ use crate::types::Value;
 /// Volcano leaf operator: yields the row at `pk` if it exists, then None.
 pub struct PkLookup {
     schema: Arc<Schema>,
-    /// The fetched row, or `None` if the PK was absent. Taken on first
-    /// `next()`; subsequent calls return `Ok(None)`.
+    /// The fetched row, or `None` if the PK was absent. `take()`n on first
+    /// `next()`, so the emptied Option IS the exhaustion state — no
+    /// separate `done` flag needed (E2).
     row: Option<Tuple>,
-    done: bool,
 }
 
 impl PkLookup {
@@ -33,20 +33,12 @@ impl PkLookup {
     pub fn new<E: StorageEngine, L: DataLayout>(table: &Table<E, L>, pk: &[Value]) -> Result<Self> {
         let row = table.get_by_pk(pk)?;
         let schema = Arc::new(table.schema().clone());
-        Ok(Self {
-            schema,
-            row,
-            done: false,
-        })
+        Ok(Self { schema, row })
     }
 }
 
 impl Executor for PkLookup {
     fn next(&mut self) -> Result<Option<Tuple>> {
-        if self.done {
-            return Ok(None);
-        }
-        self.done = true;
         Ok(self.row.take())
     }
 

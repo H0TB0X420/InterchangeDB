@@ -25,7 +25,10 @@ impl Projection {
         let child_schema = child.schema();
         for &c in &cols {
             if c >= child_schema.columns.len() {
-                return Err(Error::StorageCorrupted(format!(
+                // A bad projection index is a planner bug (E6), not disk
+                // corruption — Internal, so storage-integrity alarms stay
+                // meaningful.
+                return Err(Error::Internal(format!(
                     "projection column index {} out of range (child has {} columns)",
                     c,
                     child_schema.columns.len()
@@ -133,9 +136,11 @@ mod tests {
     #[test]
     fn out_of_range_index_errors_at_construction() {
         let child = Box::new(VecExecutor::new(three_col_schema(), vec![]));
+        // E6: a planner-emitted bad index is an Internal invariant
+        // violation, not on-disk corruption.
         match Projection::new(child, vec![0, 99]) {
-            Err(Error::StorageCorrupted(_)) => {}
-            other => panic!("expected StorageCorrupted, got {:?}", other.err()),
+            Err(Error::Internal(_)) => {}
+            other => panic!("expected Internal, got {:?}", other.err()),
         }
     }
 

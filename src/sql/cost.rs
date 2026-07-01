@@ -104,7 +104,10 @@ pub trait CostModel: Send + Sync {
     fn cost_projection(&self, input_rows: f64) -> Cost;
     fn cost_limit(&self, output_rows: f64) -> Cost;
     fn cost_sort(&self, input_rows: f64) -> Cost;
-    fn cost_hash_aggregate(&self, input_rows: f64, groups: f64) -> Cost;
+    // NOTE: no aggregate costing yet — aggregates sit above the join tree,
+    // so the join-order DP never needs it. A `cost_hash_aggregate` existed
+    // here unused (O7); re-add with a group-aware signature when a caller
+    // (Phase 17 memo planner) exists.
 
     /// Nested-loop join: outer iterated once, inner re-iterated per
     /// outer row.
@@ -203,15 +206,6 @@ impl CostModel for DefaultCostModel {
         Cost {
             io_units: 0.0,
             cpu_units: n * n.log2(),
-        }
-    }
-
-    fn cost_hash_aggregate(&self, input_rows: f64, _groups: f64) -> Cost {
-        // One probe per input row; output cardinality is `groups`
-        // but the cost driver is the probe count.
-        Cost {
-            io_units: 0.0,
-            cpu_units: input_rows,
         }
     }
 

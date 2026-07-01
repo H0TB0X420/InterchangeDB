@@ -94,6 +94,11 @@ pub enum Error {
     /// Integer arithmetic overflowed during query evaluation (e.g. SUM over
     /// Int64 values). Raised instead of silently wrapping to a wrong result.
     NumericOverflow(String),
+    /// Internal invariant violation — a programmer error (e.g. the planner
+    /// emitted a plan the executor cannot satisfy), NOT data corruption.
+    /// Distinct from `StorageCorrupted` so on-disk-integrity alarms don't
+    /// fire for plan bugs.
+    Internal(String),
     /// Row not found at the given primary key during an operation that
     /// required it (UPDATE, DELETE-with-strict-semantics). Idempotent
     /// DELETE doesn't raise this. The `table` field is a layout-level
@@ -234,6 +239,7 @@ impl fmt::Display for Error {
             }
             Error::DecimalArithmetic(msg) => write!(f, "Decimal arithmetic error: {}", msg),
             Error::NumericOverflow(msg) => write!(f, "Numeric overflow: {}", msg),
+            Error::Internal(msg) => write!(f, "Internal invariant violation: {}", msg),
             Error::RowNotFound { table } => write!(f, "row not found in {}", table),
             Error::CatalogDrift(msg) => write!(f, "catalog drift: {}", msg),
             Error::ConstraintViolation { column, rule } => {

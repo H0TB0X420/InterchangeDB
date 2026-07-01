@@ -483,21 +483,17 @@ mod tests {
     }
 
     #[test]
-    fn decimal_div_dispatches_to_div_keeping_scale() {
-        // NOTE (semantic, plan deviation): `Decimal::div_keeping_scale`
-        // divides the raw mantissas (integer truncation) and preserves the
-        // dividend's scale, NOT decimal-style division. So 10.00 / 4.00 =
-        // 0.02, not 2.50. This matches the "INT/INT" semantic the type
-        // documents but diverges from standard SQL decimal division.
-        // TPC-C doesn't divide decimals — keep the wiring test, revisit the
-        // semantic when Phase 13 SUM/AVG land (AVG may need true division).
+    fn decimal_div_is_true_decimal_division() {
+        // O4 fixed: `Decimal::div_keeping_scale` now performs real decimal
+        // division rounded to the dividend's scale — 10.00 / 4.00 = 2.50.
+        // (The old mantissa-division semantic returned 0.02.)
         let f = Expression::BinaryOp {
             op: BinaryOp::Div,
             left: Box::new(lit(dec(1000, 2))),
             right: Box::new(lit(dec(400, 2))),
         }
         .compile();
-        assert_eq!(f(&vec![]), dec(2, 2));
+        assert_eq!(f(&vec![]), dec(250, 2));
     }
 
     #[test]

@@ -144,8 +144,13 @@ impl Decimal {
     }
 
     /// Divide two same-scale decimals; result keeps `self`'s scale.
-    /// Truncates toward zero (matches SQL `INT/INT`). Errors on scale mismatch
-    /// or division by zero.
+    ///
+    /// TRUE decimal division (O4): the result is `self / other` rounded to
+    /// this scale, half away from zero — `10.00 / 4.00 = 2.50`. (The prior
+    /// implementation divided raw mantissas with truncation, yielding
+    /// `0.02` for that input — an INT/INT semantic that was wrong for any
+    /// scale > 0.) Errors on scale mismatch, division by zero, or a result
+    /// mantissa exceeding i64.
     pub fn div_keeping_scale(&self, other: &Decimal) -> Result<Decimal> {
         if self.scale != other.scale {
             return Err(Error::DecimalArithmetic(format!(
@@ -156,16 +161,41 @@ impl Decimal {
         if other.mantissa == 0 {
             return Err(Error::DecimalArithmetic("div: division by zero".into()));
         }
-        let mantissa = self.mantissa.checked_div(other.mantissa).ok_or_else(|| {
+        // value = m_a / m_b (scales cancel); mantissa at scale s is
+        // round(m_a·10^s / m_b). i128 headroom: |m_a| < 2^63 and
+        // 10^s ≤ 10^MAX_SCALE = 1e18, so the product < 1e37 << i128::MAX.
+        let numerator = self.mantissa as i128 * 10i128.pow(self.scale as u32);
+        let mantissa = div_i128_round_half_away(numerator, other.mantissa as i128);
+        let mantissa = i64::try_from(mantissa).map_err(|_| {
             Error::DecimalArithmetic(format!(
-                "div: overflow: {} / {}",
-                self.mantissa, other.mantissa
+                "div: result mantissa overflows i64: {} / {} at scale {}",
+                self.mantissa, other.mantissa, self.scale
             ))
         })?;
         Ok(Decimal {
             mantissa,
             scale: self.scale,
         })
+    }
+}
+
+/// Integer division rounding half away from zero (SQL rounding), instead of
+/// Rust's truncation toward zero. Shared by decimal division and the AVG
+/// finalizers (E14/O4). `den` must be non-zero (callers check).
+pub(crate) fn div_i128_round_half_away(num: i128, den: i128) -> i128 {
+    debug_assert!(den != 0, "div_i128_round_half_away: zero divisor");
+    let quotient = num / den;
+    let remainder = num % den;
+    if 2 * remainder.abs() >= den.abs() {
+        // The discarded fraction is ≥ half: bump one step in the true
+        // quotient's sign direction.
+        if (num < 0) == (den < 0) {
+            quotient + 1
+        } else {
+            quotient - 1
+        }
+    } else {
+        quotient
     }
 }
 
@@ -280,17 +310,29 @@ mod tests {
     }
 
     #[test]
-    fn div_truncates_toward_zero() {
-        // 7 / 3 = 2 (truncation), keeping scale of dividend.
+    fn div_is_true_decimal_division_rounded() {
+        // O4: 10.00 / 4.00 = 2.50 (the old mantissa-division gave 0.02).
+        let a = Decimal::from_i64_with_scale(1000, 2);
+        let b = Decimal::from_i64_with_scale(400, 2);
+        let r = a.div_keeping_scale(&b).unwrap();
+        assert_eq!(r.mantissa(), 250);
+        assert_eq!(r.scale(), 2);
+        // 7 / 3 at scale 0: 2.33… rounds to 2; -7 / 3 → -2 (symmetric).
         let a = Decimal::from_i64_with_scale(7, 0);
         let b = Decimal::from_i64_with_scale(3, 0);
-        let r = a.div_keeping_scale(&b).unwrap();
-        assert_eq!(r.mantissa(), 2);
-        assert_eq!(r.scale(), 0);
-        // -7 / 3 = -2 (truncate toward zero, not floor).
+        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), 2);
         let a = Decimal::from_i64_with_scale(-7, 0);
-        let r = a.div_keeping_scale(&b).unwrap();
-        assert_eq!(r.mantissa(), -2);
+        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), -2);
+        // Half cases round away from zero: 5/2 → 3, -5/2 → -3.
+        let a = Decimal::from_i64_with_scale(5, 0);
+        let b = Decimal::from_i64_with_scale(2, 0);
+        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), 3);
+        let a = Decimal::from_i64_with_scale(-5, 0);
+        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), -3);
+        // 2/3 at scale 0: 0.67 rounds to 1 (old truncation gave 0).
+        let a = Decimal::from_i64_with_scale(2, 0);
+        let b = Decimal::from_i64_with_scale(3, 0);
+        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), 1);
     }
 
     #[test]

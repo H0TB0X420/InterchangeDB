@@ -249,6 +249,19 @@ where
                 out,
             });
             let (source, in_schema) = build_push(input, sink, engine, catalog)?;
+            // Validate column range at build time, exactly like Volcano's
+            // `Projection::new` (E16): an invalid plan must fail the same
+            // clean way under both models, never panic per-tuple in the
+            // sink's `tuple[i]`.
+            for &c in cols {
+                if c >= in_schema.columns.len() {
+                    return Err(crate::common::Error::Internal(format!(
+                        "projection column index {} out of range (child has {} columns)",
+                        c,
+                        in_schema.columns.len()
+                    )));
+                }
+            }
             Ok((source, project_schema(&in_schema, cols)))
         }
         // Everything else materializes regardless (indexed access, joins,
