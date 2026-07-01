@@ -1089,6 +1089,13 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
                 let cmp_op = map_compare_op(&cmp)?;
                 let l = bind_expression(scope, *left)?;
                 let r = bind_expression(scope, *right)?;
+                // O13: reconcile a literal operand with the compared
+                // column's type here, where the type is known. Runtime
+                // comparison is already exact across numeric
+                // representations; the narrowing matters for the ACCESS
+                // PATH — PkLookup/IndexScan lowering key-encodes the
+                // literal against the column type strictly.
+                let (l, r) = narrow_compare_operands(scope, l, r);
                 Ok(Predicate::Compare {
                     op: cmp_op,
                     left: l,
@@ -1109,6 +1116,46 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
             other
         ))),
     }
+}
+
+/// When one comparison operand is a column and the other a literal, narrow
+/// the literal to the column's type — but only when the conversion is
+/// value-preserving (`Value::coerce_exact`): `WHERE int32_col = 5` carries
+/// Int32(5) into plan lowering, `WHERE char_col = 'x'` a Char. A literal no
+/// value of the column type can equal (`int32_col = 5000000000`) is left
+/// untouched: it correctly matches nothing at runtime instead of erroring.
+fn narrow_compare_operands(
+    scope: &Scope,
+    l: Expression,
+    r: Expression,
+) -> (Expression, Expression) {
+    match (&l, &r) {
+        (Expression::Column(i), Expression::Literal(v)) => {
+            match column_type_at(scope, *i).and_then(|ty| v.coerce_exact(&ty)) {
+                Some(narrowed) => (l, Expression::Literal(narrowed)),
+                None => (l, r),
+            }
+        }
+        (Expression::Literal(v), Expression::Column(i)) => {
+            match column_type_at(scope, *i).and_then(|ty| v.coerce_exact(&ty)) {
+                Some(narrowed) => (Expression::Literal(narrowed), r),
+                None => (l, r),
+            }
+        }
+        _ => (l, r),
+    }
+}
+
+/// Column type at joined-tuple position `idx`, resolved through the
+/// scope's table layout. `None` when out of range — the caller leaves the
+/// operand untouched.
+fn column_type_at(scope: &Scope, idx: usize) -> Option<ColumnType> {
+    for t in &scope.tables {
+        if idx >= t.column_offset && idx < t.column_offset + t.schema.columns.len() {
+            return Some(t.schema.columns[idx - t.column_offset].ty);
+        }
+    }
+    None
 }
 
 fn map_arith_op(op: &BinaryOperator) -> Result<BinaryOp> {

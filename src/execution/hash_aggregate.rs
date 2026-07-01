@@ -197,7 +197,7 @@ impl HashAggregate {
 
         let mut output = Vec::with_capacity(states.len());
         for (agg, state) in self.aggregates.iter().zip(states.into_iter()) {
-            output.push(finalize_state(agg, state, &input_schema));
+            output.push(finalize_state(agg, state, &input_schema)?);
         }
         Ok(output)
     }
@@ -281,12 +281,14 @@ fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<
             Ok(())
         }
         (AggregateFn::Sum(i), AggState::SumInt(acc)) => {
+            // checked_add: a wrapped sum is a silently wrong answer — SQL
+            // engines raise numeric overflow instead (E13).
             match &row[*i] {
                 Value::Int32(v) => {
-                    *acc = Some(acc.unwrap_or(0).wrapping_add(*v as i64));
+                    *acc = Some(checked_sum(acc.unwrap_or(0), *v as i64, "SUM")?);
                 }
                 Value::Int64(v) => {
-                    *acc = Some(acc.unwrap_or(0).wrapping_add(*v));
+                    *acc = Some(checked_sum(acc.unwrap_or(0), *v, "SUM")?);
                 }
                 Value::Null => {}
                 other => {
@@ -343,11 +345,11 @@ fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<
         (AggregateFn::Avg(i), AggState::AvgInt { sum, count }) => {
             match &row[*i] {
                 Value::Int32(v) => {
-                    *sum = Some(sum.unwrap_or(0).wrapping_add(*v as i64));
+                    *sum = Some(checked_sum(sum.unwrap_or(0), *v as i64, "AVG")?);
                     *count += 1;
                 }
                 Value::Int64(v) => {
-                    *sum = Some(sum.unwrap_or(0).wrapping_add(*v));
+                    *sum = Some(checked_sum(sum.unwrap_or(0), *v, "AVG")?);
                     *count += 1;
                 }
                 Value::Null => {}
@@ -385,8 +387,8 @@ fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<
     }
 }
 
-fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Value {
-    match (agg, state) {
+fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Result<Value> {
+    Ok(match (agg, state) {
         (AggregateFn::CountStar | AggregateFn::Count(_), AggState::Count(c)) => {
             Value::Int64(c as i64)
         }
@@ -412,9 +414,17 @@ fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Value 
                 Value::Null
             } else {
                 // Promote to Decimal with scale 4 for fractional result.
-                // mantissa = (sum * 10_000) / count.
+                // mantissa = (sum * 10_000) / count — computed in i128, but
+                // the Decimal mantissa is i64, so the narrowing must be
+                // checked (a near-i64::MAX sum over few rows overflows).
                 let mantissa = (s as i128 * 10_000) / count as i128;
-                Value::Decimal(Decimal::from_i64_with_scale(mantissa as i64, 4))
+                let mantissa = i64::try_from(mantissa).map_err(|_| {
+                    crate::common::Error::NumericOverflow(format!(
+                        "AVG result mantissa {} exceeds i64",
+                        mantissa
+                    ))
+                })?;
+                Value::Decimal(Decimal::from_i64_with_scale(mantissa, 4))
             }
         }
         (AggregateFn::Avg(_), AggState::AvgDecimal { sum: None, .. }) => Value::Null,
@@ -434,28 +444,28 @@ fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Value 
             }
         }
         _ => unreachable!("finalize agg/state mismatch"),
-    }
+    })
 }
 
-/// Type-aware ordering for MIN/MAX. Mirrors the existing `eval_compare`
-/// rules: Int32/Int64 cross-promote; Decimal same-scale compares
-/// mantissas; everything else uses derived ordering when available,
-/// `Equal` otherwise (matches `eval_compare`'s false-on-mismatch).
+/// `acc + v` or a `NumericOverflow` error naming the aggregate — silent
+/// wrapping would return a confidently wrong number (E13).
+fn checked_sum(acc: i64, v: i64, agg_name: &str) -> Result<i64> {
+    acc.checked_add(v).ok_or_else(|| {
+        crate::common::Error::NumericOverflow(format!("{}: {} + {} exceeds i64", agg_name, acc, v))
+    })
+}
+
+/// Type-aware ordering for MIN/MAX — the canonical `Value::compare_sql`
+/// (same ordering as Sort and predicate evaluation). Callers skip NULLs
+/// before reaching here, so an incomparable pair means mixed-type data
+/// in one aggregated column — an upstream constraint bug. Crash in dev;
+/// keep the current accumulator in release rather than mis-pick silently.
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering::*;
-    match (a, b) {
-        (Value::Int32(x), Value::Int32(y)) => x.cmp(y),
-        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
-        (Value::Int32(x), Value::Int64(y)) => (*x as i64).cmp(y),
-        (Value::Int64(x), Value::Int32(y)) => x.cmp(&(*y as i64)),
-        (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
-        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
-        (Value::Decimal(x), Value::Decimal(y)) if x.scale() == y.scale() => {
-            x.mantissa().cmp(&y.mantissa())
+    match a.compare_sql(b) {
+        Some(ord) => ord,
+        None => {
+            debug_assert!(false, "MIN/MAX: incomparable values {:?} vs {:?}", a, b);
+            std::cmp::Ordering::Equal
         }
-        // Type mismatch or unsupported pair: keep current value (Equal
-        // sorts as "no change"). Matches eval_compare's conservative
-        // false-on-mismatch.
-        _ => Equal,
     }
 }

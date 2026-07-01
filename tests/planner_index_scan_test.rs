@@ -95,10 +95,13 @@ fn select_with_equality_on_indexed_column_lowers_to_indexscan() {
         "expected index name in plan:\n{}",
         text
     );
-    // Predicate dropped — no Filter should appear above the IndexScan.
+    // MVCC recheck: the predicate is re-applied as a Filter above the
+    // IndexScan. Secondary indexes are unversioned, so a stale entry can
+    // dereference to a visible row whose indexed value no longer matches;
+    // the recheck drops those false positives (E1).
     assert!(
-        !text.contains("Filter"),
-        "predicate should be dropped:\n{}",
+        text.contains("Filter"),
+        "recheck Filter should sit above the IndexScan:\n{}",
         text
     );
 }

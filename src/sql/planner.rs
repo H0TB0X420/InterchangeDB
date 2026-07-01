@@ -267,12 +267,20 @@ where
                 };
             } else {
                 match try_lower_index_predicate(pred, &left_indexes) {
-                    IndexLowering::Matched { handle, prefix } => {
+                    IndexLowering::Matched {
+                        handle,
+                        prefix,
+                        recheck,
+                    } => {
                         current = PhysOp::IndexScan {
                             table: table_name.clone(),
                             index: handle.def.name.clone(),
                             prefix,
                         };
+                        // MVCC recheck (see IndexLowering::Matched). With no
+                        // joins, `residual` becomes the Filter directly above
+                        // this leaf.
+                        residual.push(recheck);
                     }
                     IndexLowering::Unmatched(pred) => {
                         current = PhysOp::SeqScan {
@@ -651,35 +659,24 @@ fn try_lower_pk_lookup(pred: &Predicate, schema: &Schema) -> Option<Vec<crate::t
     // The key encoder demands the value's type match the PK column exactly
     // (e.g. an unconstrained `1` literal binds as Int64 but a w_id PK is Int32),
     // so coerce; bail to scan+filter if the value can't be represented.
-    let coerced = coerce_pk_value(value, &schema.columns[pk_col].ty)?;
+    let coerced = value.coerce_exact(&schema.columns[pk_col].ty)?;
     Some(vec![coerced])
-}
-
-/// Coerce a literal to a PK column's type for key encoding. Handles the
-/// int-width cross-binding (`Int64` literal vs `Int32`/`Int64` PK) and exact
-/// matches; anything else returns `None` so the caller falls back to a scan.
-fn coerce_pk_value(
-    value: &crate::types::Value,
-    ty: &crate::types::ColumnType,
-) -> Option<crate::types::Value> {
-    use crate::types::{ColumnType, Value};
-    match (value, ty) {
-        (Value::Int64(n), ColumnType::Int32) => i32::try_from(*n).ok().map(Value::Int32),
-        (Value::Int32(n), ColumnType::Int64) => Some(Value::Int64(*n as i64)),
-        (v, _) if v.matches(ty) => Some(v.clone()),
-        _ => None,
-    }
 }
 
 /// Result of attempting to lower a `WHERE` clause into an IndexScan.
 enum IndexLowering {
     /// A single-column equality predicate matched a single-column index.
     /// `handle` is the index; `prefix` is the literal value to scan for.
-    /// The original predicate is consumed and dropped — IndexScan
-    /// guarantees no false positives for this shape.
+    /// `recheck` is the original predicate, which the caller MUST re-apply
+    /// as a Filter above the IndexScan: secondary indexes are unversioned
+    /// (raw engine, physical delete on update) while table reads are MVCC,
+    /// so a stale index entry can dereference to a snapshot-visible row
+    /// whose current indexed value no longer equals `prefix`. The recheck
+    /// drops those false positives (E1/O12).
     Matched {
         handle: crate::table::IndexHandle,
         prefix: Vec<crate::types::Value>,
+        recheck: Predicate,
     },
     /// No index matched. Original predicate returned unchanged so the
     /// caller can drop it onto a `Filter` on top of `SeqScan`.
@@ -714,10 +711,24 @@ fn try_lower_index_predicate(
         for ix in indexes {
             // Only single-column indexes match this simple shape.
             if ix.def.columns == [col_idx] {
-                return IndexLowering::Matched {
-                    handle: ix.clone(),
-                    prefix: vec![lit],
-                };
+                // The IndexScan prefix is key-encoded strictly against the
+                // indexed column's type, so lower only when the literal is
+                // exactly representable in it. This must live HERE, not
+                // just in the binder: prepared statements substitute
+                // parameters after binding, so an Int64-bound `$1` against
+                // an Int32 index reaches this point un-narrowed. A
+                // non-representable literal (`WHERE int32_col = 5e9`)
+                // falls back to SeqScan + Filter → correctly zero rows.
+                match lit.coerce_exact(&ix.key_types[0]) {
+                    Some(coerced) => {
+                        return IndexLowering::Matched {
+                            handle: ix.clone(),
+                            prefix: vec![coerced],
+                            recheck: pred,
+                        };
+                    }
+                    None => break,
+                }
             }
         }
     }
@@ -874,12 +885,19 @@ fn build_left_leaf(
             continue;
         }
         match try_lower_index_predicate(pred, indexes) {
-            IndexLowering::Matched { handle, prefix } => {
+            IndexLowering::Matched {
+                handle,
+                prefix,
+                recheck,
+            } => {
                 access = Some(PhysOp::IndexScan {
                     table: table_name.to_string(),
                     index: handle.def.name.clone(),
                     prefix,
                 });
+                // MVCC recheck (see IndexLowering::Matched) — ANDed into the
+                // leaf Filter alongside the non-lowered conjuncts.
+                leftover.push(recheck);
             }
             IndexLowering::Unmatched(pred) => leftover.push(pred),
         }
@@ -1008,13 +1026,19 @@ where
             residual_filter = None;
         } else {
             match try_lower_index_predicate(pred, &indexes) {
-                IndexLowering::Matched { handle, prefix } => {
+                IndexLowering::Matched {
+                    handle,
+                    prefix,
+                    recheck,
+                } => {
                     child = PhysOp::IndexScan {
                         table: table_name.clone(),
                         index: handle.def.name.clone(),
                         prefix,
                     };
-                    residual_filter = None;
+                    // MVCC recheck (see IndexLowering::Matched). Vital here:
+                    // a false positive would UPDATE the wrong row.
+                    residual_filter = Some(recheck);
                 }
                 IndexLowering::Unmatched(pred) => {
                     child = PhysOp::SeqScan {
@@ -1065,13 +1089,19 @@ where
             residual_filter = None;
         } else {
             match try_lower_index_predicate(pred, &indexes) {
-                IndexLowering::Matched { handle, prefix } => {
+                IndexLowering::Matched {
+                    handle,
+                    prefix,
+                    recheck,
+                } => {
                     child = PhysOp::IndexScan {
                         table: table_name.clone(),
                         index: handle.def.name.clone(),
                         prefix,
                     };
-                    residual_filter = None;
+                    // MVCC recheck (see IndexLowering::Matched). Vital here:
+                    // a false positive would DELETE the wrong row.
+                    residual_filter = Some(recheck);
                 }
                 IndexLowering::Unmatched(pred) => {
                     child = PhysOp::SeqScan {

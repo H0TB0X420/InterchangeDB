@@ -99,6 +99,40 @@ fn sum_on_empty_input_returns_null() {
     assert_eq!(row, vec![Value::Null]);
 }
 
+// E13: SUM over Int64 must raise NumericOverflow instead of silently
+// wrapping to a (confidently wrong) negative number.
+#[test]
+fn sum_int64_overflow_errors_instead_of_wrapping() {
+    let (table, _d) = payments_table();
+    table.insert(&row(1, i64::MAX, 100, None)).unwrap();
+    table.insert(&row(2, 1, 100, None)).unwrap();
+    let child = Box::new(SeqScan::new(&table).unwrap());
+    let mut op = HashAggregate::new(child, vec![AggregateFn::Sum(1)]).unwrap();
+    let err = op.next().expect_err("SUM overflow must error");
+    assert!(
+        matches!(err, interchangedb::common::Error::NumericOverflow(_)),
+        "expected NumericOverflow, got {:?}",
+        err
+    );
+}
+
+// E13: the AVG finalizer widens sum×10_000 in i128 and then narrows to
+// the result Decimal's i64 mantissa — a near-i64::MAX average must error,
+// not silently truncate the mantissa.
+#[test]
+fn avg_int64_mantissa_overflow_errors() {
+    let (table, _d) = payments_table();
+    table.insert(&row(1, i64::MAX, 100, None)).unwrap();
+    let child = Box::new(SeqScan::new(&table).unwrap());
+    let mut op = HashAggregate::new(child, vec![AggregateFn::Avg(1)]).unwrap();
+    let err = op.next().expect_err("AVG mantissa overflow must error");
+    assert!(
+        matches!(err, interchangedb::common::Error::NumericOverflow(_)),
+        "expected NumericOverflow, got {:?}",
+        err
+    );
+}
+
 #[test]
 fn count_sum_min_max_int64() {
     let (table, _d) = payments_table();

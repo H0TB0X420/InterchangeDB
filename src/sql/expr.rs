@@ -16,8 +16,13 @@
 //! ## NULL semantics
 //!
 //! - `BinaryOp` with any NULL operand → `Value::Null`.
-//! - `Compare` with any NULL operand → `false` (SQL `WHERE NULL` filters).
-//! - Type mismatch → `Value::Null` for arithmetic, `false` for compare.
+//! - Predicates evaluate in Kleene three-valued logic: a comparison with a
+//!   NULL operand (or an incomparable type pair) is UNKNOWN; `AND`/`OR`/
+//!   `NOT` combine UNKNOWN per Kleene; the compiled `WHERE` closure keeps
+//!   only TRUE rows. Collapsing UNKNOWN→false at the leaf would be wrong
+//!   under `NOT`: `NOT (x = 5)` with `x` NULL must drop the row
+//!   (`NOT UNKNOWN = UNKNOWN`), not keep it.
+//! - Type mismatch → `Value::Null` for arithmetic, UNKNOWN for compare.
 //! - Division by zero → `Value::Null`.
 
 use serde::{Deserialize, Serialize};
@@ -81,6 +86,9 @@ pub enum CompareOp {
     Gt,
     Gte,
 }
+
+/// A compiled three-valued predicate: `None` is SQL UNKNOWN.
+type Predicate3VL = Box<dyn Fn(&Tuple) -> Option<bool> + Send>;
 
 // ===========================================================================
 // Compilation: IR → closures
@@ -162,7 +170,18 @@ impl Predicate {
 }
 
 impl Predicate {
+    /// Compile to a `WHERE`-semantics closure: the row passes only when
+    /// the predicate evaluates to TRUE — UNKNOWN and FALSE both drop it.
     pub fn compile(self) -> Box<dyn Fn(&Tuple) -> bool + Send> {
+        let f = self.compile_3vl();
+        Box::new(move |t| f(t) == Some(true))
+    }
+
+    /// Kleene three-valued compilation: `None` is UNKNOWN. The collapse
+    /// to two values happens once, at the `WHERE` boundary in `compile` —
+    /// never inside the tree, where `NOT` would invert a premature
+    /// collapse into a wrong answer.
+    fn compile_3vl(self) -> Predicate3VL {
         match self {
             Predicate::Compare { op, left, right } => {
                 let l = left.compile();
@@ -170,19 +189,43 @@ impl Predicate {
                 Box::new(move |t| eval_compare(op, &l(t), &r(t)))
             }
             Predicate::And(a, b) => {
-                let a = a.compile();
-                let b = b.compile();
-                // Short-circuit: don't evaluate b if a is false.
-                Box::new(move |t| a(t) && b(t))
+                let a = a.compile_3vl();
+                let b = b.compile_3vl();
+                // Kleene AND: FALSE dominates (short-circuit), UNKNOWN
+                // contaminates everything except FALSE.
+                Box::new(move |t| {
+                    let av = a(t);
+                    if av == Some(false) {
+                        return Some(false);
+                    }
+                    match (av, b(t)) {
+                        (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    }
+                })
             }
             Predicate::Or(a, b) => {
-                let a = a.compile();
-                let b = b.compile();
-                Box::new(move |t| a(t) || b(t))
+                let a = a.compile_3vl();
+                let b = b.compile_3vl();
+                // Kleene OR: TRUE dominates (short-circuit), UNKNOWN
+                // contaminates everything except TRUE.
+                Box::new(move |t| {
+                    let av = a(t);
+                    if av == Some(true) {
+                        return Some(true);
+                    }
+                    match (av, b(t)) {
+                        (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                })
             }
             Predicate::Not(p) => {
-                let p = p.compile();
-                Box::new(move |t| !p(t))
+                let p = p.compile_3vl();
+                // NOT UNKNOWN = UNKNOWN — the case that forces real 3VL.
+                Box::new(move |t| p(t).map(|b| !b))
             }
         }
     }
@@ -195,30 +238,25 @@ fn eval_binary_op(op: BinaryOp, l: Value, r: Value) -> Value {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Value::Null;
     }
+    // NOTE (semantic, plan deviation): integer overflow yields NULL, not a
+    // SQL-standard error — expression closures are infallible by design,
+    // and NULL is this module's uniform "arithmetic failure" result
+    // (div-by-zero and Decimal overflow already collapse to NULL via
+    // `apply_decimal_op`). The prior `wrapping_*` silently returned a
+    // WRONG NUMBER; NULL at least propagates as "no value" (O3/E13).
     match (l, r) {
         (Value::Int32(a), Value::Int32(b)) => match op {
-            BinaryOp::Add => Value::Int32(a.wrapping_add(b)),
-            BinaryOp::Sub => Value::Int32(a.wrapping_sub(b)),
-            BinaryOp::Mul => Value::Int32(a.wrapping_mul(b)),
-            BinaryOp::Div => {
-                if b == 0 {
-                    Value::Null
-                } else {
-                    Value::Int32(a / b)
-                }
-            }
+            BinaryOp::Add => a.checked_add(b).map(Value::Int32).unwrap_or(Value::Null),
+            BinaryOp::Sub => a.checked_sub(b).map(Value::Int32).unwrap_or(Value::Null),
+            BinaryOp::Mul => a.checked_mul(b).map(Value::Int32).unwrap_or(Value::Null),
+            // checked_div also covers i32::MIN / -1 (overflow), not just /0.
+            BinaryOp::Div => a.checked_div(b).map(Value::Int32).unwrap_or(Value::Null),
         },
         (Value::Int64(a), Value::Int64(b)) => match op {
-            BinaryOp::Add => Value::Int64(a.wrapping_add(b)),
-            BinaryOp::Sub => Value::Int64(a.wrapping_sub(b)),
-            BinaryOp::Mul => Value::Int64(a.wrapping_mul(b)),
-            BinaryOp::Div => {
-                if b == 0 {
-                    Value::Null
-                } else {
-                    Value::Int64(a / b)
-                }
-            }
+            BinaryOp::Add => a.checked_add(b).map(Value::Int64).unwrap_or(Value::Null),
+            BinaryOp::Sub => a.checked_sub(b).map(Value::Int64).unwrap_or(Value::Null),
+            BinaryOp::Mul => a.checked_mul(b).map(Value::Int64).unwrap_or(Value::Null),
+            BinaryOp::Div => a.checked_div(b).map(Value::Int64).unwrap_or(Value::Null),
         },
         // Decimal × Decimal — uses the type's checked arithmetic. Scale
         // mismatch on add/sub/div surfaces as NULL (the planner is
@@ -263,54 +301,23 @@ fn apply_decimal_op(op: BinaryOp, a: &Decimal, b: &Decimal) -> Value {
     }
 }
 
-/// NULL-as-false comparison. SQL `WHERE` clause discards NULL rows, so a
-/// `bool` return matches that semantic directly.
-fn eval_compare(op: CompareOp, l: &Value, r: &Value) -> bool {
-    if matches!(l, Value::Null) || matches!(r, Value::Null) {
-        return false;
-    }
-    // Cross-promote Int32 ↔ Int64 for ALL comparison ops. Without this,
-    // `WHERE w_id = 1` fails whenever w_id is Int32 and the literal binds
-    // as Int64 (the unconstrained-literal default). TPC-C predicates hit
-    // this on every Payment/NewOrder.
-    let (promoted_l, promoted_r) = match (l, r) {
-        (Value::Int32(a), Value::Int64(_)) => (Value::Int64(*a as i64), r.clone()),
-        (Value::Int64(_), Value::Int32(b)) => (l.clone(), Value::Int64(*b as i64)),
-        _ => (l.clone(), r.clone()),
-    };
-    let l = &promoted_l;
-    let r = &promoted_r;
-    match op {
-        CompareOp::Eq => l == r,
-        CompareOp::Neq => l != r,
-        CompareOp::Lt | CompareOp::Lte | CompareOp::Gt | CompareOp::Gte => {
-            let ord = match (l, r) {
-                (Value::Int32(a), Value::Int32(b)) => a.cmp(b),
-                (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
-                (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
-                (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-                // Decimal ordering: same-scale → compare mantissas.
-                // Cross-scale yields false (Phase 13 will add alignment).
-                (Value::Decimal(a), Value::Decimal(b)) if a.scale() == b.scale() => {
-                    a.mantissa().cmp(&b.mantissa())
-                }
-                // NOTE (Phase 13): Char/Bytes/Timestamp ordering. TPC-C uses
-                // these only in ORDER BY clauses, which Phase 13 introduces
-                // alongside Sort. Equality already works via `PartialEq`.
-                _ => return false,
-            };
-            use std::cmp::Ordering::*;
-            matches!(
-                (op, ord),
-                (CompareOp::Lt, Less)
-                    | (CompareOp::Lte, Less)
-                    | (CompareOp::Lte, Equal)
-                    | (CompareOp::Gt, Greater)
-                    | (CompareOp::Gte, Greater)
-                    | (CompareOp::Gte, Equal)
-            )
-        }
-    }
+/// Three-valued comparison over the canonical `Value::compare_sql` —
+/// the single comparator Sort, MIN/MAX, and join-key matching share, so
+/// every execution strategy answers comparisons identically. `None` is
+/// UNKNOWN: a NULL operand, or a type pair no value coercion can relate
+/// (Int vs Varchar). Covers the full orderable matrix — Int32↔Int64,
+/// Int↔Decimal, cross-scale Decimal, Varchar/Char/Bytes/Timestamp/Boolean.
+fn eval_compare(op: CompareOp, l: &Value, r: &Value) -> Option<bool> {
+    use std::cmp::Ordering::*;
+    let ord = l.compare_sql(r)?;
+    Some(match op {
+        CompareOp::Eq => ord == Equal,
+        CompareOp::Neq => ord != Equal,
+        CompareOp::Lt => ord == Less,
+        CompareOp::Lte => ord != Greater,
+        CompareOp::Gt => ord == Greater,
+        CompareOp::Gte => ord != Less,
+    })
 }
 
 #[cfg(test)]
@@ -364,6 +371,25 @@ mod tests {
         }
         .compile();
         assert_eq!(f(&vec![]), Value::Null);
+    }
+
+    #[test]
+    fn int_overflow_yields_null_not_wrap() {
+        // O3: checked arithmetic — overflow is "no value", never a wrapped
+        // wrong number. (See the NOTE in eval_binary_op for why NULL
+        // rather than a SQL error.)
+        let f = add(lit(Value::Int64(i64::MAX)), lit(Value::Int64(1))).compile();
+        assert_eq!(f(&vec![]), Value::Null);
+        let g = add(lit(Value::Int32(i32::MAX)), lit(Value::Int32(1))).compile();
+        assert_eq!(g(&vec![]), Value::Null);
+        // i32::MIN / -1 overflows too — checked_div covers it, not just /0.
+        let h = Expression::BinaryOp {
+            op: BinaryOp::Div,
+            left: Box::new(lit(Value::Int32(i32::MIN))),
+            right: Box::new(lit(Value::Int32(-1))),
+        }
+        .compile();
+        assert_eq!(h(&vec![]), Value::Null);
     }
 
     #[test]
@@ -514,10 +540,70 @@ mod tests {
     }
 
     #[test]
-    fn decimal_cross_scale_compare_yields_false() {
-        // 1.00 vs 0.1: scale mismatch → false (Phase 13 will align).
+    fn decimal_cross_scale_compares_exactly() {
+        // Cross-scale Decimals compare by mathematical value (via
+        // compare_sql's i128 widening): 1.00 < 0.1 is false, 0.1 < 1.00
+        // is true. The old comparator returned false for BOTH (silent
+        // no-rows on any cross-scale predicate).
         let f = cmp_op(CompareOp::Lt, lit(dec(100, 2)), lit(dec(1, 1))).compile();
         assert!(!f(&vec![]));
+        let g = cmp_op(CompareOp::Lt, lit(dec(1, 1)), lit(dec(100, 2))).compile();
+        assert!(g(&vec![]));
+    }
+
+    #[test]
+    fn int_decimal_ordering_works() {
+        // O2 repro: `WHERE c_balance > 0` with a Decimal column and an
+        // integer literal used to return no rows silently.
+        let f = cmp_op(CompareOp::Gt, col(0), lit(Value::Int64(0))).compile();
+        assert!(f(&vec![dec(1, 2)])); // 0.01 > 0
+        assert!(!f(&vec![dec(-1, 2)])); // -0.01 > 0 is false
+                                        // Equality across representations: 5 = 5.00.
+        let g = cmp_op(CompareOp::Eq, col(0), lit(Value::Int64(5))).compile();
+        assert!(g(&vec![dec(500, 2)]));
+    }
+
+    #[test]
+    fn timestamp_ordering_works() {
+        // O2 repro: Timestamp ordering used to return false for all rows.
+        let f = cmp_op(CompareOp::Gt, col(0), lit(Value::Timestamp(100))).compile();
+        assert!(f(&vec![Value::Timestamp(200)]));
+        assert!(!f(&vec![Value::Timestamp(50)]));
+    }
+
+    // ---- three-valued logic (Kleene) ----
+
+    #[test]
+    fn not_over_null_comparison_drops_row() {
+        // O1: `WHERE NOT (x = 5)` with x NULL. SQL: x = 5 is UNKNOWN,
+        // NOT UNKNOWN is UNKNOWN, WHERE drops the row. The old 2VL
+        // collapse (UNKNOWN→false at the leaf) kept it (`!false`).
+        let inner = compare(CompareOp::Eq, col(0), lit(Value::Int32(5)));
+        let f = Predicate::Not(Box::new(inner)).compile();
+        assert!(!f(&vec![Value::Null]));
+        // Non-NULL rows behave two-valued as before.
+        assert!(f(&vec![Value::Int32(6)]));
+        assert!(!f(&vec![Value::Int32(5)]));
+    }
+
+    #[test]
+    fn kleene_and_or_with_unknown() {
+        // UNKNOWN AND FALSE = FALSE, so NOT(...) = TRUE → row kept.
+        // (col0 = 5) with col0 NULL → UNKNOWN; (col1 = 1) with col1=2 → FALSE.
+        let a = compare(CompareOp::Eq, col(0), lit(Value::Int32(5)));
+        let b = compare(CompareOp::Eq, col(1), lit(Value::Int32(1)));
+        let not_and = Predicate::Not(Box::new(Predicate::And(Box::new(a), Box::new(b)))).compile();
+        assert!(not_and(&vec![Value::Null, Value::Int32(2)]));
+        // UNKNOWN AND TRUE = UNKNOWN → NOT → UNKNOWN → dropped.
+        assert!(!not_and(&vec![Value::Null, Value::Int32(1)]));
+
+        // UNKNOWN OR TRUE = TRUE → kept even under NOT-free WHERE.
+        let c = compare(CompareOp::Eq, col(0), lit(Value::Int32(5)));
+        let d = compare(CompareOp::Eq, col(1), lit(Value::Int32(1)));
+        let or = Predicate::Or(Box::new(c), Box::new(d)).compile();
+        assert!(or(&vec![Value::Null, Value::Int32(1)]));
+        // UNKNOWN OR FALSE = UNKNOWN → dropped.
+        assert!(!or(&vec![Value::Null, Value::Int32(2)]));
     }
 
     #[test]

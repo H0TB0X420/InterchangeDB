@@ -218,15 +218,44 @@ impl<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout>
             Some(r) => r,
             None => return Ok(()),
         };
-        let prefix: Vec<crate::types::Value> = self
-            .outer_key_cols
-            .iter()
-            .map(|&i| outer_row[i].clone())
-            .collect();
+        // Build the probe prefix, coercing each outer key to the indexed
+        // column's type (`Int64(5)` outer vs `Int32` indexed column must
+        // match, exactly as NestedLoopJoin's predicate would say). A NULL
+        // key never matches (SQL equi-join), and a value not exactly
+        // representable in the indexed type can't equal any entry — both
+        // mean an empty probe result, not an error.
+        let mut prefix: Vec<crate::types::Value> = Vec::with_capacity(self.outer_key_cols.len());
+        for &i in &self.outer_key_cols {
+            if matches!(outer_row[i], crate::types::Value::Null) {
+                return Ok(());
+            }
+            let indexed_col = self.inner_index.def.columns[prefix.len()];
+            let ty = &self.inner_table.schema().columns[indexed_col].ty;
+            match outer_row[i].coerce_exact(ty) {
+                Some(v) => prefix.push(v),
+                None => return Ok(()),
+            }
+        }
         let mut scan =
             crate::execution::IndexScan::new(&*self.inner_table, &self.inner_index, &prefix)?;
         while let Some(row) = scan.next()? {
-            self.current_inner_buffer.push(row);
+            // Recheck: secondary indexes are unversioned, so a stale entry
+            // can dereference to a visible row whose indexed columns no
+            // longer equal the probe key (same exposure as the planner's
+            // IndexScan recheck Filter, which INLJ bypasses because the ON
+            // predicate is consumed at plan time).
+            let matches_probe =
+                self.inner_index
+                    .def
+                    .columns
+                    .iter()
+                    .zip(&prefix)
+                    .all(|(&col, probe)| {
+                        row[col].compare_sql(probe) == Some(std::cmp::Ordering::Equal)
+                    });
+            if matches_probe {
+                self.current_inner_buffer.push(row);
+            }
         }
         Ok(())
     }
@@ -339,11 +368,15 @@ impl HashJoin {
             Vec<crate::execution::Tuple>,
         > = std::collections::HashMap::new();
         while let Some(row) = inner.next()? {
-            let key = row[inner_key_col].clone();
-            if matches!(key, crate::types::Value::Null) {
+            if matches!(row[inner_key_col], crate::types::Value::Null) {
                 // SQL equi-join: NULL never matches.
                 continue;
             }
+            // Canonical key form: hash-table equality must agree with
+            // `Value::compare_sql` (Int32(5) joins Int64(5), 5 joins 5.00)
+            // or the same query returns different rows under HashJoin than
+            // under NestedLoopJoin — strategy inequivalence (E11).
+            let key = row[inner_key_col].join_key_normalized();
             inner_table.entry(key).or_default().push(row);
         }
         Ok(Self {
@@ -379,7 +412,9 @@ impl Executor for HashJoin {
             self.matches_for_current = if matches!(key, crate::types::Value::Null) {
                 Vec::new()
             } else {
-                self.inner_table.get(key).cloned().unwrap_or_default()
+                // Probe with the same canonical form the build side used.
+                let key = key.join_key_normalized();
+                self.inner_table.get(&key).cloned().unwrap_or_default()
             };
             self.match_cursor = 0;
             self.current_outer = Some(row);

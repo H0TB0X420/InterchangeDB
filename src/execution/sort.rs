@@ -117,9 +117,9 @@ fn compare_rows(a: &Tuple, b: &Tuple, keys: &[(usize, SortDir)]) -> Ordering {
 }
 
 /// Per-key comparator. NULL is "infinity" for sort purposes (sorts last
-/// regardless of direction). For non-NULL pairs, applies cross-type
-/// numeric promotion and same-scale Decimal compare; falls back to
-/// `Ordering::Equal` on incomparable types (matches `eval_compare`).
+/// regardless of direction). Non-NULL pairs use the canonical
+/// `Value::compare_sql` — the same ordering predicates and MIN/MAX use,
+/// so a query's ORDER BY can never disagree with its WHERE.
 fn compare_key(a: &Value, b: &Value, dir: SortDir) -> Ordering {
     // NULL handling: NULL > everything (always sorts last).
     match (a, b) {
@@ -128,20 +128,16 @@ fn compare_key(a: &Value, b: &Value, dir: SortDir) -> Ordering {
         (_, Value::Null) => return Ordering::Less,
         _ => {}
     }
-    let raw = match (a, b) {
-        (Value::Int32(x), Value::Int32(y)) => x.cmp(y),
-        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
-        (Value::Int32(x), Value::Int64(y)) => (*x as i64).cmp(y),
-        (Value::Int64(x), Value::Int32(y)) => x.cmp(&(*y as i64)),
-        (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
-        (Value::Char(x), Value::Char(y)) => x.cmp(y),
-        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
-        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-        (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
-        (Value::Decimal(x), Value::Decimal(y)) if x.scale() == y.scale() => {
-            x.mantissa().cmp(&y.mantissa())
+    let raw = match a.compare_sql(b) {
+        Some(ord) => ord,
+        None => {
+            // Incomparable non-NULL pair ⇒ mixed-type data in one sort
+            // column — an upstream constraint bug (the catalog enforces
+            // single-typed columns). Crash in dev; keep the order total
+            // in release rather than mis-order silently.
+            debug_assert!(false, "Sort: incomparable values {:?} vs {:?}", a, b);
+            Ordering::Equal
         }
-        _ => Ordering::Equal,
     };
     match dir {
         SortDir::Asc => raw,

@@ -94,6 +94,181 @@ impl Value {
     }
 }
 
+impl Value {
+    /// Canonical SQL comparison — THE single source of truth for value
+    /// ordering and equality across the engine. `eval_compare` (filter and
+    /// join predicates), `Sort`, MIN/MAX aggregation, and join-key matching
+    /// all derive from this so every execution strategy stays equivalent.
+    ///
+    /// Returns `None` when the pair is not comparable under SQL semantics:
+    /// either operand is NULL (the comparison is UNKNOWN) or the types are
+    /// incompatible (e.g. Int vs Varchar). Callers pick the policy —
+    /// predicates treat `None` as UNKNOWN (row dropped); `Sort` asserts
+    /// incomparable non-NULL pairs can't happen (single-typed columns).
+    ///
+    /// Numerics compare by mathematical value across representations:
+    /// Int32/Int64 promote to i64; Int↔Decimal and cross-scale Decimals
+    /// compare exactly via i128 widening — |mantissa| < 2^63 times
+    /// 10^MAX_SCALE (= 1e18) stays below i128::MAX, so no overflow and no
+    /// rounding.
+    pub fn compare_sql(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Null, _) | (_, Value::Null) => None,
+            (Value::Int32(a), Value::Int32(b)) => Some(a.cmp(b)),
+            (Value::Int64(a), Value::Int64(b)) => Some(a.cmp(b)),
+            (Value::Int32(a), Value::Int64(b)) => Some((*a as i64).cmp(b)),
+            (Value::Int64(a), Value::Int32(b)) => Some(a.cmp(&(*b as i64))),
+            (Value::Varchar(a), Value::Varchar(b)) => Some(a.cmp(b)),
+            (Value::Char(a), Value::Char(b)) => Some(a.cmp(b)),
+            // Char and Varchar are one comparable string domain (values are
+            // stored unpadded, so plain string compare is exact). Keeps
+            // `WHERE char_col = 'lit'` (literal binds Varchar) meaningful.
+            (Value::Varchar(a), Value::Char(b)) => Some(a.cmp(b)),
+            (Value::Char(a), Value::Varchar(b)) => Some(a.cmp(b)),
+            (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+            (Value::Decimal(a), Value::Decimal(b)) => Some(compare_decimals(a, b)),
+            (Value::Int32(a), Value::Decimal(d)) => Some(compare_int_decimal(*a as i64, d)),
+            (Value::Int64(a), Value::Decimal(d)) => Some(compare_int_decimal(*a, d)),
+            (Value::Decimal(d), Value::Int32(b)) => {
+                Some(compare_int_decimal(*b as i64, d).reverse())
+            }
+            (Value::Decimal(d), Value::Int64(b)) => Some(compare_int_decimal(*b, d).reverse()),
+            _ => None,
+        }
+    }
+
+    /// Canonical join-key form: two values normalize to the same key IFF
+    /// `compare_sql` says they are Equal. Lets `HashJoin`'s hash-table
+    /// matching (derived `Hash`/`Eq` on the normalized value) agree exactly
+    /// with the predicate-driven strategies — strategy equivalence (E11).
+    ///
+    /// Int32 widens to Int64; Decimals strip trailing fractional zeros, and
+    /// integral Decimals collapse to Int64 (the mantissa IS an i64, so it
+    /// always fits); Char collapses to Varchar (one string domain). All
+    /// other variants are already canonical.
+    pub fn join_key_normalized(&self) -> Value {
+        match self {
+            Value::Int32(a) => Value::Int64(*a as i64),
+            Value::Char(s) => Value::Varchar(s.clone()),
+            Value::Decimal(d) => {
+                let mut mantissa = d.mantissa();
+                let mut scale = d.scale();
+                // Strip trailing zeros: 5.00 → 5, 1.50 → 1.5. Bounded by
+                // MAX_SCALE iterations.
+                while scale > 0 && mantissa % 10 == 0 {
+                    mantissa /= 10;
+                    scale -= 1;
+                }
+                if scale == 0 {
+                    Value::Int64(mantissa)
+                } else {
+                    Value::Decimal(Decimal::from_i64_with_scale(mantissa, scale))
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Value-preserving conversion to `ty`. `Some` only when the converted
+    /// value is mathematically equal to `self` (no truncation, no rounding);
+    /// `None` means no value of type `ty` can equal `self` — callers treat
+    /// that as "matches nothing" (e.g. an Int64 join key of 5 billion can
+    /// never equal any Int32). Used to encode index-probe keys whose source
+    /// column type differs from the indexed column's type.
+    pub fn coerce_exact(&self, ty: &ColumnType) -> Option<Value> {
+        match (self, ty) {
+            (Value::Int64(n), ColumnType::Int32) => i32::try_from(*n).ok().map(Value::Int32),
+            (Value::Int32(n), ColumnType::Int64) => Some(Value::Int64(*n as i64)),
+            (Value::Int32(n), ColumnType::Decimal { scale, .. }) => {
+                int_to_decimal_exact(*n as i64, *scale)
+            }
+            (Value::Int64(n), ColumnType::Decimal { scale, .. }) => {
+                int_to_decimal_exact(*n, *scale)
+            }
+            (Value::Decimal(d), ColumnType::Int32) => {
+                decimal_to_int_exact(d).and_then(|n| i32::try_from(n).ok().map(Value::Int32))
+            }
+            (Value::Decimal(d), ColumnType::Int64) => decimal_to_int_exact(d).map(Value::Int64),
+            (Value::Decimal(d), ColumnType::Decimal { scale, .. }) if d.scale() != *scale => {
+                rescale_decimal_exact(d, *scale)
+            }
+            // One string domain, two storage variants (both unpadded).
+            (Value::Varchar(s), ColumnType::Char(_)) => Some(Value::Char(s.clone())),
+            (Value::Char(s), ColumnType::Varchar(_)) => Some(Value::Varchar(s.clone())),
+            // Same-shape values (incl. same-scale Decimal) pass through;
+            // anything else is not representable in `ty`.
+            (v, _) if v.matches(ty) => Some(v.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Exact cross-scale Decimal compare: m_a/10^s_a vs m_b/10^s_b ⟺
+/// m_a·10^s_b vs m_b·10^s_a in i128 (overflow-free, see `compare_sql`).
+fn compare_decimals(a: &Decimal, b: &Decimal) -> std::cmp::Ordering {
+    if a.scale() == b.scale() {
+        return a.mantissa().cmp(&b.mantissa());
+    }
+    let lhs = a.mantissa() as i128 * pow10_i128(b.scale());
+    let rhs = b.mantissa() as i128 * pow10_i128(a.scale());
+    lhs.cmp(&rhs)
+}
+
+/// Exact Int-vs-Decimal compare: i vs m/10^s ⟺ i·10^s vs m in i128.
+fn compare_int_decimal(i: i64, d: &Decimal) -> std::cmp::Ordering {
+    let lhs = i as i128 * pow10_i128(d.scale());
+    let rhs = d.mantissa() as i128;
+    lhs.cmp(&rhs)
+}
+
+fn pow10_i128(scale: u8) -> i128 {
+    debug_assert!(scale <= Decimal::MAX_SCALE, "scale {} out of range", scale);
+    10i128.pow(scale as u32)
+}
+
+/// `i` as a Decimal with exactly `scale`: i·10^scale, `None` on i64
+/// mantissa overflow (then no Decimal at that scale equals `i`).
+fn int_to_decimal_exact(i: i64, scale: u8) -> Option<Value> {
+    let mantissa = i.checked_mul(10i64.checked_pow(scale as u32)?)?;
+    Some(Value::Decimal(Decimal::from_i64_with_scale(
+        mantissa, scale,
+    )))
+}
+
+/// The Decimal's integer value when it has no fractional part, else None.
+fn decimal_to_int_exact(d: &Decimal) -> Option<i64> {
+    let divisor = 10i64.pow(d.scale() as u32);
+    if d.mantissa() % divisor == 0 {
+        Some(d.mantissa() / divisor)
+    } else {
+        None
+    }
+}
+
+/// Rescale to `scale` only when exact: widening multiplies the mantissa
+/// (None on overflow); narrowing requires the dropped digits be zero.
+fn rescale_decimal_exact(d: &Decimal, scale: u8) -> Option<Value> {
+    if scale > d.scale() {
+        let factor = 10i64.checked_pow((scale - d.scale()) as u32)?;
+        let mantissa = d.mantissa().checked_mul(factor)?;
+        Some(Value::Decimal(Decimal::from_i64_with_scale(
+            mantissa, scale,
+        )))
+    } else {
+        let factor = 10i64.pow((d.scale() - scale) as u32);
+        if d.mantissa() % factor == 0 {
+            Some(Value::Decimal(Decimal::from_i64_with_scale(
+                d.mantissa() / factor,
+                scale,
+            )))
+        } else {
+            None
+        }
+    }
+}
+
 fn saturating_u16(n: usize) -> u16 {
     n.min(u16::MAX as usize) as u16
 }
@@ -234,6 +409,191 @@ mod tests {
             }
             other => panic!("unexpected: {:?}", other),
         }
+    }
+
+    // ---- compare_sql: the canonical comparator ----
+
+    fn dec(mantissa: i64, scale: u8) -> Value {
+        Value::Decimal(Decimal::from_i64_with_scale(mantissa, scale))
+    }
+
+    /// NULL on either side is UNKNOWN — never an ordering.
+    #[test]
+    fn compare_sql_null_is_unknown() {
+        assert_eq!(Value::Null.compare_sql(&Value::Int32(1)), None);
+        assert_eq!(Value::Int32(1).compare_sql(&Value::Null), None);
+        assert_eq!(Value::Null.compare_sql(&Value::Null), None);
+    }
+
+    /// Cross-representation numerics compare by mathematical value:
+    /// Int32↔Int64 promotion, Int↔Decimal, and cross-scale Decimals.
+    #[test]
+    fn compare_sql_numeric_promotions() {
+        use std::cmp::Ordering::*;
+        assert_eq!(Value::Int32(5).compare_sql(&Value::Int64(5)), Some(Equal));
+        assert_eq!(Value::Int64(4).compare_sql(&Value::Int32(5)), Some(Less));
+        // 5 vs 5.00 (Int vs Decimal, both directions).
+        assert_eq!(Value::Int64(5).compare_sql(&dec(500, 2)), Some(Equal));
+        assert_eq!(dec(500, 2).compare_sql(&Value::Int32(5)), Some(Equal));
+        // 0 < 0.01: the O2 shape `WHERE c_balance > 0` must work.
+        assert_eq!(Value::Int64(0).compare_sql(&dec(1, 2)), Some(Less));
+        // Cross-scale Decimals compare exactly: 1.50 == 1.5, 0.999 < 1.0.
+        assert_eq!(dec(150, 2).compare_sql(&dec(15, 1)), Some(Equal));
+        assert_eq!(dec(999, 3).compare_sql(&dec(10, 1)), Some(Less));
+        // Extreme mantissa/scale spread must not overflow (i128 widening).
+        assert_eq!(
+            dec(i64::MAX, 0).compare_sql(&dec(i64::MIN, 18)),
+            Some(Greater)
+        );
+    }
+
+    /// Ordering exists for every same-typed orderable pair — including the
+    /// Timestamp/Char/Bytes gaps eval_compare used to silently drop (O2).
+    #[test]
+    fn compare_sql_covers_all_orderable_types() {
+        use std::cmp::Ordering::*;
+        assert_eq!(
+            Value::Timestamp(1).compare_sql(&Value::Timestamp(2)),
+            Some(Less)
+        );
+        assert_eq!(
+            Value::Char("a".into()).compare_sql(&Value::Char("b".into())),
+            Some(Less)
+        );
+        assert_eq!(
+            Value::Bytes(vec![1]).compare_sql(&Value::Bytes(vec![2])),
+            Some(Less)
+        );
+        assert_eq!(
+            Value::Boolean(false).compare_sql(&Value::Boolean(true)),
+            Some(Less)
+        );
+    }
+
+    /// Type-incompatible pairs are UNKNOWN, not false-equal or false-less:
+    /// the negative space of the comparison matrix.
+    #[test]
+    fn compare_sql_incompatible_pairs_are_unknown() {
+        assert_eq!(
+            Value::Int32(1).compare_sql(&Value::Varchar("1".into())),
+            None
+        );
+        assert_eq!(Value::Timestamp(5).compare_sql(&Value::Int64(5)), None);
+        assert_eq!(Value::Boolean(true).compare_sql(&Value::Int32(1)), None);
+    }
+
+    /// Char and Varchar form one string domain (both stored unpadded):
+    /// `WHERE char_col = 'lit'` binds the literal Varchar and must match.
+    #[test]
+    fn compare_sql_char_varchar_one_domain() {
+        use std::cmp::Ordering::*;
+        assert_eq!(
+            Value::Varchar("a".into()).compare_sql(&Value::Char("a".into())),
+            Some(Equal)
+        );
+        assert_eq!(
+            Value::Char("a".into()).compare_sql(&Value::Varchar("b".into())),
+            Some(Less)
+        );
+    }
+
+    /// THE property join-key matching relies on: two values normalize to
+    /// the same key IFF compare_sql says Equal. Checked over a catalog of
+    /// pairs covering every equality-relevant representation split.
+    #[test]
+    fn join_key_normalized_agrees_with_compare_sql() {
+        let values = [
+            Value::Int32(5),
+            Value::Int64(5),
+            Value::Int32(6),
+            dec(500, 2), // 5.00
+            dec(5, 0),   // 5
+            dec(550, 2), // 5.50
+            dec(55, 1),  // 5.5
+            dec(0, 2),   // 0.00
+            Value::Int64(0),
+            Value::Timestamp(5),
+            Value::Varchar("5".into()),
+            Value::Char("5".into()),
+            Value::Boolean(true),
+        ];
+        for a in &values {
+            for b in &values {
+                let cmp_equal = a.compare_sql(b) == Some(std::cmp::Ordering::Equal);
+                let norm_equal = a.join_key_normalized() == b.join_key_normalized();
+                assert_eq!(
+                    cmp_equal, norm_equal,
+                    "normalize/compare disagree for {:?} vs {:?}",
+                    a, b
+                );
+            }
+        }
+    }
+
+    /// Negative mantissas strip trailing zeros correctly.
+    #[test]
+    fn join_key_normalized_negative_decimal() {
+        // -15.00 → -15 (integral → Int64); -15.5 keeps its fraction.
+        assert_eq!(dec(-1500, 2).join_key_normalized(), Value::Int64(-15));
+        assert_eq!(dec(-155, 1).join_key_normalized(), dec(-155, 1));
+    }
+
+    // ---- coerce_exact ----
+
+    /// Exact conversions succeed; value-changing ones return None.
+    #[test]
+    fn coerce_exact_int_and_decimal() {
+        // Int64 → Int32 in range / out of range.
+        assert_eq!(
+            Value::Int64(5).coerce_exact(&ColumnType::Int32),
+            Some(Value::Int32(5))
+        );
+        assert_eq!(
+            Value::Int64(5_000_000_000).coerce_exact(&ColumnType::Int32),
+            None
+        );
+        // Int → Decimal(scale 2): 5 → 5.00.
+        assert_eq!(
+            Value::Int32(5).coerce_exact(&ColumnType::Decimal {
+                precision: 10,
+                scale: 2
+            }),
+            Some(dec(500, 2))
+        );
+        // Decimal → Int only when integral.
+        assert_eq!(
+            dec(500, 2).coerce_exact(&ColumnType::Int64),
+            Some(Value::Int64(5))
+        );
+        assert_eq!(dec(550, 2).coerce_exact(&ColumnType::Int64), None);
+        // Decimal rescale: widening always exact, narrowing only when the
+        // dropped digits are zero.
+        assert_eq!(
+            dec(55, 1).coerce_exact(&ColumnType::Decimal {
+                precision: 10,
+                scale: 2
+            }),
+            Some(dec(550, 2))
+        );
+        assert_eq!(
+            dec(550, 2).coerce_exact(&ColumnType::Decimal {
+                precision: 10,
+                scale: 1
+            }),
+            Some(dec(55, 1))
+        );
+        assert_eq!(
+            dec(555, 2).coerce_exact(&ColumnType::Decimal {
+                precision: 10,
+                scale: 1
+            }),
+            None
+        );
+        // Incompatible shapes.
+        assert_eq!(
+            Value::Varchar("5".into()).coerce_exact(&ColumnType::Int32),
+            None
+        );
     }
 
     /// Every Value variant round-trips through bincode (covers the serde

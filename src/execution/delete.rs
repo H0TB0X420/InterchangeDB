@@ -1,8 +1,10 @@
 //! `Delete` — removes rows pulled from a child operator.
 //!
-//! Drains the child stream, extracts each row's PK using the target table's
-//! schema, and calls `Table::delete_by_pk` for each. Yields a single
-//! `[Int64(rows_deleted)]` summary tuple.
+//! Two phases, like `Update` (Halloween Problem): the READ phase drains
+//! the child and stages each target row's PK; the WRITE phase then calls
+//! `Table::delete_by_pk` for each. Deleting inside the read loop would
+//! mutate the B-tree under a live scan cursor once scans stream. Yields
+//! a single `[Int64(rows_deleted)]` summary tuple.
 //!
 //! Same child-schema-must-match-target assumption as `Update`.
 
@@ -40,11 +42,23 @@ impl<E: StorageEngine + 'static, L: DataLayout> Executor for Delete<E, L> {
             return Ok(None);
         }
         let pk_indices = self.table.schema().primary_key.clone();
-        let mut count: i64 = 0;
+        // READ phase: stage every target PK before touching the table
+        // (see module doc — Halloween Problem). Buffer bound: O(matching
+        // rows), the same class as the eager scan output feeding it.
+        let mut staged: Vec<Vec<Value>> = Vec::new();
         while let Some(row) = self.child.next()? {
+            debug_assert_eq!(
+                row.len(),
+                self.table.schema().columns.len(),
+                "Delete child tuple width must match the target table schema"
+            );
             let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
-            self.table.delete_by_pk(&pk_values)?;
-            count += 1;
+            staged.push(pk_values);
+        }
+        // WRITE phase: the child is fully drained; apply the staged deletes.
+        let count = staged.len() as i64;
+        for pk_values in &staged {
+            self.table.delete_by_pk(pk_values)?;
         }
         self.done = true;
         Ok(Some(vec![Value::Int64(count)]))
@@ -154,5 +168,52 @@ mod tests {
         let scan = Box::new(SeqScan::new(&*table).unwrap());
         let mut op = Delete::new(table, scan);
         assert_eq!(op.next().unwrap(), Some(vec![Value::Int64(0)]));
+    }
+
+    /// Child that proves read/write phase separation: on EVERY pull —
+    /// including the final `None` — it re-reads the table and asserts no
+    /// delete has landed yet. Fails loudly if the operator interleaves
+    /// deletes into the read loop (mutating the tree under a live cursor).
+    struct PhaseProbe {
+        table: Arc<Table<BTreeEngine, RowLayout>>,
+        baseline: Vec<Tuple>,
+        cursor: usize,
+    }
+
+    impl Executor for PhaseProbe {
+        fn next(&mut self) -> Result<Option<Tuple>> {
+            assert_eq!(
+                self.table.scan().unwrap(),
+                self.baseline,
+                "table mutated before the read phase finished (Halloween)"
+            );
+            let row = self.baseline.get(self.cursor).cloned();
+            self.cursor += 1;
+            Ok(row)
+        }
+
+        fn schema(&self) -> &Schema {
+            self.table.schema()
+        }
+    }
+
+    #[test]
+    fn deletes_are_deferred_until_child_is_fully_drained() {
+        let (table, _dir) = fresh_table();
+        for i in 1..=3 {
+            table.insert(&row(i, 100)).unwrap();
+        }
+        let probe = Box::new(PhaseProbe {
+            table: table.clone(),
+            baseline: table.scan().unwrap(),
+            cursor: 0,
+        });
+        let mut op = Delete::new(table.clone(), probe);
+
+        assert_eq!(op.next().unwrap(), Some(vec![Value::Int64(3)]));
+        // All deletes landed — after the drain.
+        for i in 1..=3 {
+            assert!(table.get_by_pk(&[Value::Int32(i)]).unwrap().is_none());
+        }
     }
 }

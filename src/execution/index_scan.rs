@@ -6,7 +6,11 @@
 //! `TxnEngine`, `get_by_pk` honors the snapshot. Index entries that
 //! reference rows invisible at the current snapshot are silently
 //! skipped — the secondary index is an auxiliary structure that can
-//! lead with stale pointers; correctness lives on the PK-table read.
+//! lead with stale pointers; correctness lives on the PK-table read
+//! PLUS the recheck Filter the planner places above this operator
+//! (`IndexLowering::Matched::recheck`): a stale entry can dereference
+//! to a *visible* row whose indexed column no longer equals the scan
+//! prefix, and only the recheck catches that.
 //!
 //! Eager-collect like `SeqScan`: avoid self-referential structs at
 //! the cost of buffering. Phase-11 streaming refactor will revisit.

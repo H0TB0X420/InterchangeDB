@@ -91,6 +91,9 @@ pub enum Error {
     /// Decimal arithmetic failure — overflow, scale mismatch, division by zero.
     /// Message describes which rule was violated.
     DecimalArithmetic(String),
+    /// Integer arithmetic overflowed during query evaluation (e.g. SUM over
+    /// Int64 values). Raised instead of silently wrapping to a wrong result.
+    NumericOverflow(String),
     /// Row not found at the given primary key during an operation that
     /// required it (UPDATE, DELETE-with-strict-semantics). Idempotent
     /// DELETE doesn't raise this. The `table` field is a layout-level
@@ -230,6 +233,7 @@ impl fmt::Display for Error {
                 write!(f, "write-write conflict: transaction {} committed a newer version", writer)
             }
             Error::DecimalArithmetic(msg) => write!(f, "Decimal arithmetic error: {}", msg),
+            Error::NumericOverflow(msg) => write!(f, "Numeric overflow: {}", msg),
             Error::RowNotFound { table } => write!(f, "row not found in {}", table),
             Error::CatalogDrift(msg) => write!(f, "catalog drift: {}", msg),
             Error::ConstraintViolation { column, rule } => {

@@ -1,9 +1,12 @@
 //! `Update` — applies set-expressions to rows pulled from a child.
 //!
-//! Drains the child stream, extracts PK from each row using the target
-//! table's schema, computes new column values via `set_exprs`, and calls
-//! `Table::update_columns` for each. Yields a single
-//! `[Int64(rows_updated)]` summary tuple, then None.
+//! Two phases (System R's Halloween Problem fix): the READ phase drains
+//! the child stream, staging each target row's PK and its new column
+//! values (evaluated against the row as read); only then does the WRITE
+//! phase call `Table::update_columns` for each staged target. Writing
+//! inside the read loop would let a mutation that changes a column the
+//! access path depends on re-visit and re-mutate rows once scans stream.
+//! Yields a single `[Int64(rows_updated)]` summary tuple, then None.
 //!
 //! Stops on the first error. Caller decides commit vs abort.
 //!
@@ -27,6 +30,10 @@ use crate::types::Value;
 
 /// `(column_index_in_schema, value_fn_from_input_row)`.
 pub type SetExpr = (usize, Box<dyn Fn(&Tuple) -> Value + Send>);
+
+/// One staged UPDATE target, captured during the read phase: the row's PK
+/// values and its computed `(column, new_value)` changes.
+type StagedUpdate = (Vec<Value>, Vec<(usize, Value)>);
 
 pub struct Update<E: StorageEngine, L: DataLayout> {
     table: Arc<Table<E, L>>,
@@ -59,16 +66,31 @@ impl<E: StorageEngine + 'static, L: DataLayout> Executor for Update<E, L> {
         // Vec is typically 1-3 elements so the clone is cheap. Revisit if
         // EXPLAIN output or benchmarking shows this is a hot copy.
         let pk_indices = self.table.schema().primary_key.clone();
-        let mut count: i64 = 0;
+        // READ phase: stage every target before touching the table (see
+        // module doc — Halloween Problem). Set-expressions are evaluated
+        // here, against the row as read, so `SET x = x + 1` can never see
+        // a value this same statement wrote. Buffer bound: O(matching
+        // rows), the same class as the eager scan output feeding it.
+        let mut staged: Vec<StagedUpdate> = Vec::new();
         while let Some(row) = self.child.next()? {
+            debug_assert_eq!(
+                row.len(),
+                self.table.schema().columns.len(),
+                "Update child tuple width must match the target table schema"
+            );
             let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
             let changes: Vec<(usize, Value)> = self
                 .set_exprs
                 .iter()
                 .map(|(idx, f)| (*idx, f(&row)))
                 .collect();
-            self.table.update_columns(&pk_values, &changes)?;
-            count += 1;
+            staged.push((pk_values, changes));
+        }
+        // WRITE phase: the child is fully drained; apply the staged
+        // mutations. Nothing below reads through the access path again.
+        let count = staged.len() as i64;
+        for (pk_values, changes) in &staged {
+            self.table.update_columns(pk_values, changes)?;
         }
         self.done = true;
         Ok(Some(vec![Value::Int64(count)]))
@@ -201,6 +223,55 @@ mod tests {
         // Three lines, three indent levels, correct nesting.
         let expected = "Update(account, set_cols=[1])\n  Filter\n    SeqScan(account)\n";
         assert_eq!(tree, expected);
+    }
+
+    /// Child that proves read/write phase separation: on EVERY pull —
+    /// including the final `None` — it re-reads the table and asserts no
+    /// mutation has landed yet. Fails loudly if the operator interleaves
+    /// writes into the read loop (the Halloween Problem).
+    struct PhaseProbe {
+        table: Arc<Table<BTreeEngine, RowLayout>>,
+        baseline: Vec<Tuple>,
+        cursor: usize,
+    }
+
+    impl Executor for PhaseProbe {
+        fn next(&mut self) -> Result<Option<Tuple>> {
+            assert_eq!(
+                self.table.scan().unwrap(),
+                self.baseline,
+                "table mutated before the read phase finished (Halloween)"
+            );
+            let row = self.baseline.get(self.cursor).cloned();
+            self.cursor += 1;
+            Ok(row)
+        }
+
+        fn schema(&self) -> &Schema {
+            self.table.schema()
+        }
+    }
+
+    #[test]
+    fn writes_are_deferred_until_child_is_fully_drained() {
+        let (table, _dir) = fresh_table();
+        for i in 1..=3 {
+            table.insert(&row(i, 100)).unwrap();
+        }
+        let probe = Box::new(PhaseProbe {
+            table: table.clone(),
+            baseline: table.scan().unwrap(),
+            cursor: 0,
+        });
+        let set_exprs: Vec<SetExpr> = vec![(1, Box::new(|_| Value::Int64(999)))];
+        let mut op = Update::new(table.clone(), probe, set_exprs);
+
+        assert_eq!(op.next().unwrap(), Some(vec![Value::Int64(3)]));
+        // All writes landed — after the drain.
+        for i in 1..=3 {
+            let r = table.get_by_pk(&[Value::Int32(i)]).unwrap().unwrap();
+            assert_eq!(r[1], Value::Int64(999));
+        }
     }
 
     #[test]
