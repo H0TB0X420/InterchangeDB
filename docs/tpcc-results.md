@@ -175,6 +175,27 @@ with complementary latency profiles — LSM wins p50 (no page churn on
 writes), B+Tree wins p99. Gates: LSM unit 53/53, cross-engine
 differential, engine conformance, LSM goldenscripts, config equivalence.
 
+### Post-fix interchange sweep (final) — commit `cc95622`
+
+Same config/protocol as the first sweep; both tuning fixes applied.
+
+| engine | exec | planner | tpmC | txn/s | p99 ms | fsyncs |
+|---|---|---|---|---|---|---|
+| btree | volcano | rule-based | 3446 | 128 | 180 | 3143 |
+| btree | push | rule-based | 3417 | 127 | 188 | 3150 |
+| btree | volcano | selinger | 3399 | 126 | 172 | 3137 |
+| btree | push | selinger | 3375 | 125 | 180 | 3108 |
+| lsm | push | rule-based | 3178 | 117 | 262 | 2427 |
+| lsm | volcano | rule-based | 3158 | 116 | 246 | 2444 |
+| lsm | push | selinger | 3145 | 116 | 279 | 2529 |
+| lsm | volcano | selinger | 3136 | 115 | 263 | 2540 |
+
+All eight configurations now land within a ~10% tpmC band (was 7.6×
+between engines). Engine gap ≈8% with distinct tail profiles (btree p99
+~180ms, lsm ~260ms); exec-model and planner axes are within run noise on
+both engines. This is the interchange-thesis table the phase set out to
+produce: swap any axis, keep a working, comparable system.
+
 ### Phase 16 outcome
 
 Tuning iteration 1 fixed both profiled bottlenecks: B+Tree **+5.7% tpmC
