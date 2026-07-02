@@ -26,11 +26,101 @@
 //! ## Reference
 //! Megiddo & Modha, "ARC: A Self-Tuning, Low Overhead Replacement Cache" (2003)
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
 
 use crate::common::{FrameId, PageId};
 
 use super::{EvictionPolicy, PolicyState};
+
+/// LRU-ordered list with O(log n) mid-list removal — sequence-numbered
+/// `BTreeMap` (order) + `HashMap` (membership).
+///
+/// T16.5 tuning fix: the previous `VecDeque` representation made ARC's
+/// cache-HIT path (`record_access` move-to-MRU) an O(pool_size)
+/// `retain` scan inside the global replacer mutex — the top user-code
+/// symbol in the TPC-C profile, with the other terminals parked on the
+/// mutex behind it. Iteration order (front = LRU, back = MRU) and every
+/// ARC semantic are unchanged; only the complexity class is.
+/// NOTE (perf): frames are dense, so T1/T2 could go O(1) via a
+/// slab-backed intrusive list; ghosts are sparse PageIds and could not.
+/// One uniform O(log n) structure is the KISS choice until a profile
+/// says the BTreeMap constants matter.
+struct OrderedList<K> {
+    /// Insertion order: ascending seq = LRU → MRU.
+    by_seq: BTreeMap<u64, K>,
+    /// Membership + reverse index for O(log n) removal.
+    seq_of: HashMap<K, u64>,
+    /// Monotonic per-list counter; u64 cannot realistically wrap.
+    next_seq: u64,
+}
+
+impl<K: Copy + Eq + Hash> OrderedList<K> {
+    fn new() -> Self {
+        Self {
+            by_seq: BTreeMap::new(),
+            seq_of: HashMap::new(),
+            next_seq: 0,
+        }
+    }
+
+    /// Append at the MRU end. A key already present moves to MRU.
+    fn push_back(&mut self, key: K) {
+        if let Some(seq) = self.seq_of.remove(&key) {
+            self.by_seq.remove(&seq);
+        }
+        self.by_seq.insert(self.next_seq, key);
+        self.seq_of.insert(key, self.next_seq);
+        self.next_seq += 1;
+    }
+
+    /// Remove `key` if present; true when it was.
+    fn remove(&mut self, key: &K) -> bool {
+        match self.seq_of.remove(key) {
+            Some(seq) => {
+                self.by_seq.remove(&seq);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove and return the LRU entry.
+    fn pop_front(&mut self) -> Option<K> {
+        let (_, key) = self.by_seq.pop_first()?;
+        self.seq_of.remove(&key);
+        Some(key)
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.seq_of.contains_key(key)
+    }
+
+    fn len(&self) -> usize {
+        self.seq_of.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.seq_of.is_empty()
+    }
+
+    /// LRU → MRU iteration.
+    fn iter(&self) -> impl Iterator<Item = &K> {
+        self.by_seq.values()
+    }
+
+    /// The LRU entry, if any. Test-only observer.
+    #[cfg(test)]
+    fn front(&self) -> Option<&K> {
+        self.by_seq.first_key_value().map(|(_, k)| k)
+    }
+
+    /// The MRU entry, if any. Test-only observer.
+    #[cfg(test)]
+    fn back(&self) -> Option<&K> {
+        self.by_seq.last_key_value().map(|(_, k)| k)
+    }
+}
 
 /// ARC (Adaptive Replacement Cache) replacement policy.
 ///
@@ -39,23 +129,18 @@ use super::{EvictionPolicy, PolicyState};
 pub struct ArcReplacer {
     /// T1: LRU list for pages seen once recently.
     /// Front = LRU (evict first), Back = MRU.
-    t1: VecDeque<FrameId>,
+    t1: OrderedList<FrameId>,
 
     /// T2: LRU list for pages seen at least twice.
     /// Front = LRU (evict first), Back = MRU.
-    t2: VecDeque<FrameId>,
+    t2: OrderedList<FrameId>,
 
-    /// B1: Ghost list for T1 (tracks recently evicted PageIds from T1).
-    b1: VecDeque<PageId>,
+    /// B1: Ghost list for T1 (recently evicted PageIds from T1).
+    /// Membership is intrinsic to `OrderedList` — no companion set.
+    b1: OrderedList<PageId>,
 
-    /// O(1) membership lookup companion for b1.
-    b1_set: HashSet<PageId>,
-
-    /// B2: Ghost list for T2 (tracks recently evicted PageIds from T2).
-    b2: VecDeque<PageId>,
-
-    /// O(1) membership lookup companion for b2.
-    b2_set: HashSet<PageId>,
+    /// B2: Ghost list for T2 (recently evicted PageIds from T2).
+    b2: OrderedList<PageId>,
 
     /// Target size for T1. Adapts based on ghost hits.
     /// Invariant: 0 <= p <= c
@@ -108,12 +193,10 @@ impl ArcReplacer {
     /// `capacity` is the number of frames in the buffer pool.
     pub fn new(capacity: usize) -> Self {
         Self {
-            t1: VecDeque::new(),
-            t2: VecDeque::new(),
-            b1: VecDeque::new(),
-            b1_set: HashSet::new(),
-            b2: VecDeque::new(),
-            b2_set: HashSet::new(),
+            t1: OrderedList::new(),
+            t2: OrderedList::new(),
+            b1: OrderedList::new(),
+            b2: OrderedList::new(),
             p: 0,
             c: capacity,
             frame_location: HashMap::new(),
@@ -136,37 +219,23 @@ impl ArcReplacer {
 
     /// Check if a PageId is in B1 ghost list (O(1)).
     fn in_b1(&self, page_id: PageId) -> bool {
-        self.b1_set.contains(&page_id)
+        self.b1.contains(&page_id)
     }
 
     /// Check if a PageId is in B2 ghost list (O(1)).
     fn in_b2(&self, page_id: PageId) -> bool {
-        self.b2_set.contains(&page_id)
+        self.b2.contains(&page_id)
     }
 
-    /// Remove a PageId from B1.
-    fn remove_from_b1(&mut self, page_id: PageId) {
-        if self.b1_set.remove(&page_id) {
-            self.b1.retain(|&p| p != page_id);
-        }
-    }
-
-    /// Remove a PageId from B2.
-    fn remove_from_b2(&mut self, page_id: PageId) {
-        if self.b2_set.remove(&page_id) {
-            self.b2.retain(|&p| p != page_id);
-        }
-    }
-
-    /// Remove a frame from T1 or T2.
+    /// Remove a frame from T1 or T2 — O(log n), not a list scan.
     fn remove_from_lists(&mut self, frame_id: FrameId) {
         if let Some(location) = self.frame_location.remove(&frame_id) {
             match location {
                 ListLocation::T1 => {
-                    self.t1.retain(|&f| f != frame_id);
+                    self.t1.remove(&frame_id);
                 }
                 ListLocation::T2 => {
-                    self.t2.retain(|&f| f != frame_id);
+                    self.t2.remove(&frame_id);
                 }
             }
         }
@@ -201,13 +270,12 @@ impl ArcReplacer {
 
     /// Evict the LRU evictable frame from T1.
     fn evict_from_t1(&mut self) -> Option<FrameId> {
-        // Find first evictable frame in T1 (from front = LRU)
-        let victim_idx = self
-            .t1
-            .iter()
-            .position(|&fid| self.evictable.contains(&fid))?;
+        // First evictable frame from the LRU end. The scan is O(pinned
+        // prefix), as before; the removal is O(log n) instead of an O(n)
+        // element shift.
+        let frame_id = *self.t1.iter().find(|fid| self.evictable.contains(fid))?;
 
-        let frame_id = self.t1.remove(victim_idx)?;
+        self.t1.remove(&frame_id);
         let page_id = self.frame_to_page.remove(&frame_id);
         self.frame_location.remove(&frame_id);
         self.evictable.remove(&frame_id);
@@ -215,7 +283,6 @@ impl ArcReplacer {
         // Add to B1 ghost list
         if let Some(pid) = page_id {
             self.b1.push_back(pid);
-            self.b1_set.insert(pid);
         }
 
         Some(frame_id)
@@ -223,13 +290,9 @@ impl ArcReplacer {
 
     /// Evict the LRU evictable frame from T2.
     fn evict_from_t2(&mut self) -> Option<FrameId> {
-        // Find first evictable frame in T2 (from front = LRU)
-        let victim_idx = self
-            .t2
-            .iter()
-            .position(|&fid| self.evictable.contains(&fid))?;
+        let frame_id = *self.t2.iter().find(|fid| self.evictable.contains(fid))?;
 
-        let frame_id = self.t2.remove(victim_idx)?;
+        self.t2.remove(&frame_id);
         let page_id = self.frame_to_page.remove(&frame_id);
         self.frame_location.remove(&frame_id);
         self.evictable.remove(&frame_id);
@@ -237,7 +300,6 @@ impl ArcReplacer {
         // Add to B2 ghost list
         if let Some(pid) = page_id {
             self.b2.push_back(pid);
-            self.b2_set.insert(pid);
         }
 
         Some(frame_id)
@@ -258,14 +320,10 @@ impl ArcReplacer {
 
         if l1_len >= self.c {
             // L1 is full — trim B1 to make room (Case IV A)
-            if let Some(pid) = self.b1.pop_front() {
-                self.b1_set.remove(&pid);
-            }
+            self.b1.pop_front();
         } else if l1_len + l2_len >= 2 * self.c {
             // Total directory is full — trim B2 (Case IV B)
-            if let Some(pid) = self.b2.pop_front() {
-                self.b2_set.remove(&pid);
-            }
+            self.b2.pop_front();
         }
     }
 }
@@ -288,14 +346,16 @@ impl EvictionPolicy for ArcReplacer {
 
             match location {
                 ListLocation::T1 => {
-                    // Case I: Hit in T1 → promote to T2 (MRU)
-                    self.t1.retain(|&f| f != frame_id);
+                    // Case I: Hit in T1 → promote to T2 (MRU). O(log n) —
+                    // this and the T2 arm are THE hot path (every cache
+                    // hit lands here under the replacer mutex).
+                    self.t1.remove(&frame_id);
                     self.t2.push_back(frame_id);
                     self.frame_location.insert(frame_id, ListLocation::T2);
                 }
                 ListLocation::T2 => {
-                    // Case I: Hit in T2 → move to MRU of T2
-                    self.t2.retain(|&f| f != frame_id);
+                    // Case I: Hit in T2 → move to MRU of T2 (push_back on
+                    // a present key re-sequences it to MRU).
                     self.t2.push_back(frame_id);
                 }
             }
@@ -326,7 +386,7 @@ impl EvictionPolicy for ArcReplacer {
             }
 
             // Remove from B1 AFTER delta computation (paper: "move x from B1 to T2").
-            self.remove_from_b1(page_id);
+            self.b1.remove(&page_id);
 
             // Add to T2 (MRU)
             self.t2.push_back(frame_id);
@@ -346,7 +406,7 @@ impl EvictionPolicy for ArcReplacer {
             }
 
             // Remove from B2 AFTER delta computation (paper: "move x from B2 to T2").
-            self.remove_from_b2(page_id);
+            self.b2.remove(&page_id);
 
             // Add to T2 (MRU)
             self.t2.push_back(frame_id);
@@ -433,7 +493,7 @@ impl EvictionPolicy for ArcReplacer {
         let mut score = 1u64;
 
         // T1 pages: lower scores (recency-based, colder)
-        for &frame_id in &self.t1 {
+        for &frame_id in self.t1.iter() {
             if let Some(&page_id) = self.frame_to_page.get(&frame_id) {
                 state.hot_pages.push((page_id, score));
                 score += 1;
@@ -442,7 +502,7 @@ impl EvictionPolicy for ArcReplacer {
 
         // T2 pages: higher scores (frequency-based, hotter)
         score += 1000; // Gap to separate T1 and T2
-        for &frame_id in &self.t2 {
+        for &frame_id in self.t2.iter() {
             if let Some(&page_id) = self.frame_to_page.get(&frame_id) {
                 state.hot_pages.push((page_id, score));
                 score += 1;
@@ -533,7 +593,6 @@ mod tests {
 
         // Manually populate B1 with a page
         replacer.b1.push_back(PageId::new(100));
-        replacer.b1_set.insert(PageId::new(100));
 
         let initial_p = replacer.p;
 
@@ -559,7 +618,6 @@ mod tests {
 
         // Manually populate B2 with a page
         replacer.b2.push_back(PageId::new(100));
-        replacer.b2_set.insert(PageId::new(100));
 
         let initial_p = replacer.p;
 

@@ -28,7 +28,7 @@ type FrozenMemtable = std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -221,6 +221,15 @@ impl LsmTree {
     }
 
     /// Scan a range of keys. Returns entries in sorted order, excluding tombstones.
+    ///
+    /// T16.5b: the range is pushed DOWN into every source. The previous
+    /// implementation cloned the full memtables, read every SSTable in its
+    /// entirety, merged the whole keyspace, and only then filtered — so
+    /// each scan (and, via `TxnEngine`'s MVCC reads, each point lookup)
+    /// materialized the entire dataset. Now memtables iterate only the
+    /// range, SSTables whose `[first_key, last_key]` span misses the range
+    /// are pruned on metadata alone (no I/O), and surviving sources are
+    /// range-trimmed before the merge.
     pub fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // Lock inner to snapshot memtable state.
         let inner = self.inner.lock();
@@ -228,17 +237,26 @@ impl LsmTree {
         // Collect all sources for the merge iterator.
         let mut sources: Vec<Vec<Entry>> = Vec::new();
 
-        // 1. Active memtable.
+        // Concrete bound pair — pins `BTreeMap::range`'s search type to
+        // Vec<u8> (Borrow is ambiguous with a bare bound tuple).
+        let bounds: (Bound<&Vec<u8>>, Bound<&Vec<u8>>) = (range.start_bound(), range.end_bound());
+
+        // 1. Active memtable — range-bounded iteration (BTreeMap::range).
         let memtable_entries: Vec<Entry> = inner
             .memtable
-            .iter()
+            .range(bounds)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         sources.push(memtable_entries);
 
-        // 2. Immutable memtables (newest first).
+        // 2. Immutable memtables (newest first), same range bound. These
+        // are raw frozen BTreeMaps, so pin the search type explicitly
+        // (same Borrow ambiguity as Memtable::range).
         for imm in inner.immutable_memtables.iter().rev() {
-            let entries: Vec<Entry> = imm.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let entries: Vec<Entry> = imm
+                .range::<Vec<u8>, _>(bounds)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             sources.push(entries);
         }
 
@@ -246,32 +264,41 @@ impl LsmTree {
         let level_state = inner.level_state.clone();
         drop(inner);
 
-        // 3. L0 SSTables (newest first).
+        // 3. L0 SSTables (newest first), skipping files whose key span
+        // cannot overlap the range.
         let mut readers = self.readers.lock();
         for meta in level_state.levels[0].iter().rev() {
+            if !span_overlaps_range(&meta.first_key, &meta.last_key, &range) {
+                continue;
+            }
             if let Some(reader) = readers.get_mut(&meta.id) {
-                let entries = reader.iter()?;
+                let mut entries = reader.iter()?;
+                entries.retain(|(k, _)| range.contains(k));
                 sources.push(entries);
             }
         }
 
-        // 4. L1+ SSTables (in order within each level).
+        // 4. L1+ SSTables (in order within each level), same pruning.
         for level_idx in 1..level_state.levels.len() {
             for meta in &level_state.levels[level_idx] {
+                if !span_overlaps_range(&meta.first_key, &meta.last_key, &range) {
+                    continue;
+                }
                 if let Some(reader) = readers.get_mut(&meta.id) {
-                    let entries = reader.iter()?;
+                    let mut entries = reader.iter()?;
+                    entries.retain(|(k, _)| range.contains(k));
                     sources.push(entries);
                 }
             }
         }
 
-        // Merge all sources.
+        // Merge the (already range-trimmed) sources.
         let merged = MergeIterator::new(sources).collect_all()?;
 
-        // Filter by range and remove tombstones.
+        // Remove tombstones. Every entry is in-range by construction; the
+        // dedup across sources is the merge's job.
         let result: Vec<(Vec<u8>, Vec<u8>)> = merged
             .into_iter()
-            .filter(|(key, _)| range.contains(key))
             .filter_map(|(key, value)| value.map(|v| (key, v)))
             .collect();
 
@@ -372,6 +399,23 @@ impl LsmTree {
     pub fn level_state(&self) -> LevelState {
         self.inner.lock().level_state.clone()
     }
+}
+
+/// Whether an SSTable whose keys span `[first, last]` (inclusive, from its
+/// manifest metadata) can contain any key of `range`. Pruning on this test
+/// skips the file entirely — no disk read (T16.5b).
+fn span_overlaps_range<R: RangeBounds<Vec<u8>>>(first: &[u8], last: &[u8], range: &R) -> bool {
+    let reaches_start = match range.start_bound() {
+        Bound::Included(s) => last >= s.as_slice(),
+        Bound::Excluded(s) => last > s.as_slice(),
+        Bound::Unbounded => true,
+    };
+    let starts_before_end = match range.end_bound() {
+        Bound::Included(e) => first <= e.as_slice(),
+        Bound::Excluded(e) => first < e.as_slice(),
+        Bound::Unbounded => true,
+    };
+    reaches_start && starts_before_end
 }
 
 #[cfg(test)]

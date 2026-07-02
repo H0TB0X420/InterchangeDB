@@ -84,7 +84,9 @@ impl Memtable {
         &self,
         range: R,
     ) -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> {
-        self.entries.range(range)
+        // Turbofish pins the search type: `Vec<u8>: Borrow<T>` admits both
+        // `T = Vec<u8>` and `T = [u8]`, so inference alone is ambiguous.
+        self.entries.range::<Vec<u8>, R>(range)
     }
 
     /// Number of entries (including tombstones).
