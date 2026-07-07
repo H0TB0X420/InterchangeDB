@@ -78,6 +78,20 @@ impl PolicyState {
     }
 }
 
+/// Block-movement counters (reproduction instrumentation).
+///
+/// Mirrors Table 1 of the Clock2Q+ paper (arXiv 2511.21958): how many
+/// blocks moved Small→Main (promotion), Small→Ghost (demotion), and
+/// Ghost→Main (recognized re-access). Policies without that queue
+/// structure simply never report these (see
+/// `EvictionPolicy::movement_stats`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MovementStats {
+    pub small_to_main: u64,
+    pub small_to_ghost: u64,
+    pub ghost_to_main: u64,
+}
+
 /// Trait for buffer pool eviction policies.
 ///
 /// An eviction policy decides which page to remove from the buffer pool
@@ -191,6 +205,17 @@ pub trait EvictionPolicy: Send {
     /// # Arguments
     /// * `state` - State exported from another policy
     fn import_state(&mut self, state: &PolicyState);
+
+    /// Queue-movement counters, if this policy tracks them.
+    ///
+    /// Reproduction instrumentation (Clock2Q+ Table 1, claim C8): lets a
+    /// trace-replay harness report Small/Main/Ghost movements through
+    /// `Box<dyn EvictionPolicy>` without knowing the concrete type.
+    /// Default: `None` — policies without the queue lineage have nothing
+    /// to report.
+    fn movement_stats(&self) -> Option<MovementStats> {
+        None
+    }
 }
 
 #[cfg(test)]

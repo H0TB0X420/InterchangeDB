@@ -4,8 +4,8 @@
 //! tests). Driven from [`crate::for_each_policy`].
 
 use interchangedb::buffer::replacer::{
-    ArcReplacer, ClockReplacer, EvictionPolicy, FifoReplacer, LruKReplacer, LruReplacer,
-    TwoQReplacer,
+    ArcReplacer, Clock2QPlusReplacer, ClockReplacer, EvictionPolicy, FifoReplacer, LruKCrpReplacer,
+    LruKReplacer, LruReplacer, TwoQReplacer,
 };
 use interchangedb::common::{FrameId, PageId};
 
@@ -30,11 +30,27 @@ pub fn lru() -> Box<dyn EvictionPolicy> {
 pub fn lru_k() -> Box<dyn EvictionPolicy> {
     Box::new(LruKReplacer::new(2))
 }
+pub fn lru_k_crp() -> Box<dyn EvictionPolicy> {
+    // CRP = 5% of CAP (the sweep's middle value), RIP = CAP.
+    Box::new(LruKCrpReplacer::new(2, (CAP as u64 * 5 / 100).max(1), CAP))
+}
 pub fn two_q() -> Box<dyn EvictionPolicy> {
     Box::new(TwoQReplacer::new(CAP))
 }
 pub fn arc() -> Box<dyn EvictionPolicy> {
     Box::new(ArcReplacer::new(CAP))
+}
+pub fn clock2q_plus() -> Box<dyn EvictionPolicy> {
+    Box::new(Clock2QPlusReplacer::new(CAP))
+}
+pub fn s3_fifo() -> Box<dyn EvictionPolicy> {
+    Box::new(Clock2QPlusReplacer::s3_fifo(CAP))
+}
+pub fn s3_fifo_2bit() -> Box<dyn EvictionPolicy> {
+    Box::new(Clock2QPlusReplacer::s3_fifo_2bit(CAP))
+}
+pub fn clock_two_q() -> Box<dyn EvictionPolicy> {
+    Box::new(Clock2QPlusReplacer::clock_two_q(CAP))
 }
 
 /// Runtime view of the policy registry — for differentials and benches that

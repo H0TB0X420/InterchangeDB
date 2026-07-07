@@ -38,6 +38,12 @@ pub struct FifoReplacer {
     /// Imported page scores from warm swap, waiting to be assigned to frames.
     /// When record_access() sees a page with a score here, it transfers to frame_scores.
     pending_page_scores: HashMap<PageId, u64>,
+
+    /// Next score for a fresh frame. Invariant: strictly greater than
+    /// every score in `frame_scores`. Replaced a `values().max()` scan
+    /// on every insertion — O(n) per miss, quadratic at trace-replay
+    /// cache sizes (found by the Clock2Q+ reproduction runs).
+    next_score: u64,
 }
 
 impl FifoReplacer {
@@ -50,6 +56,7 @@ impl FifoReplacer {
             frame_to_page: HashMap::new(),
             frame_scores: HashMap::new(),
             pending_page_scores: HashMap::new(),
+            next_score: 1,
         }
     }
 
@@ -82,13 +89,13 @@ impl EvictionPolicy for FifoReplacer {
                 let pos = self.find_insert_position(score);
                 self.queue.insert(pos, frame_id);
                 self.frame_scores.insert(frame_id, score);
+                self.next_score = self.next_score.max(score + 1);
             } else {
                 // No imported score: append to back (standard FIFO behavior)
-                // Give it a score higher than any existing, so it's evicted last
-                let max_score = self.frame_scores.values().max().copied().unwrap_or(0);
-                let new_score = max_score + 1;
+                // with a score higher than any existing, so it's evicted last
                 self.queue.push_back(frame_id);
-                self.frame_scores.insert(frame_id, new_score);
+                self.frame_scores.insert(frame_id, self.next_score);
+                self.next_score += 1;
             }
             self.in_queue.insert(frame_id);
         }

@@ -20,72 +20,84 @@
 //! ## Reference
 //! O'Neil et al., "The LRU-K Page Replacement Algorithm" (1993)
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::common::{FrameId, PageId};
 
 use super::{EvictionPolicy, PolicyState};
 
-/// Tracks the last K access timestamps for a frame.
+/// Tracks the last K access times for a frame.
+///
+/// Times are ticks of the replacer's logical `access_clock`, not wall
+/// clock: K-distance ORDERING depends only on the order of kth-recent
+/// accesses (elapsed time grows uniformly for every frame), so a logical
+/// counter preserves the algorithm exactly while removing the
+/// `Instant::now` syscall per access and the nondeterministic eviction
+/// order that same-nanosecond timestamp ties produced.
 #[derive(Debug, Clone)]
 struct AccessHistory {
-    /// Timestamps of recent accesses, newest at back.
-    /// Maximum length is K.
-    timestamps: VecDeque<Instant>,
+    /// Logical times of recent accesses, newest at back. Max length K.
+    timestamps: VecDeque<u64>,
 
     /// The page currently in this frame.
     page_id: PageId,
 
-    /// Timestamp of first access (for FIFO tie-breaking among +∞ distance frames).
-    first_access: Instant,
+    /// Logical time of first access (FIFO tie-break among +∞ frames).
+    first_access_seq: u64,
 }
 
 impl AccessHistory {
-    fn new(page_id: PageId, k: usize) -> Self {
-        let now = Instant::now();
+    fn new(page_id: PageId, k: usize, seq: u64) -> Self {
         let mut timestamps = VecDeque::with_capacity(k);
-        timestamps.push_back(now);
+        timestamps.push_back(seq);
         Self {
             timestamps,
             page_id,
-            first_access: now,
+            first_access_seq: seq,
         }
     }
 
-    /// Record a new access, keeping only the last K timestamps.
-    fn record_access(&mut self, k: usize) {
-        self.timestamps.push_back(Instant::now());
+    /// Record a new access, keeping only the last K times.
+    fn record_access(&mut self, k: usize, seq: u64) {
+        self.timestamps.push_back(seq);
         while self.timestamps.len() > k {
             self.timestamps.pop_front();
         }
     }
 
-    /// Calculate backward K-distance.
-    /// Returns None if < K accesses (represents +∞ distance).
-    fn k_distance(&self, k: usize) -> Option<u128> {
+    /// Logical time of the Kth most recent access.
+    /// Returns None if < K accesses (backward K-distance = +∞).
+    fn kth_recent_seq(&self, k: usize) -> Option<u64> {
         if self.timestamps.len() < k {
             None // +∞ distance
         } else {
             // Kth most recent is at index len - k
-            let kth_access = self.timestamps[self.timestamps.len() - k];
-            Some(kth_access.elapsed().as_nanos())
+            Some(self.timestamps[self.timestamps.len() - k])
         }
     }
 
-    /// Calculate a score for warm swap export.
-    /// Higher score = hotter = smaller K-distance = evict later.
+    /// Eviction sort key: the victim is the MINIMUM key.
+    ///
+    /// Class 0 = +∞ K-distance (evict first), FIFO by first access;
+    /// class 1 = finite, oldest kth-recent access first (= largest
+    /// backward K-distance). `frame.0` last makes keys unique so a
+    /// `BTreeSet` can hold one entry per evictable frame. Keys change
+    /// only on `record_access`, so the set stays sorted between updates.
+    fn victim_key(&self, k: usize, frame_id: FrameId) -> (u8, u64, usize) {
+        match self.kth_recent_seq(k) {
+            None => (0, self.first_access_seq, frame_id.0),
+            Some(kth_seq) => (1, kth_seq, frame_id.0),
+        }
+    }
+
+    /// Score for warm swap export.
+    /// Higher score = hotter = more recent kth access = evict later.
     fn hotness_score(&self, k: usize) -> u64 {
-        match self.k_distance(k) {
+        match self.kth_recent_seq(k) {
             None => 0, // +∞ distance = coldest
-            Some(distance_nanos) => {
-                // Invert distance: smaller distance = higher score
-                // Use saturating subtraction to avoid overflow
-                let max_score = u64::MAX;
-                // Cap distance to u64 range
-                let capped_distance = distance_nanos.min(max_score as u128) as u64;
-                max_score.saturating_sub(capped_distance)
-            }
+            // +1 keeps every finite-distance frame strictly hotter than
+            // the +∞ class (importers treat score > 0 as "hot").
+            Some(kth_seq) => kth_seq + 1,
         }
     }
 }
@@ -101,8 +113,14 @@ pub struct LruKReplacer {
     /// Access history for each frame.
     history: HashMap<FrameId, AccessHistory>,
 
-    /// Set of frames that are evictable.
-    evictable: HashSet<FrameId>,
+    /// Evictable frames ordered by `victim_key` — `evict()` pops the
+    /// first entry, O(log n). Replaced the old evictable HashSet + full
+    /// linear max-scan per eviction (quadratic at trace-replay cache
+    /// sizes, found by the Clock2Q+ reproduction runs).
+    victim_order: BTreeSet<(u8, u64, usize)>,
+
+    /// Logical access clock; incremented on every `record_access`.
+    access_clock: u64,
 
     /// Imported page scores waiting for frame assignment.
     pending_page_scores: HashMap<PageId, u64>,
@@ -118,7 +136,8 @@ impl LruKReplacer {
         Self {
             k,
             history: HashMap::new(),
-            evictable: HashSet::new(),
+            victim_order: BTreeSet::new(),
+            access_clock: 0,
             pending_page_scores: HashMap::new(),
         }
     }
@@ -146,24 +165,32 @@ impl EvictionPolicy for LruKReplacer {
     }
 
     fn record_access(&mut self, frame_id: FrameId, page_id: PageId) {
+        self.access_clock += 1;
+        let seq = self.access_clock;
+
         if let Some(hist) = self.history.get_mut(&frame_id) {
-            // Existing frame: record new access
-            hist.record_access(self.k);
+            // Existing frame: its victim key changes, so pull it out of
+            // the eviction order (if evictable), update, and re-file.
+            let was_evictable = self.victim_order.remove(&hist.victim_key(self.k, frame_id));
+            hist.record_access(self.k, seq);
             hist.page_id = page_id;
+            if was_evictable {
+                let inserted = self.victim_order.insert(hist.victim_key(self.k, frame_id));
+                assert!(inserted, "victim keys are unique per frame");
+            }
         } else {
             // New frame: check for imported score
-            let mut hist = AccessHistory::new(page_id, self.k);
+            let mut hist = AccessHistory::new(page_id, self.k, seq);
 
             if let Some(score) = self.pending_page_scores.remove(&page_id) {
                 // Seed history based on imported score
                 // Higher score = hotter = simulate more recent/frequent access
                 if score > 0 {
-                    // Add K accesses to give finite K-distance
-                    // Space them based on score (higher score = more recent)
-                    let now = Instant::now();
+                    // Add K accesses at the current time to give a finite,
+                    // maximally recent K-distance
                     hist.timestamps.clear();
                     for _ in 0..self.k {
-                        hist.timestamps.push_back(now);
+                        hist.timestamps.push_back(seq);
                     }
                 }
                 // If score == 0, leave with single access (+∞ distance)
@@ -175,63 +202,38 @@ impl EvictionPolicy for LruKReplacer {
 
     fn set_evictable(&mut self, frame_id: FrameId, evictable: bool) {
         // Q-35 contract: `evictable ⊆ tracked` — see FifoReplacer.
-        if evictable && !self.history.contains_key(&frame_id) {
+        let Some(hist) = self.history.get(&frame_id) else {
             return;
-        }
+        };
+        let key = hist.victim_key(self.k, frame_id);
         if evictable {
-            self.evictable.insert(frame_id);
+            self.victim_order.insert(key); // idempotent re-insert
         } else {
-            self.evictable.remove(&frame_id);
+            self.victim_order.remove(&key);
         }
     }
 
     fn evict(&mut self) -> Option<FrameId> {
-        if self.evictable.is_empty() {
-            return None;
-        }
+        // Victim = minimum key: +∞-distance frames (class 0, FIFO) before
+        // finite ones (class 1, oldest kth-recent access first).
+        let &(class, seq, frame_index) = self.victim_order.iter().next()?;
+        let removed = self.victim_order.remove(&(class, seq, frame_index));
+        assert!(removed, "victim key must be present");
 
-        // Find evictable frame with MAXIMUM K-distance (lowest score)
-        // Tie-break: among +∞ frames, evict the one with oldest first_access (FIFO)
-        let victim = self
-            .evictable
-            .iter()
-            .filter_map(|&fid| {
-                self.history.get(&fid).map(|hist| {
-                    let k_dist = hist.k_distance(self.k);
-                    let first = hist.first_access;
-                    (fid, k_dist, first)
-                })
-            })
-            .max_by(|(_, dist_a, first_a), (_, dist_b, first_b)| {
-                // We want MAX K-distance. None (+∞) > Some(x)
-                match (dist_a, dist_b) {
-                    (None, None) => {
-                        // Both +∞: FIFO tie-break (older first_access = evict first)
-                        first_a.cmp(first_b).reverse()
-                    }
-                    (None, Some(_)) => std::cmp::Ordering::Greater, // +∞ > finite
-                    (Some(_), None) => std::cmp::Ordering::Less,    // finite < +∞
-                    (Some(a), Some(b)) => a.cmp(b),                 // Larger distance = evict first
-                }
-            })
-            .map(|(fid, _, _)| fid);
-
-        if let Some(frame_id) = victim {
-            self.history.remove(&frame_id);
-            self.evictable.remove(&frame_id);
-            return Some(frame_id);
-        }
-
-        None
+        let frame_id = FrameId::new(frame_index);
+        let evicted = self.history.remove(&frame_id);
+        assert!(evicted.is_some(), "victim frame must have history");
+        Some(frame_id)
     }
 
     fn remove(&mut self, frame_id: FrameId) {
-        self.history.remove(&frame_id);
-        self.evictable.remove(&frame_id);
+        if let Some(hist) = self.history.remove(&frame_id) {
+            self.victim_order.remove(&hist.victim_key(self.k, frame_id));
+        }
     }
 
     fn size(&self) -> usize {
-        self.evictable.len()
+        self.victim_order.len()
     }
 
     fn export_state(&self) -> PolicyState {

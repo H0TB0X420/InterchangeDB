@@ -305,6 +305,22 @@ fn policy_factories() -> Vec<PolicyFactory> {
             name: "arc",
             make: |pool_size| Box::new(ArcReplacer::new(pool_size)),
         },
+        PolicyFactory {
+            name: "clock2q+",
+            make: |pool_size| Box::new(Clock2QPlusReplacer::new(pool_size)),
+        },
+        PolicyFactory {
+            name: "s3fifo",
+            make: |pool_size| Box::new(Clock2QPlusReplacer::s3_fifo(pool_size)),
+        },
+        PolicyFactory {
+            name: "s3fifo-2bit",
+            make: |pool_size| Box::new(Clock2QPlusReplacer::s3_fifo_2bit(pool_size)),
+        },
+        PolicyFactory {
+            name: "clock2q",
+            make: |pool_size| Box::new(Clock2QPlusReplacer::clock_two_q(pool_size)),
+        },
     ]
 }
 

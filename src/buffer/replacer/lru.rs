@@ -9,7 +9,7 @@
 //! - Higher score = hotter = more recently used = evict later
 //! - Lower score = colder = least recently used = evict first
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
@@ -26,8 +26,14 @@ pub struct LruReplacer {
     /// LRU cache tracking access order. Value is PageId for export_state.
     cache: LruCache<FrameId, PageId>,
 
-    /// Set of frames that are evictable (pin_count == 0).
-    evictable: HashSet<FrameId>,
+    /// Evictable frames ordered by `(score, frame)` — `evict()` pops the
+    /// first entry, O(log n). Replaced the old evictable HashSet + full
+    /// min-scan per eviction (quadratic at trace-replay cache sizes,
+    /// found by the Clock2Q+ reproduction runs).
+    /// NOTE: ties between arbitrary imported scores were previously
+    /// broken by HashSet iteration order (nondeterministic); the frame
+    /// id in the key makes them deterministic.
+    victim_order: BTreeSet<(u64, usize)>,
 
     /// Imported page scores waiting for frame assignment (for warm swap).
     pending_page_scores: HashMap<PageId, u64>,
@@ -47,7 +53,7 @@ impl LruReplacer {
         let capacity = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
             cache: LruCache::new(capacity),
-            evictable: HashSet::new(),
+            victim_order: BTreeSet::new(),
             pending_page_scores: HashMap::new(),
             access_counter: 0,
             frame_access_order: HashMap::new(),
@@ -70,6 +76,13 @@ impl EvictionPolicy for LruReplacer {
         // Check if this page has an imported score
         let imported_score = self.pending_page_scores.remove(&page_id);
 
+        // The frame's score is about to change: pull it out of the
+        // eviction order (if evictable) and re-file it after.
+        let was_evictable = match self.frame_access_order.get(&frame_id) {
+            Some(&old_score) => self.victim_order.remove(&(old_score, frame_id.0)),
+            None => false,
+        };
+
         // Update or insert into LRU cache (this promotes to most-recently-used)
         self.cache.put(frame_id, page_id);
 
@@ -82,53 +95,48 @@ impl EvictionPolicy for LruReplacer {
             self.access_counter
         };
         self.frame_access_order.insert(frame_id, score);
+        if was_evictable {
+            self.victim_order.insert((score, frame_id.0));
+        }
     }
 
     fn set_evictable(&mut self, frame_id: FrameId, evictable: bool) {
         // Q-35 contract: `evictable ⊆ tracked` — see FifoReplacer. Doubly
-        // vital here: `evict` scores unknown frames as 0 (coldest), so a
-        // stale untracked insert would become the PREFERRED victim.
-        if evictable && !self.cache.contains(&frame_id) {
+        // vital here: an untracked frame has no score, so a stale insert
+        // would need a made-up key and become a phantom victim.
+        let Some(&score) = self.frame_access_order.get(&frame_id) else {
             return;
-        }
+        };
         if evictable {
-            self.evictable.insert(frame_id);
+            self.victim_order.insert((score, frame_id.0)); // idempotent
         } else {
-            self.evictable.remove(&frame_id);
+            self.victim_order.remove(&(score, frame_id.0));
         }
     }
 
     fn evict(&mut self) -> Option<FrameId> {
-        if self.evictable.is_empty() {
-            return None;
-        }
+        // Victim = minimum (score, frame): the least recently used
+        // evictable frame; imported warm-swap scores order consistently.
+        let &(score, frame_index) = self.victim_order.iter().next()?;
+        let removed = self.victim_order.remove(&(score, frame_index));
+        assert!(removed, "victim key must be present");
 
-        // Find the evictable frame with the lowest score (least recently used)
-        // This respects imported scores for warm swap consistency
-        let victim = self
-            .evictable
-            .iter()
-            .min_by_key(|&fid| self.frame_access_order.get(fid).copied().unwrap_or(0))
-            .copied();
-
-        if let Some(frame_id) = victim {
-            self.cache.pop(&frame_id);
-            self.evictable.remove(&frame_id);
-            self.frame_access_order.remove(&frame_id);
-            return Some(frame_id);
-        }
-
-        None
+        let frame_id = FrameId::new(frame_index);
+        self.cache.pop(&frame_id);
+        let had_score = self.frame_access_order.remove(&frame_id);
+        assert!(had_score.is_some(), "victim frame must have a score");
+        Some(frame_id)
     }
 
     fn remove(&mut self, frame_id: FrameId) {
         self.cache.pop(&frame_id);
-        self.evictable.remove(&frame_id);
-        self.frame_access_order.remove(&frame_id);
+        if let Some(score) = self.frame_access_order.remove(&frame_id) {
+            self.victim_order.remove(&(score, frame_id.0));
+        }
     }
 
     fn size(&self) -> usize {
-        self.evictable.len()
+        self.victim_order.len()
     }
 
     fn export_state(&self) -> PolicyState {

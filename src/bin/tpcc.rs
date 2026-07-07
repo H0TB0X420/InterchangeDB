@@ -41,8 +41,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use interchangedb::buffer::replacer::{
-    ArcReplacer, ClockReplacer, EvictionPolicy, FifoReplacer, LruKReplacer, LruReplacer,
-    TwoQReplacer,
+    ArcReplacer, Clock2QPlusReplacer, ClockReplacer, EvictionPolicy, FifoReplacer, LruKReplacer,
+    LruReplacer, TwoQReplacer,
 };
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::catalog::Catalog;
@@ -92,6 +92,10 @@ struct Config {
     pk_probe: bool,
     /// Table cardinality preset (`--scale smoke|big`). Default `smoke`.
     cardinality: Cardinality,
+    /// Capture the BPM page-access stream of the post-load run to this
+    /// file (raw little-endian u32 per access — trace_sim's `.pages`
+    /// format). B+Tree engine only. Reproduction tooling.
+    capture_trace: Option<PathBuf>,
 }
 
 impl Config {
@@ -112,6 +116,7 @@ impl Config {
             sweep: false,
             pk_probe: false,
             cardinality: SMOKE,
+            capture_trace: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -132,6 +137,7 @@ impl Config {
                 "--sweep" => c.sweep = true,
                 "--pk-probe" => c.pk_probe = true,
                 "--scale" => c.cardinality = parse_scale(&value()),
+                "--capture-trace" => c.capture_trace = Some(PathBuf::from(value())),
                 other => panic!("unknown flag: {}", other),
             }
         }
@@ -211,6 +217,11 @@ const SEED_ORDER_BASE: i32 = 1_000_000;
 // Buffer pool frames (B+Tree engine).
 const POOL_SIZE: usize = 8192;
 
+/// Page-access capture bound (`--capture-trace`): 64M accesses = 256 MB
+/// of u32s. Past it the BPM counts drops instead of growing (explicit
+/// limit; a multi-minute smoke-scale run stays well under).
+const TRACE_CAPTURE_CAP: usize = 64 << 20;
+
 /// Build the requested eviction policy. `capacity` is the pool size for
 /// the size-parameterized policies. (LSM ignores this — no buffer pool.)
 fn make_policy(name: &str, capacity: usize) -> Box<dyn EvictionPolicy> {
@@ -221,7 +232,14 @@ fn make_policy(name: &str, capacity: usize) -> Box<dyn EvictionPolicy> {
         "clock" => Box::new(ClockReplacer::new()),
         "2q" => Box::new(TwoQReplacer::new(capacity)),
         "arc" => Box::new(ArcReplacer::new(capacity)),
-        other => panic!("unknown policy: {} (fifo|lru|lruk|clock|2q|arc)", other),
+        "clock2q+" => Box::new(Clock2QPlusReplacer::new(capacity)),
+        "s3fifo" => Box::new(Clock2QPlusReplacer::s3_fifo(capacity)),
+        "s3fifo-2bit" => Box::new(Clock2QPlusReplacer::s3_fifo_2bit(capacity)),
+        "clock2q" => Box::new(Clock2QPlusReplacer::clock_two_q(capacity)),
+        other => panic!(
+            "unknown policy: {} (fifo|lru|lruk|clock|2q|arc|clock2q|clock2q+|s3fifo|s3fifo-2bit)",
+            other
+        ),
     }
 }
 
@@ -989,6 +1007,7 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
     database: Arc<Database<E>>,
     catalog: Arc<Catalog<E>>,
     config: &Config,
+    on_loaded: impl FnOnce(),
 ) -> RunMetrics {
     {
         let mut loader = Session::new(database.clone(), catalog.clone());
@@ -996,6 +1015,9 @@ fn run_workload<E: StorageEngine + Send + Sync + 'static>(
         load(&mut loader, config);
         println!("loaded in {:.2}s", load_start.elapsed().as_secs_f64());
     }
+    // Post-load hook: trace capture starts here so the bulk-load access
+    // pattern doesn't swamp the captured steady-state stream.
+    on_loaded();
 
     let deadline = (config.duration_secs > 0)
         .then(|| Instant::now() + Duration::from_secs(config.duration_secs));
@@ -1099,15 +1121,42 @@ fn run_one_config(config: &Config) -> RunMetrics {
             let engine = BTreeEngine::new(bpm).expect("engine");
             let database = Arc::new(Database::open(&config.data_dir, engine).expect("open db"));
             let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).expect("catalog"));
-            run_workload(database, catalog, config)
+            let capture_db = database.clone();
+            let metrics = run_workload(database.clone(), catalog, config, || {
+                if config.capture_trace.is_some() {
+                    capture_db
+                        .engine()
+                        .buffer_pool()
+                        .start_trace_capture(TRACE_CAPTURE_CAP);
+                }
+            });
+            if let Some(path) = &config.capture_trace {
+                let (accesses, dropped) = database.engine().buffer_pool().take_trace_capture();
+                let mut bytes = Vec::with_capacity(accesses.len() * 4);
+                for page in &accesses {
+                    bytes.extend_from_slice(&page.to_le_bytes());
+                }
+                std::fs::write(path, bytes).expect("write captured trace");
+                println!(
+                    "captured {} page accesses to {} ({} dropped past cap)",
+                    accesses.len(),
+                    path.display(),
+                    dropped
+                );
+            }
+            metrics
         }
         "lsm" => {
+            assert!(
+                config.capture_trace.is_none(),
+                "--capture-trace requires the btree engine (BPM-backed)"
+            );
             let lsm_dir = config.data_dir.join("lsm");
             std::fs::create_dir_all(&lsm_dir).expect("lsm dir");
             let engine = LsmEngine::new(&lsm_dir).expect("engine");
             let database = Arc::new(Database::open(&config.data_dir, engine).expect("open db"));
             let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).expect("catalog"));
-            run_workload(database, catalog, config)
+            run_workload(database, catalog, config, || {})
         }
         other => panic!("unknown engine: {} (use btree|lsm)", other),
     }

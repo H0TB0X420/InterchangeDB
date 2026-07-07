@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::sync::{Mutex, Ordering, RwLock};
+use crate::sync::{AtomicBool, Mutex, Ordering, RwLock};
 
 use crate::buffer::replacer::{EvictionPolicy, FifoReplacer};
 use crate::buffer::swap::{SwapMode, SwapResult};
@@ -65,6 +65,23 @@ pub struct BufferPoolManager {
 
     /// Number of frames in the pool (immutable after construction).
     pool_size: usize,
+
+    /// Fast gate for page-access trace capture (reproduction
+    /// instrumentation). One relaxed load per fetch when off.
+    trace_capture_on: AtomicBool,
+
+    /// Captured page-access stream: every page REQUEST (hit or miss —
+    /// the policy-independent access sequence), bounded by the capacity
+    /// given to `start_trace_capture`; overflow increments `dropped`
+    /// instead of reallocating.
+    trace_capture: Mutex<TraceCaptureState>,
+}
+
+/// State behind the trace-capture gate. Zero-capacity until started.
+struct TraceCaptureState {
+    accesses: Vec<u32>,
+    capacity: usize,
+    dropped: u64,
 }
 
 impl BufferPoolManager {
@@ -90,6 +107,53 @@ impl BufferPoolManager {
             disk_manager: Mutex::new(Box::new(disk_manager)),
             stats: BufferPoolStats::new(),
             pool_size,
+            trace_capture_on: AtomicBool::new(false),
+            trace_capture: Mutex::new(TraceCaptureState {
+                accesses: Vec::new(),
+                capacity: 0,
+                dropped: 0,
+            }),
+        }
+    }
+
+    // ========================================================================
+    // Page-access trace capture (reproduction instrumentation)
+    // ========================================================================
+
+    /// Start capturing the page-access stream (every fetch/new-page
+    /// REQUEST, hit or miss). At most `capacity` accesses are kept;
+    /// further ones are counted as dropped, never reallocated.
+    pub fn start_trace_capture(&self, capacity: usize) {
+        assert!(capacity > 0, "capture capacity must be > 0");
+        {
+            let mut capture = self.trace_capture.lock();
+            capture.accesses = Vec::with_capacity(capacity);
+            capture.capacity = capacity;
+            capture.dropped = 0;
+        }
+        self.trace_capture_on.store(true, Ordering::Release);
+    }
+
+    /// Stop capturing and return `(accesses, dropped_count)`.
+    pub fn take_trace_capture(&self) -> (Vec<u32>, u64) {
+        self.trace_capture_on.store(false, Ordering::Release);
+        let mut capture = self.trace_capture.lock();
+        capture.capacity = 0;
+        (std::mem::take(&mut capture.accesses), capture.dropped)
+    }
+
+    /// Record one page request if capture is on. The off path is a
+    /// single relaxed atomic load — no lock.
+    #[inline]
+    fn trace_record(&self, page_id: PageId) {
+        if !self.trace_capture_on.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut capture = self.trace_capture.lock();
+        if capture.accesses.len() < capture.capacity {
+            capture.accesses.push(page_id.0);
+        } else {
+            capture.dropped += 1;
         }
     }
 
@@ -182,6 +246,7 @@ impl BufferPoolManager {
     /// Unlike `fetch_page_write`, this initializes the page to zeros
     /// instead of reading from disk (since it's a new page).
     fn fetch_page_write_new(&self, page_id: PageId) -> Result<PageWriteGuard<'_>> {
+        self.trace_record(page_id);
         let frame_id = self.get_free_frame(page_id)?;
 
         let frame = &self.frames[frame_id.0];
@@ -455,6 +520,7 @@ impl BufferPoolManager {
     // ========================================================================
 
     fn fetch_page_internal(&self, page_id: PageId) -> Result<FrameId> {
+        self.trace_record(page_id);
         // Fast path: cache hit
         {
             let pt = self.page_table.read();
@@ -760,6 +826,49 @@ mod tests {
         let path = dir.path().join("test.db");
         let dm = crate::storage::FileDiskManager::create(&path).unwrap();
         (BufferPoolManager::new(pool_size, dm), dir)
+    }
+
+    // ========================================================================
+    // Page-access trace capture (reproduction instrumentation)
+    // ========================================================================
+
+    // The captured stream must be the REQUEST sequence: new pages,
+    // cache hits, and re-fetches all appear, in order.
+    #[test]
+    fn test_trace_capture_records_request_stream() {
+        let (bpm, _dir) = create_test_bpm(4);
+        // Pre-capture activity must not be recorded.
+        let p0 = bpm.new_page().unwrap().page_id();
+
+        bpm.start_trace_capture(16);
+        let p1 = bpm.new_page().unwrap().page_id();
+        drop(bpm.fetch_page_read(p0).unwrap()); // hit
+        drop(bpm.fetch_page_read(p1).unwrap()); // hit
+        drop(bpm.fetch_page_read(p0).unwrap()); // hit again
+        let (accesses, dropped) = bpm.take_trace_capture();
+
+        assert_eq!(accesses, vec![p1.0, p0.0, p1.0, p0.0]);
+        assert_eq!(dropped, 0);
+
+        // Capture is off after take: further accesses go nowhere.
+        drop(bpm.fetch_page_read(p0).unwrap());
+        let (accesses, _) = bpm.take_trace_capture();
+        assert!(accesses.is_empty());
+    }
+
+    // The capacity is a hard bound: overflow counts drops, never grows.
+    #[test]
+    fn test_trace_capture_bounded_by_capacity() {
+        let (bpm, _dir) = create_test_bpm(4);
+        let pid = bpm.new_page().unwrap().page_id();
+
+        bpm.start_trace_capture(3);
+        for _ in 0..5 {
+            drop(bpm.fetch_page_read(pid).unwrap());
+        }
+        let (accesses, dropped) = bpm.take_trace_capture();
+        assert_eq!(accesses.len(), 3);
+        assert_eq!(dropped, 2);
     }
 
     // ========================================================================

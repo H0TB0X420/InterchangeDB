@@ -134,6 +134,12 @@ impl BTreeEngine {
         })
     }
 
+    /// The engine's buffer pool — reproduction tooling reaches the
+    /// page-access trace recorder through this.
+    pub fn buffer_pool(&self) -> &BufferPoolManager {
+        &self.bpm
+    }
+
     /// Create a `BTree` handle borrowing the buffer pool.
     fn tree(&self) -> BTree<'_> {
         if self.max_tombstones > 0 {

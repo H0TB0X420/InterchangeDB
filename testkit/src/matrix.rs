@@ -19,8 +19,13 @@ macro_rules! for_each_policy {
         $cb!(clock, $crate::policy::clock);
         $cb!(lru, $crate::policy::lru);
         $cb!(lru_k, $crate::policy::lru_k);
+        $cb!(lru_k_crp, $crate::policy::lru_k_crp);
         $cb!(two_q, $crate::policy::two_q);
         $cb!(arc, $crate::policy::arc);
+        $cb!(clock2q_plus, $crate::policy::clock2q_plus);
+        $cb!(s3_fifo, $crate::policy::s3_fifo);
+        $cb!(s3_fifo_2bit, $crate::policy::s3_fifo_2bit);
+        $cb!(clock_two_q, $crate::policy::clock_two_q);
     };
 }
 

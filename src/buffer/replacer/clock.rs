@@ -18,13 +18,20 @@ use crate::common::{FrameId, PageId};
 
 use super::{EvictionPolicy, PolicyState};
 
-/// Entry in the clock buffer tracking a frame's state.
+/// Entry in the clock ring tracking a frame's state.
+///
+/// `prev`/`next` are intrusive circular-ring links (a sole entry links
+/// to itself). The ring replaced the original Vec + index-map layout,
+/// whose middle removal re-indexed every later entry — O(n) per
+/// eviction, quadratic at trace-replay cache sizes (found by the
+/// Clock2Q+ reproduction runs at 14K+ frames).
 #[derive(Debug, Clone)]
 struct ClockEntry {
-    frame_id: FrameId,
     page_id: PageId,
     ref_bit: bool,
     evictable: bool,
+    prev: FrameId,
+    next: FrameId,
 }
 
 /// Clock (second-chance) replacement policy.
@@ -33,14 +40,16 @@ struct ClockEntry {
 /// its ref bit is set. During eviction, the clock hand sweeps around,
 /// clearing ref bits until it finds an evictable frame with ref_bit=false.
 pub struct ClockReplacer {
-    /// Circular buffer of frame entries.
-    entries: Vec<ClockEntry>,
+    /// Frame state + ring links, keyed by frame. All ops O(1).
+    entries: HashMap<FrameId, ClockEntry>,
 
-    /// Maps FrameId to index in entries vector.
-    frame_to_index: HashMap<FrameId, usize>,
+    /// The frame the sweep examines next. `None` iff the ring is empty.
+    hand: Option<FrameId>,
 
-    /// Current clock hand position.
-    hand: usize,
+    /// Most recently inserted frame. New frames join between `tail` and
+    /// the oldest frame (`tail.next`), preserving insertion order around
+    /// the ring — the position `Vec::push` gave them in the old layout.
+    tail: Option<FrameId>,
 
     /// Number of evictable frames.
     num_evictable: usize,
@@ -53,19 +62,44 @@ impl ClockReplacer {
     /// Create a new Clock replacer.
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            frame_to_index: HashMap::new(),
-            hand: 0,
+            entries: HashMap::new(),
+            hand: None,
+            tail: None,
             num_evictable: 0,
             pending_page_scores: HashMap::new(),
         }
     }
 
-    /// Advance the clock hand, wrapping around if needed.
-    fn advance_hand(&mut self) {
-        if !self.entries.is_empty() {
-            self.hand = (self.hand + 1) % self.entries.len();
+    /// Unlink `frame_id` from the ring and remove it from the map,
+    /// returning its entry. `hand`/`tail` move to the successor /
+    /// predecessor respectively if they pointed at the removed frame.
+    fn unlink(&mut self, frame_id: FrameId) -> ClockEntry {
+        let entry = self
+            .entries
+            .remove(&frame_id)
+            .expect("unlink: frame not tracked");
+        if entry.next == frame_id {
+            // Sole entry: it must self-link, and the ring becomes empty.
+            assert_eq!(entry.prev, frame_id, "sole ring entry must self-link");
+            self.hand = None;
+            self.tail = None;
+        } else {
+            self.entries
+                .get_mut(&entry.prev)
+                .expect("ring: prev of unlinked frame missing")
+                .next = entry.next;
+            self.entries
+                .get_mut(&entry.next)
+                .expect("ring: next of unlinked frame missing")
+                .prev = entry.prev;
+            if self.hand == Some(frame_id) {
+                self.hand = Some(entry.next);
+            }
+            if self.tail == Some(frame_id) {
+                self.tail = Some(entry.prev);
+            }
         }
+        entry
     }
 }
 
@@ -81,12 +115,12 @@ impl EvictionPolicy for ClockReplacer {
     }
 
     fn record_access(&mut self, frame_id: FrameId, page_id: PageId) {
-        if let Some(&index) = self.frame_to_index.get(&frame_id) {
+        if let Some(entry) = self.entries.get_mut(&frame_id) {
             // Frame exists: set reference bit (second chance on next sweep)
-            self.entries[index].ref_bit = true;
-            self.entries[index].page_id = page_id;
+            entry.ref_bit = true;
+            entry.page_id = page_id;
         } else {
-            // New frame: add to clock buffer
+            // New frame: join the ring between `tail` and the oldest frame
             let ref_bit = if let Some(score) = self.pending_page_scores.remove(&page_id) {
                 // Imported page: set ref_bit based on score (hot pages get ref_bit=true)
                 // Use threshold: score > 0 means it was considered "hot" by previous policy
@@ -96,23 +130,44 @@ impl EvictionPolicy for ClockReplacer {
                 true
             };
 
-            let entry = ClockEntry {
-                frame_id,
-                page_id,
-                ref_bit,
-                evictable: false, // Starts pinned; BPM will call set_evictable
+            let (prev, next) = match self.tail {
+                // Splice between the newest and oldest frames.
+                Some(tail_id) => (tail_id, self.entries[&tail_id].next),
+                // First frame: self-linked ring.
+                None => (frame_id, frame_id),
             };
-
-            let index = self.entries.len();
-            self.entries.push(entry);
-            self.frame_to_index.insert(frame_id, index);
+            self.entries.insert(
+                frame_id,
+                ClockEntry {
+                    page_id,
+                    ref_bit,
+                    evictable: false, // Starts pinned; BPM will call set_evictable
+                    prev,
+                    next,
+                },
+            );
+            if prev == frame_id {
+                // First frame: the hand starts at the oldest frame.
+                assert!(self.hand.is_none(), "empty ring must have no hand");
+                self.hand = Some(frame_id);
+            } else {
+                self.entries
+                    .get_mut(&prev)
+                    .expect("ring: tail missing")
+                    .next = frame_id;
+                self.entries
+                    .get_mut(&next)
+                    .expect("ring: head missing")
+                    .prev = frame_id;
+            }
+            self.tail = Some(frame_id);
         }
     }
 
     fn set_evictable(&mut self, frame_id: FrameId, evictable: bool) {
-        if let Some(&index) = self.frame_to_index.get(&frame_id) {
-            let was_evictable = self.entries[index].evictable;
-            self.entries[index].evictable = evictable;
+        if let Some(entry) = self.entries.get_mut(&frame_id) {
+            let was_evictable = entry.evictable;
+            entry.evictable = evictable;
 
             // Update evictable count
             if evictable && !was_evictable {
@@ -128,76 +183,52 @@ impl EvictionPolicy for ClockReplacer {
             return None;
         }
 
-        // Sweep until we find an evictable frame with ref_bit=false
-        // Maximum iterations: 2 * entries.len() (clear all ref bits, then find victim)
+        // Sweep until we find an evictable frame with ref_bit=false.
+        // Maximum iterations: 2 * entries.len() — one lap clears every
+        // ref bit, the next lap must reach an evictable clear frame.
         let max_iterations = self.entries.len() * 2;
 
         for _ in 0..max_iterations {
-            if self.entries.is_empty() {
-                return None;
-            }
-
-            let entry = &mut self.entries[self.hand];
+            let hand_id = self
+                .hand
+                .expect("evict: evictable frames imply non-empty ring");
+            let entry = self
+                .entries
+                .get_mut(&hand_id)
+                .expect("evict: hand frame must be tracked");
+            let next = entry.next;
 
             if entry.evictable {
                 if entry.ref_bit {
                     // Second chance: clear ref bit and move on
                     entry.ref_bit = false;
                 } else {
-                    // Found victim: evictable and ref_bit=false
-                    let frame_id = entry.frame_id;
-
-                    // Remove from clock buffer
-                    let index = self.hand;
-                    self.entries.remove(index);
-                    self.frame_to_index.remove(&frame_id);
-
-                    // Update indices for entries after the removed one
-                    for entry in &self.entries[index..] {
-                        if let Some(idx) = self.frame_to_index.get_mut(&entry.frame_id) {
-                            *idx -= 1;
-                        }
-                    }
-
-                    // Adjust hand if needed
-                    if !self.entries.is_empty() {
-                        self.hand %= self.entries.len();
-                    } else {
-                        self.hand = 0;
-                    }
-
+                    // Found victim: evictable and ref_bit=false.
+                    // unlink() leaves the hand on the successor.
+                    self.unlink(hand_id);
                     self.num_evictable -= 1;
-                    return Some(frame_id);
+                    return Some(hand_id);
                 }
             }
 
-            self.advance_hand();
+            self.hand = Some(next);
         }
 
-        None // Should not reach here if num_evictable > 0
+        None // Unreachable while num_evictable > 0; kept as a bounded-loop backstop
     }
 
     fn remove(&mut self, frame_id: FrameId) {
-        if let Some(index) = self.frame_to_index.remove(&frame_id) {
-            let was_evictable = self.entries[index].evictable;
-            self.entries.remove(index);
-
-            if was_evictable {
+        if self.entries.contains_key(&frame_id) {
+            // NOTE: the old Vec layout shifted indices on removal, which
+            // silently advanced the hand past one surviving frame when
+            // the removed entry sat below it. The ring keeps the hand on
+            // its current frame unless the removed frame IS the hand —
+            // strictly truer clock behavior; no test observes the
+            // difference (victim-order tests around remove() are
+            // set-based, equivalence suites compare database results).
+            let entry = self.unlink(frame_id);
+            if entry.evictable {
                 self.num_evictable -= 1;
-            }
-
-            // Update indices for entries after the removed one
-            for entry in &self.entries[index..] {
-                if let Some(idx) = self.frame_to_index.get_mut(&entry.frame_id) {
-                    *idx -= 1;
-                }
-            }
-
-            // Adjust hand if needed
-            if !self.entries.is_empty() && self.hand >= self.entries.len() {
-                self.hand %= self.entries.len();
-            } else if self.entries.is_empty() {
-                self.hand = 0;
             }
         }
     }
@@ -209,11 +240,20 @@ impl EvictionPolicy for ClockReplacer {
     fn export_state(&self) -> PolicyState {
         let mut state = PolicyState::new(self.name());
 
-        // Export pages with scores based on ref_bit
+        // Export pages with scores based on ref_bit, walking the ring
+        // once from the oldest frame (tail.next) in insertion order —
+        // the same order the old Vec layout exported.
         // ref_bit=true (hot) gets score 1, ref_bit=false (cold) gets score 0
-        for entry in &self.entries {
-            let score = if entry.ref_bit { 1 } else { 0 };
-            state.hot_pages.push((entry.page_id, score));
+        if let Some(tail_id) = self.tail {
+            let head_id = self.entries[&tail_id].next;
+            let mut cursor = head_id;
+            for _ in 0..self.entries.len() {
+                let entry = &self.entries[&cursor];
+                let score = if entry.ref_bit { 1 } else { 0 };
+                state.hot_pages.push((entry.page_id, score));
+                cursor = entry.next;
+            }
+            assert_eq!(cursor, head_id, "ring walk must return to the oldest frame");
         }
 
         state
