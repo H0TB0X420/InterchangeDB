@@ -455,7 +455,10 @@ impl JoinStrategy for HashJoin {
 
 /// Merge equi-join over two inputs sorted ascending on their key
 /// columns. The *caller* (the memo planner's Sort enforcer, 17-B.2)
-/// guarantees the sortedness; this operator only exploits it.
+/// guarantees the sortedness; this operator exploits it — and debug
+/// builds verify it per pulled row, because an unsorted input would
+/// silently drop matches (passed keys are discarded for good), which is
+/// exactly the corruption the assert-and-crash doctrine exists to catch.
 ///
 /// Algorithm: advance the lesser side via `Value::compare_sql` — the
 /// canonical comparator, REQUIRED so `Int32(5)` merges with `Int64(5)`
@@ -484,6 +487,54 @@ pub struct MergeJoin {
     /// First right row past the current run — un-consumed lookahead.
     right_pending: Option<Tuple>,
     right_exhausted: bool,
+    #[cfg(debug_assertions)]
+    debug: MergeDebug,
+}
+
+/// Debug-build guards for `MergeJoin` (review fix #2): per-side
+/// sortedness verification plus pull counters for the no-progress
+/// backstop in `next()`. Compiled out of release builds entirely.
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct MergeDebug {
+    last_left_key: Option<crate::types::Value>,
+    last_right_key: Option<crate::types::Value>,
+    left_pulled: u64,
+    right_pulled: u64,
+}
+
+#[cfg(debug_assertions)]
+impl MergeDebug {
+    fn on_left_row(&mut self, key: &crate::types::Value) {
+        self.left_pulled += 1;
+        Self::assert_ascending(&mut self.last_left_key, key, "left");
+    }
+
+    fn on_right_row(&mut self, key: &crate::types::Value) {
+        self.right_pulled += 1;
+        Self::assert_ascending(&mut self.last_right_key, key, "right");
+    }
+
+    /// NULL keys are skipped by the merge, so their sort position is
+    /// irrelevant; incomparable keys carry no order to violate.
+    fn assert_ascending(
+        last: &mut Option<crate::types::Value>,
+        key: &crate::types::Value,
+        side: &str,
+    ) {
+        if matches!(key, crate::types::Value::Null) {
+            return;
+        }
+        if let Some(previous) = last {
+            if let Some(ordering) = key.compare_sql(previous) {
+                assert!(
+                    ordering != std::cmp::Ordering::Less,
+                    "merge join {side} input is not sorted ascending: {key:?} after {previous:?}"
+                );
+            }
+        }
+        *last = Some(key.clone());
+    }
 }
 
 impl MergeJoin {
@@ -522,6 +573,8 @@ impl MergeJoin {
             run_cursor: 0,
             right_pending: None,
             right_exhausted: false,
+            #[cfg(debug_assertions)]
+            debug: MergeDebug::default(),
         })
     }
 
@@ -545,7 +598,11 @@ impl MergeJoin {
                         return Ok(());
                     }
                     match self.right.next()? {
-                        Some(row) => row,
+                        Some(row) => {
+                            #[cfg(debug_assertions)]
+                            self.debug.on_right_row(&row[self.right_key_col]);
+                            row
+                        }
                         None => {
                             self.right_exhausted = true;
                             return Ok(());
@@ -573,9 +630,15 @@ impl MergeJoin {
                     self.run.push(row);
                     // Collect the rest of the equal run; the first
                     // non-equal row parks as lookahead.
+                    // Bounded: every iteration consumes one right row
+                    // or returns.
                     loop {
                         let next_row = match self.right.next()? {
-                            Some(row) => row,
+                            Some(row) => {
+                                #[cfg(debug_assertions)]
+                                self.debug.on_right_row(&row[self.right_key_col]);
+                                row
+                            }
                             None => {
                                 self.right_exhausted = true;
                                 return Ok(());
@@ -600,13 +663,36 @@ impl Executor for MergeJoin {
     fn next(&mut self) -> Result<Option<Tuple>> {
         // Each pass either returns a joined row, consumes a left row, or
         // advances the right side — progress is bounded by |left| + |right|.
+        // The explicit-limits backstop below makes that claim mechanical:
+        // two consecutive iterations with identical progress state would
+        // be a livelock bug and crash debug builds.
+        #[cfg(debug_assertions)]
+        let mut previous_state = None;
         loop {
+            #[cfg(debug_assertions)]
+            {
+                let state = (
+                    self.debug.left_pulled,
+                    self.debug.right_pulled,
+                    self.run_cursor,
+                    self.current_left.is_some(),
+                    self.run_key.is_some(),
+                );
+                assert!(
+                    previous_state != Some(state),
+                    "merge join made no progress across an iteration"
+                );
+                previous_state = Some(state);
+            }
             if self.current_left.is_none() {
                 self.current_left = self.left.next()?;
                 self.run_cursor = 0;
                 if self.current_left.is_none() {
                     return Ok(None); // left exhausted → join done
                 }
+                #[cfg(debug_assertions)]
+                self.debug
+                    .on_left_row(&self.current_left.as_ref().unwrap()[self.left_key_col]);
             }
             let left_row = self.current_left.as_ref().unwrap();
             let left_key = &left_row[self.left_key_col];
@@ -622,6 +708,7 @@ impl Executor for MergeJoin {
                         if self.run_cursor < self.run.len() {
                             let right_row = &self.run[self.run_cursor];
                             self.run_cursor += 1;
+                            debug_assert!(self.run_cursor <= self.run.len());
                             let mut joined = left_row.clone();
                             joined.extend_from_slice(right_row);
                             return Ok(Some(joined));
@@ -867,6 +954,36 @@ mod merge_join_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Int32(1));
         assert_eq!(rows[1][0], Value::Int32(2));
+    }
+
+    // Review fix #2: sortedness is a hard precondition — violating it
+    // silently loses matches, so debug builds must crash instead. The
+    // violating key must actually be PULLED, hence the preceding
+    // matching keys.
+    #[test]
+    #[should_panic(expected = "not sorted ascending")]
+    fn unsorted_right_input_panics_in_debug() {
+        let left = exec("l", ColumnType::Int32, vec![row32(1, Some(5))]);
+        let right = exec(
+            "r",
+            ColumnType::Int32,
+            vec![row32(10, Some(5)), row32(11, Some(3))],
+        );
+        let join = MergeJoin::new(left, right, 1, 1).unwrap();
+        drain(join);
+    }
+
+    #[test]
+    #[should_panic(expected = "not sorted ascending")]
+    fn unsorted_left_input_panics_in_debug() {
+        let left = exec(
+            "l",
+            ColumnType::Int32,
+            vec![row32(1, Some(5)), row32(2, Some(3))],
+        );
+        let right = exec("r", ColumnType::Int32, vec![row32(10, Some(5))]);
+        let join = MergeJoin::new(left, right, 1, 1).unwrap();
+        drain(join);
     }
 
     // Negative space: a key column outside the child schema must fail at
