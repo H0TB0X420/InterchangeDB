@@ -30,11 +30,18 @@ pub(crate) fn edge_order(rel: RelId, col: usize) -> OrderKey {
 }
 
 /// The query's ORDER BY as an [`OrderKey`], when it is consumable
-/// (§7.5): every key column must map to ONE relation. `None` for
-/// unordered queries or keys spanning relations — those keep the spine
-/// Sort unconditionally.
+/// (§7.5): every key column must map to ONE relation, and the query
+/// must not aggregate. `None` keeps the spine Sort unconditionally.
+///
+/// Aggregates exclude consumption (review fix #3): the spine Sort sits
+/// ABOVE HashAggregate, whose whole-table output is a single row — the
+/// Sort being "avoided" is near-free, while the gate would price it at
+/// the join core's cardinality and phantom-inflate the ordered plan.
 pub(crate) fn order_by_requirement(query: &NormalizedQuery) -> Option<OrderKey> {
     if query.spine.order_by.is_empty() {
+        return None;
+    }
+    if !query.spine.aggregates.is_empty() {
         return None;
     }
     let textual_base = query.textual_base();
@@ -66,5 +73,41 @@ pub(crate) fn merge_requirements(edge: &Edge, left_set: RelSet) -> (OrderKey, Or
             edge_order(edge.right_rel, edge.right_col),
             edge_order(edge.left_rel, edge.left_col),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::ir::logical::AggregateSpec;
+    use crate::sql::optimizer::memo::fixtures::{edge, query, rel};
+
+    // HOW: two single-column relations — global column 0 is (rel 0, 0),
+    // global 1 is (rel 1, 0) — so mapping and the span check are both
+    // visible in one fixture.
+    #[test]
+    fn order_by_requirement_maps_single_relation_keys() {
+        let mut q = query(vec![rel(10.0, 1.0), rel(10.0, 1.0)], vec![edge(0, 1, 0.1)]);
+        q.spine.order_by = vec![(1, OrderDir::Desc)];
+        assert_eq!(
+            order_by_requirement(&q),
+            Some(vec![((1, 0), OrderDir::Desc)])
+        );
+
+        // Keys spanning two relations are not consumable (§7.5).
+        q.spine.order_by = vec![(0, OrderDir::Asc), (1, OrderDir::Asc)];
+        assert_eq!(order_by_requirement(&q), None);
+    }
+
+    #[test]
+    fn aggregate_queries_are_never_consumable() {
+        // Review fix #3: with aggregates the spine Sort covers a single
+        // HashAggregate output row, so there is nothing worth consuming
+        // — and pricing the avoided Sort at join cardinality would bias
+        // plan choice toward needlessly order-enforced joins.
+        let mut q = query(vec![rel(10.0, 1.0), rel(10.0, 1.0)], vec![edge(0, 1, 0.1)]);
+        q.spine.order_by = vec![(1, OrderDir::Asc)];
+        q.spine.aggregates = vec![AggregateSpec::CountStar];
+        assert_eq!(order_by_requirement(&q), None);
     }
 }
