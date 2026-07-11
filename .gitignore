@@ -4,4 +4,9 @@ CLAUDE.md
 plan.md
 mutants.out/
 mutants.out.old/
+# Downloaded cache traces (GBs; fetch via docs/reproductions/clock2q-plus/fetch_traces.sh)
+data/traces/
+# Reproduction outputs — regenerable via the scripts; not repo material
+docs/reproductions/*/results/*.csv
+docs/reproductions/*/results/figures/
 
