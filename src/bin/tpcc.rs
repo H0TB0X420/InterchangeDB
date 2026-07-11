@@ -48,10 +48,10 @@ use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::catalog::Catalog;
 use interchangedb::common::Result as DbResult;
 use interchangedb::database::Database;
-use interchangedb::execution::ExecModel;
 use interchangedb::index::btree::BTreeEngine;
+use interchangedb::execution::ExecModel;
 use interchangedb::session::{PreparedStatement, QueryResult, Session};
-use interchangedb::sql::{Planner, RuleBasedPlanner, SelingerPlanner};
+use interchangedb::sql::{Planner, RuleBasedPlanner, SelingerPlanner, VolcanoPlanner};
 use interchangedb::storage::FileDiskManager;
 use interchangedb::types::Value;
 use interchangedb::{LsmEngine, StorageEngine};
@@ -886,7 +886,11 @@ fn parse_planner(name: &str) -> Planner {
     match name {
         "rule-based" => Planner::RuleBased(RuleBasedPlanner),
         "selinger" => Planner::Selinger(SelingerPlanner::default()),
-        other => panic!("unknown planner: {} (rule-based|selinger)", other),
+        "volcano-memo" => Planner::VolcanoMemo(VolcanoPlanner::default()),
+        other => panic!(
+            "unknown planner: {} (rule-based|selinger|volcano-memo)",
+            other
+        ),
     }
 }
 
@@ -1129,7 +1133,7 @@ fn run_sweep(base: &Config) {
     let mut results: Vec<(String, RunMetrics)> = Vec::new();
     for engine in ["btree", "lsm"] {
         for exec_model in ["volcano", "push"] {
-            for planner in ["rule-based", "selinger"] {
+            for planner in ["rule-based", "selinger", "volcano-memo"] {
                 let mut cfg = base.clone();
                 cfg.engine = engine.to_string();
                 cfg.exec_model = exec_model.to_string();

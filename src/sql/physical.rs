@@ -92,6 +92,16 @@ pub enum PhysOp {
         inner_key_col: usize,
     },
 
+    /// Merge equi-join (17-B): both inputs must arrive sorted ascending on
+    /// their key columns — the planner guarantees it (Sort enforcer).
+    /// NULL keys never match (SQL equi-join).
+    MergeJoin {
+        left: Box<PhysOp>,
+        right: Box<PhysOp>,
+        left_key_col: usize,
+        right_key_col: usize,
+    },
+
     /// Whole-relation aggregation (no GROUP BY yet). One output row.
     HashAggregate {
         input: Box<PhysOp>,
@@ -170,6 +180,16 @@ impl PhysOp {
                 "{pad}HashJoin(outer_key={outer_key_col}, inner_key={inner_key_col})\n{}{}",
                 outer.explain(indent + 1),
                 inner.explain(indent + 1)
+            ),
+            PhysOp::MergeJoin {
+                left,
+                right,
+                left_key_col,
+                right_key_col,
+            } => format!(
+                "{pad}MergeJoin(left_key={left_key_col}, right_key={right_key_col})\n{}{}",
+                left.explain(indent + 1),
+                right.explain(indent + 1)
             ),
             PhysOp::HashAggregate { input, aggregates } => {
                 let labels: Vec<String> = aggregates.iter().map(agg_label).collect();

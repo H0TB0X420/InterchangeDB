@@ -56,7 +56,9 @@ use crate::sql::stats::QueryStats;
 pub type RelId = usize;
 
 /// Subset of base relations as a bitmask (`RelId` i → bit i).
-type RelSet = u32;
+/// `pub(crate)`: the memo planner (Phase 17) keys its groups by the same
+/// convention (D2).
+pub(crate) type RelSet = u32;
 
 /// Hard cap on relation count: the subset bitset is a `u32`.
 pub const MAX_RELATIONS: usize = 31;
@@ -68,11 +70,14 @@ pub const MAX_DP_RELATIONS: usize = 12;
 /// Rows-per-page assumption for turning a row count into a page count for
 /// `cost_seq_scan`. NOTE (P14.11): a rough constant — real per-table page
 /// counts arrive when `StorageStatus` is wired into stats (Phase 16).
-const ROWS_PER_PAGE_ESTIMATE: f64 = 50.0;
+/// `pub(crate)`: the memo planner's leaf costing uses the same constant
+/// so cost comparisons across planners stay apples-to-apples (D7/G3).
+pub(crate) const ROWS_PER_PAGE_ESTIMATE: f64 = 50.0;
 
 /// Cardinality floor — never let an estimate reach zero, which would make
-/// a plan look free and poison the ranking.
-const MIN_CARD: f64 = 1.0;
+/// a plan look free and poison the ranking. `pub(crate)`: the memo
+/// planner's D7 group cardinality applies the same floor.
+pub(crate) const MIN_CARD: f64 = 1.0;
 
 /// One base relation participating in the join. Abstract w.r.t.
 /// execution: `table_id` ties it to the stats snapshot here and to a

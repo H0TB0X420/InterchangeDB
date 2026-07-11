@@ -121,6 +121,12 @@ pub trait CostModel: Send + Sync {
     /// `probe_rows`. Build side traditionally the smaller relation.
     fn cost_hash_join(&self, build_rows: f64, probe_rows: f64) -> Cost;
 
+    /// Merge join over two sorted inputs: one linear pass over each side
+    /// (sorting, when needed, is charged separately via `cost_sort` by
+    /// the enforcer). 17-B; the memo's Merge implementation rule is the
+    /// caller.
+    fn cost_merge_join(&self, left_rows: f64, right_rows: f64) -> Cost;
+
     /// Collapse a `Cost` to a single comparable scalar under this model's
     /// own weighting; lower is better. Kept on the model (rather than
     /// making callers hold a `CostWeights` and call `Cost::total`) so the
@@ -235,6 +241,17 @@ impl CostModel for DefaultCostModel {
         Cost {
             io_units: 0.0,
             cpu_units: build_rows + probe_rows,
+        }
+    }
+
+    fn cost_merge_join(&self, left_rows: f64, right_rows: f64) -> Cost {
+        // One advancing pass over each sorted side; equal-key runs are
+        // buffered but re-emitted, not re-scanned. Same linear shape as
+        // hash without the build — the difference against Sort+Merge vs
+        // Hash comes from the enforcer's `cost_sort`, not from here.
+        Cost {
+            io_units: 0.0,
+            cpu_units: left_rows + right_rows,
         }
     }
 

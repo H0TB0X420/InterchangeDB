@@ -33,19 +33,19 @@ use std::time::Duration;
 use crate::catalog::system_tables::ColumnStats;
 use crate::catalog::{Catalog, TableId};
 use crate::common::Result;
+use crate::sql::expr::{CompareOp, Expression, Predicate};
+use crate::sql::logical::{AggregateSpec, JoinClause, LogicalPlan, OrderDir};
 use crate::sql::column_map::ColumnRemap;
 use crate::sql::cost::{CostModel, DefaultCostModel};
-use crate::sql::expr::{CompareOp, Expression, Predicate};
 use crate::sql::join_order::{
     cost_of_order, enumerate_join_orders, JoinEdge, JoinOrder, JoinRelation, RelId,
 };
-use crate::sql::logical::{AggregateSpec, JoinClause, LogicalPlan, OrderDir};
+use crate::sql::selectivity::estimate_predicate_selectivity;
+use crate::sql::stats::{CatalogStatsProvider, QueryStats};
 use crate::sql::planner::{
     flatten_conjuncts, plan_inner, rebase_predicate, referenced_columns, JoinSelection,
     PhysicalPlan, PlannerStrategy,
 };
-use crate::sql::selectivity::estimate_predicate_selectivity;
-use crate::sql::stats::{CatalogStatsProvider, QueryStats};
 use crate::storage::StorageEngine;
 
 /// Cost-based planner. `cost_model` ranks plans; `time_budget_ms` bounds
@@ -116,7 +116,8 @@ fn collect_select_tables(logical: &LogicalPlan) -> Vec<String> {
 /// Snapshot stats for every table a query touches (all columns of each),
 /// through a `CatalogStatsProvider`. One pass; the cost-based join loop
 /// then reads the owned `QueryStats`.
-fn gather_query_stats<CatE: StorageEngine>(
+/// `pub(crate)`: the memo planner (T17-A.6) snapshots identically.
+pub(crate) fn gather_query_stats<CatE: StorageEngine>(
     logical: &LogicalPlan,
     catalog: &Catalog<CatE>,
 ) -> Result<QueryStats> {
@@ -141,9 +142,9 @@ fn gather_query_stats<CatE: StorageEngine>(
 /// The join graph extracted from a `SELECT`, plus the per-table metadata
 /// the rewrite needs. Tables are indexed by `RelId` in textual order
 /// (rel 0 = `FROM` table, rel i = `joins[i-1]`'s right table).
-struct JoinGraph {
-    relations: Vec<JoinRelation>,
-    edges: Vec<JoinEdge>,
+pub(crate) struct JoinGraph {
+    pub(crate) relations: Vec<JoinRelation>,
+    pub(crate) edges: Vec<JoinEdge>,
     /// Column count per table, textual order.
     widths: Vec<usize>,
     /// Tuple-global offset of each table's first column, textual order.
@@ -238,8 +239,9 @@ fn maybe_reorder<CatE: StorageEngine>(
 /// Extract the equi-join graph from a `SELECT`'s tables and `ON` clauses.
 /// Returns `None` (→ keep textual order) if any `ON` is missing or is not
 /// a single `Column = Column` equi-join, or references columns out of an
-/// expected (left-deep) ordering.
-fn build_join_graph<CatE: StorageEngine>(
+/// expected (left-deep) ordering. `pub(crate)`: the memo normalizer
+/// (T17-A.1) asserts edge-extraction parity against this function.
+pub(crate) fn build_join_graph<CatE: StorageEngine>(
     table: &str,
     joins: &[JoinClause],
     filter: Option<&Predicate>,
@@ -326,7 +328,8 @@ fn build_join_graph<CatE: StorageEngine>(
 }
 
 /// True when some index on the table covers exactly `[column]`.
-fn has_single_col_index(indexes: &[crate::table::IndexHandle], column: usize) -> bool {
+/// `pub(crate)`: shared with the memo normalizer (T17-A.1).
+pub(crate) fn has_single_col_index(indexes: &[crate::table::IndexHandle], column: usize) -> bool {
     indexes.iter().any(|ix| ix.def.columns == [column])
 }
 
@@ -379,7 +382,12 @@ fn apply_local_selectivities(
 
 /// Find the `(rel, local)` a tuple-global index belongs to in textual
 /// layout. `None` if out of range (treated as "can't reorder").
-fn decompose(global: usize, textual_base: &[usize], widths: &[usize]) -> Option<(usize, usize)> {
+/// `pub(crate)`: shared with the memo normalizer (T17-A.1).
+pub(crate) fn decompose(
+    global: usize,
+    textual_base: &[usize],
+    widths: &[usize],
+) -> Option<(usize, usize)> {
     for r in 0..widths.len() {
         if global >= textual_base[r] && global < textual_base[r] + widths[r] {
             return Some((r, global - textual_base[r]));
@@ -490,7 +498,9 @@ fn build_on_predicate(
 }
 
 /// Remap the column an aggregate reads (no-op for `COUNT(*)`).
-fn remap_aggregate(spec: AggregateSpec, remap: &ColumnRemap) -> AggregateSpec {
+/// `pub(crate)`: the memo planner's emission (T17-A.4) remaps aggregates
+/// identically.
+pub(crate) fn remap_aggregate(spec: AggregateSpec, remap: &ColumnRemap) -> AggregateSpec {
     match spec {
         AggregateSpec::CountStar => AggregateSpec::CountStar,
         AggregateSpec::Count { col, distinct } => AggregateSpec::Count {

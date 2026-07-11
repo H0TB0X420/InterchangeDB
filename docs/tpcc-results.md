@@ -203,3 +203,19 @@ Tuning iteration 1 fixed both profiled bottlenecks: B+Tree **+5.7% tpmC
 pushdown). Remaining known levers carried forward: the fsync floor
 (environment — Linux/NVMe), tuple-decode allocation churn (Phase 17+),
 block-level SSTable range reads, O(1) slab lists for ARC T1/T2.
+
+### Volcano-memo planner and merge join (Phase 17)
+
+The planner sweep axis is now 3-wide (`rule-based | selinger |
+volcano-memo`); `tpcc --sweep` covers all twelve configurations. Merge
+join is **not** expected in any TPC-C plan and was therefore not added
+as a separate sweep dimension: under the default cost model a merge is
+`cost_merge_join = left + right` CPU — the same linear shape as hash —
+*plus* an `n·log n` sort enforcer per unsorted input, and nothing
+delivers sort order natively yet (index-order delivery is a recorded
+Phase 17 non-goal). Sort+Merge therefore never costs below Hash on
+TPC-C shapes, and the memo provably never selects it there. Merge joins
+appear only when order requirements make them pay — the ORDER BY
+consumption path (`tests/merge_order_consumption_test.rs`) — or under
+IO-weighted cost models; both are covered by tests rather than the
+benchmark sweep.

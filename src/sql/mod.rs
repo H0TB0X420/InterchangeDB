@@ -17,6 +17,7 @@ pub mod expr;
 pub mod frontend;
 pub mod join_order;
 pub mod logical;
+pub mod memo;
 pub mod physical;
 pub mod planner;
 pub mod selectivity;
@@ -34,6 +35,7 @@ pub use join_order::{
     JoinRelation, RelId,
 };
 pub use logical::LogicalPlan;
+pub use memo::{BaselineCapable, VolcanoPlanner};
 pub use physical::PhysOp;
 pub use planner::{plan, PhysicalPlan, Planner, PlannerStrategy, RuleBasedPlanner};
 pub use selectivity::{

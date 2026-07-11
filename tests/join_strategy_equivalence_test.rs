@@ -20,10 +20,11 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema, TableId};
-use interchangedb::execution::ExecModel;
 use interchangedb::index::btree::BTreeEngine;
+use interchangedb::execution::ExecModel;
 use interchangedb::layout::RowLayout;
 use interchangedb::sql::expr::{CompareOp, Expression, Predicate};
+use interchangedb::sql::logical::OrderDir;
 use interchangedb::sql::physical::PhysOp;
 use interchangedb::storage::FileDiskManager;
 use interchangedb::table::Table;
@@ -150,6 +151,16 @@ fn seq(table: &str) -> Box<PhysOp> {
     })
 }
 
+/// A table scan sorted ascending on `key_col` — MergeJoin's inputs must
+/// arrive sorted (T17-B.1); the planner supplies the Sort, so the test
+/// does too.
+fn sorted_seq(table: &str, key_col: usize) -> Box<PhysOp> {
+    Box::new(PhysOp::Sort {
+        input: seq(table),
+        keys: vec![(key_col, OrderDir::Asc)],
+    })
+}
+
 fn run_sorted(env: &Env, model: &ExecModel, plan: &PhysOp) -> Vec<Vec<Value>> {
     let (_schema, mut rows) = model.execute(plan, &env.engine, &env.catalog).unwrap();
     // Values carry no Ord; Debug text is a stable total order for a test.
@@ -158,9 +169,10 @@ fn run_sorted(env: &Env, model: &ExecModel, plan: &PhysOp) -> Vec<Vec<Value>> {
 }
 
 // The joined tuple is `a || b` (4 columns): a_key is global column 1,
-// b_key is global column 3 (local 1 on the inner side). All three
+// b_key is global column 3 (local 1 on the inner side). All four
 // strategies × both execution models must agree — the strategy axis is
-// E11, the model axis is scope note S10's uncovered cross.
+// E11 (merge added in T17-B.1), the model axis is scope note S10's
+// uncovered cross. Merge's Sort wrappers don't change the row multiset.
 #[test]
 fn all_strategies_and_models_return_identical_rows_on_mixed_int_keys() {
     let env = setup();
@@ -194,6 +206,15 @@ fn all_strategies_and_models_return_identical_rows_on_mixed_int_keys() {
                 inner_table: "b".into(),
                 inner_index: "b_by_key".into(),
                 outer_key_cols: vec![1],
+            },
+        ),
+        (
+            "merge",
+            PhysOp::MergeJoin {
+                left: sorted_seq("a", 1),
+                right: sorted_seq("b", 1),
+                left_key_col: 1,
+                right_key_col: 1,
             },
         ),
     ];

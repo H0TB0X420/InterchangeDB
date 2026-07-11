@@ -16,8 +16,8 @@ use crate::catalog::Catalog;
 use crate::common::{Error, Result};
 use crate::execution::{
     AggregateFn, Delete, Executor, Filter, HashAggregate, HashJoin, IndexNestedLoopJoin, IndexScan,
-    Insert, JoinPredicate, Limit, NestedLoopJoin, PkLookup, Projection, SeqScan, SetExpr, Sort,
-    SortDir, Update,
+    Insert, JoinPredicate, Limit, MergeJoin, NestedLoopJoin, PkLookup, Projection, SeqScan,
+    SetExpr, Sort, SortDir, Update,
 };
 use crate::layout::RowLayout;
 use crate::sql::logical::{AggregateSpec, OrderDir};
@@ -117,6 +117,21 @@ where
                 inner_ex,
                 *outer_key_col,
                 *inner_key_col,
+            )?))
+        }
+        PhysOp::MergeJoin {
+            left,
+            right,
+            left_key_col,
+            right_key_col,
+        } => {
+            let left_ex = build_executor(left, engine, catalog)?;
+            let right_ex = build_executor(right, engine, catalog)?;
+            Ok(Box::new(MergeJoin::new(
+                left_ex,
+                right_ex,
+                *left_key_col,
+                *right_key_col,
             )?))
         }
         PhysOp::HashAggregate { input, aggregates } => {

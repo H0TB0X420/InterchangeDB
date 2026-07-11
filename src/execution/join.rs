@@ -449,6 +449,231 @@ impl JoinStrategy for HashJoin {
     }
 }
 
+// ===========================================================================
+// MergeJoin (T17-B.1)
+// ===========================================================================
+
+/// Merge equi-join over two inputs sorted ascending on their key
+/// columns. The *caller* (the memo planner's Sort enforcer, 17-B.2)
+/// guarantees the sortedness; this operator only exploits it.
+///
+/// Algorithm: advance the lesser side via `Value::compare_sql` — the
+/// canonical comparator, REQUIRED so `Int32(5)` merges with `Int64(5)`
+/// exactly as Hash/NLJ match them (strategy equivalence, E11). On key
+/// equality, buffer the full equal-key **run** from the right side and
+/// emit its cross product with every left row sharing the key. NULL
+/// keys never match (skipped, consistent with Hash/INLJ).
+///
+/// Both sides stream; memory is bounded by the largest equal-key run on
+/// the right (not the input), plus a one-row lookahead. NOTE: the plan
+/// (§7.1) allowed eager-materializing the right side if streaming was
+/// awkward — it wasn't, so the streaming form landed.
+pub struct MergeJoin {
+    schema: Arc<Schema>,
+    left: Box<dyn Executor>,
+    right: Box<dyn Executor>,
+    left_key_col: usize,
+    right_key_col: usize,
+
+    current_left: Option<Tuple>,
+    /// Right rows sharing `run_key`, replayed (from `run_cursor`) for
+    /// every left row that equals the key.
+    run: Vec<Tuple>,
+    run_key: Option<crate::types::Value>,
+    run_cursor: usize,
+    /// First right row past the current run — un-consumed lookahead.
+    right_pending: Option<Tuple>,
+    right_exhausted: bool,
+}
+
+impl MergeJoin {
+    pub fn new(
+        left: Box<dyn Executor>,
+        right: Box<dyn Executor>,
+        left_key_col: usize,
+        right_key_col: usize,
+    ) -> Result<Self> {
+        // Key columns must exist — fail precisely at construction, never
+        // per-tuple (E16 discipline, matching Projection::new).
+        if left_key_col >= left.schema().columns.len() {
+            return Err(crate::common::Error::Internal(format!(
+                "merge join left key column {} out of range ({} columns)",
+                left_key_col,
+                left.schema().columns.len()
+            )));
+        }
+        if right_key_col >= right.schema().columns.len() {
+            return Err(crate::common::Error::Internal(format!(
+                "merge join right key column {} out of range ({} columns)",
+                right_key_col,
+                right.schema().columns.len()
+            )));
+        }
+        let schema = Arc::new(concat_schemas(left.schema(), right.schema()));
+        Ok(Self {
+            schema,
+            left,
+            right,
+            left_key_col,
+            right_key_col,
+            current_left: None,
+            run: Vec::new(),
+            run_key: None,
+            run_cursor: 0,
+            right_pending: None,
+            right_exhausted: false,
+        })
+    }
+
+    /// Advance the right side to `target`'s equal-key run: keys below the
+    /// target are dropped for good (the ascending left side can never
+    /// need them again); the first key above it parks in `right_pending`.
+    /// Leaves `run_key` as `None` when no right key equals the target.
+    fn build_run(&mut self, target: &crate::types::Value) -> Result<()> {
+        debug_assert!(
+            !matches!(target, crate::types::Value::Null),
+            "NULL left keys are skipped before run building"
+        );
+        self.run.clear();
+        self.run_key = None;
+        self.run_cursor = 0;
+        loop {
+            let row = match self.right_pending.take() {
+                Some(row) => row,
+                None => {
+                    if self.right_exhausted {
+                        return Ok(());
+                    }
+                    match self.right.next()? {
+                        Some(row) => row,
+                        None => {
+                            self.right_exhausted = true;
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+            if matches!(row[self.right_key_col], crate::types::Value::Null) {
+                continue; // SQL equi-join: NULL right keys never match.
+            }
+            // Incomparable key domains (a join the binder let through,
+            // e.g. Varchar vs Int) merge as "no match" — drop the right
+            // row, mirroring Hash/NLJ, which simply find no pairs.
+            let ordering = row[self.right_key_col]
+                .compare_sql(target)
+                .unwrap_or(std::cmp::Ordering::Less);
+            match ordering {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Greater => {
+                    self.right_pending = Some(row);
+                    return Ok(());
+                }
+                std::cmp::Ordering::Equal => {
+                    self.run_key = Some(target.clone());
+                    self.run.push(row);
+                    // Collect the rest of the equal run; the first
+                    // non-equal row parks as lookahead.
+                    loop {
+                        let next_row = match self.right.next()? {
+                            Some(row) => row,
+                            None => {
+                                self.right_exhausted = true;
+                                return Ok(());
+                            }
+                        };
+                        let equal = next_row[self.right_key_col].compare_sql(target)
+                            == Some(std::cmp::Ordering::Equal);
+                        if equal {
+                            self.run.push(next_row);
+                        } else {
+                            self.right_pending = Some(next_row);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Executor for MergeJoin {
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        // Each pass either returns a joined row, consumes a left row, or
+        // advances the right side — progress is bounded by |left| + |right|.
+        loop {
+            if self.current_left.is_none() {
+                self.current_left = self.left.next()?;
+                self.run_cursor = 0;
+                if self.current_left.is_none() {
+                    return Ok(None); // left exhausted → join done
+                }
+            }
+            let left_row = self.current_left.as_ref().unwrap();
+            let left_key = &left_row[self.left_key_col];
+            if matches!(left_key, crate::types::Value::Null) {
+                // SQL equi-join: NULL left keys never match.
+                self.current_left = None;
+                continue;
+            }
+
+            if let Some(run_key) = &self.run_key {
+                match left_key.compare_sql(run_key) {
+                    Some(std::cmp::Ordering::Equal) => {
+                        if self.run_cursor < self.run.len() {
+                            let right_row = &self.run[self.run_cursor];
+                            self.run_cursor += 1;
+                            let mut joined = left_row.clone();
+                            joined.extend_from_slice(right_row);
+                            return Ok(Some(joined));
+                        }
+                        // Run drained for this left row; the next left
+                        // row may share the key and replay the run.
+                        self.current_left = None;
+                        continue;
+                    }
+                    Some(std::cmp::Ordering::Less) => {
+                        // Left key below the run: the right side is
+                        // already past every possible partner.
+                        self.current_left = None;
+                        continue;
+                    }
+                    // Greater or incomparable: the run is stale — build
+                    // the next one below.
+                    _ => {}
+                }
+            }
+
+            let left_key = left_key.clone();
+            self.build_run(&left_key)?;
+            if self.run_key.is_none() {
+                // No right key equals this left key.
+                self.current_left = None;
+            }
+        }
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn explain(&self, indent: usize) -> String {
+        let pad = "  ".repeat(indent);
+        let mut out = format!(
+            "{}MergeJoin(left_key={}, right_key={})\n",
+            pad, self.left_key_col, self.right_key_col
+        );
+        out.push_str(&self.left.explain(indent + 1));
+        out.push_str(&self.right.explain(indent + 1));
+        out
+    }
+}
+
+impl JoinStrategy for MergeJoin {
+    fn algorithm(&self) -> &'static str {
+        "merge"
+    }
+}
+
 /// Build the output schema for a join: outer columns then inner columns,
 /// with column names disambiguated by table-name prefix when both sides
 /// have a column of the same name.
@@ -476,5 +701,184 @@ fn concat_schemas(outer: &Schema, inner: &Schema) -> Schema {
         // Joined tuples have no PK — primary_key positions would alias
         // ambiguously across sides.
         primary_key: vec![],
+    }
+}
+
+#[cfg(test)]
+mod merge_join_tests {
+    use super::*;
+    use crate::execution::test_util::VecExecutor;
+    use crate::types::{ColumnType, Value};
+
+    fn side_schema(name: &str, key_ty: ColumnType) -> Schema {
+        Schema {
+            name: name.into(),
+            table_id: TableId(0),
+            columns: vec![
+                ColumnDef {
+                    name: format!("{name}_id"),
+                    ty: ColumnType::Int32,
+                    nullable: false,
+                    default: None,
+                },
+                ColumnDef {
+                    name: format!("{name}_key"),
+                    ty: key_ty,
+                    nullable: true,
+                    default: None,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn exec(name: &str, key_ty: ColumnType, rows: Vec<Tuple>) -> Box<dyn Executor> {
+        Box::new(VecExecutor::new(side_schema(name, key_ty), rows))
+    }
+
+    /// `(id, key)` row with an Int32 key; `None` → SQL NULL.
+    fn row32(id: i32, key: Option<i32>) -> Tuple {
+        vec![
+            Value::Int32(id),
+            key.map(Value::Int32).unwrap_or(Value::Null),
+        ]
+    }
+
+    /// `(id, key)` row with an Int64 key; `None` → SQL NULL.
+    fn row64(id: i32, key: Option<i64>) -> Tuple {
+        vec![
+            Value::Int32(id),
+            key.map(Value::Int64).unwrap_or(Value::Null),
+        ]
+    }
+
+    fn drain(mut join: MergeJoin) -> Vec<Tuple> {
+        let mut out = Vec::new();
+        while let Some(t) = join.next().unwrap() {
+            out.push(t);
+        }
+        out
+    }
+
+    // HOW: duplicate keys on BOTH sides — the buffered right run must be
+    // replayed for every equal left row, yielding the full cross product
+    // per key group (2×3 for key 1, 1×2 for key 2).
+    #[test]
+    fn duplicate_key_runs_emit_full_cross_product() {
+        let left = exec(
+            "l",
+            ColumnType::Int32,
+            vec![row32(1, Some(1)), row32(2, Some(1)), row32(3, Some(2))],
+        );
+        let right = exec(
+            "r",
+            ColumnType::Int32,
+            vec![
+                row32(10, Some(1)),
+                row32(11, Some(1)),
+                row32(12, Some(1)),
+                row32(13, Some(2)),
+                row32(14, Some(2)),
+            ],
+        );
+        let join = MergeJoin::new(left, right, 1, 1).unwrap();
+        let rows = drain(join);
+        assert_eq!(rows.len(), 2 * 3 + 2);
+        // Positive space: every emitted pair actually matches on the key.
+        for row in &rows {
+            assert_eq!(row[1].compare_sql(&row[3]), Some(std::cmp::Ordering::Equal));
+        }
+    }
+
+    #[test]
+    fn empty_inputs_yield_no_rows() {
+        let one = || vec![row32(1, Some(1))];
+        let join = MergeJoin::new(
+            exec("l", ColumnType::Int32, Vec::new()),
+            exec("r", ColumnType::Int32, one()),
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(drain(join).is_empty(), "empty left");
+
+        let join = MergeJoin::new(
+            exec("l", ColumnType::Int32, one()),
+            exec("r", ColumnType::Int32, Vec::new()),
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(drain(join).is_empty(), "empty right");
+
+        let join = MergeJoin::new(
+            exec("l", ColumnType::Int32, Vec::new()),
+            exec("r", ColumnType::Int32, Vec::new()),
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(drain(join).is_empty(), "both empty");
+    }
+
+    // HOW: NULL keys on both sides, placed first as an ascending Sort
+    // would deliver them — SQL equi-join semantics say NULL matches
+    // nothing, including another NULL.
+    #[test]
+    fn null_keys_never_match() {
+        let left = exec(
+            "l",
+            ColumnType::Int32,
+            vec![row32(1, None), row32(2, Some(1))],
+        );
+        let right = exec(
+            "r",
+            ColumnType::Int32,
+            vec![row32(10, None), row32(11, Some(1))],
+        );
+        let join = MergeJoin::new(left, right, 1, 1).unwrap();
+        let rows = drain(join);
+        assert_eq!(rows.len(), 1, "only the non-NULL key pair joins");
+        assert_eq!(rows[0][0], Value::Int32(2));
+        assert_eq!(rows[0][2], Value::Int32(11));
+    }
+
+    // HOW: Int64 left keys against Int32 right keys — the canonical
+    // comparator must merge Int64(2) with Int32(2) (E11 strategy
+    // equivalence), and 5e9 (unrepresentable in i32) must match nothing.
+    #[test]
+    fn mixed_int32_int64_keys_match_via_compare_sql() {
+        let left = exec(
+            "l",
+            ColumnType::Int64,
+            vec![
+                row64(1, Some(1)),
+                row64(2, Some(2)),
+                row64(3, Some(5_000_000_000)),
+            ],
+        );
+        let right = exec(
+            "r",
+            ColumnType::Int32,
+            vec![row32(10, Some(1)), row32(11, Some(2)), row32(12, Some(7))],
+        );
+        let join = MergeJoin::new(left, right, 1, 1).unwrap();
+        let rows = drain(join);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Int32(1));
+        assert_eq!(rows[1][0], Value::Int32(2));
+    }
+
+    // Negative space: a key column outside the child schema must fail at
+    // construction, never per-tuple.
+    #[test]
+    fn out_of_range_key_column_errors_at_construction() {
+        let result = MergeJoin::new(
+            exec("l", ColumnType::Int32, Vec::new()),
+            exec("r", ColumnType::Int32, Vec::new()),
+            9,
+            1,
+        );
+        assert!(result.is_err());
     }
 }

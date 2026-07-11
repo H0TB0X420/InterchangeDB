@@ -21,11 +21,12 @@
 
 use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::Result;
-use crate::sql::cost::{CostModel, DefaultCostModel};
 use crate::sql::expr::{Expression, Predicate};
-use crate::sql::join_order::JoinAlgorithm;
 use crate::sql::logical::LogicalPlan;
 use crate::sql::physical::PhysOp;
+use crate::sql::cost::{CostModel, DefaultCostModel};
+use crate::sql::join_order::JoinAlgorithm;
+use crate::sql::memo::VolcanoPlanner;
 use crate::sql::selectivity::join_selectivity;
 use crate::sql::selinger::SelingerPlanner;
 use crate::sql::stats::QueryStats;
@@ -115,6 +116,7 @@ impl PlannerStrategy for RuleBasedPlanner {
 pub enum Planner {
     RuleBased(RuleBasedPlanner),
     Selinger(SelingerPlanner<DefaultCostModel>),
+    VolcanoMemo(VolcanoPlanner<DefaultCostModel>),
 }
 
 impl Default for Planner {
@@ -134,6 +136,7 @@ impl Planner {
         match self {
             Planner::RuleBased(p) => p.plan(logical, catalog),
             Planner::Selinger(p) => p.plan(logical, catalog),
+            Planner::VolcanoMemo(p) => p.plan(logical, catalog),
         }
     }
 
@@ -142,6 +145,7 @@ impl Planner {
         match self {
             Planner::RuleBased(p) => p.name(),
             Planner::Selinger(p) => p.name(),
+            Planner::VolcanoMemo(p) => p.name(),
         }
     }
 }
@@ -486,6 +490,24 @@ where
         current = next;
     }
 
+    Ok(apply_select_spine(
+        current, residual, aggregates, order_by, projection, limit,
+    ))
+}
+
+/// Apply the fixed statement spine above an optimized core (D3): residual
+/// Filter → HashAggregate → Sort → Projection → Limit. Factored from
+/// `plan_select`'s tail (T17-A.4) so the memo planner's emission applies
+/// the identical spine; column indices in every argument must already be
+/// in the core's output coordinates.
+pub(crate) fn apply_select_spine(
+    mut current: PhysOp,
+    residual: Vec<Predicate>,
+    aggregates: Vec<crate::sql::logical::AggregateSpec>,
+    order_by: Vec<(usize, crate::sql::logical::OrderDir)>,
+    projection: Vec<usize>,
+    limit: Option<usize>,
+) -> PhysOp {
     if let Some(pred) = and_all(residual) {
         current = PhysOp::Filter {
             input: Box::new(current),
@@ -521,7 +543,7 @@ where
             max_rows: n,
         };
     }
-    Ok(current)
+    current
 }
 
 /// Always true unless we want to suppress Projection for aggregate plans.
@@ -637,7 +659,12 @@ fn try_match_inlj(
 /// mirror). Returns the (PK-typed) key on match. Composite PKs and non-equality
 /// predicates fall through to the index / scan paths. This is the strongest
 /// access path for `WHERE pk = …`, so callers try it first.
-fn try_lower_pk_lookup(pred: &Predicate, schema: &Schema) -> Option<Vec<crate::types::Value>> {
+/// `pub(crate)`: the memo planner's leaf candidates share this lowering
+/// verbatim (D6) — re-implementing it is forbidden (recheck bug class).
+pub(crate) fn try_lower_pk_lookup(
+    pred: &Predicate,
+    schema: &Schema,
+) -> Option<Vec<crate::types::Value>> {
     // First cut: single-column primary keys only.
     if schema.primary_key.len() != 1 {
         return None;
@@ -664,7 +691,8 @@ fn try_lower_pk_lookup(pred: &Predicate, schema: &Schema) -> Option<Vec<crate::t
 }
 
 /// Result of attempting to lower a `WHERE` clause into an IndexScan.
-enum IndexLowering {
+/// `pub(crate)`: shared with the memo planner's leaf candidates (D6).
+pub(crate) enum IndexLowering {
     /// A single-column equality predicate matched a single-column index.
     /// `handle` is the index; `prefix` is the literal value to scan for.
     /// `recheck` is the original predicate, which the caller MUST re-apply
@@ -687,7 +715,8 @@ enum IndexLowering {
 /// cut handles only the simplest indexable shape: a single equality
 /// between one indexed column and a literal. Composite indexes, range
 /// predicates, and AND-decomposition land in later phases.
-fn try_lower_index_predicate(
+/// `pub(crate)`: shared with the memo planner's leaf candidates (D6).
+pub(crate) fn try_lower_index_predicate(
     pred: Predicate,
     indexes: &[crate::table::IndexHandle],
 ) -> IndexLowering {
@@ -856,7 +885,8 @@ fn bucket_of(cols: &[usize], ranges: &[TableRange]) -> Bucket {
 }
 
 /// Re-combine conjuncts into one left-associative `AND`, or `None` if empty.
-fn and_all(preds: Vec<Predicate>) -> Option<Predicate> {
+/// `pub(crate)`: also used by the memo planner's leaf candidates (D6).
+pub(crate) fn and_all(preds: Vec<Predicate>) -> Option<Predicate> {
     preds
         .into_iter()
         .reduce(|acc, p| Predicate::And(Box::new(acc), Box::new(p)))
@@ -1133,7 +1163,8 @@ where
 /// Render an EXPLAIN string for a `PhysicalPlan`. For query plans this walks
 /// the `PhysOp` IR directly (engine-free — no build, no scan); for descriptors
 /// it emits a one-line summary.
-fn render_explain(plan: &PhysicalPlan) -> String {
+/// `pub(crate)`: the memo planner renders its own EXPLAIN arm (T17-A.6).
+pub(crate) fn render_explain(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::Query(physop) => physop.explain(0),
         PhysicalPlan::CreateTable { name, .. } => format!("CreateTable({})\n", name),
@@ -1158,8 +1189,8 @@ mod tests {
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{Schema, TableId};
     use crate::common::Error;
-    use crate::execution::build::build_executor;
     use crate::index::btree::BTreeEngine;
+    use crate::execution::build::build_executor;
     use crate::sql::binder::Binder;
     use crate::sql::frontend::parse;
     use crate::storage::FileDiskManager;

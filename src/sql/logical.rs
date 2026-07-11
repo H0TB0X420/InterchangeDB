@@ -137,8 +137,9 @@ pub enum AggregateSpec {
 
 /// SQL-level sort direction. Separate from `execution::SortDir` so the
 /// SQL IR has no executor dependency; the planner translates between
-/// them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// them. `Hash` because the memo keys winners by order requirement
+/// (17-B), and `OrderDir` is part of that key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderDir {
     Asc,
     Desc,
