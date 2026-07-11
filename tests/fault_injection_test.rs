@@ -5,7 +5,7 @@
 //!
 //! Scope clarification: this exercises the BPM's I/O failure paths only.
 //! WAL append failures (`src/wal/writer.rs`) and SSTable write failures
-//! (`src/index/lsm/sstable.rs`) use raw `std::fs::File` directly — not via
+//! (`src/engines/lsm/sstable.rs`) use raw `std::fs::File` directly — not via
 //! `DiskManager` — so this wrapper doesn't reach them. Extending fault
 //! injection to those subsystems is a separate piece of work (deferred;
 //! not in Q-07's scope).

@@ -48,9 +48,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::catalog::TableId;
-use crate::sql::cost::{Cost, CostModel};
-use crate::sql::selectivity::join_selectivity;
-use crate::sql::stats::QueryStats;
+use crate::sql::optimizer::cost::{Cost, CostModel};
+use crate::sql::optimizer::selectivity::join_selectivity;
+use crate::sql::optimizer::stats::QueryStats;
 
 /// Index of a base relation within the `relations` slice.
 pub type RelId = usize;
@@ -469,8 +469,8 @@ fn base_cardinality(r: RelId, relations: &[JoinRelation], stats: &QueryStats) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::cost::DefaultCostModel;
-    use crate::sql::stats::MockStatsProvider;
+    use crate::sql::optimizer::cost::DefaultCostModel;
+    use crate::sql::optimizer::stats::MockStatsProvider;
 
     /// `(table_id, row_count, &[(col, ndv)])` — terse table spec for DP tests.
     type TableSpec<'a> = (u32, i64, &'a [(u32, i64)]);

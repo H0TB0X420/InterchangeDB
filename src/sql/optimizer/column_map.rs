@@ -32,7 +32,7 @@
 //! a hash/index join is a fresh leaf and keeps local indices — that's the
 //! caller's concern, not the remap's.
 
-use crate::sql::expr::{Expression, Predicate};
+use crate::sql::ir::expr::{Expression, Predicate};
 
 /// A rewrite of tuple-global column indices from textual order to a chosen
 /// physical (reordered) layout. Built once per reordered plan; applied to
@@ -144,7 +144,7 @@ impl ColumnRemap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::expr::{CompareOp, Expression, Predicate};
+    use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
     use crate::types::Value;
 
     fn col(i: usize) -> Expression {
@@ -208,7 +208,7 @@ mod tests {
         // (col(0) + 5) under the swap → (col(3) + 5); literal untouched.
         let remap = ColumnRemap::new(&[2, 3], &[1, 0]);
         let expr = Expression::BinaryOp {
-            op: crate::sql::expr::BinaryOp::Add,
+            op: crate::sql::ir::expr::BinaryOp::Add,
             left: Box::new(col(0)),
             right: Box::new(Expression::Literal(Value::Int32(5))),
         };

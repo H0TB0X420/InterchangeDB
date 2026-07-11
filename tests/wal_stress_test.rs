@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use interchangedb::database::Database;
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::wal::{Lsn, WalReader};
 use tempfile::tempdir;
 

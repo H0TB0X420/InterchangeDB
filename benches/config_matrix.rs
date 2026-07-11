@@ -10,7 +10,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::MemoryDiskManager;
 
 use testkit::workload;

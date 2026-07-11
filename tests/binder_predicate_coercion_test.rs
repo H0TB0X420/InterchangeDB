@@ -20,7 +20,7 @@ use tempfile::{tempdir, TempDir};
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema, TableId};
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::storage::FileDiskManager;
 use interchangedb::types::{ColumnType, Value};

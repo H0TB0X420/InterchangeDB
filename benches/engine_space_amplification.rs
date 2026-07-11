@@ -25,8 +25,8 @@
 
 use interchangedb::buffer::replacer::ArcReplacer;
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
-use interchangedb::index::btree::{BTree, BTreeHeaderPage};
-use interchangedb::index::lsm::LsmTree;
+use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
+use interchangedb::engines::lsm::LsmTree;
 use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;
 

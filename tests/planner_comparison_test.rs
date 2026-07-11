@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, Schema, TableId};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::sql::binder::Binder;
 use interchangedb::sql::frontend::parse;
 use interchangedb::sql::{PhysicalPlan, PlannerStrategy, RuleBasedPlanner, SelingerPlanner};

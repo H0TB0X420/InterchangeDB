@@ -68,10 +68,9 @@ pub mod storage;
 /// Synchronization-primitive shim (parking_lot in prod, shuttle under test).
 pub(crate) mod sync;
 
-// Future modules (placeholders)
-pub mod concurrency;
+/// The pluggable `StorageEngine` implementations (B+Tree, LSM).
+pub mod engines;
 pub mod execution;
-pub mod index;
 pub mod session;
 pub mod sql;
 pub mod table;
@@ -85,8 +84,8 @@ pub use common::{Error, FrameId, PageId, Result};
 
 pub use buffer::{BufferPoolManager, BufferPoolStats, Frame, StatsSnapshot};
 pub use database::{BTreeDatabase, Database, LsmDatabase};
-pub use index::btree::BTreeEngine;
-pub use index::lsm::LsmEngine;
+pub use engines::btree::BTreeEngine;
+pub use engines::lsm::LsmEngine;
 pub use storage::page::{Page, PageHeader, PageType};
 pub use storage::{DiskManager, FileDiskManager, MemoryDiskManager};
 pub use storage::{ScanIterator, StorageEngine, StorageStatus};

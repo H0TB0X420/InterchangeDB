@@ -27,8 +27,8 @@ use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
 
-use interchangedb::index::lsm::manifest::Manifest;
-use interchangedb::index::lsm::sstable::SSTableReader;
+use interchangedb::engines::lsm::manifest::Manifest;
+use interchangedb::engines::lsm::sstable::SSTableReader;
 use interchangedb::types::{keyenc, tuple, ColumnType, Decimal, Value};
 use interchangedb::wal::{LogPayload, LogRecord, Lsn};
 

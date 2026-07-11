@@ -14,10 +14,10 @@ use tempfile::{tempdir, TempDir};
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{ColumnDef, Schema, TableId};
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::{
     Delete, Executor, Filter, Insert, Projection, SeqScan, SetExpr, Update,
 };
-use interchangedb::index::btree::BTreeEngine;
 use interchangedb::layout::RowLayout;
 use interchangedb::storage::FileDiskManager;
 use interchangedb::table::Table;

@@ -8,7 +8,7 @@ use tempfile::tempdir;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::FileDiskManager;
 use interchangedb::txn::TxnMode;
 
@@ -322,7 +322,7 @@ fn gc_status_tracks_committed_metadata_size() {
 #[test]
 fn gc_status_without_txn_manager_returns_error() {
     use interchangedb::buffer::BufferPoolManager;
-    use interchangedb::index::btree::BTreeEngine;
+    use interchangedb::engines::btree::BTreeEngine;
     use interchangedb::storage::FileDiskManager;
     let dir = tempdir().unwrap();
     let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();

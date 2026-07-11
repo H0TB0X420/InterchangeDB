@@ -48,7 +48,7 @@ use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::catalog::Catalog;
 use interchangedb::common::Result as DbResult;
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::ExecModel;
 use interchangedb::session::{PreparedStatement, QueryResult, Session};
 use interchangedb::sql::{Planner, RuleBasedPlanner, SelingerPlanner, VolcanoPlanner};

@@ -9,7 +9,7 @@
 //! - Data is durable across drop-and-reopen cycles.
 //! - A malformed `.tmp` orphan doesn't break open (it's swept, not parsed).
 
-use interchangedb::index::lsm::LsmTree;
+use interchangedb::engines::lsm::LsmTree;
 use std::fs;
 use tempfile::TempDir;
 

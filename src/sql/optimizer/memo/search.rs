@@ -24,11 +24,11 @@
 //! struct ("PhysicalCandidate") lives here rather than in `memo.rs` —
 //! search is its only producer and consumer.
 
-use crate::sql::cost::{Cost, CostModel};
-use crate::sql::join_order::{RelId, RelSet, ROWS_PER_PAGE_ESTIMATE};
-use crate::sql::memo::memo::{full_relset, GroupId, Memo, PhysChoice, Winner};
-use crate::sql::memo::normalize::{Edge, NormalizedQuery, RelInfo};
-use crate::sql::memo::props::{merge_requirements, OrderKey};
+use crate::sql::optimizer::cost::{Cost, CostModel};
+use crate::sql::optimizer::join_order::{RelId, RelSet, ROWS_PER_PAGE_ESTIMATE};
+use crate::sql::optimizer::memo::memo::{full_relset, GroupId, Memo, PhysChoice, Winner};
+use crate::sql::optimizer::memo::normalize::{Edge, NormalizedQuery, RelInfo};
+use crate::sql::optimizer::memo::props::{merge_requirements, OrderKey};
 use crate::sql::planner::{and_all, try_lower_index_predicate, try_lower_pk_lookup, IndexLowering};
 
 /// One physical implementation alternative for a group: the operator's
@@ -519,11 +519,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::sql::cost::DefaultCostModel;
-    use crate::sql::memo::fixtures::{bind, default_stats, edge, query, rel, setup};
-    use crate::sql::memo::normalize::normalize;
-    use crate::sql::memo::props::edge_order;
-    use crate::sql::stats::{MockStatsProvider, QueryStats};
+    use crate::sql::optimizer::cost::DefaultCostModel;
+    use crate::sql::optimizer::memo::fixtures::{bind, default_stats, edge, query, rel, setup};
+    use crate::sql::optimizer::memo::normalize::normalize;
+    use crate::sql::optimizer::memo::props::edge_order;
+    use crate::sql::optimizer::stats::{MockStatsProvider, QueryStats};
     use crate::types::Value;
 
     // ---- Brute-force reference (independent of the search machinery) ----
@@ -861,7 +861,7 @@ mod tests {
     // ---- §5 leaf candidates through the shared lowering (D6) ----
 
     fn normalized(
-        env: &crate::sql::memo::fixtures::Env,
+        env: &crate::sql::optimizer::memo::fixtures::Env,
         sql: &str,
         stats: &QueryStats,
     ) -> NormalizedQuery {
@@ -905,7 +905,7 @@ mod tests {
                 // The recheck predicate (E1/O12) must ride the winner.
                 assert!(matches!(
                     filter,
-                    crate::sql::expr::Predicate::Compare { .. }
+                    crate::sql::ir::expr::Predicate::Compare { .. }
                 ));
             }
             other => panic!("expected IndexScan, got {other:?}"),

@@ -13,7 +13,7 @@
 use proptest::prelude::*;
 
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::MemoryDiskManager;
 
 use testkit::equivalence::assert_all_equal;

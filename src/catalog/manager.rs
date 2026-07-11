@@ -37,8 +37,8 @@ use crate::catalog::system_tables::{
 };
 use crate::catalog::{IndexBackend, IndexDef, IndexId, Schema, TableId};
 use crate::common::{ConstraintRule, Error, Result};
-use crate::index::btree::BTreeEngine;
-use crate::index::lsm::LsmEngine;
+use crate::engines::btree::BTreeEngine;
+use crate::engines::lsm::LsmEngine;
 use crate::layout::{DataLayout, LayoutCtx, RowLayout};
 use crate::storage::{FileDiskManager, StorageEngine};
 use crate::types::Value;
@@ -446,7 +446,7 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{ColumnDef, Schema};
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::storage::FileDiskManager;
     use crate::types::ColumnType;
     use tempfile::TempDir;

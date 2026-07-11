@@ -38,7 +38,7 @@ use crate::database::Database;
 use crate::execution::{ExecModel, Tuple};
 use crate::sql::binder::Binder;
 use crate::sql::frontend::parse;
-use crate::sql::logical::LogicalPlan;
+use crate::sql::ir::logical::LogicalPlan;
 use crate::sql::planner::{PhysicalPlan, Planner};
 use crate::sql::workload_log::WorkloadLog;
 use crate::storage::StorageEngine;
@@ -516,7 +516,7 @@ fn kind_name(p: &PhysicalPlan) -> &'static str {
 mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::storage::FileDiskManager;
     use tempfile::TempDir;
 

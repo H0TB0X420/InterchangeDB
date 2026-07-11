@@ -62,12 +62,12 @@ macro_rules! for_each_engine {
     ($cb:ident) => {
         $cb!(
             btree,
-            interchangedb::index::btree::BTreeEngine,
+            interchangedb::engines::btree::BTreeEngine,
             $crate::engine::btree
         );
         $cb!(
             lsm,
-            interchangedb::index::lsm::LsmEngine,
+            interchangedb::engines::lsm::LsmEngine,
             $crate::engine::lsm
         );
     };

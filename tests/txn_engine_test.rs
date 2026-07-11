@@ -21,7 +21,7 @@ use tempfile::{tempdir, TempDir};
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{ColumnDef, Schema, TableId};
 use interchangedb::common::Error;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::layout::RowLayout;
 use interchangedb::storage::{FileDiskManager, StorageEngine};
 use interchangedb::table::Table;

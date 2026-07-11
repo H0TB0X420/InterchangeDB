@@ -173,8 +173,8 @@ impl StorageEngine for BTreeEngine {
         // `ValueTooLarge`. Key-side is separately guarded with a smaller
         // per-key cap (a long key forces an internal-node entry too).
         const LEAF_BUDGET: usize = crate::common::config::PAGE_SIZE
-            - crate::index::btree::node::LEAF_HEADER_SIZE
-            - crate::index::btree::node::MAX_TOMBSTONES * 2
+            - crate::engines::btree::node::LEAF_HEADER_SIZE
+            - crate::engines::btree::node::MAX_TOMBSTONES * 2
             - 4;
         if key.len() + value.len() > LEAF_BUDGET {
             return Err(crate::common::Error::ValueTooLarge(value.len()));

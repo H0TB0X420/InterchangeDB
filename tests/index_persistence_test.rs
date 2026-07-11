@@ -10,7 +10,7 @@ use std::sync::Arc;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::system_tables::read_all_index_rows;
 use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema, TableId};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::{FileDiskManager, StorageEngine};
 use interchangedb::types::ColumnType;
 

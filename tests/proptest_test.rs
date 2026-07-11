@@ -10,7 +10,7 @@ use tempfile::tempdir;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::FileDiskManager;
 use interchangedb::txn::mvcc::{
     decode_mvcc_key, decode_mvcc_value, encode_mvcc_key, encode_mvcc_value, MvccValue,
@@ -271,7 +271,7 @@ proptest! {
 
 // ---- Q-08: LSM invariants vs. HashMap oracle ----
 
-use interchangedb::index::lsm::LsmTree;
+use interchangedb::engines::lsm::LsmTree;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]

@@ -18,10 +18,10 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, Schema, TableId};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::ExecModel;
 use interchangedb::layout::RowLayout;
-use interchangedb::sql::cost::{Cost, CostModel, DefaultCostModel};
+use interchangedb::sql::optimizer::cost::{Cost, CostModel, DefaultCostModel};
 use interchangedb::sql::{
     parse, Binder, PhysicalPlan, PlannerStrategy, RuleBasedPlanner, VolcanoPlanner,
 };

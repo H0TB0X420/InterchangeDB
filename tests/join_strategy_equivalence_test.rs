@@ -20,12 +20,12 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema, TableId};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::ExecModel;
 use interchangedb::layout::RowLayout;
-use interchangedb::sql::expr::{CompareOp, Expression, Predicate};
-use interchangedb::sql::logical::OrderDir;
-use interchangedb::sql::physical::PhysOp;
+use interchangedb::sql::ir::expr::{CompareOp, Expression, Predicate};
+use interchangedb::sql::ir::logical::OrderDir;
+use interchangedb::sql::ir::physical::PhysOp;
 use interchangedb::storage::FileDiskManager;
 use interchangedb::table::Table;
 use interchangedb::types::{ColumnType, Value};

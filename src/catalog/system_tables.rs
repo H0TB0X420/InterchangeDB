@@ -718,7 +718,7 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::TableId;
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::storage::FileDiskManager;
     use tempfile::TempDir;
 

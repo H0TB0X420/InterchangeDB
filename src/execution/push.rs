@@ -51,7 +51,7 @@ use crate::execution::build::build_executor;
 use crate::execution::model::ExecutionModel;
 use crate::execution::{Executor, Tuple};
 use crate::layout::{DataLayout, LayoutCtx, RowLayout};
-use crate::sql::physical::PhysOp;
+use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 
 /// Whether a sink wants more tuples after the one it just received.
@@ -321,9 +321,9 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{ColumnDef, TableId};
+    use crate::engines::btree::BTreeEngine;
     use crate::execution::ExecutionModel;
-    use crate::index::btree::BTreeEngine;
-    use crate::sql::expr::{CompareOp, Expression, Predicate};
+    use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
     use crate::storage::FileDiskManager;
     use crate::table::Table;
     use crate::types::{ColumnType, Value};
@@ -441,7 +441,7 @@ mod tests {
     // and its result row flows into the push collector.
     #[test]
     fn push_delegates_aggregate() {
-        use crate::sql::logical::AggregateSpec;
+        use crate::sql::ir::logical::AggregateSpec;
         let (engine, catalog, _dir) = seeded(5);
         let plan = PhysOp::HashAggregate {
             input: Box::new(scan("nums")),
@@ -456,7 +456,7 @@ mod tests {
     // exercising push-over-delegated composition.
     #[test]
     fn push_limit_over_delegated_sort() {
-        use crate::sql::logical::OrderDir;
+        use crate::sql::ir::logical::OrderDir;
         let (engine, catalog, _dir) = seeded(4); // n = 0..3
         let plan = PhysOp::Limit {
             max_rows: 2,

@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, IndexId};
-use interchangedb::index::btree::BTreeEngine;
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::btree::BTreeEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::storage::{FileDiskManager, StorageEngine};
 
 fn fresh_btree_catalog() -> (Arc<Catalog<BTreeEngine>>, tempfile::TempDir) {

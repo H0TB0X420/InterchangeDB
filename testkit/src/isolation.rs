@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::FileDiskManager;
 use interchangedb::txn::isolation::{IsolationPolicy, ReadCommitted, SnapshotIsolation};
 use interchangedb::txn::TxnMode;

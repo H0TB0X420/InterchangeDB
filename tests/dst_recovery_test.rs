@@ -45,8 +45,8 @@ use tempfile::tempdir;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::btree::BTreeEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::storage::{MemoryDiskManager, StorageEngine};
 use interchangedb::txn::TxnMode;
 use interchangedb::wal::{LogPayload, LogRecord};

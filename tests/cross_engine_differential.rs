@@ -21,8 +21,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
-use interchangedb::index::btree::BTreeEngine;
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::btree::BTreeEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::storage::{FileDiskManager, StorageEngine};
 use proptest::prelude::*;
 use tempfile::{tempdir, TempDir};

@@ -16,13 +16,13 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::common::error::Result;
-use crate::index::lsm::config::{
+use crate::engines::lsm::config::{
     LEVEL_SIZE_RATIO, MAX_L0_SSTABLE_COUNT, MAX_LEVEL_COUNT, TARGET_SSTABLE_SIZE_BYTES,
 };
-use crate::index::lsm::manifest::{LevelState, Manifest};
-use crate::index::lsm::merge_iterator::MergeIterator;
-use crate::index::lsm::sstable::{write_sstable, SSTableMeta, SSTableReader};
-use crate::index::lsm::Entry;
+use crate::engines::lsm::manifest::{LevelState, Manifest};
+use crate::engines::lsm::merge_iterator::MergeIterator;
+use crate::engines::lsm::sstable::{write_sstable, SSTableMeta, SSTableReader};
+use crate::engines::lsm::Entry;
 
 /// Check if compaction is needed and run it.
 ///
@@ -324,7 +324,7 @@ fn is_bottom_level(level: usize, level_state: &LevelState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::lsm::LsmTree;
+    use crate::engines::lsm::LsmTree;
     use tempfile::TempDir;
 
     #[test]

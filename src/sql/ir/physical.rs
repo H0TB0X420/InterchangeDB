@@ -30,8 +30,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sql::expr::{Expression, Predicate};
-use crate::sql::logical::{AggregateSpec, OrderDir};
+use crate::sql::ir::expr::{Expression, Predicate};
+use crate::sql::ir::logical::{AggregateSpec, OrderDir};
 use crate::types::Value;
 
 /// One node of a physical plan. Children are owned `Box<PhysOp>`, so a plan
@@ -258,7 +258,7 @@ fn agg_label(spec: &AggregateSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::expr::{CompareOp, Expression, Predicate};
+    use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
     use crate::types::Value;
 
     // Proves the IR is serde-clean end to end: a tree carrying a `Predicate`

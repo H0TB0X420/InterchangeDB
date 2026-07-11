@@ -12,10 +12,10 @@
 //!   - Every other operator delivers nothing (index-order delivery is a
 //!     recorded non-goal).
 
-use crate::sql::logical::OrderDir;
-use crate::sql::join_order::{RelId, RelSet};
-use crate::sql::memo::normalize::{Edge, NormalizedQuery};
-use crate::sql::selinger::decompose;
+use crate::sql::ir::logical::OrderDir;
+use crate::sql::optimizer::join_order::{RelId, RelSet};
+use crate::sql::optimizer::memo::normalize::{Edge, NormalizedQuery};
+use crate::sql::optimizer::selinger::decompose;
 
 /// A stable column reference: `(relation index, relation-local column)`.
 pub(crate) type TextualColRef = (RelId, usize);

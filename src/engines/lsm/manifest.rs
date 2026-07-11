@@ -11,8 +11,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{Error, Result};
-use crate::index::lsm::config::MAX_LEVEL_COUNT;
-use crate::index::lsm::sstable::SSTableMeta;
+use crate::engines::lsm::config::MAX_LEVEL_COUNT;
+use crate::engines::lsm::sstable::SSTableMeta;
 
 /// Encode bytes as lowercase hex string.
 fn hex_encode(data: &[u8]) -> String {

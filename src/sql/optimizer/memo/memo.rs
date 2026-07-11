@@ -22,11 +22,11 @@
 
 use std::collections::HashMap;
 
-use crate::sql::expr::Predicate;
-use crate::sql::cost::Cost;
-use crate::sql::join_order::{RelId, RelSet, MAX_RELATIONS, MIN_CARD};
-use crate::sql::memo::normalize::{Edge, NormalizedQuery};
-use crate::sql::memo::props::OrderKey;
+use crate::sql::ir::expr::Predicate;
+use crate::sql::optimizer::cost::Cost;
+use crate::sql::optimizer::join_order::{RelId, RelSet, MAX_RELATIONS, MIN_CARD};
+use crate::sql::optimizer::memo::normalize::{Edge, NormalizedQuery};
+use crate::sql::optimizer::memo::props::OrderKey;
 use crate::types::Value;
 
 /// Index of a group within `Memo::groups`.
@@ -329,7 +329,7 @@ fn crosses(a: RelSet, b: RelSet, edges: &[Edge]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::memo::fixtures::{edge, query, rel};
+    use crate::sql::optimizer::memo::fixtures::{edge, query, rel};
 
     /// Chain 0—1—2 with distinct rows/selectivities for cardinality math.
     fn chain3() -> NormalizedQuery {

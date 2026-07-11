@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use test_each_file::test_each_path;
 
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::storage::engine::StorageEngine;
 
 // Auto-discover all scripts in tests/goldenscripts/lsm/.

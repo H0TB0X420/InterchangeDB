@@ -22,12 +22,12 @@
 use crate::catalog::system_tables::ColumnStats;
 use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
-use crate::sql::expr::{CompareOp, Expression, Predicate};
-use crate::sql::logical::{AggregateSpec, LogicalPlan, OrderDir};
-use crate::sql::join_order::{RelId, MAX_RELATIONS};
-use crate::sql::selectivity::{estimate_predicate_selectivity, join_selectivity};
-use crate::sql::selinger::{decompose, has_single_col_index};
-use crate::sql::stats::QueryStats;
+use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
+use crate::sql::ir::logical::{AggregateSpec, LogicalPlan, OrderDir};
+use crate::sql::optimizer::join_order::{RelId, MAX_RELATIONS};
+use crate::sql::optimizer::selectivity::{estimate_predicate_selectivity, join_selectivity};
+use crate::sql::optimizer::selinger::{decompose, has_single_col_index};
+use crate::sql::optimizer::stats::QueryStats;
 use crate::sql::planner::{flatten_conjuncts, rebase_predicate, referenced_columns};
 use crate::storage::StorageEngine;
 use crate::table::IndexHandle;
@@ -328,13 +328,13 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::TableId;
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::sql::binder::Binder;
     use crate::sql::frontend::parse;
-    use crate::sql::memo::fixtures::{bind, default_stats, int32_col, setup};
-    use crate::sql::selectivity::{EQ_FALLBACK, JOIN_FALLBACK, RANGE_FALLBACK};
-    use crate::sql::selinger::build_join_graph;
-    use crate::sql::stats::{MockStatsProvider, DEFAULT_ROW_COUNT};
+    use crate::sql::optimizer::memo::fixtures::{bind, default_stats, int32_col, setup};
+    use crate::sql::optimizer::selectivity::{EQ_FALLBACK, JOIN_FALLBACK, RANGE_FALLBACK};
+    use crate::sql::optimizer::selinger::build_join_graph;
+    use crate::sql::optimizer::stats::{MockStatsProvider, DEFAULT_ROW_COUNT};
     use crate::storage::FileDiskManager;
 
     fn assert_eq_col_lit(pred: &Predicate, col: usize) {

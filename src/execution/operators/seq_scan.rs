@@ -69,7 +69,7 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{ColumnDef, TableId};
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::layout::RowLayout;
     use crate::storage::FileDiskManager;
     use crate::types::{ColumnType, Value};

@@ -4,7 +4,7 @@
 //! must be identical. (Performance is the benches' job; correctness is here.)
 
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::{FileDiskManager, MemoryDiskManager};
 
 use testkit::equivalence::assert_all_equal;

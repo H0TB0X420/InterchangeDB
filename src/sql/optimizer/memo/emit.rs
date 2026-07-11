@@ -19,13 +19,13 @@
 //!      `apply_select_spine` with every index remapped — mirroring
 //!      `selinger::rewrite_select`.
 
-use crate::sql::expr::{CompareOp, Expression, Predicate};
-use crate::sql::physical::PhysOp;
-use crate::sql::column_map::ColumnRemap;
-use crate::sql::memo::memo::{full_relset, GroupId, Memo, PhysChoice, Winner};
-use crate::sql::memo::normalize::NormalizedQuery;
-use crate::sql::memo::props::{merge_requirements, OrderKey};
-use crate::sql::selinger::remap_aggregate;
+use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
+use crate::sql::ir::physical::PhysOp;
+use crate::sql::optimizer::column_map::ColumnRemap;
+use crate::sql::optimizer::memo::memo::{full_relset, GroupId, Memo, PhysChoice, Winner};
+use crate::sql::optimizer::memo::normalize::NormalizedQuery;
+use crate::sql::optimizer::memo::props::{merge_requirements, OrderKey};
+use crate::sql::optimizer::selinger::remap_aggregate;
 use crate::sql::planner::{and_all, apply_select_spine};
 
 /// Convert the memo's root winner into an executable `PhysOp` tree,
@@ -461,11 +461,11 @@ fn raise_predicate(pred: Predicate, offset: usize) -> Predicate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::cost::DefaultCostModel;
-    use crate::sql::memo::fixtures::{bind, default_stats, setup, Env};
-    use crate::sql::memo::normalize::normalize;
-    use crate::sql::memo::search::optimize_root;
-    use crate::sql::stats::{MockStatsProvider, QueryStats};
+    use crate::sql::optimizer::cost::DefaultCostModel;
+    use crate::sql::optimizer::memo::fixtures::{bind, default_stats, setup, Env};
+    use crate::sql::optimizer::memo::normalize::normalize;
+    use crate::sql::optimizer::memo::search::optimize_root;
+    use crate::sql::optimizer::stats::{MockStatsProvider, QueryStats};
     use crate::sql::planner::plan;
     use crate::sql::planner::PhysicalPlan;
 

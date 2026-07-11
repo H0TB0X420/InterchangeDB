@@ -34,9 +34,9 @@ pub(crate) mod search;
 
 use crate::catalog::Catalog;
 use crate::common::Result;
-use crate::sql::logical::LogicalPlan;
-use crate::sql::cost::{CostModel, DefaultCostModel};
-use crate::sql::selinger::gather_query_stats;
+use crate::sql::ir::logical::LogicalPlan;
+use crate::sql::optimizer::cost::{CostModel, DefaultCostModel};
+use crate::sql::optimizer::selinger::gather_query_stats;
 use crate::sql::planner::{
     plan_inner, render_explain, JoinSelection, PhysicalPlan, PlannerStrategy,
 };
@@ -138,12 +138,12 @@ mod tests {
     use crate::buffer::BufferPoolManager;
     use crate::catalog::Catalog;
     use crate::database::Database;
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::session::Session;
     use crate::sql::binder::Binder;
     use crate::sql::frontend::parse;
-    use crate::sql::join_order::{cost_of_order, enumerate_join_orders, RelId};
-    use crate::sql::selinger::build_join_graph;
+    use crate::sql::optimizer::join_order::{cost_of_order, enumerate_join_orders, RelId};
+    use crate::sql::optimizer::selinger::build_join_graph;
     use crate::storage::FileDiskManager;
 
     /// The selinger_reorder_test chain (a: 2 rows — b: 4 — c: 8), built

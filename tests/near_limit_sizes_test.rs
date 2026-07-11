@@ -23,8 +23,8 @@
 use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
-use interchangedb::index::btree::BTreeEngine;
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::btree::BTreeEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::storage::{FileDiskManager, StorageEngine};
 
 fn make_btree() -> (Arc<BTreeEngine>, tempfile::TempDir) {

@@ -20,7 +20,7 @@
 //!   on-disk size observability.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use interchangedb::index::lsm::LsmTree;
+use interchangedb::engines::lsm::LsmTree;
 use tempfile::tempdir;
 
 /// Total keys to insert. Matches btree_bench.
@@ -220,7 +220,7 @@ fn bench_lsm_write(c: &mut Criterion) {
 
 /// Format level table count per level as `L0=2,L1=4,...`.
 /// `LevelState::level_size(i)` returns bytes per level; we report it directly.
-fn format_levels(ls: &interchangedb::index::lsm::manifest::LevelState) -> String {
+fn format_levels(ls: &interchangedb::engines::lsm::manifest::LevelState) -> String {
     let mut parts = Vec::new();
     for i in 0..7 {
         let bytes = ls.level_size(i);

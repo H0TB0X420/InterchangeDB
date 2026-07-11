@@ -21,15 +21,15 @@
 
 use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::Result;
-use crate::sql::expr::{Expression, Predicate};
-use crate::sql::logical::LogicalPlan;
-use crate::sql::physical::PhysOp;
-use crate::sql::cost::{CostModel, DefaultCostModel};
-use crate::sql::join_order::JoinAlgorithm;
-use crate::sql::memo::VolcanoPlanner;
-use crate::sql::selectivity::join_selectivity;
-use crate::sql::selinger::SelingerPlanner;
-use crate::sql::stats::QueryStats;
+use crate::sql::ir::expr::{Expression, Predicate};
+use crate::sql::ir::logical::LogicalPlan;
+use crate::sql::ir::physical::PhysOp;
+use crate::sql::optimizer::cost::{CostModel, DefaultCostModel};
+use crate::sql::optimizer::join_order::JoinAlgorithm;
+use crate::sql::optimizer::memo::VolcanoPlanner;
+use crate::sql::optimizer::selectivity::join_selectivity;
+use crate::sql::optimizer::selinger::SelingerPlanner;
+use crate::sql::optimizer::stats::QueryStats;
 use crate::storage::StorageEngine;
 
 /// How a `SELECT`'s joins pick their algorithm. The difference between
@@ -234,11 +234,11 @@ where
 #[allow(clippy::too_many_arguments)]
 fn plan_select<CatE>(
     table_name: String,
-    joins: Vec<crate::sql::logical::JoinClause>,
+    joins: Vec<crate::sql::ir::logical::JoinClause>,
     projection: Vec<usize>,
-    aggregates: Vec<crate::sql::logical::AggregateSpec>,
+    aggregates: Vec<crate::sql::ir::logical::AggregateSpec>,
     filter: Option<Predicate>,
-    order_by: Vec<(usize, crate::sql::logical::OrderDir)>,
+    order_by: Vec<(usize, crate::sql::ir::logical::OrderDir)>,
     limit: Option<usize>,
     catalog: &Catalog<CatE>,
     selection: &JoinSelection,
@@ -503,8 +503,8 @@ where
 pub(crate) fn apply_select_spine(
     mut current: PhysOp,
     residual: Vec<Predicate>,
-    aggregates: Vec<crate::sql::logical::AggregateSpec>,
-    order_by: Vec<(usize, crate::sql::logical::OrderDir)>,
+    aggregates: Vec<crate::sql::ir::logical::AggregateSpec>,
+    order_by: Vec<(usize, crate::sql::ir::logical::OrderDir)>,
     projection: Vec<usize>,
     limit: Option<usize>,
 ) -> PhysOp {
@@ -564,9 +564,9 @@ fn aggregates_was_empty_marker(projection: &[usize]) -> bool {
 fn extract_equi_join_keys(pred: &Predicate, outer_offset: usize) -> Option<(usize, usize)> {
     let (l, r) = match pred {
         Predicate::Compare {
-            op: crate::sql::expr::CompareOp::Eq,
-            left: crate::sql::expr::Expression::Column(l),
-            right: crate::sql::expr::Expression::Column(r),
+            op: crate::sql::ir::expr::CompareOp::Eq,
+            left: crate::sql::ir::expr::Expression::Column(l),
+            right: crate::sql::ir::expr::Expression::Column(r),
         } => (*l, *r),
         _ => return None,
     };
@@ -631,9 +631,9 @@ fn try_match_inlj(
 ) -> Option<(usize, crate::table::IndexHandle)> {
     let (l, r) = match pred {
         Predicate::Compare {
-            op: crate::sql::expr::CompareOp::Eq,
-            left: crate::sql::expr::Expression::Column(l),
-            right: crate::sql::expr::Expression::Column(r),
+            op: crate::sql::ir::expr::CompareOp::Eq,
+            left: crate::sql::ir::expr::Expression::Column(l),
+            right: crate::sql::ir::expr::Expression::Column(r),
         } => (*l, *r),
         _ => return None,
     };
@@ -672,14 +672,14 @@ pub(crate) fn try_lower_pk_lookup(
     let pk_col = schema.primary_key[0];
     let value = match pred {
         Predicate::Compare {
-            op: crate::sql::expr::CompareOp::Eq,
-            left: crate::sql::expr::Expression::Column(i),
-            right: crate::sql::expr::Expression::Literal(v),
+            op: crate::sql::ir::expr::CompareOp::Eq,
+            left: crate::sql::ir::expr::Expression::Column(i),
+            right: crate::sql::ir::expr::Expression::Literal(v),
         }
         | Predicate::Compare {
-            op: crate::sql::expr::CompareOp::Eq,
-            left: crate::sql::expr::Expression::Literal(v),
-            right: crate::sql::expr::Expression::Column(i),
+            op: crate::sql::ir::expr::CompareOp::Eq,
+            left: crate::sql::ir::expr::Expression::Literal(v),
+            right: crate::sql::ir::expr::Expression::Column(i),
         } if *i == pk_col => v,
         _ => return None,
     };
@@ -724,14 +724,14 @@ pub(crate) fn try_lower_index_predicate(
     // and the mirror `Compare(Eq, Literal(v), Column(i))`.
     let extracted = match &pred {
         Predicate::Compare {
-            op: crate::sql::expr::CompareOp::Eq,
-            left: crate::sql::expr::Expression::Column(i),
-            right: crate::sql::expr::Expression::Literal(v),
+            op: crate::sql::ir::expr::CompareOp::Eq,
+            left: crate::sql::ir::expr::Expression::Column(i),
+            right: crate::sql::ir::expr::Expression::Literal(v),
         } => Some((*i, v.clone())),
         Predicate::Compare {
-            op: crate::sql::expr::CompareOp::Eq,
-            left: crate::sql::expr::Expression::Literal(v),
-            right: crate::sql::expr::Expression::Column(i),
+            op: crate::sql::ir::expr::CompareOp::Eq,
+            left: crate::sql::ir::expr::Expression::Literal(v),
+            right: crate::sql::ir::expr::Expression::Column(i),
         } => Some((*i, v.clone())),
         _ => None,
     };
@@ -837,7 +837,7 @@ struct TableRange {
 /// textual order — mirroring how `plan_select` grows `outer_offset`.
 fn table_ranges<CatE>(
     left: &Schema,
-    joins: &[crate::sql::logical::JoinClause],
+    joins: &[crate::sql::ir::logical::JoinClause],
     catalog: &Catalog<CatE>,
 ) -> Result<Vec<TableRange>>
 where
@@ -1008,7 +1008,7 @@ fn build_right_leaf(
 
 fn plan_insert<CatE>(
     table_name: String,
-    rows: Vec<Vec<crate::sql::expr::Expression>>,
+    rows: Vec<Vec<crate::sql::ir::expr::Expression>>,
     catalog: &Catalog<CatE>,
 ) -> Result<PhysOp>
 where
@@ -1035,7 +1035,7 @@ where
 
 fn plan_update<CatE>(
     table_name: String,
-    set_clauses: Vec<(usize, crate::sql::expr::Expression)>,
+    set_clauses: Vec<(usize, crate::sql::ir::expr::Expression)>,
     filter: Option<Predicate>,
     catalog: &Catalog<CatE>,
 ) -> Result<PhysOp>
@@ -1189,7 +1189,7 @@ mod tests {
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{Schema, TableId};
     use crate::common::Error;
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::execution::build::build_executor;
     use crate::sql::binder::Binder;
     use crate::sql::frontend::parse;
@@ -1522,7 +1522,7 @@ Limit(3)
     }
     fn eq(l: Expression, r: Expression) -> Predicate {
         Predicate::Compare {
-            op: crate::sql::expr::CompareOp::Eq,
+            op: crate::sql::ir::expr::CompareOp::Eq,
             left: l,
             right: r,
         }
@@ -1555,7 +1555,7 @@ Limit(3)
 
         // Arithmetic on a side recurses: `col3 + col4 = col7`.
         let arith = Expression::BinaryOp {
-            op: crate::sql::expr::BinaryOp::Add,
+            op: crate::sql::ir::expr::BinaryOp::Add,
             left: Box::new(col(3)),
             right: Box::new(col(4)),
         };

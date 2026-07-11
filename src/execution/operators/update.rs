@@ -118,9 +118,9 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{ColumnDef, TableId};
-    use crate::execution::filter::Filter;
-    use crate::execution::seq_scan::SeqScan;
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
+    use crate::execution::operators::filter::Filter;
+    use crate::execution::operators::seq_scan::SeqScan;
     use crate::layout::RowLayout;
     use crate::storage::FileDiskManager;
     use crate::types::ColumnType;

@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use test_each_file::test_each_path;
 
 use interchangedb::buffer::BufferPoolManager;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::engine::StorageEngine;
 use interchangedb::storage::FileDiskManager;
 

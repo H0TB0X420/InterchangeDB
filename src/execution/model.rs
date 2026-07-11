@@ -17,7 +17,7 @@ use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
 use crate::execution::build::build_executor;
 use crate::execution::Tuple;
-use crate::sql::physical::PhysOp;
+use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 
 /// How a physical plan is evaluated into result rows. The model owns build +

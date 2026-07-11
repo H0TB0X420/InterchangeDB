@@ -8,8 +8,8 @@
 //! `Self: Sized`, not on `dyn`).
 
 use interchangedb::buffer::BufferPoolManager;
-use interchangedb::index::btree::BTreeEngine;
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::btree::BTreeEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::storage::{MemoryDiskManager, StorageEngine};
 
 use crate::handles::Built;

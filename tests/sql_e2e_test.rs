@@ -18,7 +18,7 @@ use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::Catalog;
 use interchangedb::common::Error;
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::sql::workload_log::WorkloadLog;
 use interchangedb::storage::FileDiskManager;

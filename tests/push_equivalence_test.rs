@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::Catalog;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::ExecModel;
-use interchangedb::index::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::storage::FileDiskManager;
 use interchangedb::types::Value;

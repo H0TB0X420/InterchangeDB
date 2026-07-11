@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::ColumnDef;
-use crate::sql::expr::{Expression, Predicate};
+use crate::sql::ir::expr::{Expression, Predicate};
 use crate::types::Value;
 
 /// One catalog-resolved SQL statement.

@@ -37,7 +37,7 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use interchangedb::buffer::BufferPoolManager;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::{FileDiskManager, StorageEngine};
 use interchangedb::PageHeader;
 use testkit::faults::FaultInjectionDiskManager;

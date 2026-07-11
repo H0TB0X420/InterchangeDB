@@ -11,7 +11,7 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, Schema, TableId};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::FileDiskManager;
 use interchangedb::types::ColumnType;
 use std::sync::Arc;

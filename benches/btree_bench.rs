@@ -21,7 +21,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
-use interchangedb::index::btree::{BTree, BTreeHeaderPage};
+use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
 use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;
 

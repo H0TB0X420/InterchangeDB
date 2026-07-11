@@ -198,7 +198,7 @@ impl DataLayout for RowLayout {
 mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::storage::FileDiskManager;
     use crate::types::{keyenc, ColumnType};
     use tempfile::TempDir;

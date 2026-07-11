@@ -1,49 +1,44 @@
 //! SQL surface — parser → logical plan → physical plan (executor tree).
 //!
-//! Phase 11 components (in dependency order):
+//! Pipeline stages (in dependency order):
 //!   - `frontend`     SQL string → sqlparser AST.
-//!   - `logical`      AST → our `LogicalPlan` IR (catalog-resolved).
-//!   - `expr`         Expression / Predicate IR + closure compilation.
-//!   - `planner`      `LogicalPlan` → `Box<dyn Executor>`.
-//!   - `workload_log` Append-only journal of executed statements.
-//!
-//! Rule-based for V1. Optimizer arrives in Phase 14 (Selinger) and Phase
-//! 17/18 (Cascades, as an interchangeable alternative).
+//!   - `binder`       AST → catalog-resolved `LogicalPlan`.
+//!   - `ir`           the three plan representations: `expr`
+//!     (Expression/Predicate), `logical` (LogicalPlan), `physical`
+//!     (PhysOp — the model-neutral executor IR).
+//!   - `optimizer`    cost-based planning machinery: cost model, stats,
+//!     selectivity, join-order DP (Selinger), and the Phase 17 memo
+//!     planner.
+//!   - `planner`      the `PlannerStrategy` socket, the `Planner` enum,
+//!     and the rule-based lowering every planner shares.
+//!   - `workload_log` append-only journal of executed statements.
 
 pub mod binder;
-pub mod column_map;
-pub mod cost;
-pub mod expr;
 pub mod frontend;
-pub mod join_order;
-pub mod logical;
-pub mod memo;
-pub mod physical;
+pub mod ir;
+pub mod optimizer;
 pub mod planner;
-pub mod selectivity;
-pub mod selinger;
-pub mod stats;
 pub mod workload_log;
 
 pub use binder::Binder;
-pub use column_map::ColumnRemap;
-pub use cost::{Cost, CostModel, CostWeights, DefaultCostModel};
-pub use expr::{BinaryOp, CompareOp, Expression, Predicate};
 pub use frontend::parse;
-pub use join_order::{
+pub use ir::expr::{BinaryOp, CompareOp, Expression, Predicate};
+pub use ir::logical::LogicalPlan;
+pub use ir::physical::PhysOp;
+pub use optimizer::column_map::ColumnRemap;
+pub use optimizer::cost::{Cost, CostModel, CostWeights, DefaultCostModel};
+pub use optimizer::join_order::{
     cost_of_order, enumerate_join_orders, JoinAlgorithm, JoinEdge, JoinOrder, JoinPlan,
     JoinRelation, RelId,
 };
-pub use logical::LogicalPlan;
-pub use memo::{BaselineCapable, VolcanoPlanner};
-pub use physical::PhysOp;
-pub use planner::{plan, PhysicalPlan, Planner, PlannerStrategy, RuleBasedPlanner};
-pub use selectivity::{
+pub use optimizer::memo::{BaselineCapable, VolcanoPlanner};
+pub use optimizer::selectivity::{
     estimate_predicate_selectivity, join_selectivity, EQ_FALLBACK, JOIN_FALLBACK, MIN_SELECTIVITY,
     RANGE_FALLBACK,
 };
-pub use selinger::SelingerPlanner;
-pub use stats::{
+pub use optimizer::selinger::SelingerPlanner;
+pub use optimizer::stats::{
     CatalogStatsProvider, MockStatsProvider, QueryStats, StatsProvider, DEFAULT_ROW_COUNT,
 };
+pub use planner::{plan, PhysicalPlan, Planner, PlannerStrategy, RuleBasedPlanner};
 pub use workload_log::WorkloadLog;

@@ -6,7 +6,7 @@
 //! across memtable + every SSTable.
 //!
 //! ## Heads-up about this codebase's LSM `scan`
-//! Looking at `src/index/lsm/mod.rs::scan`, the current implementation does
+//! Looking at `src/engines/lsm/mod.rs::scan`, the current implementation does
 //! a *full-tree merge* and then filters by range. That makes short range
 //! queries dramatically expensive. Real-world LSMs (RocksDB, LevelDB) seek
 //! to the start key at the block level. This bench will surface that
@@ -28,8 +28,8 @@
 
 use interchangedb::buffer::replacer::ArcReplacer;
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
-use interchangedb::index::btree::{BTree, BTreeHeaderPage};
-use interchangedb::index::lsm::LsmTree;
+use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
+use interchangedb::engines::lsm::LsmTree;
 use interchangedb::storage::FileDiskManager;
 use std::time::Instant;
 use tempfile::tempdir;

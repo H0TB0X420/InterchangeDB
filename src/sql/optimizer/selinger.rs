@@ -33,15 +33,15 @@ use std::time::Duration;
 use crate::catalog::system_tables::ColumnStats;
 use crate::catalog::{Catalog, TableId};
 use crate::common::Result;
-use crate::sql::expr::{CompareOp, Expression, Predicate};
-use crate::sql::logical::{AggregateSpec, JoinClause, LogicalPlan, OrderDir};
-use crate::sql::column_map::ColumnRemap;
-use crate::sql::cost::{CostModel, DefaultCostModel};
-use crate::sql::join_order::{
+use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
+use crate::sql::ir::logical::{AggregateSpec, JoinClause, LogicalPlan, OrderDir};
+use crate::sql::optimizer::column_map::ColumnRemap;
+use crate::sql::optimizer::cost::{CostModel, DefaultCostModel};
+use crate::sql::optimizer::join_order::{
     cost_of_order, enumerate_join_orders, JoinEdge, JoinOrder, JoinRelation, RelId,
 };
-use crate::sql::selectivity::estimate_predicate_selectivity;
-use crate::sql::stats::{CatalogStatsProvider, QueryStats};
+use crate::sql::optimizer::selectivity::estimate_predicate_selectivity;
+use crate::sql::optimizer::stats::{CatalogStatsProvider, QueryStats};
 use crate::sql::planner::{
     flatten_conjuncts, plan_inner, rebase_predicate, referenced_columns, JoinSelection,
     PhysicalPlan, PlannerStrategy,
@@ -521,7 +521,7 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{Catalog, ColumnDef, Schema, TableId};
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::sql::binder::Binder;
     use crate::sql::frontend::parse;
     use crate::sql::planner::RuleBasedPlanner;

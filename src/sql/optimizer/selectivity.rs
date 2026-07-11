@@ -25,7 +25,7 @@
 //! ordering with infinite cost ratios.
 
 use crate::catalog::system_tables::{ColumnStats, HISTOGRAM_KIND_EQUI_WIDTH_INT};
-use crate::sql::expr::{CompareOp, Expression, Predicate};
+use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
 use crate::types::Value;
 
 /// Fallback selectivity for `col = literal` when NDV is unknown. Matches

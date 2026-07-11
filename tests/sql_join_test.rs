@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema, TableId};
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::{ExecutionModel, Volcano};
-use interchangedb::index::btree::BTreeEngine;
 use interchangedb::layout::RowLayout;
 use interchangedb::sql::{parse, plan, Binder, PhysicalPlan};
 use interchangedb::storage::FileDiskManager;

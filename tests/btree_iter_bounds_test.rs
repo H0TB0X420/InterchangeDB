@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::{Error, PageId};
-use interchangedb::index::btree::{encode_leaf_node, BTreeScanIterator, LeafNode};
+use interchangedb::engines::btree::{encode_leaf_node, BTreeScanIterator, LeafNode};
 use interchangedb::storage::FileDiskManager;
 use tempfile::TempDir;
 

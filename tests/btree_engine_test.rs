@@ -5,7 +5,7 @@
 //! there via the `database_tests!` macro.
 
 use interchangedb::buffer::BufferPoolManager;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::engine::StorageEngine;
 use interchangedb::storage::FileDiskManager;
 use tempfile::tempdir;

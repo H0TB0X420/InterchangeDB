@@ -15,16 +15,16 @@ use tempfile::TempDir;
 
 use crate::buffer::BufferPoolManager;
 use crate::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema, TableId};
-use crate::index::btree::BTreeEngine;
+use crate::engines::btree::BTreeEngine;
 use crate::sql::binder::Binder;
 use crate::sql::frontend::parse;
-use crate::sql::expr::{CompareOp, Expression, Predicate};
-use crate::sql::logical::LogicalPlan;
-use crate::sql::join_order::RelId;
-use crate::sql::memo::normalize::{
+use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
+use crate::sql::ir::logical::LogicalPlan;
+use crate::sql::optimizer::join_order::RelId;
+use crate::sql::optimizer::memo::normalize::{
     Edge, LocalPred, NormalizedQuery, RelInfo, SpineParts,
 };
-use crate::sql::stats::{MockStatsProvider, QueryStats};
+use crate::sql::optimizer::stats::{MockStatsProvider, QueryStats};
 use crate::storage::FileDiskManager;
 use crate::types::{ColumnType, Value};
 

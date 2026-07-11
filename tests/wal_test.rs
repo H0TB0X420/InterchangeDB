@@ -9,7 +9,7 @@
 //! - Checkpointing truncates old segments
 
 use interchangedb::database::Database;
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::wal::{LogPayload, Lsn, WalReader};
 use tempfile::tempdir;
 

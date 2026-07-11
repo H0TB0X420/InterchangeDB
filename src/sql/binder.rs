@@ -22,8 +22,8 @@ use sqlparser::ast::{
 
 use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::{Error, Result};
-use crate::sql::expr::{BinaryOp, CompareOp, Expression, Predicate};
-use crate::sql::logical::{AggregateSpec, LogicalPlan, OrderDir};
+use crate::sql::ir::expr::{BinaryOp, CompareOp, Expression, Predicate};
+use crate::sql::ir::logical::{AggregateSpec, LogicalPlan, OrderDir};
 use crate::storage::StorageEngine;
 use crate::types::{ColumnType, Decimal, Value};
 
@@ -321,14 +321,14 @@ impl<E: StorageEngine> Binder<E> {
         // — predicates over earlier tables still work, and over later
         // tables that haven't been joined yet would be a forward
         // reference (unusual, the binder rejects via column-not-found).
-        let mut joins: Vec<crate::sql::logical::JoinClause> =
+        let mut joins: Vec<crate::sql::ir::logical::JoinClause> =
             Vec::with_capacity(joined_tables.len());
         for (right_table, right_alias, on_expr) in joined_tables {
             let on = match on_expr {
                 Some(e) => Some(bind_predicate(&scope, e)?),
                 None => None,
             };
-            joins.push(crate::sql::logical::JoinClause {
+            joins.push(crate::sql::ir::logical::JoinClause {
                 right_table,
                 right_alias,
                 on,
@@ -1282,7 +1282,7 @@ fn decimal_args(info: &ast::ExactNumberInfo) -> Result<(u8, u8)> {
 mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
-    use crate::index::btree::BTreeEngine;
+    use crate::engines::btree::BTreeEngine;
     use crate::sql::frontend::parse;
     use crate::storage::FileDiskManager;
     use tempfile::TempDir;
@@ -1659,7 +1659,7 @@ mod tests {
                 let on = joins[0].on.as_ref().expect("ON predicate");
                 match on {
                     Predicate::Compare {
-                        op: crate::sql::expr::CompareOp::Eq,
+                        op: crate::sql::ir::expr::CompareOp::Eq,
                         left,
                         right,
                     } => {

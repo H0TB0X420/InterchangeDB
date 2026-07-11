@@ -20,8 +20,8 @@ use crate::execution::{
     SetExpr, Sort, SortDir, Update,
 };
 use crate::layout::RowLayout;
-use crate::sql::logical::{AggregateSpec, OrderDir};
-use crate::sql::physical::PhysOp;
+use crate::sql::ir::logical::{AggregateSpec, OrderDir};
+use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 use crate::table::{IndexHandle, Table};
 
@@ -240,8 +240,8 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPoolManager;
     use crate::catalog::{ColumnDef, Schema, TableId};
-    use crate::index::btree::BTreeEngine;
-    use crate::sql::expr::{CompareOp, Expression, Predicate};
+    use crate::engines::btree::BTreeEngine;
+    use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
     use crate::storage::FileDiskManager;
     use crate::types::{ColumnType, Value};
 

@@ -15,7 +15,7 @@ use tempfile::tempdir;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::Error;
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::FileDiskManager;
 use interchangedb::txn::lock_manager::{LockManager, LockMode};
 use interchangedb::txn::{TxnId, TxnMode};

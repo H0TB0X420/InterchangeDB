@@ -22,7 +22,7 @@ use std::time::Instant;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, IndexBackend, IndexDef};
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::sql::{Planner, RuleBasedPlanner, SelingerPlanner, VolcanoPlanner};
 use interchangedb::storage::FileDiskManager;

@@ -4,7 +4,7 @@
 //! shared `database_test.rs` suite. Common StorageEngine behavior is tested
 //! there via the `database_tests!` macro.
 
-use interchangedb::index::lsm::LsmEngine;
+use interchangedb::engines::lsm::LsmEngine;
 use interchangedb::storage::engine::StorageEngine;
 use tempfile::tempdir;
 

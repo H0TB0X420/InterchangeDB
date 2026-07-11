@@ -9,7 +9,7 @@ use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::system_tables::HISTOGRAM_KIND_EQUI_WIDTH_INT;
 use interchangedb::catalog::{Catalog, TableId};
 use interchangedb::database::Database;
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::storage::FileDiskManager;
 

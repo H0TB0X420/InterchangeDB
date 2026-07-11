@@ -10,7 +10,7 @@ use interchangedb::catalog::system_tables::{
     ColumnStats, TableStats, HISTOGRAM_KIND_EQUI_WIDTH_INT, HISTOGRAM_KIND_NONE,
 };
 use interchangedb::catalog::{Catalog, ColumnDef, Schema, TableId};
-use interchangedb::index::btree::BTreeEngine;
+use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::{FileDiskManager, StorageEngine};
 use interchangedb::types::ColumnType;
 
