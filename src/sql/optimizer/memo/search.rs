@@ -8,9 +8,11 @@
 //! cost accumulated so far; sibling lower bounds are 0 (documented
 //! simplification — tightening is a recorded future lever).
 //!
-//! The §4 `optimal` flag guards the classic B&B-memoization bug: a
-//! winner recorded under a finite budget answers only callers whose
-//! budget it fits — a larger budget re-searches instead of trusting it.
+//! Cached winners are reused unconditionally: with exact additive costs
+//! (no admissible lower-bound heuristic) branch-and-bound only prunes
+//! candidates that provably cannot win, so any recorded winner is the
+//! group's true optimum for its requirement — plan §4's `optimal` flag
+//! was dead machinery and was removed (see the `Winner` NOTE).
 //!
 //! NOTE (deviation from the plan §4 pseudocode): the pseudocode prunes
 //! against the caller's fixed budget only; here the bound also tightens
@@ -25,7 +27,7 @@
 //! search is its only producer and consumer.
 
 use crate::sql::optimizer::cost::{Cost, CostModel};
-use crate::sql::optimizer::join_order::{RelId, RelSet, ROWS_PER_PAGE_ESTIMATE};
+use crate::sql::optimizer::join_order::{cost_seq_scan_leaf, RelId, RelSet};
 use crate::sql::optimizer::memo::memo::{full_relset, GroupId, Memo, PhysChoice, Winner};
 use crate::sql::optimizer::memo::normalize::{Edge, NormalizedQuery, RelInfo};
 use crate::sql::optimizer::memo::props::{merge_requirements, OrderKey};
@@ -41,64 +43,64 @@ struct Candidate {
 }
 
 /// Optimize the full-query group under an infinite budget with no order
-/// requirement and return its winner. Every group's recorded winner is
-/// optimal afterwards — the invariant emission (T17-A.4) walks on.
+/// requirement, returning the winner's cost. Every group's recorded
+/// winner is optimal afterwards — the invariant emission (T17-A.4)
+/// walks on. Plans stay in the memo; only the `Copy` cost flows out
+/// (review fix #4 — the search never clones plans).
 pub(crate) fn optimize_root(
     memo: &mut Memo,
     query: &NormalizedQuery,
     cost_model: &dyn CostModel,
-) -> Winner {
-    let root = memo.group_for(full_relset(query.relations.len()), query);
-    let winner = optimize(memo, root, f64::INFINITY, None, query, cost_model)
+) -> Cost {
+    let root = memo.group_id(full_relset(query.relations.len()));
+    let cost = optimize(memo, root, f64::INFINITY, None, query, cost_model)
         .expect("an unbounded search always finds a plan — SeqScan/NestedLoop are total");
-    debug_assert!(winner.optimal, "the root search runs unbounded");
-    winner
+    debug_assert!(
+        memo.group(root).winner(None).is_some(),
+        "the root winner is recorded before its cost is returned"
+    );
+    cost
 }
 
 /// Optimize the full-query group under `required` with an infinite
 /// budget — T17-B.3's ORDER BY consumption entry point. Total because
-/// the enforcer always qualifies; the caller compares the result's cost
-/// against unordered-plus-Sort before committing to it.
+/// the enforcer always qualifies; the caller compares the returned cost
+/// against unordered-plus-Sort before committing to the ordered plan.
 pub(crate) fn optimize_root_ordered(
     memo: &mut Memo,
     query: &NormalizedQuery,
     cost_model: &dyn CostModel,
     required: &OrderKey,
-) -> Winner {
-    let root = memo.group_for(full_relset(query.relations.len()), query);
+) -> Cost {
+    let root = memo.group_id(full_relset(query.relations.len()));
     optimize(memo, root, f64::INFINITY, Some(required), query, cost_model)
         .expect("the enforcer makes every ordered search total")
 }
 
-/// Best plan for `gid` that delivers `required` (`None` = any order)
-/// with scalar cost ≤ `budget`, or `None` if no candidate fits. Records
-/// the group's winner for that requirement (§4, per-order in 17-B).
+/// Cheapest cost for `group_id` delivering `required` (`None` = any order)
+/// within `budget`, or `None` if no candidate fits. The winning plan is
+/// recorded on the group (§4, per-order in 17-B); the recursion passes
+/// only the `Copy` cost upward — callers sum costs, never read plans.
 fn optimize(
     memo: &mut Memo,
-    gid: GroupId,
+    group_id: GroupId,
     budget: f64,
     required: Option<&OrderKey>,
     query: &NormalizedQuery,
     cost_model: &dyn CostModel,
-) -> Option<Winner> {
-    let requirement: Option<OrderKey> = required.cloned();
-    // Cached winner (§4): an optimal one answers any budget; a bounded
-    // one answers only budgets it fits — for a larger budget we fall
-    // through and re-search rather than trust it.
-    if let Some(winner) = memo.group(gid).winners.get(&requirement) {
-        if winner.optimal {
-            return if cost_model.scalar(winner.cost) <= budget {
-                Some(winner.clone())
-            } else {
-                None
-            };
-        }
-        if cost_model.scalar(winner.cost) <= budget {
-            return Some(winner.clone());
-        }
+) -> Option<Cost> {
+    // Cached winner: with exact additive costs a recorded winner is the
+    // group's true optimum for its requirement (see the Winner NOTE), so
+    // it answers ANY budget — fits → reuse; exceeds → no plan can fit.
+    if let Some(winner) = memo.group(group_id).winner(required) {
+        return if cost_model.scalar(winner.cost) <= budget {
+            Some(winner.cost)
+        } else {
+            None
+        };
     }
 
-    let candidates = candidates_for(memo, gid, required, query, cost_model);
+    let candidates = candidates_for(memo, group_id, required, query, cost_model);
     assert!(
         !candidates.is_empty(),
         "every group has a total candidate (SeqScan / NestedLoop / SortEnforcer)"
@@ -108,7 +110,7 @@ fn optimize(
     // tightens to the best complete candidate so far; it prunes both the
     // local-cost check and the children's remaining budgets.
     let mut bound = budget;
-    let mut best: Option<Winner> = None;
+    let mut best: Option<(Cost, PhysChoice)> = None;
     for candidate in candidates {
         let mut total = candidate.local_cost;
         if cost_model.scalar(total) > bound {
@@ -125,7 +127,7 @@ fn optimize(
                 query,
                 cost_model,
             ) {
-                Some(child_winner) => total = total.add(child_winner.cost),
+                Some(child_cost) => total = total.add(child_cost),
                 None => {
                     // Child has no plan within the remaining budget →
                     // this candidate cannot beat the current bound.
@@ -137,45 +139,34 @@ fn optimize(
         if !complete {
             continue;
         }
-        let improves = match &best {
-            None => true,
-            Some(current) => cost_model.scalar(total) < cost_model.scalar(current.cost),
-        };
+        let improves = best
+            .as_ref()
+            .is_none_or(|(current, _)| cost_model.scalar(total) < cost_model.scalar(*current));
         if improves {
             bound = cost_model.scalar(total);
-            best = Some(Winner {
-                cost: total,
-                plan: candidate.plan,
-                optimal: budget.is_infinite(),
-            });
+            best = Some((total, candidate.plan));
         }
     }
 
-    if let Some(winner) = &best {
-        // Record only improvements — a bounded re-search must never
-        // clobber a better cached winner.
-        let group = memo.group_mut(gid);
-        let improves = group
-            .winners
-            .get(&requirement)
-            .is_none_or(|c| cost_model.scalar(winner.cost) < cost_model.scalar(c.cost));
-        if improves {
-            group.winners.insert(requirement, winner.clone());
-        }
-    }
-    best
+    let (cost, plan) = best?;
+    // Record (improvements only — the group enforces that a bounded
+    // re-search never clobbers a better cached winner). The plan moves
+    // into the memo; nothing on this path clones it.
+    memo.group_mut(group_id)
+        .record_winner(required, Winner { cost, plan }, |c| cost_model.scalar(c));
+    Some(cost)
 }
 
 /// Physical candidates for one group under a requirement (§5 + §7).
 /// Creates child groups lazily (costing needs their cardinality).
 fn candidates_for(
-    memo: &mut Memo,
-    gid: GroupId,
+    memo: &Memo,
+    group_id: GroupId,
     required: Option<&OrderKey>,
     query: &NormalizedQuery,
     cost_model: &dyn CostModel,
 ) -> Vec<Candidate> {
-    let relset = memo.group(gid).relset;
+    let relset = memo.group(group_id).relset;
     let mut out = Vec::new();
     match required {
         // Unordered: every access path / join algorithm qualifies —
@@ -185,9 +176,13 @@ fn candidates_for(
                 let rel = relset.trailing_zeros() as RelId;
                 return leaf_candidates(rel, &query.relations[rel], cost_model);
             }
-            let splits = memo.group(gid).splits.clone();
-            for (left, right) in splits {
-                split_candidates(memo, left, right, query, cost_model, &mut out);
+            for &(left, right) in &memo.group(group_id).splits {
+                let crossing = crossing_edges(left, right, &query.edges);
+                assert!(
+                    !crossing.is_empty(),
+                    "split invariant: at least one crossing edge"
+                );
+                split_candidates(memo, left, right, &crossing, query, cost_model, &mut out);
             }
         }
         // Ordered: only plans that DELIVER the key (§7.4) — merge joins
@@ -196,18 +191,28 @@ fn candidates_for(
         // nothing (index-order delivery is a non-goal, D9).
         Some(key) => {
             if relset.count_ones() > 1 {
-                let splits = memo.group(gid).splits.clone();
-                for (left, right) in splits {
+                for &(left, right) in &memo.group(group_id).splits {
+                    let crossing = crossing_edges(left, right, &query.edges);
+                    assert!(
+                        !crossing.is_empty(),
+                        "split invariant: at least one crossing edge"
+                    );
                     merge_candidates_delivering(
-                        memo, left, right, key, query, cost_model, &mut out,
+                        memo,
+                        (left, right),
+                        &crossing,
+                        key,
+                        query,
+                        cost_model,
+                        &mut out,
                     );
                 }
             }
             out.push(Candidate {
-                local_cost: cost_model.cost_sort(memo.group(gid).cardinality),
-                children: vec![(gid, None)],
+                local_cost: cost_model.cost_sort(memo.group(group_id).cardinality),
+                children: vec![(group_id, None)],
                 plan: PhysChoice::SortEnforcer {
-                    child: gid,
+                    child: group_id,
                     key: key.clone(),
                 },
             });
@@ -285,16 +290,10 @@ fn leaf_candidates(rel: RelId, info: &RelInfo, cost_model: &dyn CostModel) -> Ve
         }
     }
 
-    // 3. SeqScan — always available. Argument-for-argument parity with
-    // `join_order::sub_leaf` (G3): pages via the shared rows-per-page
-    // constant, a filter charge only when the predicates narrow.
-    let pages = (raw_rows / ROWS_PER_PAGE_ESTIMATE).ceil().max(1.0);
-    let mut seq_cost = cost_model.cost_seq_scan(pages, raw_rows);
-    if info.local_selectivity() < 1.0 {
-        seq_cost = seq_cost.add(cost_model.cost_filter(raw_rows));
-    }
+    // 3. SeqScan — always available, costed by THE shared leaf formula
+    // (G3 parity with `join_order::sub_leaf` by construction).
     candidates.push(Candidate {
-        local_cost: seq_cost,
+        local_cost: cost_seq_scan_leaf(raw_rows, info.local_selectivity(), cost_model),
         children: Vec::new(),
         plan: PhysChoice::SeqScan { rel },
     });
@@ -308,27 +307,17 @@ fn leaf_candidates(rel: RelId, info: &RelInfo, cost_model: &dyn CostModel) -> Ve
 /// fallback. Cost formulas keep argument parity with
 /// `join_order::best_algorithm` (G3).
 fn split_candidates(
-    memo: &mut Memo,
+    memo: &Memo,
     left: RelSet,
     right: RelSet,
+    crossing: &[usize],
     query: &NormalizedQuery,
     cost_model: &dyn CostModel,
     out: &mut Vec<Candidate>,
 ) {
-    let crossing = crossing_edges(left, right, &query.edges);
-    assert!(
-        !crossing.is_empty(),
-        "split invariant: at least one crossing edge"
-    );
-    // `best_algorithm`'s `sel` argument: product over connecting edges.
-    let crossing_selectivity: f64 = crossing
-        .iter()
-        .map(|&e| query.edges[e].selectivity)
-        .product();
-
     for (outer_set, inner_set) in [(left, right), (right, left)] {
-        let outer = memo.group_for(outer_set, query);
-        let inner = memo.group_for(inner_set, query);
+        let outer = memo.group_id(outer_set);
+        let inner = memo.group_id(inner_set);
         let outer_card = memo.group(outer).cardinality;
         let inner_card = memo.group(inner).cardinality;
 
@@ -353,30 +342,14 @@ fn split_candidates(
             plan: PhysChoice::Hash {
                 outer,
                 inner,
-                edges: crossing.clone(),
+                edges: crossing.to_vec(),
             },
         });
 
-        // IndexNested: inner must be a single relation probed via a
-        // single-column index on its side of a crossing edge. No inner
-        // child — probes replace the inner scan (`best_algorithm` omits
-        // the leaf cost the same way).
-        if inner_set.count_ones() == 1 {
-            let inner_rel = inner_set.trailing_zeros() as RelId;
-            if let Some((probe, index)) = probe_edge(inner_rel, &crossing, query) {
-                let avg_matches = (inner_card * crossing_selectivity).max(0.0);
-                out.push(Candidate {
-                    local_cost: cost_model.cost_index_nested_loop_join(outer_card, avg_matches),
-                    children: vec![(outer, None)],
-                    plan: PhysChoice::IndexNested {
-                        outer,
-                        inner_rel,
-                        index,
-                        probe,
-                        edges: crossing.clone(),
-                    },
-                });
-            }
+        if let Some(candidate) =
+            index_nested_candidate(memo, outer, inner_set, crossing, query, cost_model)
+        {
+            out.push(candidate);
         }
 
         // NestedLoop: always available; the ON carries every crossing edge.
@@ -386,7 +359,7 @@ fn split_candidates(
             plan: PhysChoice::NestedLoop {
                 outer,
                 inner,
-                edges: crossing.clone(),
+                edges: crossing.to_vec(),
             },
         });
 
@@ -396,9 +369,47 @@ fn split_candidates(
         // Hash plus two n·log n sorts, so it never wins here; an
         // IO-heavier hash model flips that (the B.2 cost-flip test).
         let (candidate, _delivered) =
-            merge_candidate(memo, outer_set, inner_set, &crossing, query, cost_model);
+            merge_candidate(memo, outer_set, inner_set, crossing, query, cost_model);
         out.push(candidate);
     }
+}
+
+/// IndexNested candidate for one oriented split: the inner side must be
+/// a single relation probed via a single-column index on its side of a
+/// crossing edge. No inner child — probes replace the inner scan
+/// (`best_algorithm` omits the leaf cost the same way).
+fn index_nested_candidate(
+    memo: &Memo,
+    outer: GroupId,
+    inner_set: RelSet,
+    crossing: &[usize],
+    query: &NormalizedQuery,
+    cost_model: &dyn CostModel,
+) -> Option<Candidate> {
+    if inner_set.count_ones() != 1 {
+        return None;
+    }
+    let inner_rel = inner_set.trailing_zeros() as RelId;
+    let (probe, index) = probe_edge(inner_rel, crossing, query)?;
+    // `best_algorithm`'s `sel` argument: product over connecting edges.
+    let crossing_selectivity: f64 = crossing
+        .iter()
+        .map(|&e| query.edges[e].selectivity)
+        .product();
+    let inner_card = memo.group(memo.group_id(inner_set)).cardinality;
+    let outer_card = memo.group(outer).cardinality;
+    let avg_matches = (inner_card * crossing_selectivity).max(0.0);
+    Some(Candidate {
+        local_cost: cost_model.cost_index_nested_loop_join(outer_card, avg_matches),
+        children: vec![(outer, None)],
+        plan: PhysChoice::IndexNested {
+            outer,
+            inner_rel,
+            index,
+            probe,
+            edges: crossing.to_vec(),
+        },
+    })
 }
 
 /// The merge candidate for one *oriented* split, plus the order it
@@ -406,7 +417,7 @@ fn split_candidates(
 /// the remaining crossing edges become a residual filter at emission
 /// (same single-key limitation as Hash).
 fn merge_candidate(
-    memo: &mut Memo,
+    memo: &Memo,
     left_set: RelSet,
     right_set: RelSet,
     crossing: &[usize],
@@ -415,8 +426,8 @@ fn merge_candidate(
 ) -> (Candidate, OrderKey) {
     let key_edge = &query.edges[crossing[0]];
     let (left_required, right_required) = merge_requirements(key_edge, left_set);
-    let left = memo.group_for(left_set, query);
-    let right = memo.group_for(right_set, query);
+    let left = memo.group_id(left_set);
+    let right = memo.group_id(right_set);
     let left_card = memo.group(left).cardinality;
     let right_card = memo.group(right).cardinality;
     // T17-A.5 promise ordering, same rule as the other join candidates.
@@ -449,25 +460,26 @@ fn merge_candidate(
 /// orientations tried, kept only when the key edge's left-side order
 /// equals the requirement.
 fn merge_candidates_delivering(
-    memo: &mut Memo,
-    left: RelSet,
-    right: RelSet,
+    memo: &Memo,
+    split: (RelSet, RelSet),
+    crossing: &[usize],
     key: &OrderKey,
     query: &NormalizedQuery,
     cost_model: &dyn CostModel,
     out: &mut Vec<Candidate>,
 ) {
-    let crossing = crossing_edges(left, right, &query.edges);
-    assert!(
-        !crossing.is_empty(),
-        "split invariant: at least one crossing edge"
-    );
-    for (left_set, right_set) in [(left, right), (right, left)] {
-        let (candidate, delivered) =
-            merge_candidate(memo, left_set, right_set, &crossing, query, cost_model);
-        if delivered == *key {
-            out.push(candidate);
+    let key_edge = &query.edges[crossing[0]];
+    for (left_set, right_set) in [split, (split.1, split.0)] {
+        // Delivered order = the left-side requirement, derivable from
+        // the pure `merge_requirements` — filter BEFORE building the
+        // candidate (review fix #4: no build-then-discard).
+        let (delivered, _) = merge_requirements(key_edge, left_set);
+        if delivered != *key {
+            continue;
         }
+        let (candidate, _) =
+            merge_candidate(memo, left_set, right_set, crossing, query, cost_model);
+        out.push(candidate);
     }
 }
 
@@ -574,12 +586,11 @@ mod tests {
                 info.indexes.is_empty(),
                 "brute force models SeqScan leaves only"
             );
-            let pages = (info.row_count / ROWS_PER_PAGE_ESTIMATE).ceil().max(1.0);
-            let mut cost = cm.cost_seq_scan(pages, info.row_count);
-            if info.local_selectivity() < 1.0 {
-                cost = cost.add(cm.cost_filter(info.row_count));
-            }
-            return cm.scalar(cost);
+            return cm.scalar(cost_seq_scan_leaf(
+                info.row_count,
+                info.local_selectivity(),
+                cm,
+            ));
         }
         let low = 1u32 << set.trailing_zeros();
         let mut best = f64::INFINITY;
@@ -687,13 +698,13 @@ mod tests {
     fn winner_cost_matches_brute_force_on_chain() {
         let q = pruning_chain();
         let cm = DefaultCostModel::new();
-        let mut memo = Memo::new(&q);
-        let winner = optimize_root(&mut memo, &q, &cm);
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        let cost = optimize_root(&mut memo, &q, &cm);
         let brute = brute_force_scalar(0b111, &q, &cm);
         assert!(
-            (cm.scalar(winner.cost) - brute).abs() < 1e-6,
+            (cm.scalar(cost) - brute).abs() < 1e-6,
             "search found {} but brute force found {}",
-            cm.scalar(winner.cost),
+            cm.scalar(cost),
             brute
         );
     }
@@ -712,13 +723,13 @@ mod tests {
             vec![edge(0, 1, 1e-4), edge(0, 2, 0.1), edge(0, 3, 1e-3)],
         );
         let cm = DefaultCostModel::new();
-        let mut memo = Memo::new(&q);
-        let winner = optimize_root(&mut memo, &q, &cm);
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        let cost = optimize_root(&mut memo, &q, &cm);
         let brute = brute_force_scalar(0b1111, &q, &cm);
         assert!(
-            (cm.scalar(winner.cost) - brute).abs() < 1e-6,
+            (cm.scalar(cost) - brute).abs() < 1e-6,
             "search found {} but brute force found {}",
-            cm.scalar(winner.cost),
+            cm.scalar(cost),
             brute
         );
     }
@@ -740,33 +751,34 @@ mod tests {
         // requirements) is strictly larger than the reference's, so the
         // counts no longer measure the same thing. The counting model
         // still guards promise ordering below.
-        let mut memo = Memo::new(&q);
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
         optimize_root(&mut memo, &q, &DefaultCostModel::new());
-        let g12 = memo.group_for(0b110, &q);
+        let g12 = memo.group_id(0b110);
         assert!(
-            memo.group(g12).winners.is_empty(),
+            !memo.group(g12).has_winners(),
             "pruned group {{1,2}} must never be searched"
         );
     }
 
-    // ---- §4: the optimal flag and budget refusal ----
+    // ---- §4: budget refusal on cached winners ----
 
     #[test]
-    fn optimal_flag_and_budget_refusal() {
+    fn budget_refusal_on_cached_and_fresh_groups() {
         let q = pruning_chain();
         let cm = DefaultCostModel::new();
-        let mut memo = Memo::new(&q);
-        let winner = optimize_root(&mut memo, &q, &cm);
-        assert!(winner.optimal);
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        optimize_root(&mut memo, &q, &cm);
+        let root = memo.group_id(0b111);
 
-        // A cached optimal winner refuses a budget below its cost…
-        let root = memo.group_for(0b111, &q);
+        // A cached winner is the group optimum — a budget below its
+        // cost means NO plan fits, answered without re-searching…
         assert!(optimize(&mut memo, root, 0.0, None, &q, &cm).is_none());
+
         // …and a fresh group searched under an impossible budget records
         // nothing (never clobbers with a worse result either).
-        let mut fresh = Memo::new(&q);
+        let mut fresh = Memo::try_new(&q).expect("under the group cap");
         assert!(optimize(&mut fresh, 0, 0.0, None, &q, &cm).is_none());
-        assert!(fresh.group(0).winners.is_empty());
+        assert!(!fresh.group(0).has_winners());
     }
 
     // ---- §7.4 (T17-B.2): the ordered search is genuinely cost-based ----
@@ -827,31 +839,31 @@ mod tests {
 
         // Hash-hostile model: Merge delivers the order natively and wins.
         let cm = HashHostileModel(DefaultCostModel::new());
-        let mut memo = Memo::new(&q);
-        let gid = memo.group_for(0b11, &q);
-        let winner = optimize(&mut memo, gid, f64::INFINITY, Some(&required), &q, &cm)
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        let group_id = memo.group_id(0b11);
+        optimize(&mut memo, group_id, f64::INFINITY, Some(&required), &q, &cm)
             .expect("ordered search always has the enforcer fallback");
+        let plan = &memo.group(group_id).winner(Some(&required)).unwrap().plan;
         assert!(
-            matches!(winner.plan, PhysChoice::Merge { .. }),
-            "expected Merge under a hash-hostile model, got {:?}",
-            winner.plan
+            matches!(plan, PhysChoice::Merge { .. }),
+            "expected Merge under a hash-hostile model, got {plan:?}"
         );
 
         // Default model: hashing is cheap, so the enforcer sorts the
         // unordered Hash winner instead.
         let cm = DefaultCostModel::new();
-        let mut memo = Memo::new(&q);
-        let gid = memo.group_for(0b11, &q);
-        let winner = optimize(&mut memo, gid, f64::INFINITY, Some(&required), &q, &cm)
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        let group_id = memo.group_id(0b11);
+        optimize(&mut memo, group_id, f64::INFINITY, Some(&required), &q, &cm)
             .expect("ordered search always has the enforcer fallback");
+        let plan = &memo.group(group_id).winner(Some(&required)).unwrap().plan;
         assert!(
-            matches!(winner.plan, PhysChoice::SortEnforcer { .. }),
-            "expected SortEnforcer under the default model, got {:?}",
-            winner.plan
+            matches!(plan, PhysChoice::SortEnforcer { .. }),
+            "expected SortEnforcer under the default model, got {plan:?}"
         );
         assert!(
             matches!(
-                memo.group(gid).winners.get(&None).unwrap().plan,
+                memo.group(group_id).winner(None).unwrap().plan,
                 PhysChoice::Hash { .. }
             ),
             "the enforcer must wrap the unordered Hash winner"
@@ -859,6 +871,13 @@ mod tests {
     }
 
     // ---- §5 leaf candidates through the shared lowering (D6) ----
+
+    /// The recorded unordered winner plan of the full-query group —
+    /// plans live in the memo now, not in the search's return value.
+    fn root_plan<'a>(memo: &'a Memo, q: &NormalizedQuery) -> &'a PhysChoice {
+        let root = memo.group_id(full_relset(q.relations.len()));
+        &memo.group(root).winner(None).unwrap().plan
+    }
 
     fn normalized(
         env: &crate::sql::optimizer::memo::fixtures::Env,
@@ -874,9 +893,9 @@ mod tests {
         let env = setup();
         let q = normalized(&env, "SELECT w_id FROM wh WHERE w_id = 1", &default_stats());
         let cm = DefaultCostModel::new();
-        let mut memo = Memo::new(&q);
-        let winner = optimize_root(&mut memo, &q, &cm);
-        match winner.plan {
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        optimize_root(&mut memo, &q, &cm);
+        match root_plan(&memo, &q).clone() {
             PhysChoice::PkLookup { rel, pk, residual } => {
                 assert_eq!(rel, 0);
                 assert_eq!(pk, vec![Value::Int32(1)]); // coerce_exact to the PK type
@@ -897,9 +916,9 @@ mod tests {
         let stats = QueryStats::gather(&provider, &[(env.dist_id, &[0, 1, 2])]).unwrap();
         let q = normalized(&env, "SELECT d_id FROM dist WHERE d_w_id = 7", &stats);
         let cm = DefaultCostModel::new();
-        let mut memo = Memo::new(&q);
-        let winner = optimize_root(&mut memo, &q, &cm);
-        match &winner.plan {
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        optimize_root(&mut memo, &q, &cm);
+        match root_plan(&memo, &q) {
             PhysChoice::IndexScan { index, filter, .. } => {
                 assert_eq!(index, "dist_by_w");
                 // The recheck predicate (E1/O12) must ride the winner.
@@ -918,12 +937,12 @@ mod tests {
             "SELECT d_id FROM dist WHERE d_w_id = 7",
             &default_stats(),
         );
-        let mut memo = Memo::new(&q);
-        let winner = optimize_root(&mut memo, &q, &cm);
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        optimize_root(&mut memo, &q, &cm);
         assert!(
-            matches!(winner.plan, PhysChoice::SeqScan { rel: 0 }),
+            matches!(root_plan(&memo, &q), PhysChoice::SeqScan { rel: 0 }),
             "expected SeqScan at fallback selectivity, got {:?}",
-            winner.plan
+            root_plan(&memo, &q)
         );
     }
 
@@ -949,9 +968,9 @@ mod tests {
             &stats,
         );
         let cm = DefaultCostModel::new();
-        let mut memo = Memo::new(&q);
-        let winner = optimize_root(&mut memo, &q, &cm);
-        match &winner.plan {
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
+        optimize_root(&mut memo, &q, &cm);
+        match root_plan(&memo, &q) {
             PhysChoice::IndexNested {
                 outer,
                 inner_rel,
@@ -996,7 +1015,7 @@ mod tests {
             ],
         );
         let cm = CountingCostModel::new();
-        let mut memo = Memo::new(&q);
+        let mut memo = Memo::try_new(&q).expect("under the group cap");
         optimize_root(&mut memo, &q, &cm);
         assert!(
             cm.count() < 1350,

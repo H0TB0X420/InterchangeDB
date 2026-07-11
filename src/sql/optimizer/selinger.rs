@@ -43,7 +43,7 @@ use crate::sql::optimizer::join_order::{
 use crate::sql::optimizer::selectivity::estimate_predicate_selectivity;
 use crate::sql::optimizer::stats::{CatalogStatsProvider, QueryStats};
 use crate::sql::planner::{
-    flatten_conjuncts, plan_inner, rebase_predicate, referenced_columns, JoinSelection,
+    flatten_conjuncts, plan_inner, referenced_columns, shift_predicate, JoinSelection,
     PhysicalPlan, PlannerStrategy,
 };
 use crate::storage::StorageEngine;
@@ -269,10 +269,7 @@ pub(crate) fn build_join_graph<CatE: StorageEngine>(
         });
         indexes_per_rel.push(indexes);
     }
-    let mut textual_base = vec![0usize; table_count];
-    for t in 1..table_count {
-        textual_base[t] = textual_base[t - 1] + widths[t - 1];
-    }
+    let textual_base = crate::sql::optimizer::column_map::textual_base(&widths);
 
     // O10: feed single-table WHERE conjuncts into each relation's
     // `local_selectivity` — without this the DP orders joins blind to
@@ -367,7 +364,7 @@ fn apply_local_selectivities(
         }
         // Rebase to table-local column indices — that's how the estimator
         // indexes its per-column stats slice.
-        let local_pred = rebase_predicate(conjunct, textual_base[rel]);
+        let local_pred = shift_predicate(conjunct, -(textual_base[rel] as isize));
         let column_stats: Vec<Option<ColumnStats>> = (0..widths[rel])
             .map(|c| {
                 stats

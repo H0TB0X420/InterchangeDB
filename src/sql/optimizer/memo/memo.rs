@@ -39,9 +39,11 @@ pub(crate) fn full_relset(relation_count: usize) -> RelSet {
 }
 
 /// Hard cap on materialized groups — the "put a limit on everything"
-/// guard against accidental exponential blowup (§4). Sized to the
-/// Selinger DP's exhaustive regime (`2^MAX_DP_RELATIONS`); realistic
-/// OLTP/TPC-C shapes materialize a few dozen groups at most.
+/// guard against exponential blowup (§4). Sized to the Selinger DP's
+/// exhaustive regime (`2^MAX_DP_RELATIONS`); realistic OLTP/TPC-C shapes
+/// materialize a few dozen groups at most. Exceeding it makes
+/// `Memo::try_new` bail so the planner falls back (D8) — never a panic
+/// on valid SQL (review fix #1).
 pub(crate) const GROUP_COUNT_MAX: usize = 4096;
 
 /// One memo group: every logical join tree spanning exactly `relset`.
@@ -54,22 +56,79 @@ pub(crate) struct Group {
     /// Canonical logical splits (D5). Empty for leaf (single-relation)
     /// groups.
     pub(crate) splits: Vec<(RelSet, RelSet)>,
-    /// Cheapest physical plan per required order (T17-B.2): `None` is
-    /// the unordered requirement, `Some(key)` a plan that delivers
-    /// `key`. Bounded by the distinct edge-column orders + 1.
-    pub(crate) winners: HashMap<Option<OrderKey>, Winner>,
+    /// Cheapest unordered physical plan (T17-A.3) — the requirement
+    /// every search hits by default, kept out of the hash map so the
+    /// hot path neither hashes nor allocates a key (review fix #4).
+    pub(crate) unordered_winner: Option<Winner>,
+    /// Cheapest plan per delivered order (T17-B.2). Bounded by the
+    /// distinct edge-column orders.
+    pub(crate) ordered_winners: HashMap<OrderKey, Winner>,
 }
 
-/// A group's best physical plan, with the §4 budget-honesty flag.
+impl Group {
+    /// The recorded winner for a requirement, if any.
+    pub(crate) fn winner(&self, required: Option<&OrderKey>) -> Option<&Winner> {
+        match required {
+            None => self.unordered_winner.as_ref(),
+            Some(key) => self.ordered_winners.get(key),
+        }
+    }
+
+    /// Record `winner` for a requirement — only if it improves on what
+    /// is already recorded (a bounded re-search must never clobber a
+    /// better cached winner). `scalar` supplies the ranking.
+    pub(crate) fn record_winner(
+        &mut self,
+        required: Option<&OrderKey>,
+        winner: Winner,
+        scalar: impl Fn(Cost) -> f64,
+    ) {
+        let slot = match required {
+            None => &mut self.unordered_winner,
+            Some(key) => match self.ordered_winners.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let slot = entry.into_mut();
+                    if scalar(winner.cost) < scalar(slot.cost) {
+                        *slot = winner;
+                    }
+                    return;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(winner);
+                    return;
+                }
+            },
+        };
+        let improves = slot
+            .as_ref()
+            .is_none_or(|current| scalar(winner.cost) < scalar(current.cost));
+        if improves {
+            *slot = Some(winner);
+        }
+    }
+
+    /// Whether any requirement has been searched to a winner — the
+    /// pruning tests' "this group was never optimized" probe.
+    #[cfg(test)]
+    pub(crate) fn has_winners(&self) -> bool {
+        self.unordered_winner.is_some() || !self.ordered_winners.is_empty()
+    }
+}
+
+/// A group's best physical plan.
+///
+/// NOTE (deviation from plan §4): the plan mandated an `optimal` flag
+/// guarding budget-bounded winners against reuse under larger budgets.
+/// With exact additive costs (no admissible lower-bound heuristic),
+/// branch-and-bound only ever prunes candidates that provably cannot
+/// win, so ANY recorded winner is already the group's true optimum —
+/// the flag was dead machinery and was removed in the review fixes.
+/// Re-add it together with sibling lower bounds if that recorded
+/// future lever ever lands.
 #[derive(Clone)]
 pub(crate) struct Winner {
     pub(crate) cost: Cost,
     pub(crate) plan: PhysChoice,
-    /// True when computed under an infinite budget — safe to reuse for
-    /// any caller. False means "best found under some finite budget": a
-    /// caller with a larger budget must re-search rather than trust it
-    /// (the classic branch-and-bound memoization bug, §4).
-    pub(crate) optimal: bool,
 }
 
 /// Physical choice tree — small and memo-internal; `emit.rs` (T17-A.4)
@@ -150,17 +209,23 @@ pub(crate) struct Memo {
 }
 
 impl Memo {
-    /// Build a memo seeded with one leaf group per relation, so leaf
-    /// `GroupId`s equal `RelId`s. Join groups are created lazily by
-    /// `group_for` as the search reaches them.
-    pub(crate) fn new(query: &NormalizedQuery) -> Memo {
+    /// Build the memo with EVERY connected relation subset materialized
+    /// up front: leaf groups first (so leaf `GroupId`s equal `RelId`s),
+    /// then a worklist from the full set through each group's splits.
+    /// Returns `None` when the join graph is dense enough to exceed
+    /// `GROUP_COUNT_MAX` — the caller falls back to the textual planner
+    /// (D8), the same treatment as any other unsupported shape.
+    ///
+    /// NOTE (deviation from plan §3): the plan called for lazy group
+    /// creation during search. Lazy creation discovers pathological
+    /// density only mid-search, where the only remaining option was a
+    /// panic on valid SQL. Eager materialization is bounded by the same
+    /// cap, turns the overflow into a graceful bail, and leaves the
+    /// search free of group mutation (groups become lookup-only).
+    pub(crate) fn try_new(query: &NormalizedQuery) -> Option<Memo> {
         let relation_count = query.relations.len();
         assert!(
-            relation_count >= 1,
-            "a query core spans at least one relation"
-        );
-        assert!(
-            relation_count <= MAX_RELATIONS,
+            (1..=MAX_RELATIONS).contains(&relation_count),
             "normalization enforces the bitmask cap"
         );
 
@@ -169,34 +234,48 @@ impl Memo {
             by_relset: HashMap::new(),
         };
         for rel in 0..relation_count {
-            let gid = memo.insert_group(1u32 << rel, query);
-            debug_assert_eq!(gid, rel, "leaf GroupId equals RelId");
+            let group_id = memo.insert_group(1u32 << rel, query);
+            debug_assert_eq!(group_id, rel, "leaf GroupId equals RelId");
         }
-        memo
+
+        // Worklist over split closures. Every push is a side of some
+        // materialized group's split, so total pushes are bounded by
+        // Σ splits over ≤ GROUP_COUNT_MAX groups — no explicit counter
+        // needed beyond the cap check itself.
+        let mut pending = vec![full_relset(relation_count)];
+        while let Some(relset) = pending.pop() {
+            if memo.by_relset.contains_key(&relset) {
+                continue;
+            }
+            if memo.groups.len() == GROUP_COUNT_MAX {
+                return None; // dense graph — caller takes the D8 fallback
+            }
+            let group_id = memo.insert_group(relset, query);
+            for &(left, right) in &memo.groups[group_id].splits {
+                pending.push(left);
+                pending.push(right);
+            }
+        }
+        Some(memo)
     }
 
-    /// `GroupId` for `relset`, creating the group (and enumerating its
-    /// splits) on first request.
-    pub(crate) fn group_for(&mut self, relset: RelSet, query: &NormalizedQuery) -> GroupId {
-        if let Some(&gid) = self.by_relset.get(&relset) {
-            return gid;
-        }
-        self.insert_group(relset, query)
-    }
-
-    pub(crate) fn group(&self, gid: GroupId) -> &Group {
-        &self.groups[gid]
+    pub(crate) fn group(&self, group_id: GroupId) -> &Group {
+        &self.groups[group_id]
     }
 
     /// Mutable access for winner recording (T17-A.3).
-    pub(crate) fn group_mut(&mut self, gid: GroupId) -> &mut Group {
-        &mut self.groups[gid]
+    pub(crate) fn group_mut(&mut self, group_id: GroupId) -> &mut Group {
+        &mut self.groups[group_id]
     }
 
-    /// Read-only lookup — emission (T17-A.4) walks recorded winners
-    /// without creating groups.
-    pub(crate) fn group_id_for(&self, relset: RelSet) -> Option<GroupId> {
-        self.by_relset.get(&relset).copied()
+    /// `GroupId` of a relation set — total for every connected subset
+    /// once `try_new` succeeds; a miss is a search/emission bug (crash
+    /// on corruption).
+    pub(crate) fn group_id(&self, relset: RelSet) -> GroupId {
+        *self
+            .by_relset
+            .get(&relset)
+            .expect("connected subsets are total after Memo::try_new")
     }
 
     /// Test-only diagnostic — production callers track groups via ids.
@@ -207,9 +286,9 @@ impl Memo {
 
     fn insert_group(&mut self, relset: RelSet, query: &NormalizedQuery) -> GroupId {
         assert!(relset != 0, "a group spans at least one relation");
-        assert!(
+        debug_assert!(
             self.groups.len() < GROUP_COUNT_MAX,
-            "memo group count exceeded {GROUP_COUNT_MAX} — pathological query shape"
+            "try_new enforces the group cap before inserting"
         );
 
         let splits = if relset.count_ones() == 1 {
@@ -226,15 +305,16 @@ impl Memo {
             "requested group {relset:#b} is disconnected"
         );
 
-        let gid = self.groups.len();
+        let group_id = self.groups.len();
         self.groups.push(Group {
             relset,
             cardinality: cardinality(relset, query),
             splits,
-            winners: HashMap::new(),
+            unordered_winner: None,
+            ordered_winners: HashMap::new(),
         });
-        self.by_relset.insert(relset, gid);
-        gid
+        self.by_relset.insert(relset, group_id);
+        group_id
     }
 }
 
@@ -342,8 +422,7 @@ mod tests {
     #[test]
     fn leaf_groups_seeded_with_relid_group_ids() {
         let q = chain3();
-        let memo = Memo::new(&q);
-        assert_eq!(memo.group_count(), 3);
+        let memo = Memo::try_new(&q).expect("under the group cap");
         for rel_id in 0..3 {
             let g = memo.group(rel_id);
             assert_eq!(g.relset, 1u32 << rel_id);
@@ -359,9 +438,9 @@ mod tests {
         // {0,1,2} on a chain: {0}|{1,2} and {0,1}|{2} are valid;
         // {0,2}|{1} is discarded — {0,2} has no internal edge.
         let q = chain3();
-        let mut memo = Memo::new(&q);
-        let gid = memo.group_for(0b111, &q);
-        let splits = &memo.group(gid).splits;
+        let memo = Memo::try_new(&q).expect("under the group cap");
+        let group_id = memo.group_id(0b111);
+        let splits = &memo.group(group_id).splits;
         assert_eq!(splits.len(), 2);
         assert!(splits.contains(&(0b001, 0b110)));
         assert!(splits.contains(&(0b011, 0b100)));
@@ -373,9 +452,9 @@ mod tests {
             vec![rel(10.0, 1.0), rel(10.0, 1.0), rel(10.0, 1.0)],
             vec![edge(0, 1, 0.1), edge(0, 2, 0.1), edge(1, 2, 0.1)],
         );
-        let mut memo = Memo::new(&q);
-        let gid = memo.group_for(0b111, &q);
-        assert_eq!(memo.group(gid).splits.len(), 3);
+        let memo = Memo::try_new(&q).expect("under the group cap");
+        let group_id = memo.group_id(0b111);
+        assert_eq!(memo.group(group_id).splits.len(), 3);
     }
 
     #[test]
@@ -387,9 +466,9 @@ mod tests {
             (0..4).map(|_| rel(10.0, 1.0)).collect(),
             vec![edge(0, 1, 0.1), edge(0, 2, 0.1), edge(0, 3, 0.1)],
         );
-        let mut memo = Memo::new(&q);
-        let gid = memo.group_for(0b1111, &q);
-        let splits = &memo.group(gid).splits;
+        let memo = Memo::try_new(&q).expect("under the group cap");
+        let group_id = memo.group_id(0b1111);
+        let splits = &memo.group(group_id).splits;
         assert_eq!(splits.len(), 3);
         assert!(splits.contains(&(0b0111, 0b1000)));
         assert!(splits.contains(&(0b1011, 0b0100)));
@@ -401,9 +480,9 @@ mod tests {
         // Sub-relset {1,2} (no bit 0): the canonical left side must hold
         // the set's own minimum (relation 1), not global relation 0.
         let q = chain3();
-        let mut memo = Memo::new(&q);
-        let gid = memo.group_for(0b110, &q);
-        let splits = &memo.group(gid).splits;
+        let memo = Memo::try_new(&q).expect("under the group cap");
+        let group_id = memo.group_id(0b110);
+        let splits = &memo.group(group_id).splits;
         assert_eq!(splits.as_slice(), &[(0b010, 0b100)]);
         // Positive + negative space: every split's left holds the min bit
         // and each unordered partition appears exactly once.
@@ -416,12 +495,12 @@ mod tests {
     #[test]
     fn cardinality_follows_d7_formula() {
         let q = chain3();
-        let mut memo = Memo::new(&q);
+        let memo = Memo::try_new(&q).expect("under the group cap");
         // {0,1}: (100×0.5) × 10 × edge01(0.01) = 5.
-        let g01 = memo.group_for(0b011, &q);
+        let g01 = memo.group_id(0b011);
         assert!((memo.group(g01).cardinality - 5.0).abs() < 1e-9);
         // {0,1,2}: 5 × 1000 × edge12(0.001) = 5. Both edges internal.
-        let g012 = memo.group_for(0b111, &q);
+        let g012 = memo.group_id(0b111);
         assert!((memo.group(g012).cardinality - 5.0).abs() < 1e-9);
         // {0,2} never materializes (disconnected) — its edge product
         // would skip both edges; no group to assert, by design.
@@ -433,38 +512,43 @@ mod tests {
             vec![rel(10.0, 0.001), rel(10.0, 0.001)],
             vec![edge(0, 1, 0.0001)],
         );
-        let mut memo = Memo::new(&q);
-        let gid = memo.group_for(0b11, &q);
-        assert_eq!(memo.group(gid).cardinality, MIN_CARD);
+        let memo = Memo::try_new(&q).expect("under the group cap");
+        let group_id = memo.group_id(0b11);
+        assert_eq!(memo.group(group_id).cardinality, MIN_CARD);
     }
 
     #[test]
-    fn group_for_is_idempotent() {
+    fn try_new_materializes_exactly_the_connected_subsets() {
+        // chain3's connected subsets: 3 leaves + {0,1} + {1,2} + {0,1,2}.
+        // Negative space: the disconnected {0,2} never materializes.
         let q = chain3();
-        let mut memo = Memo::new(&q);
-        let a = memo.group_for(0b011, &q);
-        let count_after_first = memo.group_count();
-        let b = memo.group_for(0b011, &q);
-        assert_eq!(a, b);
-        assert_eq!(memo.group_count(), count_after_first);
+        let memo = Memo::try_new(&q).expect("under the group cap");
+        assert_eq!(memo.group_count(), 6);
+        for relset in [0b001u32, 0b010, 0b100, 0b011, 0b110, 0b111] {
+            assert_eq!(memo.group(memo.group_id(relset)).relset, relset);
+        }
+    }
+
+    /// Hub-and-spokes star with `spokes` spokes: the 2^spokes subsets
+    /// containing the hub plus the spoke singletons are connected.
+    fn star(spokes: usize) -> NormalizedQuery {
+        let edges = (1..=spokes).map(|s| edge(0, s, 0.1)).collect();
+        let relations = (0..=spokes).map(|_| rel(10.0, 1.0)).collect();
+        query(relations, edges)
     }
 
     #[test]
-    #[should_panic(expected = "memo group count exceeded")]
-    fn group_count_cap_panics_on_pathological_shape() {
-        // 13-relation clique: every one of the 2^13 - 1 subsets is
-        // connected, so materializing them all must trip GROUP_COUNT_MAX.
-        let n = 13;
-        let mut edges = Vec::new();
-        for a in 0..n {
-            for b in (a + 1)..n {
-                edges.push(edge(a, b, 0.1));
-            }
-        }
-        let q = query((0..n).map(|_| rel(10.0, 1.0)).collect(), edges);
-        let mut memo = Memo::new(&q);
-        for relset in 1u32..(1 << n) {
-            memo.group_for(relset, &q);
-        }
+    fn group_cap_bails_gracefully_on_dense_graphs() {
+        // Boundary pair around GROUP_COUNT_MAX = 4096 (review fix #1 —
+        // a bail the planner turns into the D8 fallback, never a panic
+        // on valid SQL): an 11-spoke star materializes 2^11 + 11 = 2059
+        // groups and succeeds; a 12-spoke star needs 2^12 + 12 = 4108
+        // and must return None.
+        let under = star(11);
+        let memo = Memo::try_new(&under).expect("2059 groups fit the cap");
+        assert_eq!(memo.group_count(), 2059);
+
+        let over = star(12);
+        assert!(Memo::try_new(&over).is_none());
     }
 }

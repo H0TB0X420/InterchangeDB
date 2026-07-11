@@ -24,11 +24,12 @@ use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
 use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
 use crate::sql::ir::logical::{AggregateSpec, LogicalPlan, OrderDir};
+use crate::sql::optimizer::column_map::textual_base;
 use crate::sql::optimizer::join_order::{RelId, MAX_RELATIONS};
 use crate::sql::optimizer::selectivity::{estimate_predicate_selectivity, join_selectivity};
 use crate::sql::optimizer::selinger::{decompose, has_single_col_index};
 use crate::sql::optimizer::stats::QueryStats;
-use crate::sql::planner::{flatten_conjuncts, rebase_predicate, referenced_columns};
+use crate::sql::planner::{flatten_conjuncts, referenced_columns, shift_predicate};
 use crate::storage::StorageEngine;
 use crate::table::IndexHandle;
 
@@ -114,14 +115,9 @@ impl NormalizedQuery {
     }
 
     /// Tuple-global offset of each relation's first column, textual
-    /// order (prefix sum of `widths`).
+    /// order (the shared prefix sum).
     pub(crate) fn textual_base(&self) -> Vec<usize> {
-        let widths = self.widths();
-        let mut base = vec![0usize; widths.len()];
-        for r in 1..widths.len() {
-            base[r] = base[r - 1] + widths[r - 1];
-        }
-        base
+        textual_base(&self.widths())
     }
 }
 
@@ -170,13 +166,10 @@ pub(crate) fn normalize<CatE: StorageEngine>(
         });
     }
 
-    // Tuple-global base offset of each relation (prefix sum of widths) —
-    // the key for decomposing textual-global column indices.
+    // Tuple-global base offset of each relation — the key for
+    // decomposing textual-global column indices.
     let widths: Vec<usize> = relations.iter().map(|r| r.schema.columns.len()).collect();
-    let mut textual_base = vec![0usize; relation_count];
-    for r in 1..relation_count {
-        textual_base[r] = textual_base[r - 1] + widths[r - 1];
-    }
+    let textual_base = textual_base(&widths);
 
     // --- Route WHERE conjuncts: single-table → that relation's local
     // predicates (rebased to local columns); everything else (cross-table,
@@ -188,7 +181,7 @@ pub(crate) fn normalize<CatE: StorageEngine>(
         referenced_columns(&conjunct, &mut cols);
         match single_relation_of(&cols, &textual_base, &widths) {
             Some(rel) => {
-                let local = rebase_predicate(conjunct, textual_base[rel]);
+                let local = shift_predicate(conjunct, -(textual_base[rel] as isize));
                 // Selectivity is filled by the per-relation pass below
                 // (batching the column-stats snapshot per relation).
                 relations[rel].local_preds.push(LocalPred {

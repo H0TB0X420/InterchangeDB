@@ -70,9 +70,14 @@ impl<C: CostModel> PlannerStrategy for VolcanoPlanner<C> {
         }
 
         let stats = gather_query_stats(&logical, catalog)?;
-        match normalize::normalize(&logical, catalog, &stats)? {
-            Some(query) => {
-                let mut memo = memo::Memo::new(&query);
+        // Two bail points share the D8 fallback: normalize rejects the
+        // statement shape, or the join graph is dense enough that the
+        // memo's group cap would overflow (review fix #1 — a bail, never
+        // a panic, on valid SQL).
+        let core = normalize::normalize(&logical, catalog, &stats)?
+            .and_then(|query| memo::Memo::try_new(&query).map(|memo| (query, memo)));
+        match core {
+            Some((query, mut memo)) => {
                 let unordered = search::optimize_root(&mut memo, &query, &self.cost_model);
 
                 // §7.5 ORDER BY consumption: when the ORDER BY maps to a
@@ -86,14 +91,18 @@ impl<C: CostModel> PlannerStrategy for VolcanoPlanner<C> {
                 if let Some(key) = props::order_by_requirement(&query) {
                     let ordered =
                         search::optimize_root_ordered(&mut memo, &query, &self.cost_model, &key);
-                    let root_gid = memo
-                        .group_id_for(memo::full_relset(query.relations.len()))
-                        .expect("optimize_root materialized the full-query group");
-                    let sorted_unordered = self.cost_model.scalar(unordered.cost)
-                        + self
-                            .cost_model
-                            .scalar(self.cost_model.cost_sort(memo.group(root_gid).cardinality));
-                    if self.cost_model.scalar(ordered.cost) < sorted_unordered {
+                    let root_group_id = memo.group_id(memo::full_relset(query.relations.len()));
+                    // Add the Costs, then scalarize ONCE — the trait does
+                    // not promise `scalar` is linear, and every other
+                    // comparison in the pipeline sums before ranking
+                    // (review fix #3).
+                    let sorted_unordered = self.cost_model.scalar(
+                        unordered.add(
+                            self.cost_model
+                                .cost_sort(memo.group(root_group_id).cardinality),
+                        ),
+                    );
+                    if self.cost_model.scalar(ordered) < sorted_unordered {
                         root_required = Some(key);
                     }
                 }
@@ -216,9 +225,8 @@ mod tests {
             let query = normalize::normalize(&logical, &catalog, &stats)
                 .unwrap()
                 .unwrap();
-            let mut m = memo::Memo::new(&query);
-            let winner = search::optimize_root(&mut m, &query, &cost_model);
-            let memo_scalar = cost_model.scalar(winner.cost);
+            let mut m = memo::Memo::try_new(&query).expect("under the group cap");
+            let memo_scalar = cost_model.scalar(search::optimize_root(&mut m, &query, &cost_model));
 
             let LogicalPlan::Select {
                 table,
@@ -253,5 +261,45 @@ mod tests {
                 "G3 violated on `{sql}`: memo {memo_scalar} > selinger {selinger_scalar}"
             );
         }
+    }
+
+    /// Review fix #1 regression: a 12-spoke star join is valid SQL whose
+    /// connected-subset count (2^12 + 12) exceeds GROUP_COUNT_MAX. The
+    /// planner must produce a plan via the D8 fallback — the original
+    /// lazy-creation memo panicked mid-search on exactly this shape.
+    #[test]
+    fn dense_join_graph_falls_back_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
+        let bpm = BufferPoolManager::new(512, dm);
+        let engine = BTreeEngine::new(bpm).unwrap();
+        let database = Arc::new(Database::open(dir.path(), engine).unwrap());
+        let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
+        let mut session = Session::new(database.clone(), catalog.clone());
+
+        let hub_columns: String = (1..=12).map(|k| format!(", h{k} INT")).collect();
+        session
+            .execute(&format!(
+                "CREATE TABLE hub (h_id INT PRIMARY KEY{hub_columns})"
+            ))
+            .unwrap();
+        let mut sql = String::from("SELECT h_id FROM hub");
+        for k in 1..=12 {
+            session
+                .execute(&format!(
+                    "CREATE TABLE s{k} (s{k}_id INT PRIMARY KEY, s{k}_h INT)"
+                ))
+                .unwrap();
+            sql += &format!(" JOIN s{k} ON s{k}_h = h{k}");
+        }
+
+        let binder = Binder::new(catalog.clone());
+        let stmts = parse(&sql).unwrap();
+        let logical = binder.bind(stmts.into_iter().next().unwrap()).unwrap();
+        let plan = VolcanoPlanner::default().plan(logical, &catalog).unwrap();
+        assert!(
+            matches!(plan, PhysicalPlan::Query(_)),
+            "dense star must plan through the fallback"
+        );
     }
 }

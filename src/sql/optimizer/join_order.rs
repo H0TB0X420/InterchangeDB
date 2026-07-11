@@ -261,6 +261,25 @@ pub fn cost_of_order(
     Some(plan.cost)
 }
 
+/// Cost of scanning one base relation sequentially and filtering by its
+/// local predicates — THE leaf formula (pages via the shared
+/// rows-per-page constant, a filter charge only when the predicates
+/// narrow). One home, shared by the DP's `sub_leaf` and the memo's
+/// SeqScan candidate, so the two planners can never silently drift
+/// apart on leaf costs (G3 depends on the parity).
+pub(crate) fn cost_seq_scan_leaf(
+    raw_rows: f64,
+    local_selectivity: f64,
+    cost_model: &dyn CostModel,
+) -> Cost {
+    let pages = (raw_rows / ROWS_PER_PAGE_ESTIMATE).ceil().max(1.0);
+    let mut cost = cost_model.cost_seq_scan(pages, raw_rows);
+    if local_selectivity < 1.0 {
+        cost = cost.add(cost_model.cost_filter(raw_rows));
+    }
+    cost
+}
+
 /// Leaf access plan for one relation: a seq scan over the full table,
 /// plus a filter charge when a local predicate narrows it. Output
 /// cardinality is the filtered row count.
@@ -271,17 +290,11 @@ fn sub_leaf(
     cost_model: &dyn CostModel,
 ) -> SubPlan {
     let raw_rows = stats.row_count(relations[r].table_id);
-    let pages = (raw_rows / ROWS_PER_PAGE_ESTIMATE).ceil().max(1.0);
-    let mut cost = cost_model.cost_seq_scan(pages, raw_rows);
-
     let local_sel = relations[r].local_selectivity;
-    if local_sel < 1.0 {
-        cost = cost.add(cost_model.cost_filter(raw_rows));
-    }
     let out_card = (raw_rows * local_sel).max(MIN_CARD);
     SubPlan {
         cardinality: out_card,
-        cost,
+        cost: cost_seq_scan_leaf(raw_rows, local_sel, cost_model),
         order: JoinOrder::Scan { rel: r },
     }
 }

@@ -22,11 +22,12 @@
 use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
 use crate::sql::ir::physical::PhysOp;
 use crate::sql::optimizer::column_map::ColumnRemap;
+use crate::sql::optimizer::join_order::RelId;
 use crate::sql::optimizer::memo::memo::{full_relset, GroupId, Memo, PhysChoice, Winner};
 use crate::sql::optimizer::memo::normalize::NormalizedQuery;
 use crate::sql::optimizer::memo::props::{merge_requirements, OrderKey};
 use crate::sql::optimizer::selinger::remap_aggregate;
-use crate::sql::planner::{and_all, apply_select_spine};
+use crate::sql::planner::{and_all, apply_select_spine, shift_predicate};
 
 /// Convert the memo's root winner into an executable `PhysOp` tree,
 /// spine included. `optimize_root` must have run on `memo` first; when
@@ -38,10 +39,8 @@ pub(crate) fn emit(
     root_required: &Option<OrderKey>,
 ) -> PhysOp {
     let relation_count = query.relations.len();
-    let root_gid = memo
-        .group_id_for(full_relset(relation_count))
-        .expect("optimize_root materialized the full-query group");
-    let root = winner_of(memo, root_gid, root_required);
+    let root_group_id = memo.group_id(full_relset(relation_count));
+    let root = winner_of(memo, root_group_id, root_required.as_ref());
 
     // 1. Physical relation order = in-order leaves of the winner tree.
     // Positive + negative space: exactly one leaf per relation;
@@ -107,10 +106,9 @@ pub(crate) fn emit(
 /// A group's recorded winner for one order requirement — present for
 /// every `(group, requirement)` on the winner path once `optimize_root`
 /// has run.
-fn winner_of<'a>(memo: &'a Memo, gid: GroupId, required: &Option<OrderKey>) -> &'a Winner {
-    memo.group(gid)
-        .winners
-        .get(required)
+fn winner_of<'a>(memo: &'a Memo, group_id: GroupId, required: Option<&OrderKey>) -> &'a Winner {
+    memo.group(group_id)
+        .winner(required)
         .expect("winner-path group has a recorded winner for its requirement")
 }
 
@@ -129,13 +127,13 @@ fn collect_leaf_order(
         | PhysChoice::IndexScan { rel, .. }
         | PhysChoice::PkLookup { rel, .. } => out.push(*rel),
         PhysChoice::NestedLoop { outer, inner, .. } | PhysChoice::Hash { outer, inner, .. } => {
-            collect_leaf_order(memo, query, &winner_of(memo, *outer, &None).plan, out);
-            collect_leaf_order(memo, query, &winner_of(memo, *inner, &None).plan, out);
+            collect_leaf_order(memo, query, &winner_of(memo, *outer, None).plan, out);
+            collect_leaf_order(memo, query, &winner_of(memo, *inner, None).plan, out);
         }
         PhysChoice::IndexNested {
             outer, inner_rel, ..
         } => {
-            collect_leaf_order(memo, query, &winner_of(memo, *outer, &None).plan, out);
+            collect_leaf_order(memo, query, &winner_of(memo, *outer, None).plan, out);
             out.push(*inner_rel);
         }
         PhysChoice::Merge { left, right, edges } => {
@@ -145,20 +143,20 @@ fn collect_leaf_order(
             collect_leaf_order(
                 memo,
                 query,
-                &winner_of(memo, *left, &Some(left_required)).plan,
+                &winner_of(memo, *left, Some(&left_required)).plan,
                 out,
             );
             collect_leaf_order(
                 memo,
                 query,
-                &winner_of(memo, *right, &Some(right_required)).plan,
+                &winner_of(memo, *right, Some(&right_required)).plan,
                 out,
             );
         }
         PhysChoice::SortEnforcer { child, .. } => {
             // The enforcer reorders rows, not columns — its layout is
             // its child's unordered winner's.
-            collect_leaf_order(memo, query, &winner_of(memo, *child, &None).plan, out);
+            collect_leaf_order(memo, query, &winner_of(memo, *child, None).plan, out);
         }
     }
 }
@@ -186,8 +184,8 @@ impl EmitContext<'_> {
     }
 
     /// Total column width of a group's relations.
-    fn group_width(&self, gid: GroupId) -> usize {
-        let relset = self.memo.group(gid).relset;
+    fn group_width(&self, group_id: GroupId) -> usize {
+        let relset = self.memo.group(group_id).relset;
         self.widths
             .iter()
             .enumerate()
@@ -200,36 +198,54 @@ impl EmitContext<'_> {
     /// (mirrors `selinger::build_on_predicate`).
     fn edge_compare(&self, edge_index: usize, node_start: usize) -> Predicate {
         let edge = &self.query.edges[edge_index];
-        let ga = self.textual_base[edge.left_rel] + edge.left_col;
-        let gb = self.textual_base[edge.right_rel] + edge.right_col;
+        let left_col_global = self.textual_base[edge.left_rel] + edge.left_col;
+        let right_col_global = self.textual_base[edge.right_rel] + edge.right_col;
         Predicate::Compare {
             op: CompareOp::Eq,
-            left: Expression::Column(self.node_coord(ga, node_start)),
-            right: Expression::Column(self.node_coord(gb, node_start)),
+            left: Expression::Column(self.node_coord(left_col_global, node_start)),
+            right: Expression::Column(self.node_coord(right_col_global, node_start)),
         }
+    }
+
+    /// Residual join filter for the single-key joins (Hash/Merge):
+    /// every crossing edge past the key `edges[0]`, conjoined in node
+    /// coordinates. One home so the two arms can never drift (review
+    /// fix #5).
+    fn residual_edge_filter(&self, edges: &[usize], node_start: usize) -> Option<Predicate> {
+        and_all(
+            edges[1..]
+                .iter()
+                .map(|&e| self.edge_compare(e, node_start))
+                .collect(),
+        )
     }
 
     /// An edge's endpoints as textual-global columns, ordered
     /// (outer-side, inner-side) for the join whose outer group is given.
     fn oriented_endpoints(&self, edge_index: usize, outer: GroupId) -> (usize, usize) {
         let edge = &self.query.edges[edge_index];
-        let ga = self.textual_base[edge.left_rel] + edge.left_col;
-        let gb = self.textual_base[edge.right_rel] + edge.right_col;
+        let left_col_global = self.textual_base[edge.left_rel] + edge.left_col;
+        let right_col_global = self.textual_base[edge.right_rel] + edge.right_col;
         let outer_set = self.memo.group(outer).relset;
         if outer_set & (1u32 << edge.left_rel) != 0 {
             debug_assert!(outer_set & (1u32 << edge.right_rel) == 0, "edge must cross");
-            (ga, gb)
+            (left_col_global, right_col_global)
         } else {
             debug_assert!(outer_set & (1u32 << edge.right_rel) != 0, "edge must cross");
-            (gb, ga)
+            (right_col_global, left_col_global)
         }
     }
 
     /// Build the `PhysOp` subtree for one group's winner under an order
     /// requirement, whose output slice starts at `node_start` in the
     /// full physical layout.
-    fn build_group(&self, gid: GroupId, node_start: usize, required: &Option<OrderKey>) -> PhysOp {
-        self.build_choice(&winner_of(self.memo, gid, required).plan, node_start)
+    fn build_group(
+        &self,
+        group_id: GroupId,
+        node_start: usize,
+        required: Option<&OrderKey>,
+    ) -> PhysOp {
+        self.build_choice(&winner_of(self.memo, group_id, required).plan, node_start)
     }
 
     fn build_choice(&self, choice: &PhysChoice, node_start: usize) -> PhysOp {
@@ -280,134 +296,156 @@ impl EmitContext<'_> {
                 outer,
                 inner,
                 edges,
-            } => {
-                let outer_width = self.group_width(*outer);
-                let outer_op = self.build_group(*outer, node_start, &None);
-                let inner_op = self.build_group(*inner, node_start + outer_width, &None);
-                let on = and_all(
-                    edges
-                        .iter()
-                        .map(|&e| self.edge_compare(e, node_start))
-                        .collect(),
-                );
-                debug_assert!(on.is_some(), "split invariant: at least one edge");
-                PhysOp::NestedLoopJoin {
-                    outer: Box::new(outer_op),
-                    inner: Box::new(inner_op),
-                    on,
-                }
-            }
-
+            } => self.build_nested_loop(*outer, *inner, edges, node_start),
             PhysChoice::Hash {
                 outer,
                 inner,
                 edges,
-            } => {
-                let outer_width = self.group_width(*outer);
-                let outer_op = self.build_group(*outer, node_start, &None);
-                let inner_op = self.build_group(*inner, node_start + outer_width, &None);
-                // edges[0] is the hash key; the executor's inner key is
-                // local to the inner subtree's own tuple.
-                let (g_outer, g_inner) = self.oriented_endpoints(edges[0], *outer);
-                let join = PhysOp::HashJoin {
-                    outer: Box::new(outer_op),
-                    inner: Box::new(inner_op),
-                    outer_key_col: self.node_coord(g_outer, node_start),
-                    inner_key_col: self.node_coord(g_inner, node_start + outer_width),
-                };
-                // Non-key edges: residual join filter (single-key
-                // HashJoin limitation, §5).
-                let residual = and_all(
-                    edges[1..]
-                        .iter()
-                        .map(|&e| self.edge_compare(e, node_start))
-                        .collect(),
-                );
-                filter_above(join, residual)
-            }
-
+            } => self.build_hash(*outer, *inner, edges, node_start),
             PhysChoice::IndexNested {
                 outer,
                 inner_rel,
                 index,
                 probe,
                 edges,
-            } => {
-                let outer_op = self.build_group(*outer, node_start, &None);
-                let (g_outer, _) = self.oriented_endpoints(*probe, *outer);
-                let info = &self.query.relations[*inner_rel];
-                let join = PhysOp::IndexNestedLoopJoin {
-                    outer: Box::new(outer_op),
-                    inner_table: info.name.clone(),
-                    inner_index: index.clone(),
-                    outer_key_cols: vec![self.node_coord(g_outer, node_start)],
-                };
-                // Probes carry neither the non-probe edges nor the
-                // inner's local predicates — both filter above the join
-                // (plan_select's INLJ path kicks them upward the same
-                // way, just to the top of the tree instead).
-                let mut parts: Vec<Predicate> = edges
-                    .iter()
-                    .filter(|&&e| e != *probe)
-                    .map(|&e| self.edge_compare(e, node_start))
-                    .collect();
-                let inner_base = self.node_coord(self.textual_base[*inner_rel], node_start);
-                parts.extend(
-                    info.local_preds
-                        .iter()
-                        .map(|p| raise_predicate(p.pred.clone(), inner_base)),
-                );
-                filter_above(join, and_all(parts))
-            }
-
+            } => self.build_index_nested(*outer, *inner_rel, index, *probe, edges, node_start),
             PhysChoice::Merge { left, right, edges } => {
-                let left_width = self.group_width(*left);
-                // Children resolve under the same requirements the
-                // search imposed — merge_requirements is the single
-                // source of truth for both sides.
-                let key_edge = &self.query.edges[edges[0]];
-                let (left_required, right_required) =
-                    merge_requirements(key_edge, self.memo.group(*left).relset);
-                let left_op = self.build_group(*left, node_start, &Some(left_required));
-                let right_op =
-                    self.build_group(*right, node_start + left_width, &Some(right_required));
-                let (g_left, g_right) = self.oriented_endpoints(edges[0], *left);
-                let join = PhysOp::MergeJoin {
-                    left: Box::new(left_op),
-                    right: Box::new(right_op),
-                    left_key_col: self.node_coord(g_left, node_start),
-                    right_key_col: self.node_coord(g_right, node_start + left_width),
-                };
-                // Non-key edges: residual join filter (single-key merge,
-                // same limitation as Hash).
-                let residual = and_all(
-                    edges[1..]
-                        .iter()
-                        .map(|&e| self.edge_compare(e, node_start))
-                        .collect(),
-                );
-                filter_above(join, residual)
+                self.build_merge(*left, *right, edges, node_start)
             }
-
             PhysChoice::SortEnforcer { child, key } => {
-                // The enforcer sorts its group's unordered winner; the
-                // layout (and therefore `node_start`) is unchanged, so
-                // the key columns land in the child's own coordinates.
-                let child_op = self.build_group(*child, node_start, &None);
-                let keys = key
-                    .iter()
-                    .map(|&((rel, col), dir)| {
-                        (
-                            self.node_coord(self.textual_base[rel] + col, node_start),
-                            dir,
-                        )
-                    })
-                    .collect();
-                PhysOp::Sort {
-                    input: Box::new(child_op),
-                    keys,
-                }
+                self.build_sort_enforcer(*child, key, node_start)
             }
+        }
+    }
+
+    fn build_nested_loop(
+        &self,
+        outer: GroupId,
+        inner: GroupId,
+        edges: &[usize],
+        node_start: usize,
+    ) -> PhysOp {
+        let outer_width = self.group_width(outer);
+        let outer_op = self.build_group(outer, node_start, None);
+        let inner_op = self.build_group(inner, node_start + outer_width, None);
+        let on = and_all(
+            edges
+                .iter()
+                .map(|&e| self.edge_compare(e, node_start))
+                .collect(),
+        );
+        debug_assert!(on.is_some(), "split invariant: at least one edge");
+        PhysOp::NestedLoopJoin {
+            outer: Box::new(outer_op),
+            inner: Box::new(inner_op),
+            on,
+        }
+    }
+
+    fn build_hash(
+        &self,
+        outer: GroupId,
+        inner: GroupId,
+        edges: &[usize],
+        node_start: usize,
+    ) -> PhysOp {
+        let outer_width = self.group_width(outer);
+        let outer_op = self.build_group(outer, node_start, None);
+        let inner_op = self.build_group(inner, node_start + outer_width, None);
+        // edges[0] is the hash key; the executor's inner key is local to
+        // the inner subtree's own tuple.
+        let (outer_col_global, inner_col_global) = self.oriented_endpoints(edges[0], outer);
+        let join = PhysOp::HashJoin {
+            outer: Box::new(outer_op),
+            inner: Box::new(inner_op),
+            outer_key_col: self.node_coord(outer_col_global, node_start),
+            inner_key_col: self.node_coord(inner_col_global, node_start + outer_width),
+        };
+        // Non-key edges: residual join filter (single-key limitation, §5).
+        filter_above(join, self.residual_edge_filter(edges, node_start))
+    }
+
+    fn build_index_nested(
+        &self,
+        outer: GroupId,
+        inner_rel: RelId,
+        index: &str,
+        probe: usize,
+        edges: &[usize],
+        node_start: usize,
+    ) -> PhysOp {
+        let outer_op = self.build_group(outer, node_start, None);
+        let (outer_col_global, _) = self.oriented_endpoints(probe, outer);
+        let info = &self.query.relations[inner_rel];
+        let join = PhysOp::IndexNestedLoopJoin {
+            outer: Box::new(outer_op),
+            inner_table: info.name.clone(),
+            inner_index: index.to_string(),
+            outer_key_cols: vec![self.node_coord(outer_col_global, node_start)],
+        };
+        // Probes carry neither the non-probe edges nor the inner's local
+        // predicates — both filter above the join (plan_select's INLJ
+        // path kicks them upward the same way, just to the top of the
+        // tree instead).
+        let mut parts: Vec<Predicate> = edges
+            .iter()
+            .filter(|&&e| e != probe)
+            .map(|&e| self.edge_compare(e, node_start))
+            .collect();
+        let inner_base = self.node_coord(self.textual_base[inner_rel], node_start);
+        parts.extend(
+            info.local_preds
+                .iter()
+                .map(|p| shift_predicate(p.pred.clone(), inner_base as isize)),
+        );
+        filter_above(join, and_all(parts))
+    }
+
+    fn build_merge(
+        &self,
+        left: GroupId,
+        right: GroupId,
+        edges: &[usize],
+        node_start: usize,
+    ) -> PhysOp {
+        let left_width = self.group_width(left);
+        // Children resolve under the same requirements the search
+        // imposed — merge_requirements is the single source of truth
+        // for both sides.
+        let key_edge = &self.query.edges[edges[0]];
+        let (left_required, right_required) =
+            merge_requirements(key_edge, self.memo.group(left).relset);
+        let left_op = self.build_group(left, node_start, Some(&left_required));
+        let right_op = self.build_group(right, node_start + left_width, Some(&right_required));
+        let (left_col_global, right_col_global) = self.oriented_endpoints(edges[0], left);
+        let join = PhysOp::MergeJoin {
+            left: Box::new(left_op),
+            right: Box::new(right_op),
+            left_key_col: self.node_coord(left_col_global, node_start),
+            right_key_col: self.node_coord(right_col_global, node_start + left_width),
+        };
+        // Non-key edges: residual join filter (single-key limitation,
+        // same as Hash).
+        filter_above(join, self.residual_edge_filter(edges, node_start))
+    }
+
+    fn build_sort_enforcer(&self, child: GroupId, key: &OrderKey, node_start: usize) -> PhysOp {
+        // The enforcer sorts its group's unordered winner; the layout
+        // (and therefore `node_start`) is unchanged, so the key columns
+        // land in the child's own coordinates.
+        let child_op = self.build_group(child, node_start, None);
+        let keys = key
+            .iter()
+            .map(|&((rel, col), dir)| {
+                (
+                    self.node_coord(self.textual_base[rel] + col, node_start),
+                    dir,
+                )
+            })
+            .collect();
+        PhysOp::Sort {
+            input: Box::new(child_op),
+            keys,
         }
     }
 }
@@ -420,41 +458,6 @@ fn filter_above(op: PhysOp, predicate: Option<Predicate>) -> PhysOp {
             predicate,
         },
         None => op,
-    }
-}
-
-/// Shift every column index in an expression up by `offset` — the
-/// inverse of `planner::rebase_expr`, turning a relation-local index
-/// into a join-tuple index.
-fn raise_expr(expr: Expression, offset: usize) -> Expression {
-    match expr {
-        Expression::Column(i) => Expression::Column(i + offset),
-        lit_or_param @ (Expression::Literal(_) | Expression::Parameter(_)) => lit_or_param,
-        Expression::BinaryOp { op, left, right } => Expression::BinaryOp {
-            op,
-            left: Box::new(raise_expr(*left, offset)),
-            right: Box::new(raise_expr(*right, offset)),
-        },
-    }
-}
-
-/// Raise every column in a predicate by `offset` (see `raise_expr`).
-fn raise_predicate(pred: Predicate, offset: usize) -> Predicate {
-    match pred {
-        Predicate::Compare { op, left, right } => Predicate::Compare {
-            op,
-            left: raise_expr(left, offset),
-            right: raise_expr(right, offset),
-        },
-        Predicate::And(a, b) => Predicate::And(
-            Box::new(raise_predicate(*a, offset)),
-            Box::new(raise_predicate(*b, offset)),
-        ),
-        Predicate::Or(a, b) => Predicate::Or(
-            Box::new(raise_predicate(*a, offset)),
-            Box::new(raise_predicate(*b, offset)),
-        ),
-        Predicate::Not(p) => Predicate::Not(Box::new(raise_predicate(*p, offset))),
     }
 }
 
@@ -474,7 +477,7 @@ mod tests {
     fn memo_plan(env: &Env, sql: &str, stats: &QueryStats) -> PhysOp {
         let logical = bind(env, sql);
         let query = normalize(&logical, &env.catalog, stats).unwrap().unwrap();
-        let mut memo = Memo::new(&query);
+        let mut memo = Memo::try_new(&query).expect("under the group cap");
         optimize_root(&mut memo, &query, &DefaultCostModel::new());
         emit(&memo, &query, &None)
     }

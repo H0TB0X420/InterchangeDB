@@ -34,6 +34,18 @@
 
 use crate::sql::ir::expr::{Expression, Predicate};
 
+/// Tuple-global offset of each table's first column in textual (binder)
+/// order — the prefix sum of `widths`. The single home for this layout
+/// table (review fix #5): the remap below, the Selinger join-graph
+/// builder, and the memo normalizer all derive coordinates from it.
+pub(crate) fn textual_base(widths: &[usize]) -> Vec<usize> {
+    let mut base = vec![0usize; widths.len()];
+    for table in 1..widths.len() {
+        base[table] = base[table - 1] + widths[table - 1];
+    }
+    base
+}
+
 /// A rewrite of tuple-global column indices from textual order to a chosen
 /// physical (reordered) layout. Built once per reordered plan; applied to
 /// every column reference the plan carries.
@@ -58,11 +70,7 @@ impl ColumnRemap {
             "physical_order must cover every table"
         );
 
-        // Textual base offset of each table = prefix sum of widths.
-        let mut textual_base = vec![0usize; table_count];
-        for t in 1..table_count {
-            textual_base[t] = textual_base[t - 1] + widths[t - 1];
-        }
+        let textual_base = textual_base(widths);
 
         // Physical base offset of each table = prefix sum along the chosen
         // order. `seen` doubles as the permutation check.

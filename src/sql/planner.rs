@@ -953,37 +953,44 @@ fn predicate_touches_range(pred: &Predicate, range: &TableRange) -> bool {
     cols.iter().any(|&c| c >= range.start && c < range.end)
 }
 
-/// Shift every column index in an expression down by `offset` — turning a
-/// global join-tuple index into a right-table-local one.
-fn rebase_expr(expr: Expression, offset: usize) -> Expression {
+/// Shift every column index in an expression by `delta` — negative to
+/// rebase a join-tuple index down to a table-local one, positive to
+/// raise a local index into a join tuple. One walk for both directions
+/// (review fix #5): a new `Expression` variant is handled here exactly
+/// once. Underflow is a coordinate-space bug and crashes.
+fn shift_expr(expr: Expression, delta: isize) -> Expression {
     match expr {
-        Expression::Column(i) => Expression::Column(i - offset),
+        Expression::Column(i) => {
+            let shifted = i as isize + delta;
+            assert!(shifted >= 0, "column {i} shifted below zero by {delta}");
+            Expression::Column(shifted as usize)
+        }
         lit_or_param @ (Expression::Literal(_) | Expression::Parameter(_)) => lit_or_param,
         Expression::BinaryOp { op, left, right } => Expression::BinaryOp {
             op,
-            left: Box::new(rebase_expr(*left, offset)),
-            right: Box::new(rebase_expr(*right, offset)),
+            left: Box::new(shift_expr(*left, delta)),
+            right: Box::new(shift_expr(*right, delta)),
         },
     }
 }
 
-/// Rebase every column in a predicate down by `offset` (see `rebase_expr`).
-pub(crate) fn rebase_predicate(pred: Predicate, offset: usize) -> Predicate {
+/// Shift every column in a predicate by `delta` (see `shift_expr`).
+pub(crate) fn shift_predicate(pred: Predicate, delta: isize) -> Predicate {
     match pred {
         Predicate::Compare { op, left, right } => Predicate::Compare {
             op,
-            left: rebase_expr(left, offset),
-            right: rebase_expr(right, offset),
+            left: shift_expr(left, delta),
+            right: shift_expr(right, delta),
         },
         Predicate::And(a, b) => Predicate::And(
-            Box::new(rebase_predicate(*a, offset)),
-            Box::new(rebase_predicate(*b, offset)),
+            Box::new(shift_predicate(*a, delta)),
+            Box::new(shift_predicate(*b, delta)),
         ),
         Predicate::Or(a, b) => Predicate::Or(
-            Box::new(rebase_predicate(*a, offset)),
-            Box::new(rebase_predicate(*b, offset)),
+            Box::new(shift_predicate(*a, delta)),
+            Box::new(shift_predicate(*b, delta)),
         ),
-        Predicate::Not(p) => Predicate::Not(Box::new(rebase_predicate(*p, offset))),
+        Predicate::Not(p) => Predicate::Not(Box::new(shift_predicate(*p, delta))),
     }
 }
 
@@ -1001,7 +1008,7 @@ fn build_right_leaf(
 ) -> PhysOp {
     let local_preds = global_preds
         .into_iter()
-        .map(|p| rebase_predicate(p, offset))
+        .map(|p| shift_predicate(p, -(offset as isize)))
         .collect();
     build_left_leaf(local_preds, schema, table_name, indexes)
 }

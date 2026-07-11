@@ -132,10 +132,10 @@ pub(crate) fn default_stats() -> QueryStats {
 /// Minimal single-column relation — hand-built fixtures exercise graph
 /// shape and cost arithmetic, never the schema or predicate content, so
 /// one Int32 column and a placeholder conjunct carrying
-/// `local_selectivity` suffice. The placeholder compares with `<` so it
-/// can never lower to a PkLookup/IndexScan access path (an `=` on the
-/// single column would pin the PK and hand SeqScan-only reference
-/// models a surprise PkLookup candidate).
+/// `local_selectivity` suffice. No primary key and no indexes, so
+/// access-path lowering is structurally impossible (review fix #5:
+/// SeqScan-only reference models can't be surprised by a future
+/// widening of the lowering rules).
 pub(crate) fn rel(rows: f64, local_selectivity: f64) -> RelInfo {
     let local_preds = if local_selectivity < 1.0 {
         vec![LocalPred {
@@ -155,7 +155,7 @@ pub(crate) fn rel(rows: f64, local_selectivity: f64) -> RelInfo {
             name: "r".into(),
             table_id: TableId(0),
             columns: vec![int32_col("c")],
-            primary_key: vec![0],
+            primary_key: vec![],
         }),
         indexes: Vec::new(),
         local_preds,

@@ -181,6 +181,12 @@ Concretes:
   arrives with a larger budget. Root optimization runs with INF, so in
   practice every group's final winner is optimal; the flag keeps the
   invariant honest and testable.
+  [NOTE, post-review 2026-07-10: the flag was REMOVED. With exact
+  additive costs (zero sibling lower bounds, no admissible heuristic),
+  branch-and-bound only prunes candidates that provably cannot win, so
+  any recorded winner is already the group's true optimum — the flag
+  and its re-search branch were dead machinery. Re-add together with
+  the lower-bound tightening lever if it ever lands.]
 - Termination/bounds: recursion depth ≤ relation count; group count
   ≤ 2^MAX_RELATIONS but only connected subsets materialize; assert
   `groups.len()` stays under a hard cap (e.g. 4096) as the
