@@ -98,3 +98,21 @@ all = "warn"
 
 [features]
 shuttle = ["dep:shuttle"]
+
+[profile.dev]
+# Full debuginfo dominates ld64 link time and we rarely step-debug; line
+# tables keep panic locations and test-failure backtraces legible at a
+# fraction of the link cost. Measured rationale: docs/plan-build-times.md.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies compile once and then run inside every test; optimizing them
+# pays back on every proptest/goldenscript run. Wildcard excludes workspace
+# members, so interchangedb/testkit iteration stays fast-compiling.
+opt-level = 2
+debug = false
+
+[profile.dev.build-override]
+# Proc macros (serde_derive, thiserror) execute at compile time; optimizing
+# them speeds up every build that expands them.
+opt-level = 3
