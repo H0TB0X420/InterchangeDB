@@ -182,7 +182,7 @@ impl Decimal {
 /// Integer division rounding half away from zero (SQL rounding), instead of
 /// Rust's truncation toward zero. Shared by decimal division and the AVG
 /// finalizers (E14/O4). `den` must be non-zero (callers check).
-pub(crate) fn div_i128_round_half_away(num: i128, den: i128) -> i128 {
+pub fn div_i128_round_half_away(num: i128, den: i128) -> i128 {
     debug_assert!(den != 0, "div_i128_round_half_away: zero divisor");
     let quotient = num / den;
     let remainder = num % den;

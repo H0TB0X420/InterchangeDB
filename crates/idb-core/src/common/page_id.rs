@@ -11,7 +11,7 @@ use std::fmt;
 ///
 /// # Example
 /// ```
-/// use interchangedb::PageId;
+/// use idb_core::common::PageId;
 ///
 /// let page_id = PageId::new(42);
 /// assert!(page_id.is_valid());

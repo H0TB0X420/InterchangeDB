@@ -17,3 +17,8 @@ pub mod value;
 
 pub use decimal::Decimal;
 pub use value::{ColumnType, Value};
+
+/// A materialized row flowing between operators: one `Value` per column.
+/// Lives in the vocabulary crate — both the IR (`sql`) and the executors
+/// (`execution`) reference it, so neither may own it.
+pub type Tuple = Vec<Value>;

@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::execution::Tuple;
+use crate::types::Tuple;
 use crate::types::{Decimal, Value};
 
 /// An expression that evaluates to a `Value` against an input tuple.

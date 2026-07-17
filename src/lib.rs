@@ -60,13 +60,14 @@
 // Core modules
 pub mod buffer;
 pub mod catalog;
-pub mod common;
+pub use idb_core::common;
 pub mod database;
 pub mod layout;
 pub mod storage;
 
 /// Synchronization-primitive shim (parking_lot in prod, shuttle under test).
-pub(crate) mod sync;
+pub(crate) use idb_core::sync;
+pub use idb_core::sync_trace;
 
 /// The pluggable `StorageEngine` implementations (B+Tree, LSM).
 pub mod engines;
@@ -75,7 +76,7 @@ pub mod session;
 pub mod sql;
 pub mod table;
 pub mod txn;
-pub mod types;
+pub use idb_core::types;
 pub mod wal;
 
 // Re-export commonly used items at crate root for convenience

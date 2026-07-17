@@ -11,7 +11,7 @@ use std::fmt;
 ///
 /// # Example
 /// ```
-/// use interchangedb::FrameId;
+/// use idb_core::common::FrameId;
 ///
 /// let frame_id = FrameId::new(5);
 /// // Can use directly as index: frames[frame_id.0]

@@ -48,11 +48,11 @@ pub use operators::update::{SetExpr, Update};
 
 use crate::catalog::{ColumnDef, Schema, TableId};
 use crate::common::Result;
-use crate::types::{ColumnType, Value};
+use crate::types::ColumnType;
 
 /// A row of values in schema order. Reuses the shape `Table::scan` already
 /// emits, so layout-level I/O and execution speak the same tuple type.
-pub type Tuple = Vec<Value>;
+pub use crate::types::Tuple;
 
 /// Pull-based query operator.
 ///
