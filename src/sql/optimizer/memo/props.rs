@@ -99,6 +99,35 @@ mod tests {
         assert_eq!(order_by_requirement(&q), None);
     }
 
+    // HOW: an edge anchored ABOVE relation 0 (rel 1 ↔ rel 2), evaluated
+    // from both sides of the split. Transitive coverage only ever drove
+    // merges through an edge whose left_rel is 0 sitting in the left
+    // group — the one input where a broken membership test (`|` for `&`,
+    // `>>` for `<<`) is indistinguishable from the correct one. Distinct
+    // column indexes (1 vs 2) make a rel/col swap visible too.
+    #[test]
+    fn merge_requirements_orients_by_left_set_membership() {
+        let e = Edge {
+            left_rel: 1,
+            right_rel: 2,
+            left_col: 1,
+            right_col: 2,
+            left_indexed: false,
+            right_indexed: false,
+            selectivity: 0.1,
+        };
+
+        // edge.left_rel inside the left group → canonical orientation.
+        let (left, right) = merge_requirements(&e, 0b010);
+        assert_eq!(left, edge_order(1, 1));
+        assert_eq!(right, edge_order(2, 2));
+
+        // edge.left_rel NOT in the left group → flipped orientation.
+        let (left, right) = merge_requirements(&e, 0b100);
+        assert_eq!(left, edge_order(2, 2));
+        assert_eq!(right, edge_order(1, 1));
+    }
+
     #[test]
     fn aggregate_queries_are_never_consumable() {
         // Review fix #3: with aggregates the spine Sort covers a single

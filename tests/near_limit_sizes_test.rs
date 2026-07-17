@@ -86,6 +86,35 @@ fn btree_oversized_value_does_not_panic() {
     let _ = e.put(b"k", &val); // ignore Ok or Err; assert no panic
 }
 
+#[test]
+fn btree_entry_at_exact_leaf_budget_boundary() {
+    // HOW: Q-16's guard admits (key + value) up to exactly
+    // PAGE_SIZE − LEAF_HEADER_SIZE − MAX_TOMBSTONES·2 − 4
+    //   = 4096 − 33 − 16 − 4 = 4043 bytes.
+    // The tolerant tests above can't pin that line — this one asserts BOTH
+    // sides of it. A wider budget re-opens the pre-Q-16 encoder panic
+    // ("range end out of slice") for entries in the gap window; a narrower
+    // one rejects storable data.
+    const LEAF_BUDGET: usize = 4096 - 33 - 8 * 2 - 4;
+
+    let (e, _d) = make_btree();
+
+    // 1-byte key + (budget − 1)-byte value = exactly at budget: must store
+    // and round-trip.
+    let fits = vec![0x42; LEAF_BUDGET - 1];
+    e.put(b"k", &fits).unwrap();
+    assert_eq!(e.get(b"k").unwrap(), Some(fits));
+
+    // One byte over: a clean ValueTooLarge, not a panic and not an Ok.
+    let over = vec![0x43; LEAF_BUDGET];
+    match e.put(b"j", &over) {
+        Err(interchangedb::common::Error::ValueTooLarge(_)) => {}
+        other => panic!("expected ValueTooLarge one byte over budget, got {other:?}"),
+    }
+    // The reject happened before any tree mutation — no partial write.
+    assert_eq!(e.get(b"j").unwrap(), None);
+}
+
 // ---- LSM u16-length boundaries ----
 
 #[test]

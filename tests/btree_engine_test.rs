@@ -59,6 +59,41 @@ fn test_engine_initial_disk_size() {
 }
 
 #[test]
+fn test_engine_status_size_tracks_entry_bytes_exactly() {
+    // HOW: `status().size` is maintained by three separate accounting arms
+    // in `put`/`delete` (insert adds key+value, overwrite swaps old value
+    // for new, delete subtracts key+value). Walk the whole lifecycle with
+    // DISTINCT key and value lengths so any arithmetic slip in any arm
+    // (wrong operator, wrong operand) lands on a different number.
+    let (engine, _dir) = setup_engine();
+
+    engine.put(b"kk", &[0x11; 10]).unwrap(); // insert: 2 + 10
+    let status = engine.status();
+    assert_eq!(status.keys, 1);
+    assert_eq!(status.size, 12);
+
+    engine.put(b"kk", &[0x22; 30]).unwrap(); // overwrite: 12 − 10 + 30
+    let status = engine.status();
+    assert_eq!(status.keys, 1, "overwrite must not change key count");
+    assert_eq!(status.size, 32);
+
+    engine.put(b"j", &[0x33; 5]).unwrap(); // second insert: 32 + 1 + 5
+    let status = engine.status();
+    assert_eq!(status.keys, 2);
+    assert_eq!(status.size, 38);
+
+    engine.delete(b"kk").unwrap(); // delete: 38 − 2 − 30
+    let status = engine.status();
+    assert_eq!(status.keys, 1);
+    assert_eq!(status.size, 6);
+
+    engine.delete(b"j").unwrap(); // back to empty: everything cancels
+    let status = engine.status();
+    assert_eq!(status.keys, 0);
+    assert_eq!(status.size, 0, "full lifecycle must return size to zero");
+}
+
+#[test]
 fn test_engine_many_keys_with_splits() {
     // Use small node sizes to force many splits — exercises BTree-specific
     // split/merge/redistribute logic that LSM doesn't have.

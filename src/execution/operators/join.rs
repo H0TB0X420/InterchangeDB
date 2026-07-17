@@ -58,6 +58,13 @@ pub struct NestedLoopJoin {
     /// Cached current outer row; we walk through all inner rows for each.
     current_outer: Option<Tuple>,
     inner_cursor: usize,
+
+    /// Debug-only bound: rows emitted for the current outer row. Exceeds
+    /// `inner_rows.len()` only if the scan cursor regressed and re-matched
+    /// a row — the emit-path analogue of the structurally bounded scan in
+    /// `next()` (explicit-limits rule: crash, don't stream forever).
+    #[cfg(debug_assertions)]
+    emitted_for_outer: usize,
 }
 
 impl NestedLoopJoin {
@@ -86,6 +93,8 @@ impl NestedLoopJoin {
             predicate,
             current_outer: None,
             inner_cursor: 0,
+            #[cfg(debug_assertions)]
+            emitted_for_outer: 0,
         })
     }
 }
@@ -97,6 +106,10 @@ impl Executor for NestedLoopJoin {
             if self.current_outer.is_none() {
                 self.current_outer = self.outer.next()?;
                 self.inner_cursor = 0;
+                #[cfg(debug_assertions)]
+                {
+                    self.emitted_for_outer = 0;
+                }
                 if self.current_outer.is_none() {
                     // Outer exhausted → join is done.
                     return Ok(None);
@@ -105,10 +118,23 @@ impl Executor for NestedLoopJoin {
             let outer_row = self.current_outer.as_ref().unwrap();
 
             // Scan inner from the current cursor; emit on first match.
-            while self.inner_cursor < self.inner_rows.len() {
-                let inner_row = &self.inner_rows[self.inner_cursor];
-                self.inner_cursor += 1;
+            // `for` over the remaining range is structurally bounded, so
+            // the no-match scan terminates even if the cursor bookkeeping
+            // regresses; the emit path is bounded by `emitted_for_outer`
+            // above (together: the explicit-limits rule — a progress bug
+            // crashes in debug instead of spinning or streaming forever).
+            for idx in self.inner_cursor..self.inner_rows.len() {
+                self.inner_cursor = idx + 1;
+                let inner_row = &self.inner_rows[idx];
                 if (self.predicate)(outer_row, inner_row) {
+                    #[cfg(debug_assertions)]
+                    {
+                        self.emitted_for_outer += 1;
+                        debug_assert!(
+                            self.emitted_for_outer <= self.inner_rows.len(),
+                            "nested-loop emitted more rows for one outer row than the inner holds"
+                        );
+                    }
                     let mut joined = outer_row.clone();
                     joined.extend_from_slice(inner_row);
                     return Ok(Some(joined));
