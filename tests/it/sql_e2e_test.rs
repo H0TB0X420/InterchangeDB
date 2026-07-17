@@ -21,8 +21,9 @@ use interchangedb::database::Database;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
 use interchangedb::sql::workload_log::WorkloadLog;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::types::Value;
+use interchangedb::wal::SyncMode;
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -37,11 +38,11 @@ struct Env {
 
 fn setup() -> Env {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(512, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let database = Arc::new(Database::open(dir.path(), engine).unwrap());
+    let database =
+        Arc::new(Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap());
     let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
     let session = Session::new(database.clone(), catalog.clone());
     Env {

@@ -14,16 +14,16 @@ use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::Error;
 use interchangedb::database::Database;
 use interchangedb::engines::btree::BTreeEngine;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::txn::TxnMode;
+use interchangedb::wal::SyncMode;
 
 fn setup_shared() -> (Arc<Database<BTreeEngine>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
     (Arc::new(db), dir)
 }
 
@@ -312,11 +312,10 @@ fn snapshot_consistency_under_writes() {
     // Reader takes a snapshot, 4 writers modify data, reader re-reads.
     // Reader must see the same values both times (snapshot frozen).
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     // Seed data.
     for i in 0..10 {

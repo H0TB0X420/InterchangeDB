@@ -22,15 +22,17 @@ use interchangedb::catalog::Catalog;
 use interchangedb::database::Database;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::types::Value;
+use interchangedb::wal::SyncMode;
 
 fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("t.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(256, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let database = Arc::new(Database::open(dir.path(), engine).unwrap());
+    let database =
+        Arc::new(Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap());
     let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
     let mut s = Session::new(database, catalog);
 

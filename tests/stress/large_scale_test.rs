@@ -23,14 +23,12 @@ use std::sync::Arc;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::engines::lsm::LsmEngine;
-use interchangedb::storage::{FileDiskManager, StorageEngine};
+use interchangedb::storage::{MemoryDiskManager, StorageEngine};
 
-fn make_btree(pool_size: usize) -> (Arc<BTreeEngine>, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
+fn make_btree(pool_size: usize) -> Arc<BTreeEngine> {
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(pool_size, dm);
-    let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
-    (engine, dir)
+    Arc::new(BTreeEngine::new(bpm).unwrap())
 }
 
 fn make_lsm() -> (Arc<LsmEngine>, tempfile::TempDir) {
@@ -49,12 +47,12 @@ fn value_for(i: u32) -> Vec<u8> {
 
 #[test]
 fn btree_100k_keys_bounded_pool_no_eviction_failures() {
-    // 25K is the largest tractable size at debug build with FileDiskManager
-    // (which fsyncs every write_page). Real throughput goals belong in
-    // criterion benchmarks, not integration tests. This test's job is to
-    // verify correctness under sustained eviction pressure, not perf.
+    // Sized when the engine ran on FileDiskManager (fsync per write_page);
+    // kept at 25K on the in-memory backend because the subject is
+    // correctness under sustained eviction pressure, not throughput —
+    // perf goals belong in criterion benchmarks.
     const N: u32 = 25_000;
-    let (e, _d) = make_btree(64);
+    let e = make_btree(64);
 
     for i in 0..N {
         e.put(&key_for(i), &value_for(i)).unwrap();
@@ -74,7 +72,7 @@ fn btree_100k_keys_bounded_pool_no_eviction_failures() {
 #[test]
 fn btree_25k_scan_returns_sorted() {
     const N: u32 = 25_000;
-    let (e, _d) = make_btree(64);
+    let e = make_btree(64);
     for i in 0..N {
         e.put(&key_for(i), &value_for(i)).unwrap();
     }
@@ -125,7 +123,7 @@ fn btree_random_read_pattern_under_eviction_pressure() {
     // sustained eviction (every read likely misses → eviction).
     const N: u32 = 50_000;
     const READS: u32 = 5_000;
-    let (e, _d) = make_btree(32);
+    let e = make_btree(32);
     for i in 0..N {
         e.put(&key_for(i), &value_for(i)).unwrap();
     }
@@ -156,7 +154,7 @@ fn btree_random_read_pattern_under_eviction_pressure() {
 #[ignore = "slow; run with --include-ignored"]
 fn btree_1m_keys_release_build_recommended() {
     const N: u32 = 1_000_000;
-    let (e, _d) = make_btree(256);
+    let e = make_btree(256);
     for i in 0..N {
         e.put(&key_for(i), &value_for(i)).unwrap();
     }

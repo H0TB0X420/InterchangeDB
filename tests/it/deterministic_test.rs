@@ -16,9 +16,10 @@ use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::Error;
 use interchangedb::database::Database;
 use interchangedb::engines::btree::BTreeEngine;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::txn::lock_manager::{LockManager, LockMode};
 use interchangedb::txn::{TxnId, TxnMode};
+use interchangedb::wal::SyncMode;
 
 // ---------------------------------------------------------------------------
 // Lock Manager: forced orderings
@@ -123,11 +124,10 @@ fn mvcc_write_then_read_sees_nothing() {
     // T1 writes. T2 (started after T1 but before T1 commits) reads.
     // T2 must NOT see T1's write.
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     db.put(b"key", b"original").unwrap();
 
@@ -166,11 +166,10 @@ fn mvcc_concurrent_writes_one_wins() {
     // T1 and T2 both try to write the same key.
     // One succeeds (gets X lock first), the other gets blocked/deadlock/timeout.
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     let t2 = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -196,11 +195,10 @@ fn mvcc_concurrent_writes_one_wins() {
 fn mvcc_abort_then_read_sees_original() {
     // T1 writes + aborts. T2 reads — must see original (not T1's aborted write).
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     db.put(b"key", b"original").unwrap();
 
@@ -223,11 +221,10 @@ fn mvcc_abort_then_read_sees_original() {
 fn mvcc_own_write_visible_before_commit() {
     // T1 writes a key, then reads it — must see own write even before commit.
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     db.txn_put(t1, b"new_key", b"my_value").unwrap();
@@ -250,11 +247,10 @@ fn mvcc_own_write_visible_before_commit() {
 fn write_write_both_orderings() {
     // Test both possible orderings: T1 first vs T2 first.
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     // Ordering 1: T1 writes first, T2 blocked.
     {

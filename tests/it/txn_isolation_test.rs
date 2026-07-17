@@ -14,8 +14,9 @@ use tempfile::tempdir;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
 use interchangedb::engines::btree::BTreeEngine;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::txn::TxnMode;
+use interchangedb::wal::SyncMode;
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -23,11 +24,10 @@ use interchangedb::txn::TxnMode;
 
 fn setup_shared_db() -> (Arc<Database<BTreeEngine>>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
     (Arc::new(db), dir)
 }
 
@@ -76,11 +76,10 @@ fn dirty_read_prevention() {
     // T1 writes a key but does NOT commit. T2 reads — must NOT see T1's write.
     // Under MVCC: T2's snapshot excludes T1 (T1 is in active_txns at snapshot time).
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     // Seed a pre-existing value.
     db.put(b"secret", b"original").unwrap();
@@ -116,11 +115,10 @@ fn lost_update_prevention() {
     // Two sequential txns write to the same key.
     // Under 2PL, they are serialized — the second sees the first's write.
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     db.put(b"counter", b"0").unwrap();
 
@@ -149,11 +147,10 @@ fn deadlock_resolution_through_database() {
     // T2 requests A → deadlock detected (T2 completes the cycle).
     // This tests the lock manager's deadlock detection through the Database API.
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
     let t2 = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -199,11 +196,10 @@ fn serialization_counter_increment() {
     // each increment 10 shared counters by 1, 50 times.
     // Final sum = initial_sum + (4 * 50).
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
     // Initialize 10 counters to 0.
     let counter_count = 10;

@@ -33,8 +33,9 @@ use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema,
 use interchangedb::database::Database;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::session::{QueryResult, Session};
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::types::{ColumnType, Value};
+use interchangedb::wal::SyncMode;
 
 struct Env {
     database: Arc<Database<BTreeEngine>>,
@@ -48,9 +49,10 @@ struct Env {
 /// under test.
 fn setup() -> Env {
     let dir = tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let engine = BTreeEngine::new(BufferPoolManager::new(512, dm)).unwrap();
-    let database = Arc::new(Database::open(dir.path(), engine).unwrap());
+    let database =
+        Arc::new(Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap());
     let catalog = Arc::new(
         Catalog::open_persistent(database.engine_arc().clone(), dir.path().join("indexes"))
             .unwrap(),

@@ -19,18 +19,16 @@
 //!
 //! All tests run against both engines via the existing `Database<E>` API.
 
+use interchangedb::wal::SyncMode;
 use interchangedb::{Database, Error, TxnMode};
 use tempfile::TempDir;
 
 fn fresh_db() -> (Database<interchangedb::BTreeEngine>, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let bpm = interchangedb::BufferPoolManager::new(
-        64,
-        interchangedb::FileDiskManager::create(dir.path().join("test.db")).unwrap(),
-    );
+    let bpm = interchangedb::BufferPoolManager::new(64, interchangedb::MemoryDiskManager::new());
     let engine = interchangedb::BTreeEngine::new(bpm).unwrap();
     // Open (not new) — txn manager + WAL required for explicit transactions.
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
     (db, dir)
 }
 

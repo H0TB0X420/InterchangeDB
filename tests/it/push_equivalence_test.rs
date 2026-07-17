@@ -16,18 +16,20 @@ use interchangedb::catalog::Catalog;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::ExecModel;
 use interchangedb::session::{QueryResult, Session};
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::types::Value;
+use interchangedb::wal::SyncMode;
 use interchangedb::Database;
 
 /// Build a session over a fresh BTree-backed database seeded with two small
 /// tables: `item(i_id, i_price)` (5 rows) and `stock(s_id, s_qty)` (3 rows).
 fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("t.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(512, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let database = Arc::new(Database::open(dir.path(), engine).unwrap());
+    let database =
+        Arc::new(Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap());
     let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
     let mut session = Session::new(database, catalog);
 

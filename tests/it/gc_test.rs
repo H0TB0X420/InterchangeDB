@@ -9,16 +9,16 @@ use tempfile::tempdir;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
 use interchangedb::engines::btree::BTreeEngine;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::txn::TxnMode;
+use interchangedb::wal::SyncMode;
 
 fn setup() -> (Database<BTreeEngine>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&db_path).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(1000, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
-    let db = Database::open(dir.path(), engine).unwrap();
+    let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
     (db, dir)
 }
 
@@ -323,9 +323,8 @@ fn gc_status_tracks_committed_metadata_size() {
 fn gc_status_without_txn_manager_returns_error() {
     use interchangedb::buffer::BufferPoolManager;
     use interchangedb::engines::btree::BTreeEngine;
-    use interchangedb::storage::FileDiskManager;
-    let dir = tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
+    use interchangedb::storage::MemoryDiskManager;
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     let engine = BTreeEngine::new(bpm).unwrap();
     // Database::new — no txn manager.

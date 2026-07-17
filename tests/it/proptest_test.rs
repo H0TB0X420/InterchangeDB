@@ -11,7 +11,7 @@ use tempfile::tempdir;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::database::Database;
 use interchangedb::engines::btree::BTreeEngine;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::txn::mvcc::{
     decode_mvcc_key, decode_mvcc_value, encode_mvcc_key, encode_mvcc_value, MvccValue,
 };
@@ -133,11 +133,10 @@ proptest! {
         )
     ) {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let dm = FileDiskManager::create(&db_path).unwrap();
+        let dm = MemoryDiskManager::new();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
         // Track expected state.
         let mut expected: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
@@ -169,11 +168,10 @@ proptest! {
         num_versions in 2usize..5,
     ) {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let dm = FileDiskManager::create(&db_path).unwrap();
+        let dm = MemoryDiskManager::new();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
         // Write multiple versions of each key.
         for k in 0..num_keys {
@@ -224,11 +222,10 @@ proptest! {
         ),
     ) {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let dm = FileDiskManager::create(&db_path).unwrap();
+        let dm = MemoryDiskManager::new();
         let bpm = BufferPoolManager::new(1000, dm);
         let engine = BTreeEngine::new(bpm).unwrap();
-        let db = Database::open(dir.path(), engine).unwrap();
+        let db = Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap();
 
         // Committed transaction.
         let t1 = db.begin_txn(TxnMode::ReadWrite).unwrap();
@@ -382,6 +379,7 @@ proptest! {
 
 use interchangedb::txn::lock_manager::LockManager;
 use interchangedb::txn::LockMode;
+use interchangedb::wal::SyncMode;
 
 proptest! {
     /// Any sequence of uncontested acquires followed by `release_all`
