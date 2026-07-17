@@ -985,8 +985,11 @@ mod merge_join_tests {
     // Review fix #2: sortedness is a hard precondition — violating it
     // silently loses matches, so debug builds must crash instead. The
     // violating key must actually be PULLED, hence the preceding
-    // matching keys.
+    // matching keys. The asserts are `MergeDebug` machinery that only
+    // exists under debug_assertions, so the tests are gated the same way
+    // — in release there is nothing to panic.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "not sorted ascending")]
     fn unsorted_right_input_panics_in_debug() {
         let left = exec("l", ColumnType::Int32, vec![row32(1, Some(5))]);
@@ -1000,6 +1003,7 @@ mod merge_join_tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "not sorted ascending")]
     fn unsorted_left_input_panics_in_debug() {
         let left = exec(
