@@ -10,7 +10,7 @@
 
 use interchangedb::database::Database;
 use interchangedb::engines::lsm::LsmEngine;
-use interchangedb::wal::{LogPayload, Lsn, WalReader};
+use interchangedb::wal::{LogPayload, Lsn, SyncMode, WalReader};
 use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
@@ -492,5 +492,69 @@ fn recovery_without_checkpoint_full_replay() {
         assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SyncMode seam (test tiers T2). HOW: the seam's contract is that `NoSync`
+// changes exactly one thing — whether the sync syscall is issued — so we
+// assert both sides of it: the syscall count diverges (positive vs zero)
+// while results and clean-shutdown recovery are identical.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sync_mode_durable_counts_fsyncs_nosync_counts_zero() {
+    let run = |mode: SyncMode| {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let engine = LsmEngine::new(&data_dir.join("lsm")).unwrap();
+        let db = Database::open_with_sync_mode(&data_dir, engine, mode).unwrap();
+        for i in 0..20u8 {
+            db.put(&[i], &[i, i]).unwrap();
+        }
+        let reads: Vec<_> = (0..20u8).map(|i| db.get(&[i]).unwrap()).collect();
+        (db.wal_fsync_count(), reads)
+    };
+
+    let (durable_fsyncs, durable_reads) = run(SyncMode::Durable);
+    let (nosync_fsyncs, nosync_reads) = run(SyncMode::NoSync);
+
+    assert!(
+        durable_fsyncs >= 1,
+        "Durable must issue sync syscalls (got {durable_fsyncs})"
+    );
+    assert_eq!(nosync_fsyncs, 0, "NoSync must never issue the syscall");
+    assert_eq!(
+        durable_reads, nosync_reads,
+        "results must be mode-independent"
+    );
+}
+
+#[test]
+fn nosync_data_survives_clean_reopen() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let lsm_dir = data_dir.join("lsm");
+
+    // Phase 1: write under NoSync, then clean shutdown (drop flushes the
+    // buffered WAL bytes to the OS; no sync syscall ever runs).
+    {
+        let engine = LsmEngine::new(&lsm_dir).unwrap();
+        let db = Database::open_with_sync_mode(&data_dir, engine, SyncMode::NoSync).unwrap();
+        db.put(b"k1", b"v1").unwrap();
+        db.put(b"k2", b"v2").unwrap();
+        db.delete(b"k1").unwrap();
+        assert_eq!(db.wal_fsync_count(), 0);
+    }
+
+    // Phase 2: reopen fully Durable — recovery must replay the NoSync-era
+    // records identically (the WAL content is mode-independent).
+    {
+        let engine = LsmEngine::new(&lsm_dir).unwrap();
+        let db = Database::open(&data_dir, engine).unwrap();
+        assert_eq!(db.get(b"k1").unwrap(), None);
+        assert_eq!(db.get(b"k2").unwrap(), Some(b"v2".to_vec()));
     }
 }

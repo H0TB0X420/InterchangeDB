@@ -31,6 +31,21 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::common::Result;
 
+/// How the WAL treats the sync syscall when durability is requested.
+///
+/// `Durable` is the default everywhere. `NoSync` exists for tests and
+/// throwaway environments whose subject is not crash durability: the
+/// entire WAL code path still runs — record encoding, batching, segment
+/// rotation, recovery on clean reopen — only the `sync_data` syscall is
+/// skipped. With `NoSync`, recovery after a *process kill* is undefined
+/// (OS-buffered bytes may be lost); recovery after clean shutdown is
+/// unchanged. Passed explicitly at open — never an env var or global.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    Durable,
+    NoSync,
+}
+
 /// WAL facade — combines writer and reader with checkpoint tracking.
 ///
 /// Supports group commit: multiple threads append records concurrently,
@@ -56,14 +71,22 @@ pub struct Wal {
     /// meaningful state — it pairs with the Condvar.
     sync_waiters: Mutex<()>,
     sync_notify: Condvar,
+    /// See [`SyncMode`]. `NoSync` skips only the `sync_data` syscalls (and
+    /// their `fsync_count` accounting); every other path is identical.
+    sync_mode: SyncMode,
 }
 
 impl Wal {
-    /// Open or create a WAL in the given directory.
+    /// Open or create a WAL in the given directory, fully durable.
     ///
     /// If the directory already contains segments, resumes from the last state.
     /// Scans for the last checkpoint LSN for recovery purposes.
     pub fn open(wal_dir: &Path) -> Result<Self> {
+        Self::open_with_sync_mode(wal_dir, SyncMode::Durable)
+    }
+
+    /// Open or create a WAL with an explicit [`SyncMode`].
+    pub fn open_with_sync_mode(wal_dir: &Path, sync_mode: SyncMode) -> Result<Self> {
         let writer = WalWriter::open(wal_dir)?;
 
         // Scan for the last checkpoint LSN.
@@ -78,6 +101,7 @@ impl Wal {
             fsync_count: AtomicU64::new(0),
             sync_waiters: Mutex::new(()),
             sync_notify: Condvar::new(),
+            sync_mode,
         })
     }
 
@@ -91,8 +115,14 @@ impl Wal {
     /// durability goes through `sync_to`'s group commit.
     pub fn sync(&self) -> Result<()> {
         let mut writer = self.writer.lock();
-        writer.sync()?;
-        self.fsync_count.fetch_add(1, Ordering::Relaxed);
+        if self.sync_mode == SyncMode::Durable {
+            writer.sync()?;
+            self.fsync_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // NoSync: push the buffer to the OS (clean-shutdown reopen
+            // still sees every byte) but skip the sync syscall.
+            writer.flush_buffer()?;
+        }
         // Cover everything written so far. `fetch_max` so a concurrent
         // group-commit batch can't be clobbered backwards.
         let new_synced = writer.next_lsn().0.saturating_sub(1);
@@ -140,8 +170,16 @@ impl Wal {
                 // fsync — no writer lock held. We appended `target_lsn`
                 // before calling sync_to, so `flushed_lsn >= target_lsn`:
                 // leading always makes our own commit durable.
-                file.sync_data()?;
-                self.fsync_count.fetch_add(1, Ordering::Relaxed);
+                if self.sync_mode == SyncMode::Durable {
+                    file.sync_data()?;
+                    self.fsync_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // NoSync: the buffer was flushed to the OS under the
+                    // writer lock above; `synced_lsn` still advances so
+                    // committers never spin waiting for durability that
+                    // this mode deliberately does not provide.
+                    let _ = file; // handle unused without the syscall
+                }
                 self.synced_lsn.fetch_max(flushed_lsn, Ordering::AcqRel);
                 self.sync_notify.notify_all();
                 return Ok(());

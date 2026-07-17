@@ -84,6 +84,17 @@ impl<E: StorageEngine> Database<E> {
         Self::open_with_isolation(data_dir, engine, Arc::new(SnapshotIsolation))
     }
 
+    /// Open WAL-enabled with an explicit [`crate::wal::SyncMode`]. `NoSync`
+    /// keeps the full WAL path but skips the sync syscall — for tests and
+    /// throwaway environments whose subject is not crash durability.
+    pub fn open_with_sync_mode(
+        data_dir: &Path,
+        engine: E,
+        sync_mode: crate::wal::SyncMode,
+    ) -> Result<Self> {
+        Self::open_inner(data_dir, engine, Arc::new(SnapshotIsolation), sync_mode)
+    }
+
     /// Open a WAL-enabled database running a specific concurrency-control
     /// protocol (isolation level).
     pub fn open_with_isolation(
@@ -91,8 +102,17 @@ impl<E: StorageEngine> Database<E> {
         engine: E,
         policy: Arc<dyn IsolationPolicy>,
     ) -> Result<Self> {
+        Self::open_inner(data_dir, engine, policy, crate::wal::SyncMode::Durable)
+    }
+
+    fn open_inner(
+        data_dir: &Path,
+        engine: E,
+        policy: Arc<dyn IsolationPolicy>,
+        sync_mode: crate::wal::SyncMode,
+    ) -> Result<Self> {
         let wal_dir = data_dir.join("wal");
-        let wal = Wal::open(&wal_dir)?;
+        let wal = Wal::open_with_sync_mode(&wal_dir, sync_mode)?;
 
         // Run recovery: replay WAL records into the engine.
         let reader = wal.reader()?;
