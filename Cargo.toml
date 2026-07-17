@@ -37,6 +37,18 @@ goldenscript = "0.7"
 test_each_file = "0.3"
 testkit = { path = "testkit" }
 
+# Integration tests are two explicit harnesses (build-times P2): every
+# former tests/*.rs file was its own binary, so a one-line src/ edit
+# relinked 88 of them. Subdirectory placement ends Cargo's auto-discovery;
+# these two entries are the only integration-test binaries.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+[[test]]
+name = "stress"
+path = "tests/stress/main.rs"
+
 [[bench]]
 name = "eviction_policies"
 harness = false

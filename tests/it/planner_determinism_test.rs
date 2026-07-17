@@ -14,10 +14,8 @@
 //! checks that table_id assignment / column_id assignment / any other
 //! sequential allocation doesn't leak into the rendered plan).
 
-mod common;
-
-use common::golden_plan::pretty_plan;
-use common::mock_catalog::MockCatalog;
+use crate::common::golden_plan::pretty_plan;
+use crate::common::mock_catalog::MockCatalog;
 use interchangedb::sql::{parse, plan, Binder, PhysicalPlan};
 use interchangedb::types::ColumnType;
 

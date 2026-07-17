@@ -26,8 +26,6 @@
 //! The invariants: every fetch of page P returns P's own marker (never another
 //! page's), and at rest every frame is either free or mapped (no ghost).
 
-#![cfg(feature = "shuttle")]
-
 use interchangedb::buffer::replacer::{ClockReplacer, FifoReplacer, LruReplacer};
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::storage::MemoryDiskManager;

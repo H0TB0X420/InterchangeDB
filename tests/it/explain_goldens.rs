@@ -10,10 +10,8 @@
 //! Scaffolding from Q-02: `tests/common/mock_catalog.rs`,
 //! `tests/common/golden_plan.rs`.
 
-mod common;
-
-use common::golden_plan::assert_plan_matches;
-use common::mock_catalog::MockCatalog;
+use crate::common::golden_plan::assert_plan_matches;
+use crate::common::mock_catalog::MockCatalog;
 use interchangedb::sql::{parse, plan, Binder, PhysicalPlan};
 use interchangedb::types::ColumnType;
 

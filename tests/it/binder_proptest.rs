@@ -13,9 +13,7 @@
 //!    catalog must produce a `LogicalPlan` that references real
 //!    catalog entries with the declared types.
 
-mod common;
-
-use common::mock_catalog::MockCatalog;
+use crate::common::mock_catalog::MockCatalog;
 use interchangedb::sql::{parse, Binder, LogicalPlan};
 use interchangedb::types::ColumnType;
 use proptest::prelude::*;

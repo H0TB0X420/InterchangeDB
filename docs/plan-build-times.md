@@ -156,16 +156,20 @@ pass preceded by `touch src/sql/binder.rs`.
 
 | Measurement | Baseline | After P1 | After P2 | After P3 |
 | --- | --- | --- | --- | --- |
-| `cargo check --lib` after 1-line `src/sql/` edit | 7.8 s | 1.2 s | | |
-| `cargo test --lib --no-run` after edit | 10.4 s | 4.2 s | | |
-| `cargo test --no-run` after edit | **127 s** | **29.3 s** | | |
-| `cargo bench --no-run` after edit | 150 s | 152 s | | |
+| `cargo check --lib` after 1-line `src/sql/` edit | 7.8 s | 1.2 s | 1.5 s | |
+| `cargo test --lib --no-run` after edit | 10.4 s | 4.2 s | 5.4 s | |
+| `cargo test --no-run` after edit | **127 s** | **29.3 s** | **7.8 s** | |
+| `cargo bench --no-run` after edit | 150 s | 152 s | 152 s (untouched) | |
 | Test binaries linked | 88 | 88 | 2 | 2 |
 | Bench binaries linked | 14 | 14 | 14 | 3 |
-| `target/` size | 15 GB | 1.6 GB | | |
+| `target/` size | 15 GB | 1.6 GB | 1.6 GB | |
 
 P1 gates 2026-07-17: fmt ✓ · clippy ✓ · debug 91 suites 1386/0 ✓ ·
 release 91 suites 1384/0 ✓ (2 fewer = the debug-gated should-panic pair).
+
+P2 gates 2026-07-17: fmt ✓ · clippy ✓ · debug 5 suites 1335/0 ✓ ·
+release 5 suites 1333/0 ✓ (each exactly 51 below P1 = the de-duplicated
+3 × 17 `tests/common` unit-test runs; test-list identity 599 = 599).
 
 **Hypothesis confirmed.** The same one-line edit costs 10.4 s when only the
 lib test binary is rebuilt and 127 s for the full test set: ~92 % of the
