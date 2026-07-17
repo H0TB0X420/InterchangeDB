@@ -165,6 +165,41 @@ table row.
 - Full-suite wall time (debug gate) drops from ~10 min toward ~3–4 min
   (residual = stress + durability + LSM, all deliberate).
 
+## Executed 2026-07 — results
+
+| Measurement | Baseline | Post-T1 | Post-T2 |
+| --- | --- | --- | --- |
+| `it` harness run | 364 s | 315 s | **147.5 s** |
+| `stress` harness run | 224 s | 169 s | **90.7 s** |
+| `it::proptest_test` | 200.4 s | — | **39.0 s** |
+| `stress::large_scale_test` | 101.5 s | — | **5.2 s** |
+| `stress::btree_scale_test` | 65.8 s | **1.6 s** | — |
+
+Commits: T1 `a6c2d98` (30 memory conversions) · T2a `0f6bdb7` (SyncMode
+seam + contract tests) · T2b `00118fb` (20 NoSync conversions +
+large_scale). Gates green at each step; final debug 1337/0, release
+1335/0 (+2 = the seam tests). Phase docs:
+`docs/build-times/tier-t1-memory-conversions.md`, `tier-t2-wal-nosync.md`.
+
+**T3 verdict (recorded, no change):** pure-LSM suites measured cheap
+(lsm_engine 2.3 s, atomic_flush 1.0 s, goldenscript_lsm 0.4 s) — memtable
+batching means no per-op fsync pain; no LSM I/O seam warranted.
+
+**Acceptance, revised honestly:** the <60 s `it` target undercounted the
+compute-bound share. Actual 147 s = ~77 s compute-bound proptests
+(tier-immune: faster means changing test logic), ~50 s durability tier
+doing its real-fsync job, ~17 s matrix anchors. The structural goal is
+met: no convertible suite is gated on the disk, on any machine. Full
+debug gate ~10 min → ~4.5 min.
+
+**Durability tier, enumerated:** wal_test (incl. the SyncMode contract
+tests), wal_group_commit, wal_stress, crash_recovery, torn_page_recovery,
+dst_recovery, checkpoint_prune, index_persistence, index_engine_reopen,
+stats_persistence, soak, fault_injection, acid_test, txn_database_test,
+goldenscript_bpm; per-test: buffer_pool_integration::test_flush_and_reload,
+proptest_test::lsm_state_survives_reopen,
+mvcc_si_conflict_test::concurrent_counter_increments_no_lost_updates.
+
 ## Explicitly out of scope
 
 An LSM storage seam; changing the `bench` path; cargo-nextest and
