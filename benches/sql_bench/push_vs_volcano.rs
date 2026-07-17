@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, Criterion};
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::Catalog;
 use interchangedb::engines::btree::BTreeEngine;
@@ -76,4 +76,3 @@ fn scan_limit(c: &mut Criterion) {
 }
 
 criterion_group!(benches, scan_limit);
-criterion_main!(benches);

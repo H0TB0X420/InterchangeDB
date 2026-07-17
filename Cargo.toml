@@ -49,28 +49,28 @@ path = "tests/it/main.rs"
 name = "stress"
 path = "tests/stress/main.rs"
 
+# Criterion micro-benches are two explicit harnesses (build-times P3);
+# group/function ids are preserved verbatim so criterion result paths and
+# benches/RESULTS.md references stay valid. `eviction_policies` (bespoke
+# summary-mode main) and the seven `engine_*` experiment harnesses (custom
+# mains writing CSVs) stay standalone — merging custom mains is a CLI
+# redesign, out of scope for a no-semantic-change phase.
+[[bench]]
+name = "engine_bench"
+path = "benches/engine_bench/main.rs"
+harness = false
+
+[[bench]]
+name = "sql_bench"
+path = "benches/sql_bench/main.rs"
+harness = false
+
 [[bench]]
 name = "eviction_policies"
 harness = false
 
 [[bench]]
-name = "push_vs_volcano"
-harness = false
-
-[[bench]]
 name = "bpm_bench"
-harness = false
-
-[[bench]]
-name = "btree_bench"
-harness = false
-
-[[bench]]
-name = "lsm_bench"
-harness = false
-
-[[bench]]
-name = "txn_bench"
 harness = false
 
 [[bench]]
@@ -99,10 +99,6 @@ harness = false
 
 [[bench]]
 name = "engine_ycsb"
-harness = false
-
-[[bench]]
-name = "config_matrix"
 harness = false
 
 [lints.clippy]

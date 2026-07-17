@@ -19,7 +19,7 @@
 //! - End-of-bench prints `level_state()` for level distribution and
 //!   on-disk size observability.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use interchangedb::engines::lsm::LsmTree;
 use tempfile::tempdir;
 
@@ -236,4 +236,3 @@ fn format_levels(ls: &interchangedb::engines::lsm::manifest::LevelState) -> Stri
 }
 
 criterion_group!(benches, bench_lsm_insert, bench_lsm_read, bench_lsm_write);
-criterion_main!(benches);

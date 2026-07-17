@@ -18,7 +18,7 @@
 //! - End-of-bench prints `bpm.stats().snapshot()` for cache hit rate
 //!   and pages-read/written observability.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
 use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
@@ -254,4 +254,3 @@ criterion_group!(
     bench_btree_read,
     bench_btree_write
 );
-criterion_main!(benches);

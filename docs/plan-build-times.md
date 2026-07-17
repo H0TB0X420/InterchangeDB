@@ -159,10 +159,17 @@ pass preceded by `touch src/sql/binder.rs`.
 | `cargo check --lib` after 1-line `src/sql/` edit | 7.8 s | 1.2 s | 1.5 s | |
 | `cargo test --lib --no-run` after edit | 10.4 s | 4.2 s | 5.4 s | |
 | `cargo test --no-run` after edit | **127 s** | **29.3 s** | **7.8 s** | |
-| `cargo bench --no-run` after edit | 150 s | 152 s | 152 s (untouched) | |
+| `cargo bench --no-run` after edit | 150 s | 152 s | 152 s (untouched) | ~152 s¹ |
 | Test binaries linked | 88 | 88 | 2 | 2 |
-| Bench binaries linked | 14 | 14 | 14 | 3 |
-| `target/` size | 15 GB | 1.6 GB | 1.6 GB | |
+| Bench binaries linked | 14 | 14 | 14 | 11² |
+| `target/` size | 15 GB | 1.6 GB | 1.6 GB | 1.6 GB |
+
+¹ Measured 182 s wall at identical ~460 s user — the delta is CPU-parallelism
+variance (thermal), not the merge; the path is codegen-bound as Phase 0 said.
+² Not 3: the inventory found only 6 of the 14 are plain criterion benches —
+the 7 `engine_*` files and `eviction_policies` have custom mains, and merging
+those is a CLI redesign (stopped and flagged; see
+docs/build-times/phase-3-bench-harnesses.md).
 
 P1 gates 2026-07-17: fmt ✓ · clippy ✓ · debug 91 suites 1386/0 ✓ ·
 release 91 suites 1384/0 ✓ (2 fewer = the debug-gated should-panic pair).
@@ -170,6 +177,9 @@ release 91 suites 1384/0 ✓ (2 fewer = the debug-gated should-panic pair).
 P2 gates 2026-07-17: fmt ✓ · clippy ✓ · debug 5 suites 1335/0 ✓ ·
 release 5 suites 1333/0 ✓ (each exactly 51 below P1 = the de-duplicated
 3 × 17 `tests/common` unit-test runs; test-list identity 599 = 599).
+
+P3 gates 2026-07-17: fmt ✓ · clippy ✓ · debug 1335/0 ✓ · release 1333/0 ✓
+(benchmark-id identity: `-- --list` exact diff, 29 = 29).
 
 **Hypothesis confirmed.** The same one-line edit costs 10.4 s when only the
 lib test binary is rebuilt and 127 s for the full test set: ~92 % of the

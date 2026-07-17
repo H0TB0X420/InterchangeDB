@@ -7,7 +7,7 @@
 //! Run: `cargo bench --bench config_matrix`. Each criterion group puts every
 //! config in one comparison chart.
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{criterion_group, BatchSize, Criterion};
 
 use interchangedb::buffer::{BufferPoolManager, SwapMode};
 use interchangedb::engines::btree::BTreeEngine;
@@ -57,4 +57,3 @@ fn by_engine(c: &mut Criterion) {
 }
 
 criterion_group!(benches, by_policy, by_engine);
-criterion_main!(benches);

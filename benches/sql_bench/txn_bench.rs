@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::Error;
 use interchangedb::database::Database;
@@ -361,4 +361,3 @@ criterion_group!(
     bench_gc,
     bench_recovery,
 );
-criterion_main!(benches);
