@@ -23,7 +23,7 @@ use std::sync::Arc;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::engines::lsm::LsmEngine;
-use interchangedb::storage::{FileDiskManager, StorageEngine};
+use interchangedb::storage::{MemoryDiskManager, StorageEngine};
 use proptest::prelude::*;
 use tempfile::{tempdir, TempDir};
 
@@ -51,7 +51,7 @@ fn op_strategy(pool: usize) -> impl Strategy<Value = Op> {
 
 fn make_btree() -> (Arc<BTreeEngine>, TempDir) {
     let dir = tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("btree.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     (engine, dir)

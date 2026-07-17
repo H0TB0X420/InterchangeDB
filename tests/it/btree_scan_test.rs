@@ -7,18 +7,15 @@
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
 use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
-use interchangedb::storage::FileDiskManager;
-use tempfile::tempdir;
+use interchangedb::storage::MemoryDiskManager;
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-fn setup_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
-    (BufferPoolManager::new(pool_size, dm), dir)
+fn setup_bpm(pool_size: usize) -> BufferPoolManager {
+    let dm = MemoryDiskManager::new();
+    BufferPoolManager::new(pool_size, dm)
 }
 
 fn create_empty_tree(bpm: &BufferPoolManager) -> PageId {
@@ -82,7 +79,7 @@ fn populate_tree<'a>(
 /// Why: Tests full unbounded scan — equivalent to scan_all().
 #[test]
 fn test_scan_full_range() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
@@ -107,7 +104,7 @@ fn test_scan_full_range() {
 /// Why: Tests start-inclusive, end-unbounded range.
 #[test]
 fn test_scan_from_start_inclusive() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
@@ -132,7 +129,7 @@ fn test_scan_from_start_inclusive() {
 /// Why: Tests inclusive-inclusive range.
 #[test]
 fn test_scan_range_inclusive() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
@@ -158,7 +155,7 @@ fn test_scan_range_inclusive() {
 /// Why: Tests inclusive-exclusive range.
 #[test]
 fn test_scan_range_exclusive_end() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
@@ -184,7 +181,7 @@ fn test_scan_range_exclusive_end() {
 /// Why: Tests unbounded-start, exclusive-end range.
 #[test]
 fn test_scan_up_to_exclusive() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
@@ -205,7 +202,7 @@ fn test_scan_up_to_exclusive() {
 /// Why: Tests unbounded-start, inclusive-end range.
 #[test]
 fn test_scan_up_to_inclusive() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
@@ -231,7 +228,7 @@ fn test_scan_up_to_inclusive() {
 /// Why: Tests that an empty range returns nothing (start past end).
 #[test]
 fn test_scan_empty_range_start_past_end() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
@@ -250,7 +247,7 @@ fn test_scan_empty_range_start_past_end() {
 /// Why: Tests scanning an empty tree returns nothing without error.
 #[test]
 fn test_scan_empty_tree() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 3, 3);
 
@@ -269,7 +266,7 @@ fn test_scan_empty_tree() {
 /// Why: Tests range where bounds don't exactly match existing keys.
 #[test]
 fn test_scan_range_between_keys() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 10);
 
@@ -297,7 +294,7 @@ fn test_scan_range_between_keys() {
 /// Why: Tests that the iterator skips tombstoned entries (via live_entries).
 #[test]
 fn test_scan_skips_tombstones() {
-    let (bpm, _dir) = setup_bpm(100);
+    let bpm = setup_bpm(100);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_tombstones(&bpm, header_id, 3, 3, 8);
 
@@ -331,7 +328,7 @@ fn test_scan_skips_tombstones() {
 ///      all pages.
 #[test]
 fn test_scan_early_termination() {
-    let (bpm, _dir) = setup_bpm(200);
+    let bpm = setup_bpm(200);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 3, 3, 100);
 
@@ -357,7 +354,7 @@ fn test_scan_early_termination() {
 /// Why: Tests correctness across many leaf pages.
 #[test]
 fn test_scan_large() {
-    let (bpm, _dir) = setup_bpm(500);
+    let bpm = setup_bpm(500);
     let header_id = create_empty_tree(&bpm);
     let tree = populate_tree(&bpm, header_id, 4, 4, 500);
 
@@ -383,7 +380,7 @@ fn test_scan_large() {
 /// Why: Tests that scan_all() wrapper produces same results as before.
 #[test]
 fn test_scan_all_backward_compat() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 2, 3);
 
@@ -406,7 +403,7 @@ fn test_scan_all_backward_compat() {
 /// Why: Tests that scan_from() wrapper produces same results as before.
 #[test]
 fn test_scan_from_backward_compat() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 2, 3);
 
@@ -432,7 +429,7 @@ fn test_scan_from_backward_compat() {
 /// Why: Tests scan on a tree with exactly one leaf containing one entry.
 #[test]
 fn test_scan_single_entry() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 3, 3);
 
@@ -451,7 +448,7 @@ fn test_scan_single_entry() {
 /// Why: Tests point-range scan (start == end, inclusive both sides).
 #[test]
 fn test_scan_point_range() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 3, 3);
 
@@ -471,7 +468,7 @@ fn test_scan_point_range() {
 /// Why: Tests scan that starts past all existing entries.
 #[test]
 fn test_scan_past_all_entries() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 3, 3);
 

@@ -15,16 +15,12 @@ use std::sync::Arc;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::{Error, PageId};
 use interchangedb::engines::btree::{encode_leaf_node, BTreeScanIterator, LeafNode};
-use interchangedb::storage::FileDiskManager;
-use tempfile::TempDir;
+use interchangedb::storage::MemoryDiskManager;
 
-/// Build a fresh BPM with a small pool and an empty disk file.
-fn fresh_bpm() -> (Arc<BufferPoolManager>, TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
-    let bpm = Arc::new(BufferPoolManager::new(16, dm));
-    (bpm, dir)
+/// Build a fresh BPM with a small pool over in-memory backing.
+fn fresh_bpm() -> Arc<BufferPoolManager> {
+    let dm = MemoryDiskManager::new();
+    Arc::new(BufferPoolManager::new(16, dm))
 }
 
 /// Allocate a new page, encode `leaf` into it, drop the write guard.
@@ -39,7 +35,7 @@ fn write_leaf(bpm: &BufferPoolManager, leaf: &LeafNode) -> PageId {
 
 #[test]
 fn out_of_range_next_page_id_returns_storage_corrupted() {
-    let (bpm, _dir) = fresh_bpm();
+    let bpm = fresh_bpm();
 
     // Build a valid one-entry leaf, then set its sibling pointer to a
     // page id beyond the BPM's disk_page_count (which is small here).
@@ -72,7 +68,7 @@ fn valid_invalid_terminator_iterates_cleanly() {
     // Regression guard: the bounds check must not reject `PageId::INVALID`
     // (the normal terminator for the leaf chain). A single-leaf tree with
     // next_page_id == INVALID is the most common scan shape.
-    let (bpm, _dir) = fresh_bpm();
+    let bpm = fresh_bpm();
 
     let mut leaf = LeafNode::new(10);
     leaf.keys.push(b"a".to_vec());
@@ -99,7 +95,7 @@ fn valid_invalid_terminator_iterates_cleanly() {
 fn next_page_id_at_disk_page_count_is_out_of_range() {
     // Edge case: next_page_id exactly equal to disk_page_count is invalid
     // (page ids are 0..disk_page_count, exclusive). The check uses >=, not >.
-    let (bpm, _dir) = fresh_bpm();
+    let bpm = fresh_bpm();
 
     let mut leaf = LeafNode::new(10);
     leaf.keys.push(b"k".to_vec());

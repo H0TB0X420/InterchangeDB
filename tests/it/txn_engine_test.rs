@@ -23,7 +23,7 @@ use interchangedb::catalog::{ColumnDef, Schema, TableId};
 use interchangedb::common::Error;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::layout::RowLayout;
-use interchangedb::storage::{FileDiskManager, StorageEngine};
+use interchangedb::storage::{MemoryDiskManager, StorageEngine};
 use interchangedb::table::Table;
 use interchangedb::txn::engine::TxnEngine;
 use interchangedb::txn::{TransactionManager, TxnId, TxnMode};
@@ -45,7 +45,7 @@ struct Env {
 
 fn setup() -> Env {
     let dir = tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(256, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());

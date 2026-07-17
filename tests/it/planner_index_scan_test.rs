@@ -11,7 +11,7 @@ use interchangedb::buffer::BufferPoolManager;
 use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema, TableId};
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::sql::{parse, plan, Binder, PhysicalPlan};
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::types::ColumnType;
 
 struct Setup {
@@ -21,7 +21,7 @@ struct Setup {
 
 fn setup_with_name_index() -> Setup {
     let dir = tempfile::tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("cat.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let catalog =

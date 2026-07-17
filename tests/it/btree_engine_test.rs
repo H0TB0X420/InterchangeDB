@@ -7,33 +7,22 @@
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::engine::StorageEngine;
-use interchangedb::storage::FileDiskManager;
-use tempfile::tempdir;
+use interchangedb::storage::MemoryDiskManager;
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-fn setup_engine() -> (BTreeEngine, tempfile::TempDir) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
+fn setup_engine() -> BTreeEngine {
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(128, dm);
-    let engine = BTreeEngine::new(bpm).unwrap();
-    (engine, dir)
+    BTreeEngine::new(bpm).unwrap()
 }
 
-fn setup_engine_with_sizes(
-    leaf_max: u16,
-    internal_max: u16,
-    max_tombstones: usize,
-) -> (BTreeEngine, tempfile::TempDir) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
+fn setup_engine_with_sizes(leaf_max: u16, internal_max: u16, max_tombstones: usize) -> BTreeEngine {
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(256, dm);
-    let engine = BTreeEngine::with_sizes(bpm, leaf_max, internal_max, max_tombstones).unwrap();
-    (engine, dir)
+    BTreeEngine::with_sizes(bpm, leaf_max, internal_max, max_tombstones).unwrap()
 }
 
 // =============================================================================
@@ -42,7 +31,7 @@ fn setup_engine_with_sizes(
 
 #[test]
 fn test_engine_name() {
-    let (engine, _dir) = setup_engine();
+    let engine = setup_engine();
     assert_eq!(engine.name(), "btree");
 }
 
@@ -50,7 +39,7 @@ fn test_engine_name() {
 fn test_engine_initial_disk_size() {
     // BTree allocates a header page on creation, so disk_size > 0 from the start.
     // LSM starts at 0 — this is a BTree-specific invariant.
-    let (engine, _dir) = setup_engine();
+    let engine = setup_engine();
     let status = engine.status();
     assert!(
         status.disk_size > 0,
@@ -65,7 +54,7 @@ fn test_engine_status_size_tracks_entry_bytes_exactly() {
     // for new, delete subtracts key+value). Walk the whole lifecycle with
     // DISTINCT key and value lengths so any arithmetic slip in any arm
     // (wrong operator, wrong operand) lands on a different number.
-    let (engine, _dir) = setup_engine();
+    let engine = setup_engine();
 
     engine.put(b"kk", &[0x11; 10]).unwrap(); // insert: 2 + 10
     let status = engine.status();
@@ -97,7 +86,7 @@ fn test_engine_status_size_tracks_entry_bytes_exactly() {
 fn test_engine_many_keys_with_splits() {
     // Use small node sizes to force many splits — exercises BTree-specific
     // split/merge/redistribute logic that LSM doesn't have.
-    let (engine, _dir) = setup_engine_with_sizes(3, 3, 0);
+    let engine = setup_engine_with_sizes(3, 3, 0);
 
     // Insert 100 keys.
     for i in 0u16..100 {

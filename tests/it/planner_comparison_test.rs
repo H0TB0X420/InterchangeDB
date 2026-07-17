@@ -20,7 +20,7 @@ use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::sql::binder::Binder;
 use interchangedb::sql::frontend::parse;
 use interchangedb::sql::{PhysicalPlan, PlannerStrategy, RuleBasedPlanner, SelingerPlanner};
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::types::ColumnType;
 
 struct Env {
@@ -31,7 +31,7 @@ struct Env {
 
 fn setup() -> Env {
     let dir = tempfile::tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("t.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(512, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let catalog = Arc::new(Catalog::open(engine.clone()).unwrap());

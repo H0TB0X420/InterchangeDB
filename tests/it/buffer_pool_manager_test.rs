@@ -5,17 +5,14 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use std::sync::Arc;
-use tempfile::tempdir;
 
 const FRAMES: usize = 10;
 
-fn create_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
-    (BufferPoolManager::new(pool_size, dm), dir)
+fn create_bpm(pool_size: usize) -> BufferPoolManager {
+    let dm = MemoryDiskManager::new();
+    BufferPoolManager::new(pool_size, dm)
 }
 
 /// Helper to write a string to page data.
@@ -39,7 +36,7 @@ fn read_string(data: &[u8]) -> String {
 /// Reference: TEST(BufferPoolManagerTest, VeryBasicTest)
 #[test]
 fn test_very_basic() {
-    let (bpm, _dir) = create_bpm(FRAMES);
+    let bpm = create_bpm(FRAMES);
     let str_data = "Hello, world!";
 
     // Allocate a new page (BusTub style: NewPage() just gets ID)
@@ -74,7 +71,7 @@ fn test_very_basic() {
 /// Reference: TEST(BufferPoolManagerTest, PagePinEasyTest)
 #[test]
 fn test_page_pin_easy() {
-    let (bpm, _dir) = create_bpm(2);
+    let bpm = create_bpm(2);
 
     // Allocate and load two pages
     let pageid0 = bpm.allocate_page_id().unwrap();
@@ -182,7 +179,7 @@ fn test_page_pin_easy() {
 /// Reference: TEST(BufferPoolManagerTest, PagePinMediumTest)
 #[test]
 fn test_page_pin_medium() {
-    let (bpm, _dir) = create_bpm(FRAMES);
+    let bpm = create_bpm(FRAMES);
 
     // Scenario: The buffer pool is empty. We should be able to create a new page.
     let pid0 = bpm.allocate_page_id().unwrap();
@@ -263,7 +260,7 @@ fn test_page_pin_medium() {
 /// Reference: TEST(PageGuardTest, DropTest)
 #[test]
 fn test_drop() {
-    let (bpm, _dir) = create_bpm(FRAMES);
+    let bpm = create_bpm(FRAMES);
 
     {
         let pid0 = bpm.allocate_page_id().unwrap();
@@ -365,7 +362,7 @@ fn test_evictable() {
     const ROUNDS: usize = 50;
     const NUM_READERS: usize = 4;
 
-    let (bpm, _dir) = create_bpm(1); // Only 1 frame
+    let bpm = create_bpm(1); // Only 1 frame
     let bpm = Arc::new(bpm);
 
     for round in 0..ROUNDS {
@@ -446,7 +443,7 @@ fn test_page_access() {
     use std::thread;
     use std::time::Duration;
 
-    let (bpm, _dir) = create_bpm(FRAMES);
+    let bpm = create_bpm(FRAMES);
     let bpm = Arc::new(bpm);
 
     let pid0 = bpm.allocate_page_id().unwrap();
@@ -495,7 +492,7 @@ fn test_page_access() {
 /// Test the convenience method that combines allocate + fetch.
 #[test]
 fn test_new_page_convenience() {
-    let (bpm, _dir) = create_bpm(FRAMES);
+    let bpm = create_bpm(FRAMES);
     let data = b"Hello, world!";
 
     // Create and write using convenience method

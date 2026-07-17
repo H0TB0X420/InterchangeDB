@@ -7,13 +7,13 @@ use interchangedb::catalog::{ColumnDef, Schema, TableId};
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::{Executor, HashJoin, JoinStrategy, SeqScan};
 use interchangedb::layout::RowLayout;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::table::Table;
 use interchangedb::types::{ColumnType, Value};
 
 fn fresh_engine() -> (Arc<BTreeEngine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     (Arc::new(BTreeEngine::new(bpm).unwrap()), dir)
 }

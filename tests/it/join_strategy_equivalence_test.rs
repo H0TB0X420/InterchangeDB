@@ -26,7 +26,7 @@ use interchangedb::layout::RowLayout;
 use interchangedb::sql::ir::expr::{CompareOp, Expression, Predicate};
 use interchangedb::sql::ir::logical::OrderDir;
 use interchangedb::sql::ir::physical::PhysOp;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::table::Table;
 use interchangedb::types::{ColumnType, Value};
 
@@ -42,7 +42,7 @@ struct Env {
 /// exclusion, and plain non-matches.
 fn setup() -> Env {
     let dir = tempfile::tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let engine = Arc::new(BTreeEngine::new(BufferPoolManager::new(256, dm)).unwrap());
     let catalog =
         Arc::new(Catalog::open_persistent(engine.clone(), dir.path().join("indexes")).unwrap());

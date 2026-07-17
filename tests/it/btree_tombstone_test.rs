@@ -8,18 +8,15 @@
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
 use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
-use interchangedb::storage::FileDiskManager;
-use tempfile::tempdir;
+use interchangedb::storage::MemoryDiskManager;
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-fn setup_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
-    (BufferPoolManager::new(pool_size, dm), dir)
+fn setup_bpm(pool_size: usize) -> BufferPoolManager {
+    let dm = MemoryDiskManager::new();
+    BufferPoolManager::new(pool_size, dm)
 }
 
 fn create_empty_tree(bpm: &BufferPoolManager) -> PageId {
@@ -100,7 +97,7 @@ fn total_tombstones(tree: &BTree) -> usize {
 ///      after 2 deletes a leaf must flush old tombstones to stay within limit.
 #[test]
 fn test_tombstone_basic() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_tombstones(&bpm, header_id, 4, 4, 2);
 
@@ -158,7 +155,7 @@ fn test_tombstone_basic() {
 ///      Tombstones should survive the split and remain in the correct half.
 #[test]
 fn test_tombstone_split() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_tombstones(&bpm, header_id, 5, 4, 3);
 
@@ -225,7 +222,7 @@ fn test_tombstone_split() {
 ///      a leaf with 1 live entry + 1 tombstone can still underflow.
 #[test]
 fn test_tombstone_borrow() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_tombstones(&bpm, header_id, 4, 4, 1);
 
@@ -295,7 +292,7 @@ fn test_tombstone_borrow() {
 ///      must be processed.
 #[test]
 fn test_tombstone_coalesce() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_tombstones(&bpm, header_id, 6, 6, 2);
 

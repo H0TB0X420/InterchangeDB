@@ -8,7 +8,7 @@ use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::{ExecutionModel, Volcano};
 use interchangedb::layout::RowLayout;
 use interchangedb::sql::{parse, plan, Binder, PhysicalPlan};
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::table::Table;
 use interchangedb::types::{ColumnType, Value};
 
@@ -20,7 +20,7 @@ struct Setup {
 
 fn setup() -> Setup {
     let dir = tempfile::tempdir().unwrap();
-    let dm = FileDiskManager::create(dir.path().join("cat.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     let catalog =

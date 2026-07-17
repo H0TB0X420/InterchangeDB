@@ -13,7 +13,7 @@ use test_each_file::test_each_path;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::storage::engine::StorageEngine;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 
 // Auto-discover all scripts in tests/goldenscripts/btree/.
 test_each_path! { in "tests/goldenscripts/btree" as btree => test_goldenscript }
@@ -32,8 +32,7 @@ struct BTreeRunner {
 impl BTreeRunner {
     fn new() -> Self {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let path = dir.path().join("test.db");
-        let dm = FileDiskManager::create(&path).expect("failed to create disk manager");
+        let dm = MemoryDiskManager::new();
         let bpm = BufferPoolManager::new(256, dm);
         let engine = BTreeEngine::new(bpm).expect("failed to create BTreeEngine");
         Self { engine, _dir: dir }

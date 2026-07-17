@@ -16,18 +16,15 @@ use std::thread;
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
 use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
-use interchangedb::storage::FileDiskManager;
-use tempfile::tempdir;
+use interchangedb::storage::MemoryDiskManager;
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-fn setup_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
-    (BufferPoolManager::new(pool_size, dm), dir)
+fn setup_bpm(pool_size: usize) -> BufferPoolManager {
+    let dm = MemoryDiskManager::new();
+    BufferPoolManager::new(pool_size, dm)
 }
 
 fn create_empty_tree(bpm: &BufferPoolManager) -> PageId {
@@ -73,7 +70,7 @@ fn decode_value(bytes: &[u8]) -> i64 {
 /// Verifies no panics or data corruption under concurrent read access.
 #[test]
 fn test_concurrent_readers() {
-    let (bpm, _dir) = setup_bpm(200);
+    let bpm = setup_bpm(200);
     let header_id = create_empty_tree(&bpm);
 
     // Pre-insert 100 keys single-threaded.
@@ -112,7 +109,7 @@ fn test_concurrent_readers() {
 /// After all threads complete, every key from every range must be present.
 #[test]
 fn test_concurrent_insert_disjoint() {
-    let (bpm, _dir) = setup_bpm(500);
+    let bpm = setup_bpm(500);
     let header_id = create_empty_tree(&bpm);
 
     let thread_count = 4;
@@ -153,7 +150,7 @@ fn test_concurrent_insert_disjoint() {
 /// per key should succeed. Verify the final count matches the range size.
 #[test]
 fn test_concurrent_insert_overlapping() {
-    let (bpm, _dir) = setup_bpm(500);
+    let bpm = setup_bpm(500);
     let header_id = create_empty_tree(&bpm);
 
     let thread_count = 4;
@@ -191,7 +188,7 @@ fn test_concurrent_insert_overlapping() {
 /// the tree should be empty.
 #[test]
 fn test_concurrent_delete() {
-    let (bpm, _dir) = setup_bpm(500);
+    let bpm = setup_bpm(500);
     let header_id = create_empty_tree(&bpm);
 
     let thread_count = 4;
@@ -240,7 +237,7 @@ fn test_concurrent_delete() {
 /// continuously scan. No panics or corruption should occur.
 #[test]
 fn test_concurrent_reader_writer() {
-    let (bpm, _dir) = setup_bpm(500);
+    let bpm = setup_bpm(500);
     let header_id = create_empty_tree(&bpm);
 
     let writer_count = 2;
@@ -307,7 +304,7 @@ fn test_concurrent_reader_writer() {
 /// present or absent, no corruption.
 #[test]
 fn test_concurrent_insert_delete_mix() {
-    let (bpm, _dir) = setup_bpm(500);
+    let bpm = setup_bpm(500);
     let header_id = create_empty_tree(&bpm);
 
     let key_count: i64 = 100;

@@ -19,12 +19,12 @@ use interchangedb::catalog::{Catalog, ColumnDef, IndexBackend, IndexDef, Schema,
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::{Executor, IndexScan};
 use interchangedb::layout::RowLayout;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::MemoryDiskManager;
 use interchangedb::table::Table;
 use interchangedb::types::{ColumnType, Value};
 
 fn open_catalog_at(dir: &std::path::Path) -> Arc<Catalog<BTreeEngine>> {
-    let dm = FileDiskManager::open_or_create(dir.join("cat.db")).unwrap();
+    let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
     Arc::new(Catalog::open_persistent(engine, dir.join("indexes")).unwrap())

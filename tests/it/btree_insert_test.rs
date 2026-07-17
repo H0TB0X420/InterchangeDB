@@ -7,18 +7,15 @@
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
 use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
-use interchangedb::storage::FileDiskManager;
-use tempfile::tempdir;
+use interchangedb::storage::MemoryDiskManager;
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-fn setup_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
-    (BufferPoolManager::new(pool_size, dm), dir)
+fn setup_bpm(pool_size: usize) -> BufferPoolManager {
+    let dm = MemoryDiskManager::new();
+    BufferPoolManager::new(pool_size, dm)
 }
 
 fn create_empty_tree(bpm: &BufferPoolManager) -> PageId {
@@ -68,7 +65,7 @@ fn decode_value(bytes: &[u8]) -> i64 {
 /// Why: Tests the simplest insert case — single key into empty tree, no split.
 #[test]
 fn test_basic_insert() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 2, 3);
 
@@ -103,7 +100,7 @@ fn test_basic_insert() {
 /// We skip I/O counting since our optimistic path is deferred to 3.2.6.
 #[test]
 fn test_optimistic_insert() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 4, 3);
 
@@ -162,7 +159,7 @@ fn test_optimistic_insert() {
 ///      point lookups (no iterator).
 #[test]
 fn test_insert_no_iterator() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 2, 3);
 
@@ -192,7 +189,7 @@ fn test_insert_no_iterator() {
 ///      full iteration, and partial iteration from a given start key.
 #[test]
 fn test_insert_with_scan() {
-    let (bpm, _dir) = setup_bpm(50);
+    let bpm = setup_bpm(50);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 2, 3);
 

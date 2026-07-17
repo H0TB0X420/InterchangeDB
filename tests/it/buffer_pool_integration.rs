@@ -4,15 +4,14 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::common::PageId;
-use interchangedb::storage::FileDiskManager;
+use interchangedb::storage::{FileDiskManager, MemoryDiskManager};
 use std::sync::Arc;
 use std::thread;
 use tempfile::tempdir;
 
 fn create_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
+    let dm = MemoryDiskManager::new();
     (BufferPoolManager::new(pool_size, dm), dir)
 }
 
@@ -41,6 +40,8 @@ fn test_data_persistence_across_evictions() {
 /// Test flush and reload across BPM instances.
 #[test]
 fn test_flush_and_reload() {
+    // Durability-tier exception: this test's subject IS survival across
+    // real file close/reopen, so it stays on FileDiskManager.
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let data = b"persistent!";

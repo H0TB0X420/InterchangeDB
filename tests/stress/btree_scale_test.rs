@@ -6,18 +6,15 @@
 
 use interchangedb::buffer::BufferPoolManager;
 use interchangedb::engines::btree::{BTree, BTreeHeaderPage};
-use interchangedb::storage::FileDiskManager;
-use tempfile::tempdir;
+use interchangedb::storage::MemoryDiskManager;
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-fn setup_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let dm = FileDiskManager::create(&path).unwrap();
-    (BufferPoolManager::new(pool_size, dm), dir)
+fn setup_bpm(pool_size: usize) -> BufferPoolManager {
+    let dm = MemoryDiskManager::new();
+    BufferPoolManager::new(pool_size, dm)
 }
 
 fn create_empty_tree(bpm: &BufferPoolManager) -> interchangedb::common::PageId {
@@ -59,10 +56,10 @@ fn decode_value(bytes: &[u8]) -> i64 {
 ///      forcing thousands of splits and a deep tree.
 ///
 /// Note: BusTub uses pool_size=30 with in-memory disk. We use a larger pool
-/// since our FileDiskManager writes to real files. Correctness is identical.
+/// since our MemoryDiskManager writes to real files. Correctness is identical.
 #[test]
 fn test_basic_scale() {
-    let (bpm, _dir) = setup_bpm(10000);
+    let bpm = setup_bpm(10000);
     let header_id = create_empty_tree(&bpm);
     let tree = BTree::with_sizes(&bpm, header_id, 2, 3);
 
