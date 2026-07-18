@@ -71,6 +71,35 @@ Mechanics that keep churn near zero:
 - One extraction per commit, full gates each (fmt, clippy `-D warnings`,
   test, test --release, test-list identity).
 
+## Pass 1 executed (2026-07) — results
+
+Commits: W1 `5c9acff` (idb-core) · W2 `72bf383` (idb-storage) · W3
+`80d9f0f` (idb-wal + idb-txn). Gates green at each step; final workspace
+totals 1344/0 debug, 1342/0 release across 15 suites — conserved exactly
+through every move (`--workspace` is now the gate invocation, which also
+picked up testkit's 5 unit tests the old single-package gate never ran).
+
+**What the compiler enforced, concretely:** every extraction compiled with
+zero production errors thanks to the dependency-module shims — the only
+demanded changes were one conscious `pub(crate) → pub` escalation
+(`div_i128_round_half_away`, cross-crate consumer named at the site), five
+doc examples repointed from the facade to their defining crates, and
+`#[cfg(test)]`-gated shims for idb-txn's engine-constructing unit tests.
+Test arithmetic balanced at every step (731 = 645+86; 645 = 413+232;
+413 = 304+48+61).
+
+**Gains:** the four layers' dependency directions are now machine-checked
+— `idb-storage` cannot grow a WAL/SQL dependency without a Cargo.toml
+change reviewed as such; an `sql/` edit rebuilds only the root crate
+(~23k LOC of storage/wal/txn no longer recompile; inner loop measured
+unchanged at 7.7 s). Git recorded the whole split as ~100% renames.
+
+**Draws:** four more Cargo.tomls with duplicated dependency versions
+(workspace-level `[workspace.dependencies]` is the fix if drift appears);
+the shim re-exports mean `idb_storage::common` exists as a public path
+(harmless alias, but an extra way to name the same module); gates must
+remember `--workspace`.
+
 ## Pass 2 (gated, not this execution)
 
 Fix knot 3 (index-engine factory out of catalog), knots 4/5 (TableId,
