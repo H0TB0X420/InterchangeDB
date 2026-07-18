@@ -51,10 +51,12 @@ use crate::common::Result;
 use crate::execution::build::{build_executor, translate_aggregate_spec};
 use crate::execution::model::ExecutionModel;
 use crate::execution::operators::hash_aggregate::{
-    build_aggregate_schema, compare_keys, finalize_state, update_state, AggState, MAX_GROUP_COUNT,
+    build_aggregate_schema, compare_keys, finalize_state, update_state, AggState, ArgEvaluator,
+    MAX_GROUP_COUNT,
 };
 use crate::execution::{AggregateFn, Executor, Tuple};
 use crate::layout::{DataLayout, LayoutCtx, RowLayout};
+use crate::sql::ir::expr::Expression;
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 use crate::types::Value;
@@ -198,6 +200,10 @@ impl<E: StorageEngine + 'static> Source for ScanSource<E> {
 struct GroupedAggregateSink {
     group_by: Vec<usize>,
     aggregates: Vec<AggregateFn>,
+    /// Compiled per-row argument evaluators, parallel to `aggregates`
+    /// (`None` for `COUNT(*)`). Compilation is schema-free, so these are
+    /// built at sink construction.
+    args: Vec<Option<ArgEvaluator>>,
     input_schema: Rc<RefCell<Option<Schema>>>,
     groups: HashMap<Vec<Value>, Vec<AggState>>,
     out: Box<dyn Sink>,
@@ -227,8 +233,9 @@ impl Sink for GroupedAggregateSink {
                 v.insert(states)
             }
         };
-        for (agg, state) in self.aggregates.iter().zip(states.iter_mut()) {
-            update_state(agg, state, &tuple)?;
+        for (k, (agg, state)) in self.aggregates.iter().zip(states.iter_mut()).enumerate() {
+            let value = self.args[k].as_ref().map(|f| f(&tuple));
+            update_state(agg, state, value)?;
         }
         // A downstream `Stop` can't arrive during the input phase (nothing
         // has been emitted yet), and the aggregate must see every input
@@ -237,16 +244,12 @@ impl Sink for GroupedAggregateSink {
     }
 
     fn finish(&mut self) -> Result<()> {
-        let schema_slot = self.input_schema.borrow();
-        let input_schema = schema_slot
-            .as_ref()
-            .expect("input_schema filled at build time");
         let mut keyed: Vec<(Vec<Value>, Vec<AggState>)> = self.groups.drain().collect();
         keyed.sort_by(|(a, _), (b, _)| compare_keys(a, b));
         for (key, states) in keyed {
             let mut row = key;
             for (agg, state) in self.aggregates.iter().zip(states.into_iter()) {
-                row.push(finalize_state(agg, state, input_schema)?);
+                row.push(finalize_state(agg, state)?);
             }
             if let Flow::Stop = self.out.push(row)? {
                 break;
@@ -354,16 +357,23 @@ where
                 .cloned()
                 .map(translate_aggregate_spec)
                 .collect();
+            // Argument closures compile schema-free — build them once here,
+            // parallel to `agg_fns`.
+            let arg_fns: Vec<Option<ArgEvaluator>> = agg_fns
+                .iter()
+                .map(|a| a.arg().cloned().map(Expression::compile))
+                .collect();
             let schema_slot = Rc::new(RefCell::new(None));
             let sink = Box::new(GroupedAggregateSink {
                 group_by: group_by.clone(),
                 aggregates: agg_fns.clone(),
+                args: arg_fns,
                 input_schema: schema_slot.clone(),
                 groups: HashMap::new(),
                 out,
             });
             let (source, in_schema) = build_push(input, sink, engine, catalog)?;
-            let out_schema = build_aggregate_schema(&in_schema, group_by, &agg_fns);
+            let out_schema = build_aggregate_schema(&in_schema, group_by, &agg_fns)?;
             *schema_slot.borrow_mut() = Some(in_schema);
             Ok((source, out_schema))
         }

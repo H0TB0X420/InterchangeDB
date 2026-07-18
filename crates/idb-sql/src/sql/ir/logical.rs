@@ -148,18 +148,20 @@ pub struct JoinClause {
 }
 
 /// SQL-level aggregate function spec. The planner translates each
-/// variant into the corresponding `execution::AggregateFn`. Column
-/// references are tuple-global indices (same convention as
-/// `Predicate`). `PartialEq` so the binder can match an ORDER BY /
-/// HAVING aggregate expression against the SELECT list's specs.
+/// variant into the corresponding `execution::AggregateFn`. Each payload
+/// is an `Expression` (H2a: aggregates over arithmetic, e.g. Q1's
+/// `SUM(l_extendedprice * (1 - l_discount))`); any column references
+/// inside are tuple-global indices (same convention as `Predicate`).
+/// `PartialEq`/`Eq` so the binder can match an ORDER BY / HAVING
+/// aggregate expression against the SELECT list's specs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregateSpec {
     CountStar,
-    Count { col: usize, distinct: bool },
-    Sum(usize),
-    Min(usize),
-    Max(usize),
-    Avg(usize),
+    Count { arg: Expression, distinct: bool },
+    Sum(Expression),
+    Min(Expression),
+    Max(Expression),
+    Avg(Expression),
 }
 
 /// SQL-level sort direction. Separate from `execution::SortDir` so the

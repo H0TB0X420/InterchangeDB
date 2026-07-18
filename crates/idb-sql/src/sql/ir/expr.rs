@@ -28,10 +28,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::Tuple;
-use crate::types::{Decimal, Value};
+use crate::types::{ColumnType, Decimal, Value};
 
 /// An expression that evaluates to a `Value` against an input tuple.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `PartialEq`/`Eq` so the binder can match ORDER BY / HAVING aggregate
+/// expressions against the SELECT list's specs (and so `AggregateSpec`,
+/// which now carries expressions, keeps its derived `Eq`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expression {
     /// A constant value embedded in the plan (e.g., `42`, `'alice'`).
     Literal(Value),
@@ -143,6 +146,97 @@ impl Expression {
                 left: Box::new(left.substitute_params(params)?),
                 right: Box::new(right.substitute_params(params)?),
             }),
+        }
+    }
+
+    /// Static result type of this expression over a row of
+    /// `column_types` — MUST mirror `eval_binary_op` exactly, or the
+    /// aggregate accumulator (picked from this type) diverges from the
+    /// values the closure produces at runtime. `None` = not statically
+    /// inferable (NULL literal, unsubstituted parameter, or a type
+    /// combination `eval_binary_op` resolves to NULL).
+    pub fn column_type(&self, column_types: &[ColumnType]) -> Option<ColumnType> {
+        match self {
+            // `Null` literal → None (it has no intrinsic type).
+            Expression::Literal(v) => v.type_of(),
+            Expression::Column(i) => column_types.get(*i).copied(),
+            Expression::Parameter(_) => None,
+            Expression::BinaryOp { op, left, right } => {
+                // None propagates: a NULL-typed sub-expression makes the
+                // whole result NULL, exactly as `eval_binary_op` does.
+                let l = left.column_type(column_types)?;
+                let r = right.column_type(column_types)?;
+                infer_binary_op_type(*op, l, r)
+            }
+        }
+    }
+}
+
+/// The mirror of `eval_binary_op`'s type resolution: the static result
+/// type of `l op r`, or `None` for any operand pair `eval_binary_op`
+/// resolves to `Value::Null` (scale-mismatched Decimal Add/Sub/Div, or an
+/// unsupported type combination).
+fn infer_binary_op_type(op: BinaryOp, l: ColumnType, r: ColumnType) -> Option<ColumnType> {
+    use ColumnType::*;
+    match (l, r) {
+        (Int32, Int32) => Some(Int32),
+        (Int64, Int64) => Some(Int64),
+        (
+            Decimal {
+                precision,
+                scale: s1,
+            },
+            Decimal { scale: s2, .. },
+        ) => decimal_op_type(op, precision, s1, s2),
+        // Int promotes to a scale-0 Decimal at the decimal side's
+        // precision (see `eval_binary_op`'s Int×Decimal arms).
+        (Int32 | Int64, Decimal { precision, scale }) => decimal_op_type(op, precision, 0, scale),
+        (Decimal { precision, scale }, Int32 | Int64) => decimal_op_type(op, precision, scale, 0),
+        // Every other pair is NULL in `eval_binary_op`.
+        _ => None,
+    }
+}
+
+/// Decimal-op scale algebra (`s1` = left scale, `s2` = right scale,
+/// `precision` from the left operand): Add/Sub/Div require equal scales
+/// (else `None`, mirroring the runtime NULL — `div_keeping_scale` rejects a
+/// scale mismatch exactly like `add`/`sub`), keeping the shared scale; Mul
+/// alone promotes, summing the operand scales.
+fn decimal_op_type(op: BinaryOp, precision: u8, s1: u8, s2: u8) -> Option<ColumnType> {
+    let scale = match op {
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Div => {
+            if s1 != s2 {
+                return None;
+            }
+            s1
+        }
+        BinaryOp::Mul => s1 + s2,
+    };
+    Some(ColumnType::Decimal { precision, scale })
+}
+
+impl std::fmt::Display for Expression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // `c{i}` so a column reference can't be read as an integer
+            // literal — `(c2 + 3)` distinguishes column 2 from the value 3.
+            Expression::Column(i) => write!(f, "c{}", i),
+            Expression::Literal(Value::Int32(n)) => write!(f, "{}", n),
+            Expression::Literal(Value::Int64(n)) => write!(f, "{}", n),
+            Expression::Literal(Value::Null) => write!(f, "NULL"),
+            // `Value` has no `Display`; Debug is the honest fallback.
+            Expression::Literal(v) => write!(f, "{:?}", v),
+            // 1-based to match SQL's `$1` placeholder syntax.
+            Expression::Parameter(i) => write!(f, "${}", i + 1),
+            Expression::BinaryOp { op, left, right } => {
+                let symbol = match op {
+                    BinaryOp::Add => '+',
+                    BinaryOp::Sub => '-',
+                    BinaryOp::Mul => '*',
+                    BinaryOp::Div => '/',
+                };
+                write!(f, "({} {} {})", left, symbol, right)
+            }
         }
     }
 }
@@ -331,8 +425,11 @@ mod tests {
         Expression::Literal(v)
     }
     fn add(l: Expression, r: Expression) -> Expression {
+        binop(BinaryOp::Add, l, r)
+    }
+    fn binop(op: BinaryOp, l: Expression, r: Expression) -> Expression {
         Expression::BinaryOp {
-            op: BinaryOp::Add,
+            op,
             left: Box::new(l),
             right: Box::new(r),
         }
@@ -402,6 +499,134 @@ mod tests {
     fn binary_op_type_mismatch_yields_null() {
         let f = add(lit(Value::Int32(1)), lit(Value::Varchar("x".into()))).compile();
         assert_eq!(f(&vec![]), Value::Null);
+    }
+
+    // ---- column_type: static type inference (mirrors eval_binary_op) ----
+
+    #[test]
+    fn column_type_literal_column_parameter() {
+        let types = [ColumnType::Int32, ColumnType::Int64];
+        assert_eq!(
+            lit(Value::Int32(1)).column_type(&types),
+            Some(ColumnType::Int32)
+        );
+        assert_eq!(col(0).column_type(&types), Some(ColumnType::Int32));
+        assert_eq!(col(1).column_type(&types), Some(ColumnType::Int64));
+        // Out-of-range column index and unsubstituted parameter → None.
+        assert_eq!(col(9).column_type(&types), None);
+        assert_eq!(Expression::Parameter(0).column_type(&types), None);
+    }
+
+    #[test]
+    fn column_type_null_literal_is_none() {
+        // NULL has no intrinsic type — and None must propagate up a tree.
+        assert_eq!(lit(Value::Null).column_type(&[]), None);
+        assert_eq!(
+            add(lit(Value::Null), lit(Value::Int32(1))).column_type(&[]),
+            None
+        );
+    }
+
+    #[test]
+    fn column_type_int_arithmetic() {
+        assert_eq!(
+            add(lit(Value::Int32(1)), lit(Value::Int32(2))).column_type(&[]),
+            Some(ColumnType::Int32)
+        );
+        assert_eq!(
+            add(lit(Value::Int64(1)), lit(Value::Int64(2))).column_type(&[]),
+            Some(ColumnType::Int64)
+        );
+        // Int32 + Int64 has no `eval_binary_op` arm → NULL → None.
+        assert_eq!(
+            add(lit(Value::Int32(1)), lit(Value::Int64(2))).column_type(&[]),
+            None
+        );
+    }
+
+    #[test]
+    fn column_type_decimal_rules() {
+        let types = [
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2,
+            },
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 4,
+            },
+        ];
+        // Add same scale → keeps scale.
+        assert_eq!(
+            add(col(0), col(0)).column_type(&types),
+            Some(ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            })
+        );
+        // Add scale mismatch → None (mirrors the runtime NULL).
+        assert_eq!(add(col(0), col(1)).column_type(&types), None);
+        // Mul sums scales: 2 + 4 = 6.
+        assert_eq!(
+            binop(BinaryOp::Mul, col(0), col(1)).column_type(&types),
+            Some(ColumnType::Decimal {
+                precision: 12,
+                scale: 6
+            })
+        );
+        // Div requires equal scales at runtime (`div_keeping_scale` NULLs
+        // on mismatch, exactly like Add/Sub), so scale 2 / scale 4 → None.
+        assert_eq!(
+            binop(BinaryOp::Div, col(0), col(1)).column_type(&types),
+            None
+        );
+        // Equal-scale division keeps that scale: scale 2 / scale 2 → scale 2.
+        assert_eq!(
+            binop(BinaryOp::Div, col(0), col(0)).column_type(&types),
+            Some(ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            })
+        );
+    }
+
+    #[test]
+    fn column_type_int_times_decimal() {
+        // Int × Decimal(12,2): int promotes to scale-0 Decimal, Mul sums
+        // scales → Decimal(12, 0+2) = Decimal(12,2). This is the TPC-C
+        // `ol_quantity * i_price` shape.
+        let types = [ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        }];
+        assert_eq!(
+            binop(BinaryOp::Mul, lit(Value::Int64(1)), col(0)).column_type(&types),
+            Some(ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            })
+        );
+        // Int − Decimal is scale 0 vs 2 → mismatch → None (why Q1's
+        // `1 - l_discount` needs bind-time literal alignment).
+        assert_eq!(
+            binop(BinaryOp::Sub, lit(Value::Int64(1)), col(0)).column_type(&types),
+            None
+        );
+    }
+
+    // ---- Display ----
+
+    #[test]
+    fn display_renders_columns_c_prefixed_and_nests_binops() {
+        // Column → `c{i}`, which can't collide with an integer literal.
+        assert_eq!(col(2).to_string(), "c2");
+        assert_eq!(lit(Value::Int64(5)).to_string(), "5");
+        assert_eq!(lit(Value::Null).to_string(), "NULL");
+        assert_eq!(Expression::Parameter(0).to_string(), "$1");
+        // (c2 * (1 - c3)) — bare `1` is the literal, `c3` the column.
+        let inner = binop(BinaryOp::Sub, lit(Value::Int64(1)), col(3));
+        let outer = binop(BinaryOp::Mul, col(2), inner);
+        assert_eq!(outer.to_string(), "(c2 * (1 - c3))");
     }
 
     // ---- Predicate ----

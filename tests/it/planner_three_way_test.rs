@@ -152,6 +152,19 @@ const CORPUS: &[&str] = &[
     "SELECT b_a, SUM(c_val) FROM b JOIN c ON c_b = b_id GROUP BY b_a",
     "SELECT c_b, SUM(c_val) FROM c GROUP BY c_b HAVING SUM(c_val) > 10",
     "SELECT c_b, COUNT(*) FROM c GROUP BY c_b ORDER BY COUNT(*) DESC, c_b ASC",
+    // H2a expression aggregates. The single-table entry guards literal
+    // narrowing (Int32 column × default-Int64 literal in `SUM(c_val * 2)`),
+    // not the remap. The joined one exercises expression remap under
+    // Selinger/memo reorder — the argument's column indices must be
+    // remapped through `apply_expression`, not just `apply_index`. It
+    // MUST be the 3-relation worst-textual-order shape (big table c first,
+    // like the proven reorder query at the top of this corpus): a
+    // 2-relation equi-join costs the same in either order, so the cost tie
+    // never fires the strictly-cheaper reorder gate and the remap stays an
+    // identity no-op that guards nothing. Three relations in big-first
+    // order actually reorder, making the remap non-identity.
+    "SELECT c_b, SUM(c_val * 2) FROM c GROUP BY c_b",
+    "SELECT a_val, SUM(c_val + b_val) FROM c JOIN b ON c_b = b_id JOIN a ON b_a = a_id GROUP BY a_val",
 ];
 
 fn rows(session: &mut Session<BTreeEngine>, sql: &str) -> Vec<Vec<Value>> {

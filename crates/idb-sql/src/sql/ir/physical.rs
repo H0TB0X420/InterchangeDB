@@ -203,7 +203,9 @@ impl PhysOp {
                 // stays byte-identical (EXPLAIN golden stability).
                 let mut labels: Vec<String> = Vec::with_capacity(aggregates.len() + 1);
                 if !group_by.is_empty() {
-                    let keys: Vec<String> = group_by.iter().map(|c| c.to_string()).collect();
+                    // `c{i}` matches how aggregate args render their columns,
+                    // so group keys read as columns, not integer literals.
+                    let keys: Vec<String> = group_by.iter().map(|c| format!("c{c}")).collect();
                     labels.push(format!("group=({})", keys.join(",")));
                 }
                 labels.extend(aggregates.iter().map(agg_label));
@@ -250,22 +252,24 @@ impl PhysOp {
     }
 }
 
-/// Aggregate label for EXPLAIN, mirroring `HashAggregate`'s operator labels.
+/// Aggregate label for EXPLAIN, mirroring `HashAggregate`'s operator
+/// labels. Args render through `Expression::Display`, whose `Column(i) →
+/// c{i}` renders a column-only arg as `SUM(c3)`, not the ambiguous `SUM(3)`.
 fn agg_label(spec: &AggregateSpec) -> String {
     match spec {
         AggregateSpec::CountStar => "COUNT(*)".to_string(),
         AggregateSpec::Count {
-            col,
+            arg,
             distinct: false,
-        } => format!("COUNT({col})"),
+        } => format!("COUNT({arg})"),
         AggregateSpec::Count {
-            col,
+            arg,
             distinct: true,
-        } => format!("COUNT(DISTINCT {col})"),
-        AggregateSpec::Sum(col) => format!("SUM({col})"),
-        AggregateSpec::Min(col) => format!("MIN({col})"),
-        AggregateSpec::Max(col) => format!("MAX({col})"),
-        AggregateSpec::Avg(col) => format!("AVG({col})"),
+        } => format!("COUNT(DISTINCT {arg})"),
+        AggregateSpec::Sum(arg) => format!("SUM({arg})"),
+        AggregateSpec::Min(arg) => format!("MIN({arg})"),
+        AggregateSpec::Max(arg) => format!("MAX({arg})"),
+        AggregateSpec::Avg(arg) => format!("AVG({arg})"),
     }
 }
 

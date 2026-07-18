@@ -101,6 +101,41 @@ it; no per-planner walkers.
 Gates: Q1 shape end-to-end (dates stubbed as Timestamp literals until H3);
 parity + equivalence suites extended; workload-log/plan serde still round-trips.
 
+**H2 staged (deviation note).** H2 executes in two steps: **H2a** —
+aggregates over expressions (the load-bearing TPC-H piece; every Q1-class
+query) — and **H2b** — computed projections (row-level and
+post-aggregate, e.g. Q14's `100.00 * sum(..)/sum(..)`), still open.
+Recorded here per the plan-deviation rule; the split bounds the IR blast
+radius per increment.
+
+**H2a executed (2026-07-18).** Change, generic: aggregate arguments are
+expression trees — `AggregateSpec`/`AggregateFn` carry `Expression`, a
+static `Expression::column_type()` inference mirrors the runtime
+arithmetic exactly (Int pairs; Decimal scale algebra: Mul sums scales,
+Add/Sub/Div require equal scales), args compile once per operator and
+both execution models share the fold kernel; bind-time integer-literal
+alignment (to Int32 peers, and to the Decimal peer's scale for
+Add/Sub/Div) closes the promote-to-scale-0 NULL landmines (`1 - l_discount`,
+`price / 2`, `c_val * 2`). Remap rides the one shared walker
+(`ColumnRemap::apply_expression`) for Selinger and memo alike.
+Review findings (Sonnet pass) fixed before commit: (1) CONFIRMED — Div
+inference originally claimed Mul-like any-scale validity while the
+runtime requires equal scales → `SUM(price / 2)` silently all-NULL, its
+unit test asserting the bug; fixed both sides (inference mirrors, binder
+aligns Div literals). (2) The expression-remap parity guard used a
+2-relation join whose order-symmetric costs tie → the strictly-cheaper
+gate never rewrote → identity remap guarded nothing; replaced with a
+3-relation worst-textual-order query, rewrite verified to fire (arg
+columns remap (2,5)→(7,4)). (3) EXPLAIN columns now render `c{i}` so
+column-vs-literal is unambiguous in labels. Gains: Q1's full aggregate
+shape (scales 2/4/6) runs grouped through all three planners and both
+exec models, hand-computed slt expectations independently recomputed in
+review; tests 1317 → 1324. Draws: aggregate labels duplicate between IR
+and operator explain (pre-existing pattern, recorded, unfixed);
+Int32-column × Int64-column arithmetic errs loudly rather than aligning
+(no consumer); Decimal Mul scale growth unbounded in inference
+(runtime-asserted; scope ends at 6 here).
+
 ### H3 — scalar and predicate surface
 
 - DATE: **decided 2026-07-18** — new `Value::Date(i32 days)` with its own

@@ -229,17 +229,17 @@ pub(crate) fn translate_aggregate_spec(spec: AggregateSpec) -> AggregateFn {
     match spec {
         AggregateSpec::CountStar => AggregateFn::CountStar,
         AggregateSpec::Count {
-            col,
+            arg,
             distinct: false,
-        } => AggregateFn::Count(col),
+        } => AggregateFn::Count(arg),
         AggregateSpec::Count {
-            col,
+            arg,
             distinct: true,
-        } => AggregateFn::CountDistinct(col),
-        AggregateSpec::Sum(col) => AggregateFn::Sum(col),
-        AggregateSpec::Min(col) => AggregateFn::Min(col),
-        AggregateSpec::Max(col) => AggregateFn::Max(col),
-        AggregateSpec::Avg(col) => AggregateFn::Avg(col),
+        } => AggregateFn::CountDistinct(arg),
+        AggregateSpec::Sum(arg) => AggregateFn::Sum(arg),
+        AggregateSpec::Min(arg) => AggregateFn::Min(arg),
+        AggregateSpec::Max(arg) => AggregateFn::Max(arg),
+        AggregateSpec::Avg(arg) => AggregateFn::Avg(arg),
     }
 }
 

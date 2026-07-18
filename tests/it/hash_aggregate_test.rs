@@ -7,6 +7,7 @@ use interchangedb::catalog::{ColumnDef, Schema, TableId};
 use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::{AggregateFn, Executor, HashAggregate, SeqScan};
 use interchangedb::layout::RowLayout;
+use interchangedb::sql::Expression;
 use interchangedb::storage::MemoryDiskManager;
 use interchangedb::table::Table;
 use interchangedb::types::{ColumnType, Decimal, Value};
@@ -94,7 +95,8 @@ fn count_star_on_empty_input_returns_zero() {
 fn sum_on_empty_input_returns_null() {
     let (table, _d) = payments_table();
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Sum(1)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Sum(Expression::Column(1))]).unwrap();
     let row = collect_one(&mut op);
     assert_eq!(row, vec![Value::Null]);
 }
@@ -107,7 +109,8 @@ fn sum_int64_overflow_errors_instead_of_wrapping() {
     table.insert(&row(1, i64::MAX, 100, None)).unwrap();
     table.insert(&row(2, 1, 100, None)).unwrap();
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Sum(1)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Sum(Expression::Column(1))]).unwrap();
     let err = op.next().expect_err("SUM overflow must error");
     assert!(
         matches!(err, interchangedb::common::Error::NumericOverflow(_)),
@@ -124,7 +127,8 @@ fn avg_int64_mantissa_overflow_errors() {
     let (table, _d) = payments_table();
     table.insert(&row(1, i64::MAX, 100, None)).unwrap();
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Avg(1)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Avg(Expression::Column(1))]).unwrap();
     let err = op.next().expect_err("AVG mantissa overflow must error");
     assert!(
         matches!(err, interchangedb::common::Error::NumericOverflow(_)),
@@ -146,9 +150,9 @@ fn count_sum_min_max_int64() {
         vec![],
         vec![
             AggregateFn::CountStar,
-            AggregateFn::Sum(1),
-            AggregateFn::Min(1),
-            AggregateFn::Max(1),
+            AggregateFn::Sum(Expression::Column(1)),
+            AggregateFn::Min(Expression::Column(1)),
+            AggregateFn::Max(Expression::Column(1)),
         ],
     )
     .unwrap();
@@ -170,7 +174,10 @@ fn count_col_skips_nulls() {
     let mut op = HashAggregate::new(
         child,
         vec![],
-        vec![AggregateFn::CountStar, AggregateFn::Count(3)],
+        vec![
+            AggregateFn::CountStar,
+            AggregateFn::Count(Expression::Column(3)),
+        ],
     )
     .unwrap();
     let r = collect_one(&mut op);
@@ -186,7 +193,8 @@ fn sum_skips_null_inputs() {
     table.insert(&row(3, 30, 150, Some(7))).unwrap();
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Sum(3)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Sum(Expression::Column(3))]).unwrap();
     let r = collect_one(&mut op);
     assert_eq!(r[0], Value::Int64(12)); // 5 + 7
 }
@@ -202,7 +210,10 @@ fn min_max_decimal() {
     let mut op = HashAggregate::new(
         child,
         vec![],
-        vec![AggregateFn::Min(2), AggregateFn::Max(2)],
+        vec![
+            AggregateFn::Min(Expression::Column(2)),
+            AggregateFn::Max(Expression::Column(2)),
+        ],
     )
     .unwrap();
     let r = collect_one(&mut op);
@@ -218,7 +229,8 @@ fn sum_decimal_preserves_scale() {
     table.insert(&row(3, 30, 175, None)).unwrap(); // 1.75
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Sum(2)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Sum(Expression::Column(2))]).unwrap();
     let r = collect_one(&mut op);
     assert_eq!(r[0], Value::Decimal(Decimal::from_i64_with_scale(525, 2))); // 5.25
 }
@@ -232,7 +244,8 @@ fn avg_int_yields_decimal_scale_4() {
     table.insert(&row(2, 30, 100, None)).unwrap();
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Avg(1)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Avg(Expression::Column(1))]).unwrap();
     let r = collect_one(&mut op);
     // (10 + 30) / 2 = 20 → 20.0000 in scale-4 decimal → mantissa 200000.
     assert_eq!(
@@ -251,7 +264,8 @@ fn avg_int_rounds_instead_of_truncating() {
     table.insert(&row(3, 2, 100, None)).unwrap();
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Avg(1)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Avg(Expression::Column(1))]).unwrap();
     let r = collect_one(&mut op);
     // 5/3 = 1.66666… → mantissa round(50000/3) = 16667.
     assert_eq!(r[0], Value::Decimal(Decimal::from_i64_with_scale(16667, 4)));
@@ -261,7 +275,8 @@ fn avg_int_rounds_instead_of_truncating() {
 fn avg_on_empty_input_returns_null() {
     let (table, _d) = payments_table();
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Avg(1)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Avg(Expression::Column(1))]).unwrap();
     let r = collect_one(&mut op);
     assert_eq!(r[0], Value::Null);
 }
@@ -275,10 +290,10 @@ fn output_schema_names_and_types() {
         vec![],
         vec![
             AggregateFn::CountStar,
-            AggregateFn::Count(1),
-            AggregateFn::Sum(1),
-            AggregateFn::Min(2),
-            AggregateFn::Avg(1),
+            AggregateFn::Count(Expression::Column(1)),
+            AggregateFn::Sum(Expression::Column(1)),
+            AggregateFn::Min(Expression::Column(2)),
+            AggregateFn::Avg(Expression::Column(1)),
         ],
     )
     .unwrap();
@@ -338,7 +353,8 @@ fn sum_int32_promotes_output_to_int64() {
     table.insert(&[Value::Int32(2), Value::Int32(1)]).unwrap();
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::Sum(1)]).unwrap();
+    let mut op =
+        HashAggregate::new(child, vec![], vec![AggregateFn::Sum(Expression::Column(1))]).unwrap();
     // i32::MAX + 1 = 2_147_483_648 — would overflow Int32 but fits Int64.
     let r = collect_one(&mut op);
     assert_eq!(r[0], Value::Int64(i32::MAX as i64 + 1));
@@ -351,7 +367,12 @@ fn sum_int32_promotes_output_to_int64() {
 fn count_distinct_empty_input_returns_zero() {
     let (table, _d) = payments_table();
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::CountDistinct(1)]).unwrap();
+    let mut op = HashAggregate::new(
+        child,
+        vec![],
+        vec![AggregateFn::CountDistinct(Expression::Column(1))],
+    )
+    .unwrap();
     let r = collect_one(&mut op);
     assert_eq!(r[0], Value::Int64(0));
 }
@@ -369,7 +390,12 @@ fn count_distinct_skips_nulls_and_dedups() {
     table.insert(&row(6, 60, 100, Some(7))).unwrap();
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::CountDistinct(3)]).unwrap();
+    let mut op = HashAggregate::new(
+        child,
+        vec![],
+        vec![AggregateFn::CountDistinct(Expression::Column(3))],
+    )
+    .unwrap();
     let r = collect_one(&mut op);
     assert_eq!(r[0], Value::Int64(2));
 }
@@ -388,7 +414,10 @@ fn count_distinct_vs_count_disagree_when_duplicates_present() {
     let mut op = HashAggregate::new(
         child,
         vec![],
-        vec![AggregateFn::Count(1), AggregateFn::CountDistinct(1)],
+        vec![
+            AggregateFn::Count(Expression::Column(1)),
+            AggregateFn::CountDistinct(Expression::Column(1)),
+        ],
     )
     .unwrap();
     let r = collect_one(&mut op);
@@ -405,7 +434,12 @@ fn count_distinct_on_decimal_column_works() {
     table.insert(&row(3, 30, 5000, None)).unwrap(); // 50.00
 
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let mut op = HashAggregate::new(child, vec![], vec![AggregateFn::CountDistinct(2)]).unwrap();
+    let mut op = HashAggregate::new(
+        child,
+        vec![],
+        vec![AggregateFn::CountDistinct(Expression::Column(2))],
+    )
+    .unwrap();
     let r = collect_one(&mut op);
     assert_eq!(r[0], Value::Int64(2));
 }
@@ -414,7 +448,12 @@ fn count_distinct_on_decimal_column_works() {
 fn count_distinct_output_schema_naming() {
     let (table, _d) = payments_table();
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let op = HashAggregate::new(child, vec![], vec![AggregateFn::CountDistinct(1)]).unwrap();
+    let op = HashAggregate::new(
+        child,
+        vec![],
+        vec![AggregateFn::CountDistinct(Expression::Column(1))],
+    )
+    .unwrap();
     assert_eq!(op.schema().columns[0].name, "count_distinct_amount");
     assert_eq!(op.schema().columns[0].ty, ColumnType::Int64);
 }
@@ -423,9 +462,14 @@ fn count_distinct_output_schema_naming() {
 fn count_distinct_explain_label() {
     let (table, _d) = payments_table();
     let child = Box::new(SeqScan::new(&table).unwrap());
-    let op = HashAggregate::new(child, vec![], vec![AggregateFn::CountDistinct(1)]).unwrap();
+    let op = HashAggregate::new(
+        child,
+        vec![],
+        vec![AggregateFn::CountDistinct(Expression::Column(1))],
+    )
+    .unwrap();
     let s = op.explain(0);
-    assert!(s.contains("COUNT(DISTINCT 1)"), "got:\n{}", s);
+    assert!(s.contains("COUNT(DISTINCT c1)"), "got:\n{}", s);
 }
 
 #[test]
@@ -437,15 +481,15 @@ fn explain_includes_aggregate_labels() {
         vec![],
         vec![
             AggregateFn::CountStar,
-            AggregateFn::Sum(1),
-            AggregateFn::Max(1),
+            AggregateFn::Sum(Expression::Column(1)),
+            AggregateFn::Max(Expression::Column(1)),
         ],
     )
     .unwrap();
     let s = op.explain(0);
     assert!(s.contains("HashAggregate"));
     assert!(s.contains("COUNT(*)"));
-    assert!(s.contains("SUM(1)"));
-    assert!(s.contains("MAX(1)"));
+    assert!(s.contains("SUM(c1)"));
+    assert!(s.contains("MAX(c1)"));
     assert!(s.contains("SeqScan"), "should include child operator");
 }

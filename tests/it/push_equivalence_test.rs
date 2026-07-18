@@ -121,6 +121,10 @@ fn grouped_aggregate_is_equivalent() {
         "SELECT kind, COUNT(*) FROM ev GROUP BY kind ORDER BY COUNT(*) DESC, kind ASC",
         "SELECT kind, MIN(amt), MAX(amt), AVG(amt) FROM ev GROUP BY kind",
         "SELECT kind, COUNT(*) FROM ev WHERE amt > 15 GROUP BY kind",
+        // H2a: aggregates over arithmetic expressions run through the same
+        // native push sink; the compiled arg closure must agree with pull.
+        "SELECT kind, SUM(amt * 2) FROM ev GROUP BY kind",
+        "SELECT kind, MIN(amt + 1), AVG(amt) FROM ev GROUP BY kind",
     ];
     for q in queries {
         assert_equivalent(&mut s, q);

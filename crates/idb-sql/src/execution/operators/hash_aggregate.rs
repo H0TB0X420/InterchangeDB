@@ -33,75 +33,129 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::catalog::{ColumnDef, Schema, TableId};
-use crate::common::Result;
+use crate::common::{Error, Result};
 use crate::execution::{Executor, Tuple};
+use crate::sql::ir::expr::Expression;
 use crate::types::{ColumnType, Decimal, Value};
 
-/// A single aggregate function applied to a column (or the entire row,
-/// for `COUNT(*)`).
+/// A per-row argument evaluator, compiled once from an aggregate's
+/// argument `Expression`. `COUNT(*)` has none.
+pub(crate) type ArgEvaluator = Box<dyn Fn(&Tuple) -> Value + Send>;
+
+/// A single aggregate function applied to an argument expression (or the
+/// entire row, for `COUNT(*)`). H2a: the argument is any `Expression`,
+/// evaluated per row by a compiled closure — `SUM(price * (1 - disc))`.
 #[derive(Debug, Clone)]
 pub enum AggregateFn {
     /// `COUNT(*)` — counts every input row.
     CountStar,
-    /// `COUNT(col)` — counts non-NULL values of the given column.
-    Count(usize),
-    /// `COUNT(DISTINCT col)` — counts unique non-NULL values. Tracks a
-    /// `HashSet<Value>` per row's column value; finalizes to the set
-    /// size. TPC-C StockLevel needs this for its `s_i_id` count.
-    CountDistinct(usize),
-    /// `SUM(col)` — running sum; NULL on empty / all-NULL input.
-    Sum(usize),
-    /// `MIN(col)` — smallest non-NULL value.
-    Min(usize),
-    /// `MAX(col)` — largest non-NULL value.
-    Max(usize),
-    /// `AVG(col)` — sum / count of non-NULL values. NULL on empty input.
-    Avg(usize),
+    /// `COUNT(expr)` — counts non-NULL evaluated values.
+    Count(Expression),
+    /// `COUNT(DISTINCT expr)` — counts unique non-NULL values. Tracks a
+    /// `HashSet<Value>` per evaluated value; finalizes to the set size.
+    /// TPC-C StockLevel needs this for its `s_i_id` count.
+    CountDistinct(Expression),
+    /// `SUM(expr)` — running sum; NULL on empty / all-NULL input.
+    Sum(Expression),
+    /// `MIN(expr)` — smallest non-NULL value.
+    Min(Expression),
+    /// `MAX(expr)` — largest non-NULL value.
+    Max(Expression),
+    /// `AVG(expr)` — sum / count of non-NULL values. NULL on empty input.
+    Avg(Expression),
 }
 
 impl AggregateFn {
-    /// Column name for the synthetic schema entry this aggregate emits.
-    fn output_name(&self, input_schema: &Schema) -> String {
+    /// The argument expression, or `None` for `COUNT(*)`.
+    pub(crate) fn arg(&self) -> Option<&Expression> {
         match self {
-            AggregateFn::CountStar => "count_star".to_string(),
-            AggregateFn::Count(i) => format!("count_{}", input_schema.columns[*i].name),
-            AggregateFn::CountDistinct(i) => {
-                format!("count_distinct_{}", input_schema.columns[*i].name)
-            }
-            AggregateFn::Sum(i) => format!("sum_{}", input_schema.columns[*i].name),
-            AggregateFn::Min(i) => format!("min_{}", input_schema.columns[*i].name),
-            AggregateFn::Max(i) => format!("max_{}", input_schema.columns[*i].name),
-            AggregateFn::Avg(i) => format!("avg_{}", input_schema.columns[*i].name),
+            AggregateFn::CountStar => None,
+            AggregateFn::Count(e)
+            | AggregateFn::CountDistinct(e)
+            | AggregateFn::Sum(e)
+            | AggregateFn::Min(e)
+            | AggregateFn::Max(e)
+            | AggregateFn::Avg(e) => Some(e),
         }
     }
 
-    /// Output column type. `COUNT` is always `Int64`. `SUM(Int32)`
-    /// promotes to `Int64` to avoid overflow. `MIN`/`MAX` preserve the
-    /// input type. `AVG` is `Decimal { scale: 4 }` for integer inputs
-    /// (matches typical SQL behavior of producing a fractional result)
-    /// and the input's scale for `Decimal` inputs.
-    fn output_type(&self, input_schema: &Schema) -> ColumnType {
+    /// Short name for error messages ("SUM: cannot infer argument type").
+    fn label(&self) -> &'static str {
         match self {
-            AggregateFn::CountStar | AggregateFn::Count(_) | AggregateFn::CountDistinct(_) => {
-                ColumnType::Int64
-            }
-            AggregateFn::Sum(i) | AggregateFn::Max(i) | AggregateFn::Min(i) => {
-                let input = input_schema.columns[*i].ty;
-                if matches!(self, AggregateFn::Sum(_)) && matches!(input, ColumnType::Int32) {
-                    // Promote to Int64 for sum-of-Int32.
-                    ColumnType::Int64
-                } else {
-                    input
-                }
-            }
-            AggregateFn::Avg(i) => match input_schema.columns[*i].ty {
-                ColumnType::Int32 | ColumnType::Int64 => ColumnType::Decimal {
-                    precision: 18,
-                    scale: 4,
-                },
-                other => other,
-            },
+            AggregateFn::CountStar => "COUNT(*)",
+            AggregateFn::Count(_) => "COUNT",
+            AggregateFn::CountDistinct(_) => "COUNT(DISTINCT)",
+            AggregateFn::Sum(_) => "SUM",
+            AggregateFn::Min(_) => "MIN",
+            AggregateFn::Max(_) => "MAX",
+            AggregateFn::Avg(_) => "AVG",
         }
+    }
+}
+
+/// The static type an aggregate's argument produces over `input_schema`,
+/// or `None` for `COUNT(*)`. Errors loudly when an argument expression's
+/// type can't be inferred (mirrors `eval_binary_op`) — the accumulator
+/// and output type are picked from this and MUST match the runtime values.
+fn infer_arg_type(agg: &AggregateFn, input_schema: &Schema) -> Result<Option<ColumnType>> {
+    match agg.arg() {
+        None => Ok(None),
+        Some(expr) => expr
+            .column_type(&input_schema.column_types())
+            .map(Some)
+            .ok_or_else(|| Error::SqlParse(format!("{}: cannot infer argument type", agg.label()))),
+    }
+}
+
+/// Column name for the synthetic schema entry this aggregate emits. A
+/// bare-column argument keeps the pre-H2a "{fn}_{column}" naming (schema
+/// stability); any richer expression is "{fn}_expr".
+fn output_name(agg: &AggregateFn, input_schema: &Schema) -> String {
+    let prefix = match agg {
+        AggregateFn::CountStar => return "count_star".to_string(),
+        AggregateFn::Count(_) => "count",
+        AggregateFn::CountDistinct(_) => "count_distinct",
+        AggregateFn::Sum(_) => "sum",
+        AggregateFn::Min(_) => "min",
+        AggregateFn::Max(_) => "max",
+        AggregateFn::Avg(_) => "avg",
+    };
+    match agg.arg() {
+        Some(Expression::Column(i)) => format!("{}_{}", prefix, input_schema.columns[*i].name),
+        _ => format!("{}_expr", prefix),
+    }
+}
+
+/// Output column type from the argument's inferred type (`arg_type` is
+/// `None` only for `COUNT(*)`). `COUNT`→`Int64`; `SUM(Int32)` promotes to
+/// `Int64` to avoid overflow, `SUM(Int64/Decimal)` keeps its type;
+/// `MIN`/`MAX` preserve the argument type; `AVG` is `Decimal{18,4}` for
+/// integer inputs (a fractional result) and the input's scale for Decimal.
+fn output_type(agg: &AggregateFn, arg_type: Option<ColumnType>) -> Result<ColumnType> {
+    match agg {
+        AggregateFn::CountStar | AggregateFn::Count(_) | AggregateFn::CountDistinct(_) => {
+            Ok(ColumnType::Int64)
+        }
+        AggregateFn::Sum(_) => match arg_type.expect("Sum has an argument") {
+            ColumnType::Int32 | ColumnType::Int64 => Ok(ColumnType::Int64),
+            ty @ ColumnType::Decimal { .. } => Ok(ty),
+            other => Err(Error::SqlParse(format!(
+                "SUM of non-numeric type {:?} not supported",
+                other
+            ))),
+        },
+        AggregateFn::Min(_) | AggregateFn::Max(_) => Ok(arg_type.expect("Min/Max has an argument")),
+        AggregateFn::Avg(_) => match arg_type.expect("Avg has an argument") {
+            ColumnType::Int32 | ColumnType::Int64 => Ok(ColumnType::Decimal {
+                precision: 18,
+                scale: 4,
+            }),
+            ty @ ColumnType::Decimal { .. } => Ok(ty),
+            other => Err(Error::SqlParse(format!(
+                "AVG of non-numeric type {:?} not supported",
+                other
+            ))),
+        },
     }
 }
 
@@ -112,7 +166,7 @@ pub(crate) enum AggState {
     /// `COUNT(DISTINCT col)` — tracks seen non-NULL values.
     DistinctSet(HashSet<Value>),
     /// `SUM`. None until the first non-NULL value. Numeric variant kept
-    /// in lock-step with the input column's type.
+    /// in lock-step with the argument's inferred type.
     SumInt(Option<i64>),
     SumDecimal(Option<Decimal>),
     /// `MIN` / `MAX`. None until the first non-NULL value.
@@ -134,29 +188,35 @@ impl AggState {
         match agg {
             AggregateFn::CountStar | AggregateFn::Count(_) => Ok(AggState::Count(0)),
             AggregateFn::CountDistinct(_) => Ok(AggState::DistinctSet(HashSet::new())),
-            AggregateFn::Sum(i) => match input_schema.columns[*i].ty {
-                ColumnType::Int32 | ColumnType::Int64 => Ok(AggState::SumInt(None)),
-                ColumnType::Decimal { .. } => Ok(AggState::SumDecimal(None)),
-                other => Err(crate::common::Error::SqlParse(format!(
-                    "SUM of non-numeric column type {:?} not supported",
-                    other
-                ))),
-            },
             AggregateFn::Min(_) | AggregateFn::Max(_) => Ok(AggState::MinMaxValue(None)),
-            AggregateFn::Avg(i) => match input_schema.columns[*i].ty {
-                ColumnType::Int32 | ColumnType::Int64 => Ok(AggState::AvgInt {
-                    sum: None,
-                    count: 0,
-                }),
-                ColumnType::Decimal { .. } => Ok(AggState::AvgDecimal {
-                    sum: None,
-                    count: 0,
-                }),
-                other => Err(crate::common::Error::SqlParse(format!(
-                    "AVG of non-numeric column type {:?} not supported",
-                    other
-                ))),
-            },
+            // The numeric accumulator must match the argument's inferred
+            // type, not a bare column type — the argument may be arithmetic.
+            AggregateFn::Sum(_) => {
+                match infer_arg_type(agg, input_schema)?.expect("Sum has an arg") {
+                    ColumnType::Int32 | ColumnType::Int64 => Ok(AggState::SumInt(None)),
+                    ColumnType::Decimal { .. } => Ok(AggState::SumDecimal(None)),
+                    other => Err(Error::SqlParse(format!(
+                        "SUM of non-numeric type {:?} not supported",
+                        other
+                    ))),
+                }
+            }
+            AggregateFn::Avg(_) => {
+                match infer_arg_type(agg, input_schema)?.expect("Avg has an arg") {
+                    ColumnType::Int32 | ColumnType::Int64 => Ok(AggState::AvgInt {
+                        sum: None,
+                        count: 0,
+                    }),
+                    ColumnType::Decimal { .. } => Ok(AggState::AvgDecimal {
+                        sum: None,
+                        count: 0,
+                    }),
+                    other => Err(Error::SqlParse(format!(
+                        "AVG of non-numeric type {:?} not supported",
+                        other
+                    ))),
+                }
+            }
         }
     }
 }
@@ -173,6 +233,10 @@ pub struct HashAggregate {
     child: Box<dyn Executor>,
     group_by: Vec<usize>,
     aggregates: Vec<AggregateFn>,
+    /// Compiled per-row argument evaluators, parallel to `aggregates`
+    /// (`None` for `COUNT(*)`). Compiled once at construction so the
+    /// hot loop just calls closures.
+    args: Vec<Option<ArgEvaluator>>,
     /// `None` until first `next()` computes; then the buffered output rows.
     output: Option<std::vec::IntoIter<Tuple>>,
 }
@@ -184,7 +248,7 @@ impl HashAggregate {
         aggregates: Vec<AggregateFn>,
     ) -> Result<Self> {
         if aggregates.is_empty() {
-            return Err(crate::common::Error::SqlParse(
+            return Err(Error::SqlParse(
                 "HashAggregate requires at least one aggregate".into(),
             ));
         }
@@ -196,12 +260,17 @@ impl HashAggregate {
             child.schema(),
             &group_by,
             &aggregates,
-        ));
+        )?);
+        let args: Vec<Option<ArgEvaluator>> = aggregates
+            .iter()
+            .map(|a| a.arg().cloned().map(Expression::compile))
+            .collect();
         Ok(Self {
             schema,
             child,
             group_by,
             aggregates,
+            args,
             output: None,
         })
     }
@@ -219,14 +288,15 @@ impl HashAggregate {
         let mut states = self.new_states(&input_schema)?;
 
         while let Some(row) = self.child.next()? {
-            for (agg, state) in self.aggregates.iter().zip(states.iter_mut()) {
-                update_state(agg, state, &row)?;
+            for (k, (agg, state)) in self.aggregates.iter().zip(states.iter_mut()).enumerate() {
+                let value = self.args[k].as_ref().map(|f| f(&row));
+                update_state(agg, state, value)?;
             }
         }
 
         let mut output = Vec::with_capacity(states.len());
         for (agg, state) in self.aggregates.iter().zip(states.into_iter()) {
-            output.push(finalize_state(agg, state, &input_schema)?);
+            output.push(finalize_state(agg, state)?);
         }
         Ok(vec![output])
     }
@@ -251,8 +321,9 @@ impl HashAggregate {
                     v.insert(self.new_states(&input_schema)?)
                 }
             };
-            for (agg, state) in self.aggregates.iter().zip(states.iter_mut()) {
-                update_state(agg, state, &row)?;
+            for (k, (agg, state)) in self.aggregates.iter().zip(states.iter_mut()).enumerate() {
+                let value = self.args[k].as_ref().map(|f| f(&row));
+                update_state(agg, state, value)?;
             }
         }
 
@@ -263,7 +334,7 @@ impl HashAggregate {
         for (key, states) in keyed {
             let mut row = key;
             for (agg, state) in self.aggregates.iter().zip(states.into_iter()) {
-                row.push(finalize_state(agg, state, &input_schema)?);
+                row.push(finalize_state(agg, state)?);
             }
             output.push(row);
         }
@@ -292,19 +363,21 @@ impl Executor for HashAggregate {
         let pad = "  ".repeat(indent);
         let mut labels: Vec<String> = Vec::with_capacity(self.aggregates.len() + 1);
         if !self.group_by.is_empty() {
-            // Grouped-only segment keeps ungrouped EXPLAIN output
-            // byte-identical to the pre-GROUP-BY rendering.
-            let keys: Vec<String> = self.group_by.iter().map(|c| c.to_string()).collect();
+            // `c{i}` matches how aggregate args render their columns, so a
+            // group key reads as a column reference, not an integer literal.
+            let keys: Vec<String> = self.group_by.iter().map(|c| format!("c{c}")).collect();
             labels.push(format!("group=({})", keys.join(",")));
         }
+        // Args render through `Expression::Display` (`Column(i) → c{i}`), so
+        // a column-only arg reads as `SUM(c3)`, not the ambiguous `SUM(3)`.
         labels.extend(self.aggregates.iter().map(|a| match a {
             AggregateFn::CountStar => "COUNT(*)".to_string(),
-            AggregateFn::Count(i) => format!("COUNT({})", i),
-            AggregateFn::CountDistinct(i) => format!("COUNT(DISTINCT {})", i),
-            AggregateFn::Sum(i) => format!("SUM({})", i),
-            AggregateFn::Min(i) => format!("MIN({})", i),
-            AggregateFn::Max(i) => format!("MAX({})", i),
-            AggregateFn::Avg(i) => format!("AVG({})", i),
+            AggregateFn::Count(arg) => format!("COUNT({arg})"),
+            AggregateFn::CountDistinct(arg) => format!("COUNT(DISTINCT {arg})"),
+            AggregateFn::Sum(arg) => format!("SUM({arg})"),
+            AggregateFn::Min(arg) => format!("MIN({arg})"),
+            AggregateFn::Max(arg) => format!("MAX({arg})"),
+            AggregateFn::Avg(arg) => format!("AVG({arg})"),
         }));
         let mut out = format!("{}HashAggregate[{}]\n", pad, labels.join(", "));
         out.push_str(&self.child.explain(indent + 1));
@@ -313,29 +386,35 @@ impl Executor for HashAggregate {
 }
 
 /// Output schema: group-key columns (cloned from the input schema, in
-/// `group_by` order) followed by one synthetic column per aggregate.
+/// `group_by` order) followed by one synthetic column per aggregate. The
+/// argument type is inferred once per aggregate here; a type that can't be
+/// inferred or that the aggregate rejects (non-numeric SUM/AVG) errors
+/// loudly rather than reaching the accumulator.
 pub(crate) fn build_aggregate_schema(
     input: &Schema,
     group_by: &[usize],
     aggregates: &[AggregateFn],
-) -> Schema {
+) -> Result<Schema> {
     let mut columns: Vec<ColumnDef> = group_by.iter().map(|&c| input.columns[c].clone()).collect();
-    columns.extend(aggregates.iter().map(|a| ColumnDef {
-        name: a.output_name(input),
-        ty: a.output_type(input),
-        // Aggregates can return NULL (empty input → SUM/AVG/MIN/MAX).
-        // COUNT returns 0, never NULL, but unifying as nullable keeps
-        // the schema simple and matches PostgreSQL.
-        nullable: true,
-        default: None,
-    }));
-    Schema {
+    for agg in aggregates {
+        let arg_type = infer_arg_type(agg, input)?;
+        columns.push(ColumnDef {
+            name: output_name(agg, input),
+            ty: output_type(agg, arg_type)?,
+            // Aggregates can return NULL (empty input → SUM/AVG/MIN/MAX).
+            // COUNT returns 0, never NULL, but unifying as nullable keeps
+            // the schema simple and matches PostgreSQL.
+            nullable: true,
+            default: None,
+        });
+    }
+    Ok(Schema {
         name: "aggregate".into(),
         // Synthetic — not a real table.
         table_id: TableId(0),
         columns,
         primary_key: vec![],
-    }
+    })
 }
 
 /// Total order over equal-length group keys: position by position, NULL
@@ -357,39 +436,49 @@ pub(crate) fn compare_keys(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-/// Fold one input row into each aggregate's accumulator.
-pub(crate) fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<()> {
+/// Fold one input row into each aggregate's accumulator. `arg_value` is
+/// the aggregate's argument evaluated against the row (`None` only for
+/// `COUNT(*)`); the caller compiles and runs the argument closure.
+pub(crate) fn update_state(
+    agg: &AggregateFn,
+    state: &mut AggState,
+    arg_value: Option<Value>,
+) -> Result<()> {
     match (agg, state) {
         (AggregateFn::CountStar, AggState::Count(c)) => {
             *c += 1;
             Ok(())
         }
-        (AggregateFn::Count(i), AggState::Count(c)) => {
-            if !matches!(row[*i], Value::Null) {
-                *c += 1;
+        (AggregateFn::Count(_), AggState::Count(c)) => {
+            // COUNT(expr): count non-NULL evaluated values.
+            if let Some(v) = &arg_value {
+                if !matches!(v, Value::Null) {
+                    *c += 1;
+                }
             }
             Ok(())
         }
-        (AggregateFn::CountDistinct(i), AggState::DistinctSet(set)) => {
-            let v = &row[*i];
-            if !matches!(v, Value::Null) {
-                set.insert(v.clone());
+        (AggregateFn::CountDistinct(_), AggState::DistinctSet(set)) => {
+            if let Some(v) = arg_value {
+                if !matches!(v, Value::Null) {
+                    set.insert(v);
+                }
             }
             Ok(())
         }
-        (AggregateFn::Sum(i), AggState::SumInt(acc)) => {
+        (AggregateFn::Sum(_), AggState::SumInt(acc)) => {
             // checked_add: a wrapped sum is a silently wrong answer — SQL
             // engines raise numeric overflow instead (E13).
-            match &row[*i] {
-                Value::Int32(v) => {
-                    *acc = Some(checked_sum(acc.unwrap_or(0), *v as i64, "SUM")?);
+            match arg_value {
+                Some(Value::Int32(v)) => {
+                    *acc = Some(checked_sum(acc.unwrap_or(0), v as i64, "SUM")?);
                 }
-                Value::Int64(v) => {
-                    *acc = Some(checked_sum(acc.unwrap_or(0), *v, "SUM")?);
+                Some(Value::Int64(v)) => {
+                    *acc = Some(checked_sum(acc.unwrap_or(0), v, "SUM")?);
                 }
-                Value::Null => {}
-                other => {
-                    return Err(crate::common::Error::SqlParse(format!(
+                Some(Value::Null) | None => {}
+                Some(other) => {
+                    return Err(Error::SqlParse(format!(
                         "SUM expected integer, got {:?}",
                         other
                     )));
@@ -397,41 +486,39 @@ pub(crate) fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple)
             }
             Ok(())
         }
-        (AggregateFn::Sum(i), AggState::SumDecimal(acc)) => {
-            match &row[*i] {
-                Value::Decimal(d) => {
+        (AggregateFn::Sum(_), AggState::SumDecimal(acc)) => {
+            match arg_value {
+                Some(Value::Decimal(d)) => {
                     *acc = Some(match acc {
-                        None => *d,
+                        None => d,
                         Some(prev) => prev
-                            .add(d)
-                            .map_err(|e| crate::common::Error::SqlParse(format!("SUM: {}", e)))?,
+                            .add(&d)
+                            .map_err(|e| Error::SqlParse(format!("SUM: {}", e)))?,
                     });
                 }
-                Value::Null => {}
-                other => {
-                    return Err(crate::common::Error::SqlParse(format!(
-                        "SUM(Decimal) got {:?}",
-                        other
-                    )));
+                Some(Value::Null) | None => {}
+                Some(other) => {
+                    return Err(Error::SqlParse(format!("SUM(Decimal) got {:?}", other)));
                 }
             }
             Ok(())
         }
-        (AggregateFn::Min(i), AggState::MinMaxValue(acc))
-        | (AggregateFn::Max(i), AggState::MinMaxValue(acc)) => {
-            let v = &row[*i];
-            if matches!(v, Value::Null) {
-                return Ok(());
-            }
+        (AggregateFn::Min(_), AggState::MinMaxValue(acc))
+        | (AggregateFn::Max(_), AggState::MinMaxValue(acc)) => {
+            let v = match arg_value {
+                Some(v) if !matches!(v, Value::Null) => v,
+                // NULL argument (or COUNT(*), which never lands here): skip.
+                _ => return Ok(()),
+            };
             *acc = Some(match acc {
-                None => v.clone(),
+                None => v,
                 Some(prev) => {
-                    let ord = compare_values(prev, v);
+                    let ord = compare_values(prev, &v);
                     let want_smaller = matches!(agg, AggregateFn::Min(_));
                     if (want_smaller && ord == std::cmp::Ordering::Greater)
                         || (!want_smaller && ord == std::cmp::Ordering::Less)
                     {
-                        v.clone()
+                        v
                     } else {
                         prev.clone()
                     }
@@ -439,19 +526,19 @@ pub(crate) fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple)
             });
             Ok(())
         }
-        (AggregateFn::Avg(i), AggState::AvgInt { sum, count }) => {
-            match &row[*i] {
-                Value::Int32(v) => {
-                    *sum = Some(checked_sum(sum.unwrap_or(0), *v as i64, "AVG")?);
+        (AggregateFn::Avg(_), AggState::AvgInt { sum, count }) => {
+            match arg_value {
+                Some(Value::Int32(v)) => {
+                    *sum = Some(checked_sum(sum.unwrap_or(0), v as i64, "AVG")?);
                     *count += 1;
                 }
-                Value::Int64(v) => {
-                    *sum = Some(checked_sum(sum.unwrap_or(0), *v, "AVG")?);
+                Some(Value::Int64(v)) => {
+                    *sum = Some(checked_sum(sum.unwrap_or(0), v, "AVG")?);
                     *count += 1;
                 }
-                Value::Null => {}
-                other => {
-                    return Err(crate::common::Error::SqlParse(format!(
+                Some(Value::Null) | None => {}
+                Some(other) => {
+                    return Err(Error::SqlParse(format!(
                         "AVG expected integer, got {:?}",
                         other
                     )));
@@ -459,23 +546,20 @@ pub(crate) fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple)
             }
             Ok(())
         }
-        (AggregateFn::Avg(i), AggState::AvgDecimal { sum, count }) => {
-            match &row[*i] {
-                Value::Decimal(d) => {
+        (AggregateFn::Avg(_), AggState::AvgDecimal { sum, count }) => {
+            match arg_value {
+                Some(Value::Decimal(d)) => {
                     *sum = Some(match sum {
-                        None => *d,
+                        None => d,
                         Some(prev) => prev
-                            .add(d)
-                            .map_err(|e| crate::common::Error::SqlParse(format!("AVG: {}", e)))?,
+                            .add(&d)
+                            .map_err(|e| Error::SqlParse(format!("AVG: {}", e)))?,
                     });
                     *count += 1;
                 }
-                Value::Null => {}
-                other => {
-                    return Err(crate::common::Error::SqlParse(format!(
-                        "AVG(Decimal) got {:?}",
-                        other
-                    )));
+                Some(Value::Null) | None => {}
+                Some(other) => {
+                    return Err(Error::SqlParse(format!("AVG(Decimal) got {:?}", other)));
                 }
             }
             Ok(())
@@ -484,7 +568,7 @@ pub(crate) fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple)
     }
 }
 
-pub(crate) fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Result<Value> {
+pub(crate) fn finalize_state(agg: &AggregateFn, state: AggState) -> Result<Value> {
     Ok(match (agg, state) {
         (AggregateFn::CountStar | AggregateFn::Count(_), AggState::Count(c)) => {
             Value::Int64(c as i64)

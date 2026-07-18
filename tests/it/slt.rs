@@ -157,3 +157,8 @@ fn slt_insert() {
 fn slt_group_by() {
     run_slt("group_by.slt");
 }
+
+#[test]
+fn slt_aggregate_expr() {
+    run_slt("aggregate_expr.slt");
+}

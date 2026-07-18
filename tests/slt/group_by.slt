@@ -111,7 +111,7 @@ EXPLAIN SELECT region, SUM(total) FROM orders GROUP BY region HAVING SUM(total) 
 ----
 Sort[1 DESC]
 Filter
-HashAggregate[group=(1), SUM(3)]
+HashAggregate[group=(c1), SUM(c3)]
 SeqScan(orders)
 
 # ---- negative space: every unsupported or invalid shape rejects loudly ----

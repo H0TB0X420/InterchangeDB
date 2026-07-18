@@ -1048,8 +1048,8 @@ fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<Aggreg
                     Ok(AggregateSpec::CountStar)
                 }
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                    let col = resolve_column_expr(scope, e)?;
-                    Ok(AggregateSpec::Count { col, distinct })
+                    let arg = bind_expression(scope, e.clone())?;
+                    Ok(AggregateSpec::Count { arg, distinct })
                 }
                 other => Err(Error::SqlParse(format!(
                     "binder: unsupported COUNT argument shape: {:?}",
@@ -1070,9 +1070,9 @@ fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<Aggreg
                     name
                 )));
             }
-            let col = match &args[0] {
+            let arg = match &args[0] {
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                    resolve_column_expr(scope, e)?
+                    bind_expression(scope, e.clone())?
                 }
                 other => {
                     return Err(Error::SqlParse(format!(
@@ -1082,10 +1082,10 @@ fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<Aggreg
                 }
             };
             Ok(match name.as_str() {
-                "SUM" => AggregateSpec::Sum(col),
-                "MIN" => AggregateSpec::Min(col),
-                "MAX" => AggregateSpec::Max(col),
-                "AVG" => AggregateSpec::Avg(col),
+                "SUM" => AggregateSpec::Sum(arg),
+                "MIN" => AggregateSpec::Min(arg),
+                "MAX" => AggregateSpec::Max(arg),
+                "AVG" => AggregateSpec::Avg(arg),
                 _ => unreachable!(),
             })
         }
@@ -1096,9 +1096,9 @@ fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<Aggreg
     }
 }
 
-/// Aggregates only accept a column reference as the argument expression
-/// — not arbitrary expressions (yet). This helper centralizes that
-/// resolution and the corresponding error message.
+/// Resolve an AST expression that must be a plain column reference to a
+/// tuple-global index. Serves GROUP BY and ORDER BY keys (which are
+/// column-only); aggregate arguments now bind through `bind_expression`.
 fn resolve_column_expr(scope: &Scope, e: &AstExpr) -> Result<usize> {
     match e {
         AstExpr::Identifier(ident) => column_index(scope, &ident.value),
@@ -1106,7 +1106,7 @@ fn resolve_column_expr(scope: &Scope, e: &AstExpr) -> Result<usize> {
             column_index_qualified(scope, &parts[0].value, &parts[1].value)
         }
         other => Err(Error::SqlParse(format!(
-            "binder: aggregate argument must be a column reference, got {:?}",
+            "binder: expected a plain column reference, got {:?}",
             other
         ))),
     }
@@ -1314,6 +1314,10 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
             let arith_op = map_arith_op(&op)?;
             let l = bind_expression(scope, *left)?;
             let r = bind_expression(scope, *right)?;
+            // Align an integer literal to the other operand's numeric type
+            // so the arithmetic is well-typed under eval_binary_op (which
+            // otherwise resolves the mismatch to NULL).
+            let (l, r) = align_numeric_literal(scope, arith_op, l, r);
             Ok(Expression::BinaryOp {
                 op: arith_op,
                 left: Box::new(l),
@@ -1326,6 +1330,77 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
             other
         ))),
     }
+}
+
+/// Bind-time integer-literal alignment for arithmetic. `eval_binary_op`
+/// only combines matching numeric representations, so a whole-number
+/// literal — bound at the default width (Int64) — can silently resolve an
+/// entire arithmetic expression to NULL against an Int32 or Decimal
+/// column. Coerce the literal to the other operand's type when
+/// value-preserving (`coerce_exact`); an unrepresentable literal (e.g. an
+/// out-of-i32 value, or too many integer digits for the scale) is left
+/// untouched, preserving today's NULL for that case.
+///
+/// NOTE (plan deviation): step 3c specified only the Decimal Add/Sub
+/// landmine (Q1's `1 - l_discount`); the Int32 case (any op) is required
+/// for the `SUM(c_val * 2)` parity corpus — same landmine (Int32 column ×
+/// default-Int64 literal), same value-preserving fix.
+fn align_numeric_literal(
+    scope: &Scope,
+    op: BinaryOp,
+    l: Expression,
+    r: Expression,
+) -> (Expression, Expression) {
+    let types = scope_column_types(scope);
+    if let Expression::Literal(v @ (Value::Int32(_) | Value::Int64(_))) = &l {
+        if let Some(target) = align_target(op, r.column_type(&types)) {
+            if let Some(coerced) = v.coerce_exact(&target) {
+                return (Expression::Literal(coerced), r);
+            }
+        }
+    }
+    if let Expression::Literal(v @ (Value::Int32(_) | Value::Int64(_))) = &r {
+        if let Some(target) = align_target(op, l.column_type(&types)) {
+            if let Some(coerced) = v.coerce_exact(&target) {
+                return (l, Expression::Literal(coerced));
+            }
+        }
+    }
+    (l, r)
+}
+
+/// The type an integer literal should coerce toward, given the other
+/// operand's inferred type and the operator: Int32 for any op; Decimal for
+/// Add/Sub/Div but NOT Mul. The split follows the runtime decimal algebra:
+/// Mul *promotes* (result scale = sum of operand scales), so an Int literal
+/// already promotes to a scale-0 Decimal in `eval_binary_op` and coercing
+/// it to the column's scale would change the result scale. Add/Sub/Div all
+/// *require equal scales* at runtime (`div_keeping_scale` rejects a
+/// mismatch exactly like `add`/`sub`), so coercing the literal to the
+/// Decimal side's scale is what turns `price / 2` into a legal scale-2
+/// division instead of an every-row NULL.
+fn align_target(op: BinaryOp, other: Option<ColumnType>) -> Option<ColumnType> {
+    match other {
+        Some(ty @ ColumnType::Int32) => Some(ty),
+        Some(ty @ ColumnType::Decimal { .. })
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Div) =>
+        {
+            Some(ty)
+        }
+        _ => None,
+    }
+}
+
+/// Flatten the scope's tables into a tuple-global `Vec<ColumnType>`, the
+/// view `Expression::column_type` infers against. Order matches
+/// `column_index`'s tuple-global layout (each table contributes a
+/// contiguous run at its `column_offset`).
+fn scope_column_types(scope: &Scope) -> Vec<ColumnType> {
+    scope
+        .tables
+        .iter()
+        .flat_map(|t| t.schema.columns.iter().map(|c| c.ty))
+        .collect()
 }
 
 /// Map a literal without a target column type. Used inside expressions

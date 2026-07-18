@@ -510,20 +510,21 @@ fn build_on_predicate(
     compares.fold(first, |acc, c| Predicate::And(Box::new(acc), Box::new(c)))
 }
 
-/// Remap the column an aggregate reads (no-op for `COUNT(*)`).
-/// `pub(crate)`: the memo planner's emission (T17-A.4) remaps aggregates
-/// identically.
+/// Remap the columns an aggregate's argument expression reads (no-op for
+/// `COUNT(*)`). `pub(crate)`: the memo planner's emission (T17-A.4) remaps
+/// aggregates identically. Routes through the shared `apply_expression`
+/// walker so arithmetic arguments (H2a) remap under join reorder.
 pub(crate) fn remap_aggregate(spec: AggregateSpec, remap: &ColumnRemap) -> AggregateSpec {
     match spec {
         AggregateSpec::CountStar => AggregateSpec::CountStar,
-        AggregateSpec::Count { col, distinct } => AggregateSpec::Count {
-            col: remap.apply_index(col),
+        AggregateSpec::Count { arg, distinct } => AggregateSpec::Count {
+            arg: remap.apply_expression(arg),
             distinct,
         },
-        AggregateSpec::Sum(c) => AggregateSpec::Sum(remap.apply_index(c)),
-        AggregateSpec::Min(c) => AggregateSpec::Min(remap.apply_index(c)),
-        AggregateSpec::Max(c) => AggregateSpec::Max(remap.apply_index(c)),
-        AggregateSpec::Avg(c) => AggregateSpec::Avg(remap.apply_index(c)),
+        AggregateSpec::Sum(e) => AggregateSpec::Sum(remap.apply_expression(e)),
+        AggregateSpec::Min(e) => AggregateSpec::Min(remap.apply_expression(e)),
+        AggregateSpec::Max(e) => AggregateSpec::Max(remap.apply_expression(e)),
+        AggregateSpec::Avg(e) => AggregateSpec::Avg(remap.apply_expression(e)),
     }
 }
 
