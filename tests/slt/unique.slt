@@ -1,0 +1,62 @@
+# UNIQUE index enforcement: insert/update rejection, NULL distinctness,
+# self-exclusion on update, and the CREATE-time duplicate pre-flight
+# (which must run BEFORE registration — there is no DROP INDEX).
+
+statement ok
+CREATE TABLE users (u_id INT PRIMARY KEY, email VARCHAR(40), team INT NOT NULL)
+
+statement ok
+INSERT INTO users VALUES (1, 'a@x', 10), (2, 'b@x', 20), (3, NULL, 30), (4, NULL, 40)
+
+# CREATE-time pre-flight: team has no duplicates yet -> ok; then the
+# email index (NULLs exempt) is also fine.
+statement ok
+CREATE UNIQUE INDEX users_by_team ON users (team)
+
+statement ok
+CREATE UNIQUE INDEX users_by_email ON users (email)
+
+# Insert with a duplicate unique value is rejected...
+statement error unique index 'users_by_team' violation
+INSERT INTO users VALUES (5, 'c@x', 10)
+
+# ...but NULLs are distinct: a third NULL email is fine.
+statement ok
+INSERT INTO users VALUES (6, NULL, 60)
+
+# Update INTO a collision is rejected; the row is unchanged.
+statement error unique index 'users_by_team' violation
+UPDATE users SET team = 20 WHERE u_id = 1
+
+query I
+SELECT team FROM users WHERE u_id = 1
+----
+10
+
+# Self-exclusion: rewriting a row to its own current unique value is fine,
+# as is updating a non-indexed column of a unique-indexed row.
+statement ok
+UPDATE users SET team = 10 WHERE u_id = 1
+
+statement ok
+UPDATE users SET email = 'a2@x' WHERE u_id = 1
+
+# CREATE UNIQUE INDEX over data that already violates it fails BEFORE
+# registration; a retry after fixing the data succeeds.
+statement ok
+CREATE TABLE dup (d_id INT PRIMARY KEY, v INT NOT NULL)
+
+statement ok
+INSERT INTO dup VALUES (1, 7), (2, 7)
+
+statement error unique index 'dup_by_v' violation
+CREATE UNIQUE INDEX dup_by_v ON dup (v)
+
+statement ok
+UPDATE dup SET v = 8 WHERE d_id = 2
+
+statement ok
+CREATE UNIQUE INDEX dup_by_v ON dup (v)
+
+statement error unique index 'dup_by_v' violation
+INSERT INTO dup VALUES (3, 8)

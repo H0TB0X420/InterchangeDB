@@ -362,6 +362,22 @@ impl<E: StorageEngine + 'static> Session<E> {
         backend: crate::catalog::IndexBackend,
     ) -> Result<QueryResult> {
         let schema = self.catalog.get_table(&table)?;
+        let txn_id = match self.current_txn {
+            Some(t) => t,
+            None => crate::txn::TxnId::AUTO_COMMIT,
+        };
+        let txn_engine = self.database.txn_engine_handle(txn_id)?;
+        if unique {
+            // No DROP INDEX exists yet, so duplicate detection must run
+            // BEFORE registration — a failing backfill must not strand a
+            // half-created index.
+            let plain = crate::table::Table::new(
+                Arc::new(self.database.txn_engine_handle(txn_id)?),
+                schema.clone(),
+                crate::layout::RowLayout,
+            );
+            plain.assert_unique_feasible(&columns, &name)?;
+        }
         let index_id = self.catalog.create_index(crate::catalog::IndexDef {
             name,
             table_id: schema.table_id,
@@ -370,11 +386,6 @@ impl<E: StorageEngine + 'static> Session<E> {
             backend,
         })?;
 
-        let txn_id = match self.current_txn {
-            Some(t) => t,
-            None => crate::txn::TxnId::AUTO_COMMIT,
-        };
-        let txn_engine = self.database.txn_engine_handle(txn_id)?;
         let handles = self.catalog.indexes_for_table(schema.table_id, &schema)?;
         let new_index: Vec<_> = handles.into_iter().filter(|h| h.id == index_id).collect();
         assert_eq!(

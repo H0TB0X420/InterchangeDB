@@ -233,3 +233,45 @@ fn table_without_indexes_does_not_touch_any_index() {
         0
     );
 }
+
+#[test]
+fn unique_index_rejects_duplicate_insert_and_upsert() {
+    // Table-level UNIQUE enforcement, no SQL in the loop: a duplicate
+    // value on a unique index must fail insert AND upsert with
+    // UniqueViolation, while the original row stays intact.
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = open_catalog_at(dir.path());
+    let t_id = catalog
+        .create_table("warehouse".into(), warehouse_schema())
+        .unwrap();
+    catalog
+        .create_index(IndexDef {
+            name: "wh_by_name".into(),
+            table_id: t_id,
+            columns: vec![1],
+            unique: true,
+            backend: IndexBackend::BTree,
+        })
+        .unwrap();
+    let schema = catalog.get_table("warehouse").unwrap();
+    let indexes = catalog.indexes_for_table(t_id, &schema).unwrap();
+    let table = Table::with_indexes(catalog.engine().clone(), schema, RowLayout, indexes);
+
+    table
+        .insert(&[Value::Int32(1), Value::Varchar("north".into())])
+        .unwrap();
+    let dup = table.insert(&[Value::Int32(2), Value::Varchar("north".into())]);
+    assert!(
+        matches!(dup, Err(interchangedb::Error::UniqueViolation { ref index }) if index == "wh_by_name"),
+        "insert must hit the unique index, got: {dup:?}"
+    );
+    let dup2 = table.upsert(&[Value::Int32(3), Value::Varchar("north".into())]);
+    assert!(
+        matches!(dup2, Err(interchangedb::Error::UniqueViolation { .. })),
+        "upsert must hit the unique index, got: {dup2:?}"
+    );
+    // Self-rewrite via upsert keeps its own entry and passes.
+    table
+        .upsert(&[Value::Int32(1), Value::Varchar("north".into())])
+        .unwrap();
+}

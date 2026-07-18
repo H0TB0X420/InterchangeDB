@@ -125,6 +125,10 @@ pub enum Error {
     /// upsert semantics; raised by `Table::insert` only.
     DuplicateKey { table: String },
 
+    /// A `UNIQUE` secondary index rejected a write whose indexed column
+    /// values duplicate an existing row's (NULLs never conflict).
+    UniqueViolation { index: String },
+
     /// `create_table` with a name already in the catalog.
     TableAlreadyExists { name: String },
 
@@ -246,6 +250,9 @@ impl fmt::Display for Error {
                 write!(f, "constraint violation on column '{}': {}", column, rule)
             }
             Error::DuplicateKey { table } => write!(f, "duplicate key in table '{}'", table),
+            Error::UniqueViolation { index } => {
+                write!(f, "unique index '{}' violation: duplicate value", index)
+            }
             Error::TableAlreadyExists { name } => write!(f, "table '{}' already exists", name),
             Error::TableNotFound { name } => write!(f, "table '{}' not found", name),
             Error::IndexAlreadyExists { name } => write!(f, "index '{}' already exists", name),

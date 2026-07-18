@@ -24,5 +24,11 @@ Deliberately still Rust:
   two sessions; workload-log capture asserts on the filesystem.
 
 Later: the same corpus can run against every engine config (implement the
-harness over `Database<E>` generically), and SQLite's cross-verified
-sqllogictest corpus becomes usable at TPC-H time.
+harness over `Database<E>` generically).
+
+SQLite's cross-verified corpus (probed 2026-07 via the gregrahn mirror):
+its very first statements already miss our dialect — CREATE TABLE without
+PRIMARY KEY, column-list INSERT (`INSERT INTO t1(e,c,b,d,a) VALUES…`),
+the `INTEGER` type alias — before reaching its CASE/GROUP BY-heavy
+queries. Adopt when those land (the TPC-H-era dialect work), not before;
+partial adoption earlier would mostly measure the dialect gap.

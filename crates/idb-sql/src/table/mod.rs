@@ -93,6 +93,82 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
         Ok(())
     }
 
+    /// Enforce `UNIQUE` indexes for a row about to be written: reject if
+    /// any unique index already holds an entry with the same indexed
+    /// component values under a DIFFERENT primary key. Rows with NULL in
+    /// any indexed column never conflict (SQL: NULLs are distinct). The
+    /// self-key exclusion lets updates keep their own entry, and lets a
+    /// same-PK re-insert surface as `DuplicateKey` from the PK path
+    /// instead of being masked here.
+    ///
+    /// Consistency level: the index engines' current contents — the same
+    /// as index maintenance itself (entries are unversioned; E1 recheck).
+    fn check_unique_indexes(&self, new_row: &[Value]) -> Result<()> {
+        for ix in &self.indexes {
+            if !ix.def.unique {
+                continue;
+            }
+            let components: Vec<&Value> = ix.def.columns.iter().map(|&i| &new_row[i]).collect();
+            if components.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let prefix =
+                keyenc::encode_key_components(&components, &ix.key_types[..components.len()])?;
+            let self_key = self.build_index_key(ix, new_row)?;
+            // `prefix_increment`, not `byte_increment`: entries carry an
+            // arbitrary PK suffix after the prefix, so the upper bound
+            // must cover every extension (see keyenc's own warning).
+            let upper = match keyenc::prefix_increment(&prefix) {
+                Some(u) => std::ops::Bound::Excluded(u),
+                None => std::ops::Bound::Unbounded,
+            };
+            // Bounded: at most the entries sharing this exact component
+            // prefix — 0 or 1 when the invariant holds; the first foreign
+            // key decides when it doesn't. The starts_with guard covers
+            // the Unbounded arm (all-0xFF prefix), where the range would
+            // otherwise run past the prefix.
+            for entry in ix
+                .engine
+                .scan_range(std::ops::Bound::Included(prefix.clone()), upper)
+            {
+                let (key, _) = entry?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if key != self_key {
+                    return Err(Error::UniqueViolation {
+                        index: ix.def.name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pre-flight for `CREATE UNIQUE INDEX`: verify no two existing rows
+    /// share values on `columns` (NULL-containing rows exempt). Runs
+    /// BEFORE the index is registered — there is no DROP INDEX yet, so a
+    /// failing backfill must not strand a half-created index.
+    pub fn assert_unique_feasible(&self, columns: &[usize], index_name: &str) -> Result<()> {
+        use std::collections::HashSet;
+        let types: Vec<crate::types::ColumnType> =
+            columns.iter().map(|&i| self.schema.columns[i].ty).collect();
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for row in self.scan()? {
+            let components: Vec<&Value> = columns.iter().map(|&i| &row[i]).collect();
+            if components.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let key = keyenc::encode_key_components(&components, &types)?;
+            if !seen.insert(key) {
+                return Err(Error::UniqueViolation {
+                    index: index_name.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Write index entries for every EXISTING row into the attached
     /// indexes. Used once at `CREATE INDEX` time — the session attaches
     /// only the newly created index, so rows inserted before it existed
@@ -136,6 +212,7 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
                 table: self.schema.name.clone(),
             });
         }
+        self.check_unique_indexes(&values)?;
         self.layout
             .put_row(&*self.engine, ctx, &pk_encoded, &values)?;
         // P12.4: maintain secondary indexes. Done after the PK write so a
@@ -160,6 +237,7 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
         };
         // If there's a prior row at this PK, remove its old index entries
         // first (they may have different indexed-column values).
+        self.check_unique_indexes(&values)?;
         if !self.indexes.is_empty() {
             if let Some(prev) = self.layout.get_row(&*self.engine, ctx, &pk_encoded)? {
                 self.delete_index_entries(&prev)?;
@@ -188,6 +266,7 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
         } else {
             None
         };
+        self.check_unique_indexes(&new_values)?;
         self.layout
             .update_row(&*self.engine, ctx, &pk_encoded, &new_values)?;
         if let Some(prev) = prev {
@@ -220,14 +299,22 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
         } else {
             None
         };
+        // Materialize the post-update row BEFORE mutating so unique
+        // enforcement can veto the write while nothing has changed.
+        let new_row = prev.as_ref().map(|prev| {
+            let mut row = prev.clone();
+            for (col_idx, new_val) in changes {
+                row[*col_idx] = new_val.clone();
+            }
+            row
+        });
+        if let Some(new_row) = &new_row {
+            self.check_unique_indexes(new_row)?;
+        }
         self.layout
             .update_columns(&*self.engine, ctx, &pk_encoded, changes)?;
-        if let Some(prev) = prev {
+        if let (Some(prev), Some(new_row)) = (prev, new_row) {
             self.delete_index_entries(&prev)?;
-            let mut new_row = prev.clone();
-            for (col_idx, new_val) in changes {
-                new_row[*col_idx] = new_val.clone();
-            }
             self.put_index_entries(&new_row)?;
         }
         Ok(())

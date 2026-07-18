@@ -142,3 +142,8 @@ fn slt_create_index() {
 fn slt_join() {
     run_slt("join.slt");
 }
+
+#[test]
+fn slt_unique() {
+    run_slt("unique.slt");
+}
