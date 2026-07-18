@@ -12,14 +12,16 @@ explicit point at their stored scale, EXPLAIN output one trimmed line per
 row (pins operator trees exactly).
 
 Provenance: converted from `sql_order_by_test.rs`, `sql_aggregate_test.rs`,
-and the single-session half of `sql_e2e_test.rs` — assertion-for-assertion,
+`sql_join_test.rs` (unblocked by SQL CREATE INDEX — `join.slt` pins exact
+INLJ plan trees over a SQL-created, backfilled index), and the
+single-session half of `sql_e2e_test.rs` — assertion-for-assertion,
 several strengthened (full-row expectations, exact EXPLAIN trees).
+`create_index.slt` covers the CREATE INDEX feature itself, including the
+backfill path.
 
 Deliberately still Rust:
 - `sql_e2e_test.rs` (slimmed): snapshot isolation and write-conflict need
   two sessions; workload-log capture asserts on the filesystem.
-- `sql_join_test.rs`: its INLJ setup needs `catalog.create_index` — the
-  SQL surface has no CREATE INDEX yet. Convert when it does.
 
 Later: the same corpus can run against every engine config (implement the
 harness over `Database<E>` generically), and SQLite's cross-verified
