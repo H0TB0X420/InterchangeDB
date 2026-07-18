@@ -222,10 +222,12 @@ where
             aggregates,
             filter,
             order_by,
+            having,
             limit,
         } => {
             let physop = plan_select(
-                table, joins, projection, aggregates, filter, order_by, limit, catalog, selection,
+                table, joins, projection, aggregates, filter, order_by, having, limit, catalog,
+                selection,
             )?;
             Ok(PhysicalPlan::Query(physop))
         }
@@ -259,6 +261,7 @@ fn plan_select<CatE>(
     aggregates: Vec<crate::sql::ir::logical::AggregateSpec>,
     filter: Option<Predicate>,
     order_by: Vec<(usize, crate::sql::ir::logical::OrderDir)>,
+    having: Option<Predicate>,
     limit: Option<usize>,
     catalog: &Catalog<CatE>,
     selection: &JoinSelection,
@@ -511,47 +514,67 @@ where
     }
 
     Ok(apply_select_spine(
-        current, residual, aggregates, order_by, projection, limit,
+        current, residual, aggregates, order_by, having, projection, limit,
     ))
 }
 
 /// Apply the fixed statement spine above an optimized core (D3): residual
-/// Filter → HashAggregate → Sort → Projection → Limit. Factored from
-/// `plan_select`'s tail (T17-A.4) so the memo planner's emission applies
-/// the identical spine; column indices in every argument must already be
-/// in the core's output coordinates.
+/// Filter → HashAggregate → HAVING Filter → Sort → Projection → Limit.
+/// Factored from `plan_select`'s tail (T17-A.4) so the memo planner's
+/// emission applies the identical spine; column indices in every argument
+/// must already be in the core's output coordinates — except `having`,
+/// whose indices are in the aggregate OUTPUT row (the binder's coordinate
+/// rule), which no core optimization can move.
 pub(crate) fn apply_select_spine(
     mut current: PhysOp,
     residual: Vec<Predicate>,
     aggregates: Vec<crate::sql::ir::logical::AggregateSpec>,
     order_by: Vec<(usize, crate::sql::ir::logical::OrderDir)>,
+    having: Option<Predicate>,
     projection: Vec<usize>,
     limit: Option<usize>,
 ) -> PhysOp {
+    // Binder invariant: HAVING only exists alongside aggregates.
+    assert!(having.is_none() || !aggregates.is_empty());
     if let Some(pred) = and_all(residual) {
         current = PhysOp::Filter {
             input: Box::new(current),
             predicate: pred,
         };
     }
-    if !aggregates.is_empty() {
-        // P13.4: HashAggregate before Projection (aggregates ARE the
-        // output; binder enforces projection empty alongside aggregates).
+    let aggregated = !aggregates.is_empty();
+    if aggregated {
+        // P13.4/H1: with GROUP BY, the projected plain columns ARE the
+        // group keys (binder contract), so `projection` doubles as
+        // `group_by` — empty for whole-table aggregation. Either way the
+        // aggregate's output is already in final column order (keys ++
+        // aggregates), so no trailing Projection runs above it.
         current = PhysOp::HashAggregate {
             input: Box::new(current),
+            group_by: projection.clone(),
             aggregates,
         };
+        if let Some(pred) = having {
+            // HAVING filters aggregate output rows, so it sits directly
+            // above the aggregate and below Sort/Limit.
+            current = PhysOp::Filter {
+                input: Box::new(current),
+                predicate: pred,
+            };
+        }
     }
     // P13.6: Sort BEFORE Projection so sort keys can reference columns
     // even if they're not in the projection (TPC-C Payment does this).
-    // Binder resolves ORDER BY indices against the pre-projection scope.
+    // Binder resolves ORDER BY indices against the pre-projection scope —
+    // or against the aggregate output row when aggregated (coordinate
+    // rule), where the Sort correctly sits above the HashAggregate.
     if !order_by.is_empty() {
         current = PhysOp::Sort {
             input: Box::new(current),
             keys: order_by,
         };
     }
-    if aggregates_was_empty_marker(&projection) && !projection.is_empty() {
+    if !aggregated && !projection.is_empty() {
         current = PhysOp::Projection {
             input: Box::new(current),
             cols: projection,
@@ -564,17 +587,6 @@ pub(crate) fn apply_select_spine(
         };
     }
     current
-}
-
-/// Always true unless we want to suppress Projection for aggregate plans.
-/// The aggregate path replaces the input schema entirely, so a trailing
-/// Projection would re-index into the aggregate's output tuple, not the
-/// pre-aggregate scope. Binder enforces projection is empty when
-/// aggregates are non-empty, so this guard is conservative: only run
-/// Projection if there's something to project.
-fn aggregates_was_empty_marker(projection: &[usize]) -> bool {
-    let _ = projection;
-    true
 }
 
 /// Extract `(outer_col_global, inner_col_local)` from an equi-join ON
@@ -1534,6 +1546,7 @@ Limit(3)
             aggregates: vec![],
             filter: None,
             order_by: vec![],
+            having: None,
             limit: None,
         };
         match plan(logical, &env.catalog) {

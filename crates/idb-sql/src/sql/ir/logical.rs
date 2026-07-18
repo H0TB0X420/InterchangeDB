@@ -53,13 +53,22 @@ pub enum LogicalPlan {
     /// index into the concatenated `table || joins[0] || joins[1] || …`
     /// row produced by the operator tree.
     ///
-    /// Exactly one of `projection` and `aggregates` is non-empty:
+    /// Projection/aggregates combinations:
     /// - `projection` non-empty, `aggregates` empty: column-projection (or
     ///   `SELECT *` when both are empty).
     /// - `aggregates` non-empty, `projection` empty: whole-table
     ///   aggregation (no GROUP BY).
-    /// - Both non-empty: GROUP BY semantics (rejected by the binder for
-    ///   now — lands in Phase 14 alongside `HashAggregate`'s grouped path).
+    /// - Both non-empty: GROUP BY — `projection` holds the group-key
+    ///   columns (the binder enforces that the GROUP BY clause and the
+    ///   projected plain columns coincide, keys listed before aggregates).
+    ///   The aggregate output row is keys in projection order, then
+    ///   aggregates in `aggregates` order.
+    ///
+    /// Coordinate rule: when `aggregates` is non-empty, `order_by` and
+    /// `having` index the aggregate OUTPUT row (keys ++ aggregates), not
+    /// the input tuple — the input scope no longer exists above the
+    /// aggregate. When `aggregates` is empty they index the input tuple
+    /// like `filter` does.
     Select {
         table: String,
         joins: Vec<JoinClause>,
@@ -72,8 +81,13 @@ pub enum LogicalPlan {
         aggregates: Vec<AggregateSpec>,
         filter: Option<Predicate>,
         /// `ORDER BY (col, dir)+`. Column indices are tuple-global (same
-        /// scope as `projection` / `filter`). Empty means unsorted.
+        /// scope as `projection` / `filter`) — except under GROUP BY; see
+        /// the coordinate rule above. Empty means unsorted.
         order_by: Vec<(usize, OrderDir)>,
+        /// `HAVING` predicate over the aggregate output row (coordinate
+        /// rule above). `None` when absent; the binder only produces
+        /// `Some` alongside non-empty `aggregates`.
+        having: Option<Predicate>,
         limit: Option<usize>,
     },
 
@@ -136,8 +150,9 @@ pub struct JoinClause {
 /// SQL-level aggregate function spec. The planner translates each
 /// variant into the corresponding `execution::AggregateFn`. Column
 /// references are tuple-global indices (same convention as
-/// `Predicate`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Predicate`). `PartialEq` so the binder can match an ORDER BY /
+/// HAVING aggregate expression against the SELECT list's specs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregateSpec {
     CountStar,
     Count { col: usize, distinct: bool },
@@ -170,6 +185,7 @@ impl LogicalPlan {
                 aggregates,
                 filter,
                 order_by,
+                having,
                 limit,
             } => {
                 let joins = joins
@@ -189,6 +205,10 @@ impl LogicalPlan {
                     Some(p) => Some(p.substitute_params(params)?),
                     None => None,
                 };
+                let having = match having {
+                    Some(p) => Some(p.substitute_params(params)?),
+                    None => None,
+                };
                 Ok(LogicalPlan::Select {
                     table,
                     joins,
@@ -196,6 +216,7 @@ impl LogicalPlan {
                     aggregates,
                     filter,
                     order_by,
+                    having,
                     limit,
                 })
             }

@@ -190,6 +190,7 @@ pub(crate) fn query(relations: Vec<RelInfo>, edges: Vec<Edge>) -> NormalizedQuer
             projection: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
+            having: None,
             limit: None,
         },
     }

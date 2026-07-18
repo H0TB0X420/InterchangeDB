@@ -42,17 +42,22 @@
 //! SQL runs through either model at runtime.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
-use crate::execution::build::build_executor;
+use crate::execution::build::{build_executor, translate_aggregate_spec};
 use crate::execution::model::ExecutionModel;
-use crate::execution::{Executor, Tuple};
+use crate::execution::operators::hash_aggregate::{
+    build_aggregate_schema, compare_keys, finalize_state, update_state, AggState, MAX_GROUP_COUNT,
+};
+use crate::execution::{AggregateFn, Executor, Tuple};
 use crate::layout::{DataLayout, LayoutCtx, RowLayout};
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
+use crate::types::Value;
 
 /// Whether a sink wants more tuples after the one it just received.
 pub(crate) enum Flow {
@@ -181,6 +186,76 @@ impl<E: StorageEngine + 'static> Source for ScanSource<E> {
     }
 }
 
+/// Grouped aggregation as a native push sink — the canonical push
+/// pipeline breaker: accumulate per key on `push`, emit finalized groups
+/// on `finish` (canonical key order, same as the pull operator — the
+/// equivalence suite compares the two byte-for-byte).
+///
+/// `input_schema` is a shared slot filled by the build arm after
+/// recursion returns the input pipeline's schema (sinks thread downward
+/// before schemas flow back up — same `Rc<RefCell>` idiom as
+/// `Collector`). It is always `Some` by the time the source runs.
+struct GroupedAggregateSink {
+    group_by: Vec<usize>,
+    aggregates: Vec<AggregateFn>,
+    input_schema: Rc<RefCell<Option<Schema>>>,
+    groups: HashMap<Vec<Value>, Vec<AggState>>,
+    out: Box<dyn Sink>,
+}
+
+impl Sink for GroupedAggregateSink {
+    fn push(&mut self, tuple: Tuple) -> Result<Flow> {
+        let schema_slot = self.input_schema.borrow();
+        let input_schema = schema_slot
+            .as_ref()
+            .expect("input_schema filled at build time");
+        let key: Vec<Value> = self.group_by.iter().map(|&c| tuple[c].clone()).collect();
+        let group_count = self.groups.len();
+        let states = match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                assert!(
+                    group_count < MAX_GROUP_COUNT,
+                    "GROUP BY exceeded {} distinct groups",
+                    MAX_GROUP_COUNT
+                );
+                let states = self
+                    .aggregates
+                    .iter()
+                    .map(|a| AggState::new_for(a, input_schema))
+                    .collect::<Result<Vec<_>>>()?;
+                v.insert(states)
+            }
+        };
+        for (agg, state) in self.aggregates.iter().zip(states.iter_mut()) {
+            update_state(agg, state, &tuple)?;
+        }
+        // A downstream `Stop` can't arrive during the input phase (nothing
+        // has been emitted yet), and the aggregate must see every input
+        // row regardless — always continue.
+        Ok(Flow::Continue)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let schema_slot = self.input_schema.borrow();
+        let input_schema = schema_slot
+            .as_ref()
+            .expect("input_schema filled at build time");
+        let mut keyed: Vec<(Vec<Value>, Vec<AggState>)> = self.groups.drain().collect();
+        keyed.sort_by(|(a, _), (b, _)| compare_keys(a, b));
+        for (key, states) in keyed {
+            let mut row = key;
+            for (agg, state) in self.aggregates.iter().zip(states.into_iter()) {
+                row.push(finalize_state(agg, state, input_schema)?);
+            }
+            if let Flow::Stop = self.out.push(row)? {
+                break;
+            }
+        }
+        self.out.finish()
+    }
+}
+
 /// Bridges a pull operator tree into the push pipeline: drains the executor and
 /// pushes each tuple downstream, honoring `Stop`. Used for the operators Push
 /// delegates to `build_executor` — indexed access, joins, breakers, and DML,
@@ -264,11 +339,40 @@ where
             }
             Ok((source, project_schema(&in_schema, cols)))
         }
+        // Grouped aggregation runs as a native push sink (H1 decision:
+        // accumulate-on-push/emit-on-finish is the shape push models are
+        // best at; bridging would quietly retire Push on every grouped
+        // query). Whole-table aggregation (group_by empty, one output
+        // row) has nothing to stream and stays on the delegated path.
+        PhysOp::HashAggregate {
+            input,
+            group_by,
+            aggregates,
+        } if !group_by.is_empty() => {
+            let agg_fns: Vec<AggregateFn> = aggregates
+                .iter()
+                .cloned()
+                .map(translate_aggregate_spec)
+                .collect();
+            let schema_slot = Rc::new(RefCell::new(None));
+            let sink = Box::new(GroupedAggregateSink {
+                group_by: group_by.clone(),
+                aggregates: agg_fns.clone(),
+                input_schema: schema_slot.clone(),
+                groups: HashMap::new(),
+                out,
+            });
+            let (source, in_schema) = build_push(input, sink, engine, catalog)?;
+            let out_schema = build_aggregate_schema(&in_schema, group_by, &agg_fns);
+            *schema_slot.borrow_mut() = Some(in_schema);
+            Ok((source, out_schema))
+        }
         // Everything else materializes regardless (indexed access, joins,
-        // Sort, HashAggregate, DML) — build it with the shared operator builder
-        // and bridge its output into the push pipeline. The bridged executor's
-        // own `schema()` is the output schema. New operators default to this
-        // safe path until given a push sink of their own.
+        // Sort, ungrouped HashAggregate, DML) — build it with the shared
+        // operator builder and bridge its output into the push pipeline. The
+        // bridged executor's own `schema()` is the output schema. New
+        // operators default to this safe path until given a push sink of
+        // their own.
         _ => {
             let exec = build_executor(plan, engine, catalog)?;
             let out_schema = exec.schema().clone();
@@ -445,6 +549,7 @@ mod tests {
         let (engine, catalog, _dir) = seeded(5);
         let plan = PhysOp::HashAggregate {
             input: Box::new(scan("nums")),
+            group_by: vec![],
             aggregates: vec![AggregateSpec::CountStar],
         };
         let (_schema, rows) = Push.execute(&plan, &engine, &catalog).unwrap();

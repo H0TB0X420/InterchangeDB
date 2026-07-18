@@ -88,10 +88,14 @@ pub(crate) struct Edge {
 
 /// The fixed statement spine (D3): applied above the memo's output in
 /// original textual-global coordinates, untouched by optimization.
+/// Exception: `having` (and `order_by` when `aggregates` is non-empty)
+/// index the aggregate OUTPUT row — those are remap-invariant and must
+/// pass through emission untouched.
 pub(crate) struct SpineParts {
     pub(crate) projection: Vec<usize>,
     pub(crate) aggregates: Vec<AggregateSpec>,
     pub(crate) order_by: Vec<(usize, OrderDir)>,
+    pub(crate) having: Option<Predicate>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -138,6 +142,7 @@ pub(crate) fn normalize<CatE: StorageEngine>(
         aggregates,
         filter,
         order_by,
+        having,
         limit,
     } = logical
     else {
@@ -272,6 +277,7 @@ pub(crate) fn normalize<CatE: StorageEngine>(
             projection: projection.clone(),
             aggregates: aggregates.clone(),
             order_by: order_by.clone(),
+            having: having.clone(),
             limit: *limit,
         },
     }))

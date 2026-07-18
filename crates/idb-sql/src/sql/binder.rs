@@ -341,6 +341,14 @@ impl<E: StorageEngine> Binder<E> {
             }
         };
 
+        // Silently dropping a clause returns confidently wrong rows —
+        // every unbound clause must reject loudly.
+        if select.distinct.is_some() {
+            return Err(Error::SqlParse(
+                "binder: SELECT DISTINCT not supported".into(),
+            ));
+        }
+
         if select.from.is_empty() {
             return Err(Error::SqlParse("binder: SELECT needs a FROM clause".into()));
         }
@@ -417,20 +425,100 @@ impl<E: StorageEngine> Binder<E> {
         // Projection + aggregates: empty Vec / empty Vec = SELECT *.
         let (projection, aggregates) = bind_select_items(&scope, &select.projection)?;
 
+        // GROUP BY clause → input-space plain columns. H1 scope:
+        // expressions and Snowflake-style ALL reject loudly.
+        let group_cols: Vec<usize> = match &select.group_by {
+            ast::GroupByExpr::Expressions(exprs, modifiers) => {
+                if !modifiers.is_empty() {
+                    return Err(Error::SqlParse(
+                        "binder: GROUP BY modifiers (ROLLUP/CUBE/…) not supported".into(),
+                    ));
+                }
+                exprs
+                    .iter()
+                    .map(|e| resolve_column_expr(&scope, e))
+                    .collect::<Result<Vec<_>>>()?
+            }
+            ast::GroupByExpr::All(_) => {
+                return Err(Error::SqlParse("binder: GROUP BY ALL not supported".into()))
+            }
+        };
+
+        // Grouping rules. The IR carries group keys IN `projection`
+        // (LogicalPlan::Select's contract), so the GROUP BY clause and the
+        // projected plain columns must name the same set — each direction
+        // violated gets its own blame.
+        if group_cols.is_empty() {
+            if !projection.is_empty() && !aggregates.is_empty() {
+                return Err(Error::SqlParse(
+                    "binder: mixed column-and-aggregate projection requires GROUP BY".into(),
+                ));
+            }
+        } else {
+            if aggregates.is_empty() {
+                return Err(Error::SqlParse(
+                    "binder: GROUP BY without aggregates not supported (did you mean DISTINCT?)"
+                        .into(),
+                ));
+            }
+            for &p in &projection {
+                if !group_cols.contains(&p) {
+                    return Err(Error::SqlParse(format!(
+                        "binder: column '{}' must appear in GROUP BY",
+                        column_name_at(&scope, p)
+                    )));
+                }
+            }
+            for &g in &group_cols {
+                if !projection.contains(&g) {
+                    return Err(Error::SqlParse(format!(
+                        "binder: GROUP BY column '{}' must appear in the SELECT list",
+                        column_name_at(&scope, g)
+                    )));
+                }
+            }
+        }
+
         // WHERE clause.
         let filter = match select.selection {
             Some(e) => Some(bind_predicate(&scope, e)?),
             None => None,
         };
 
+        // HAVING filters the aggregate output row — legal with GROUP BY
+        // and with whole-table aggregates, meaningless without either.
+        let having = match select.having {
+            Some(e) => {
+                if aggregates.is_empty() {
+                    return Err(Error::SqlParse(
+                        "binder: HAVING requires an aggregate in the SELECT list".into(),
+                    ));
+                }
+                Some(bind_having_predicate(&scope, e, &projection, &aggregates)?)
+            }
+            None => None,
+        };
+
         // P13.6: ORDER BY. sqlparser exposes `Option<OrderBy>` on Query;
         // each `OrderByExpr` has the expression + an optional ASC/DESC
-        // flag (None defaults to ASC).
+        // flag (None defaults to ASC). Coordinate rule: without
+        // aggregates, keys are input-space columns; with aggregates the
+        // Sort runs above the HashAggregate, so keys resolve into its
+        // output row (group key position, or SELECT-list aggregate).
         let order_by = match q.order_by {
             Some(ob) => {
                 let mut keys: Vec<(usize, OrderDir)> = Vec::with_capacity(ob.exprs.len());
                 for obe in ob.exprs {
-                    let col = resolve_column_expr(&scope, &obe.expr)?;
+                    let col = if aggregates.is_empty() {
+                        resolve_column_expr(&scope, &obe.expr)?
+                    } else {
+                        resolve_aggregate_output_column(
+                            &scope,
+                            &obe.expr,
+                            &projection,
+                            &aggregates,
+                        )?
+                    };
                     let dir = match obe.asc {
                         Some(false) => OrderDir::Desc,
                         _ => OrderDir::Asc, // None defaults to ASC per SQL spec
@@ -449,6 +537,7 @@ impl<E: StorageEngine> Binder<E> {
             aggregates,
             filter,
             order_by,
+            having,
             limit,
         })
     }
@@ -727,8 +816,11 @@ fn column_index_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<
 /// - Only projection non-empty: column projection (`SELECT a, b.c FROM …`).
 /// - Only aggregates non-empty: whole-table aggregation
 ///   (`SELECT COUNT(*), SUM(x) FROM …`).
-/// - Both non-empty: GROUP BY semantics, which Phase 13 doesn't support
-///   (rejected here; lands in Phase 14).
+/// - Both non-empty: GROUP BY — the caller (`bind_query`) validates the
+///   mix against the GROUP BY clause. The two vecs lose the SELECT
+///   list's interleaving, and aggregate output is keys-then-aggregates,
+///   so any interleaving other than keys-first would silently reorder
+///   the user's columns — rejected here instead.
 fn bind_select_items(
     scope: &Scope,
     items: &[ast::SelectItem],
@@ -753,9 +845,19 @@ fn bind_select_items(
         };
         match expr {
             AstExpr::Identifier(ident) => {
+                if !aggregates.is_empty() {
+                    return Err(Error::SqlParse(
+                        "binder: group columns must precede aggregates in the SELECT list".into(),
+                    ));
+                }
                 projection.push(column_index(scope, &ident.value)?);
             }
             AstExpr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                if !aggregates.is_empty() {
+                    return Err(Error::SqlParse(
+                        "binder: group columns must precede aggregates in the SELECT list".into(),
+                    ));
+                }
                 projection.push(column_index_qualified(
                     scope,
                     &parts[0].value,
@@ -774,12 +876,118 @@ fn bind_select_items(
         }
     }
 
-    if !projection.is_empty() && !aggregates.is_empty() {
-        return Err(Error::SqlParse(
-            "binder: mixed column-and-aggregate projection requires GROUP BY (Phase 14)".into(),
-        ));
-    }
     Ok((projection, aggregates))
+}
+
+/// Reverse of `column_index`: the display name of joined-tuple position
+/// `idx`, for error messages. Positions come from successful binding, so
+/// out-of-range is a binder bug.
+fn column_name_at(scope: &Scope, idx: usize) -> String {
+    for t in &scope.tables {
+        if idx >= t.column_offset && idx < t.column_offset + t.schema.columns.len() {
+            return t.schema.columns[idx - t.column_offset].name.clone();
+        }
+    }
+    unreachable!("column_name_at: {} out of scope", idx)
+}
+
+/// Resolve an ORDER BY / HAVING operand into the aggregate OUTPUT row
+/// (keys ++ aggregates): a plain column must be a group key (→ its
+/// position in `projection`); an aggregate call must match a SELECT-list
+/// spec (→ `projection.len()` + its position).
+fn resolve_aggregate_output_column(
+    scope: &Scope,
+    e: &AstExpr,
+    projection: &[usize],
+    aggregates: &[AggregateSpec],
+) -> Result<usize> {
+    match e {
+        AstExpr::Function(func) => {
+            let spec = bind_aggregate_function(scope, func)?;
+            match aggregates.iter().position(|a| *a == spec) {
+                Some(pos) => Ok(projection.len() + pos),
+                None => Err(Error::SqlParse(
+                    "binder: aggregate in ORDER BY/HAVING must also appear in the SELECT list"
+                        .into(),
+                )),
+            }
+        }
+        other => {
+            let input_col = resolve_column_expr(scope, other)?;
+            match projection.iter().position(|&p| p == input_col) {
+                Some(pos) => Ok(pos),
+                None => Err(Error::SqlParse(format!(
+                    "binder: column '{}' in ORDER BY/HAVING must be a group key",
+                    column_name_at(scope, input_col)
+                ))),
+            }
+        }
+    }
+}
+
+/// Bind a HAVING predicate over the aggregate output row. Mirrors
+/// `bind_predicate`'s shape (And/Or/Not over comparisons) but resolves
+/// operands through `resolve_aggregate_output_column` — the input scope
+/// no longer exists above the aggregate.
+fn bind_having_predicate(
+    scope: &Scope,
+    e: AstExpr,
+    projection: &[usize],
+    aggregates: &[AggregateSpec],
+) -> Result<Predicate> {
+    match e {
+        AstExpr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                let l = bind_having_predicate(scope, *left, projection, aggregates)?;
+                let r = bind_having_predicate(scope, *right, projection, aggregates)?;
+                Ok(Predicate::And(Box::new(l), Box::new(r)))
+            }
+            BinaryOperator::Or => {
+                let l = bind_having_predicate(scope, *left, projection, aggregates)?;
+                let r = bind_having_predicate(scope, *right, projection, aggregates)?;
+                Ok(Predicate::Or(Box::new(l), Box::new(r)))
+            }
+            cmp => {
+                let cmp_op = map_compare_op(&cmp)?;
+                let l = bind_having_operand(scope, *left, projection, aggregates)?;
+                let r = bind_having_operand(scope, *right, projection, aggregates)?;
+                Ok(Predicate::Compare {
+                    op: cmp_op,
+                    left: l,
+                    right: r,
+                })
+            }
+        },
+        AstExpr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => {
+            let inner = bind_having_predicate(scope, *expr, projection, aggregates)?;
+            Ok(Predicate::Not(Box::new(inner)))
+        }
+        AstExpr::Nested(inner) => bind_having_predicate(scope, *inner, projection, aggregates),
+        other => Err(Error::SqlParse(format!(
+            "binder: HAVING shape unsupported: {:?}",
+            other
+        ))),
+    }
+}
+
+/// One comparison operand inside HAVING: a literal, or anything
+/// `resolve_aggregate_output_column` accepts.
+fn bind_having_operand(
+    scope: &Scope,
+    e: AstExpr,
+    projection: &[usize],
+    aggregates: &[AggregateSpec],
+) -> Result<Expression> {
+    match e {
+        AstExpr::Value(v) => Ok(Expression::Literal(ast_value_to_value_unconstrained(v)?)),
+        AstExpr::Nested(inner) => bind_having_operand(scope, *inner, projection, aggregates),
+        other => Ok(Expression::Column(resolve_aggregate_output_column(
+            scope, &other, projection, aggregates,
+        )?)),
+    }
 }
 
 /// Translate a sqlparser `Function` AST node into our `AggregateSpec`.
@@ -1578,6 +1786,7 @@ mod tests {
                 aggregates,
                 filter,
                 order_by,
+                having,
                 limit,
             } => {
                 assert_eq!(table, "warehouse");
@@ -1586,6 +1795,7 @@ mod tests {
                 assert!(order_by.is_empty());
                 assert!(projection.is_empty(), "SELECT * → empty projection");
                 assert!(filter.is_none());
+                assert!(having.is_none());
                 assert!(limit.is_none());
             }
             _ => panic!(),

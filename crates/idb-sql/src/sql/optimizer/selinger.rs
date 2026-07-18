@@ -177,6 +177,7 @@ fn maybe_reorder<CatE: StorageEngine>(
             aggregates,
             filter,
             order_by,
+            having,
             limit,
         } => {
             // No joins, or an `ON` we can't model as a clean equi-join
@@ -194,6 +195,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                     aggregates,
                     filter,
                     order_by,
+                    having,
                     limit,
                 });
             };
@@ -219,6 +221,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                     aggregates,
                     filter,
                     order_by,
+                    having,
                     limit,
                 });
             }
@@ -229,6 +232,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                 aggregates,
                 filter,
                 order_by,
+                having,
                 limit,
             ))
         }
@@ -421,6 +425,7 @@ fn flatten_join_order(order: &JoinOrder) -> (RelId, Vec<(RelId, Vec<usize>)>) {
 /// physical layout. The result lowers through the normal textual path; its
 /// `Projection` selects columns in the original SELECT order, so output
 /// column order is preserved.
+#[allow(clippy::too_many_arguments)] // mirrors the Select fields, same as plan_select.
 fn rewrite_select(
     graph: &JoinGraph,
     order: &JoinOrder,
@@ -428,6 +433,7 @@ fn rewrite_select(
     aggregates: Vec<AggregateSpec>,
     filter: Option<Predicate>,
     order_by: Vec<(usize, OrderDir)>,
+    having: Option<Predicate>,
     limit: Option<usize>,
 ) -> LogicalPlan {
     let (first_rel, steps) = flatten_join_order(order);
@@ -449,6 +455,18 @@ fn rewrite_select(
         });
     }
 
+    // Coordinate rule (see LogicalPlan::Select): with aggregates present,
+    // `order_by` and `having` index the aggregate OUTPUT row — invariant
+    // under table reorder, so they must NOT be remapped. Without
+    // aggregates, `order_by` is input-space like everything else.
+    let order_by = if aggregates.is_empty() {
+        order_by
+            .into_iter()
+            .map(|(c, d)| (remap.apply_index(c), d))
+            .collect()
+    } else {
+        order_by
+    };
     LogicalPlan::Select {
         table: graph.names[first_rel].clone(),
         joins: new_joins,
@@ -461,10 +479,8 @@ fn rewrite_select(
             .map(|a| remap_aggregate(a, &remap))
             .collect(),
         filter: filter.map(|f| remap.apply_predicate(f)),
-        order_by: order_by
-            .into_iter()
-            .map(|(c, d)| (remap.apply_index(c), d))
-            .collect(),
+        order_by,
+        having,
         limit,
     }
 }

@@ -102,9 +102,12 @@ pub enum PhysOp {
         right_key_col: usize,
     },
 
-    /// Whole-relation aggregation (no GROUP BY yet). One output row.
+    /// Aggregation. `group_by` empty: whole-relation, one output row.
+    /// Non-empty: one row per distinct key — key columns (input
+    /// coordinates, in `group_by` order) then aggregates.
     HashAggregate {
         input: Box<PhysOp>,
+        group_by: Vec<usize>,
         aggregates: Vec<AggregateSpec>,
     },
 
@@ -191,8 +194,19 @@ impl PhysOp {
                 left.explain(indent + 1),
                 right.explain(indent + 1)
             ),
-            PhysOp::HashAggregate { input, aggregates } => {
-                let labels: Vec<String> = aggregates.iter().map(agg_label).collect();
+            PhysOp::HashAggregate {
+                input,
+                group_by,
+                aggregates,
+            } => {
+                // group segment only when grouped — ungrouped rendering
+                // stays byte-identical (EXPLAIN golden stability).
+                let mut labels: Vec<String> = Vec::with_capacity(aggregates.len() + 1);
+                if !group_by.is_empty() {
+                    let keys: Vec<String> = group_by.iter().map(|c| c.to_string()).collect();
+                    labels.push(format!("group=({})", keys.join(",")));
+                }
+                labels.extend(aggregates.iter().map(agg_label));
                 format!(
                     "{pad}HashAggregate[{}]\n{}",
                     labels.join(", "),

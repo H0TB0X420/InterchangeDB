@@ -152,3 +152,8 @@ fn slt_unique() {
 fn slt_insert() {
     run_slt("insert.slt");
 }
+
+#[test]
+fn slt_group_by() {
+    run_slt("group_by.slt");
+}

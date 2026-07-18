@@ -1,16 +1,19 @@
-//! `HashAggregate` — whole-table aggregation operator (no GROUP BY yet).
+//! `HashAggregate` — aggregation operator, whole-table or GROUP BY.
 //!
 //! Computes a fixed list of aggregates (`COUNT`, `SUM`, `MIN`, `MAX`,
-//! `AVG`) over the child's full output and emits a single row of
-//! aggregate results.
+//! `AVG`) over the child's full output. With `group_by` empty it emits
+//! exactly one row of aggregate results (even on empty input — SQL's
+//! whole-table rule). With `group_by` columns it buckets rows by key in
+//! a `HashMap<Vec<Value>, Vec<AggState>>` and emits one row per group —
+//! key values first, then aggregates — and zero rows on empty input.
+//! Derived `Eq` on `Value` makes `Null == Null`, so SQL's "NULLs form
+//! one group" rule falls out of the map for free.
 //!
-//! ## Why "Hash"?
-//!
-//! Phase 13's first cut has no GROUP BY, so this is effectively a
-//! single-bucket aggregation. The "Hash" naming anchors the eventual
-//! GROUP BY extension: same operator with a `Vec<usize>` of grouping
-//! columns and a `HashMap<Vec<Value>, AggregateState>` for buckets.
-//! For now there's exactly one (implicit) bucket.
+//! Groups are emitted in canonical key order (NULL first, then
+//! `Value::compare_sql` — the same ordering Sort uses): SQL promises no
+//! order, but deterministic emission keeps planner-parity and
+//! exec-model-equivalence suites byte-comparable without sprinkling
+//! ORDER BY everywhere.
 //!
 //! ## NULL semantics
 //!
@@ -23,10 +26,10 @@
 //! ## Pull/finalize shape
 //!
 //! Eager-collect on first `next()`: drain the child, fold per-row into
-//! accumulators, finalize each accumulator to a `Value`, return that
-//! row. Subsequent `next()` calls return `None`.
+//! accumulators, finalize to output rows, then drain that buffer across
+//! subsequent `next()` calls.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::catalog::{ColumnDef, Schema, TableId};
@@ -103,7 +106,7 @@ impl AggregateFn {
 }
 
 /// Per-aggregate accumulator state.
-enum AggState {
+pub(crate) enum AggState {
     /// `COUNT(*)` and `COUNT(col)`.
     Count(u64),
     /// `COUNT(DISTINCT col)` — tracks seen non-NULL values.
@@ -127,7 +130,7 @@ enum AggState {
 }
 
 impl AggState {
-    fn new_for(agg: &AggregateFn, input_schema: &Schema) -> Result<Self> {
+    pub(crate) fn new_for(agg: &AggregateFn, input_schema: &Schema) -> Result<Self> {
         match agg {
             AggregateFn::CountStar | AggregateFn::Count(_) => Ok(AggState::Count(0)),
             AggregateFn::CountDistinct(_) => Ok(AggState::DistinctSet(HashSet::new())),
@@ -158,36 +161,62 @@ impl AggState {
     }
 }
 
+/// Explicit bound on distinct groups (limit on everything): 2^20 groups
+/// ≈ TPC-H SF1's largest GROUP BY with two orders of magnitude of head
+/// room. Exceeding it is a workload we never promised to handle — crash
+/// loudly rather than grow without bound. Revisit trigger recorded in
+/// docs/plan-tpch.md (sort-based grouping is the standard fallback).
+pub(crate) const MAX_GROUP_COUNT: usize = 1 << 20;
+
 pub struct HashAggregate {
     schema: Arc<Schema>,
     child: Box<dyn Executor>,
+    group_by: Vec<usize>,
     aggregates: Vec<AggregateFn>,
-    emitted: bool,
+    /// `None` until first `next()` computes; then the buffered output rows.
+    output: Option<std::vec::IntoIter<Tuple>>,
 }
 
 impl HashAggregate {
-    pub fn new(child: Box<dyn Executor>, aggregates: Vec<AggregateFn>) -> Result<Self> {
+    pub fn new(
+        child: Box<dyn Executor>,
+        group_by: Vec<usize>,
+        aggregates: Vec<AggregateFn>,
+    ) -> Result<Self> {
         if aggregates.is_empty() {
             return Err(crate::common::Error::SqlParse(
                 "HashAggregate requires at least one aggregate".into(),
             ));
         }
-        let schema = Arc::new(build_aggregate_schema(child.schema(), &aggregates));
+        // Planner/binder guarantee in-range group columns; a violation
+        // here is a coordinate-remap bug, not user error.
+        let input_width = child.schema().columns.len();
+        assert!(group_by.iter().all(|&c| c < input_width));
+        let schema = Arc::new(build_aggregate_schema(
+            child.schema(),
+            &group_by,
+            &aggregates,
+        ));
         Ok(Self {
             schema,
             child,
+            group_by,
             aggregates,
-            emitted: false,
+            output: None,
         })
     }
 
-    fn compute_row(&mut self) -> Result<Tuple> {
-        let input_schema = self.child.schema().clone();
-        let mut states: Vec<AggState> = self
-            .aggregates
+    fn new_states(&self, input_schema: &Schema) -> Result<Vec<AggState>> {
+        self.aggregates
             .iter()
-            .map(|a| AggState::new_for(a, &input_schema))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|a| AggState::new_for(a, input_schema))
+            .collect()
+    }
+
+    /// Whole-table path: one output row, even on empty input.
+    fn compute_ungrouped(&mut self) -> Result<Vec<Tuple>> {
+        let input_schema = self.child.schema().clone();
+        let mut states = self.new_states(&input_schema)?;
 
         while let Some(row) = self.child.next()? {
             for (agg, state) in self.aggregates.iter().zip(states.iter_mut()) {
@@ -199,18 +228,60 @@ impl HashAggregate {
         for (agg, state) in self.aggregates.iter().zip(states.into_iter()) {
             output.push(finalize_state(agg, state, &input_schema)?);
         }
+        Ok(vec![output])
+    }
+
+    /// GROUP BY path: one output row per distinct key (keys ++
+    /// aggregates), zero rows on empty input, canonical key order.
+    fn compute_grouped(&mut self) -> Result<Vec<Tuple>> {
+        let input_schema = self.child.schema().clone();
+        let mut groups: HashMap<Vec<Value>, Vec<AggState>> = HashMap::new();
+
+        while let Some(row) = self.child.next()? {
+            let key: Vec<Value> = self.group_by.iter().map(|&c| row[c].clone()).collect();
+            let group_count = groups.len();
+            let states = match groups.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    assert!(
+                        group_count < MAX_GROUP_COUNT,
+                        "GROUP BY exceeded {} distinct groups",
+                        MAX_GROUP_COUNT
+                    );
+                    v.insert(self.new_states(&input_schema)?)
+                }
+            };
+            for (agg, state) in self.aggregates.iter().zip(states.iter_mut()) {
+                update_state(agg, state, &row)?;
+            }
+        }
+
+        let mut keyed: Vec<(Vec<Value>, Vec<AggState>)> = groups.into_iter().collect();
+        keyed.sort_by(|(a, _), (b, _)| compare_keys(a, b));
+
+        let mut output = Vec::with_capacity(keyed.len());
+        for (key, states) in keyed {
+            let mut row = key;
+            for (agg, state) in self.aggregates.iter().zip(states.into_iter()) {
+                row.push(finalize_state(agg, state, &input_schema)?);
+            }
+            output.push(row);
+        }
         Ok(output)
     }
 }
 
 impl Executor for HashAggregate {
     fn next(&mut self) -> Result<Option<Tuple>> {
-        if self.emitted {
-            return Ok(None);
+        if self.output.is_none() {
+            let rows = if self.group_by.is_empty() {
+                self.compute_ungrouped()?
+            } else {
+                self.compute_grouped()?
+            };
+            self.output = Some(rows.into_iter());
         }
-        self.emitted = true;
-        let row = self.compute_row()?;
-        Ok(Some(row))
+        Ok(self.output.as_mut().unwrap().next())
     }
 
     fn schema(&self) -> &Schema {
@@ -219,38 +290,45 @@ impl Executor for HashAggregate {
 
     fn explain(&self, indent: usize) -> String {
         let pad = "  ".repeat(indent);
-        let labels: Vec<String> = self
-            .aggregates
-            .iter()
-            .map(|a| match a {
-                AggregateFn::CountStar => "COUNT(*)".to_string(),
-                AggregateFn::Count(i) => format!("COUNT({})", i),
-                AggregateFn::CountDistinct(i) => format!("COUNT(DISTINCT {})", i),
-                AggregateFn::Sum(i) => format!("SUM({})", i),
-                AggregateFn::Min(i) => format!("MIN({})", i),
-                AggregateFn::Max(i) => format!("MAX({})", i),
-                AggregateFn::Avg(i) => format!("AVG({})", i),
-            })
-            .collect();
+        let mut labels: Vec<String> = Vec::with_capacity(self.aggregates.len() + 1);
+        if !self.group_by.is_empty() {
+            // Grouped-only segment keeps ungrouped EXPLAIN output
+            // byte-identical to the pre-GROUP-BY rendering.
+            let keys: Vec<String> = self.group_by.iter().map(|c| c.to_string()).collect();
+            labels.push(format!("group=({})", keys.join(",")));
+        }
+        labels.extend(self.aggregates.iter().map(|a| match a {
+            AggregateFn::CountStar => "COUNT(*)".to_string(),
+            AggregateFn::Count(i) => format!("COUNT({})", i),
+            AggregateFn::CountDistinct(i) => format!("COUNT(DISTINCT {})", i),
+            AggregateFn::Sum(i) => format!("SUM({})", i),
+            AggregateFn::Min(i) => format!("MIN({})", i),
+            AggregateFn::Max(i) => format!("MAX({})", i),
+            AggregateFn::Avg(i) => format!("AVG({})", i),
+        }));
         let mut out = format!("{}HashAggregate[{}]\n", pad, labels.join(", "));
         out.push_str(&self.child.explain(indent + 1));
         out
     }
 }
 
-fn build_aggregate_schema(input: &Schema, aggregates: &[AggregateFn]) -> Schema {
-    let columns: Vec<ColumnDef> = aggregates
-        .iter()
-        .map(|a| ColumnDef {
-            name: a.output_name(input),
-            ty: a.output_type(input),
-            // Aggregates can return NULL (empty input → SUM/AVG/MIN/MAX).
-            // COUNT returns 0, never NULL, but unifying as nullable keeps
-            // the schema simple and matches PostgreSQL.
-            nullable: true,
-            default: None,
-        })
-        .collect();
+/// Output schema: group-key columns (cloned from the input schema, in
+/// `group_by` order) followed by one synthetic column per aggregate.
+pub(crate) fn build_aggregate_schema(
+    input: &Schema,
+    group_by: &[usize],
+    aggregates: &[AggregateFn],
+) -> Schema {
+    let mut columns: Vec<ColumnDef> = group_by.iter().map(|&c| input.columns[c].clone()).collect();
+    columns.extend(aggregates.iter().map(|a| ColumnDef {
+        name: a.output_name(input),
+        ty: a.output_type(input),
+        // Aggregates can return NULL (empty input → SUM/AVG/MIN/MAX).
+        // COUNT returns 0, never NULL, but unifying as nullable keeps
+        // the schema simple and matches PostgreSQL.
+        nullable: true,
+        default: None,
+    }));
     Schema {
         name: "aggregate".into(),
         // Synthetic — not a real table.
@@ -260,8 +338,27 @@ fn build_aggregate_schema(input: &Schema, aggregates: &[AggregateFn]) -> Schema 
     }
 }
 
+/// Total order over equal-length group keys: position by position, NULL
+/// first (the Sort operator's NULL = −∞ convention), non-NULL pairs via
+/// the canonical comparator.
+pub(crate) fn compare_keys(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    debug_assert_eq!(a.len(), b.len());
+    for (va, vb) in a.iter().zip(b.iter()) {
+        let ord = match (matches!(va, Value::Null), matches!(vb, Value::Null)) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => compare_values(va, vb),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// Fold one input row into each aggregate's accumulator.
-fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<()> {
+pub(crate) fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<()> {
     match (agg, state) {
         (AggregateFn::CountStar, AggState::Count(c)) => {
             *c += 1;
@@ -387,7 +484,7 @@ fn update_state(agg: &AggregateFn, state: &mut AggState, row: &Tuple) -> Result<
     }
 }
 
-fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Result<Value> {
+pub(crate) fn finalize_state(agg: &AggregateFn, state: AggState, _input: &Schema) -> Result<Value> {
     Ok(match (agg, state) {
         (AggregateFn::CountStar | AggregateFn::Count(_), AggState::Count(c)) => {
             Value::Int64(c as i64)

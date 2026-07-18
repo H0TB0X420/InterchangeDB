@@ -1,0 +1,144 @@
+# H1 grouped aggregation through the full pipeline: GROUP BY + HAVING +
+# ORDER BY over aggregate output, NULL-group semantics, empty input, the
+# grouped EXPLAIN tree, and the loud negative space. Grouped output with
+# no ORDER BY is pinned in canonical key order (NULL first, then
+# ascending) — deliberate: deterministic emission is part of the
+# operator's contract.
+
+statement ok
+CREATE TABLE orders (o_id INT PRIMARY KEY, region VARCHAR(8), status VARCHAR(8), total BIGINT NOT NULL)
+
+statement ok
+INSERT INTO orders VALUES (1, 'east', 'open', 100), (2, 'west', 'open', 200), (3, 'east', 'done', 300), (4, 'west', 'done', 400), (5, 'east', 'open', 500), (6, NULL, 'open', 60), (7, NULL, 'done', 7)
+
+# Single-key grouping: keys then aggregates, NULLs form one group.
+query TII
+SELECT region, COUNT(*), SUM(total) FROM orders GROUP BY region
+----
+NULL 2 67
+east 3 900
+west 2 600
+
+# Multi-key grouping.
+query TTI
+SELECT region, status, COUNT(*) FROM orders GROUP BY region, status
+----
+NULL done 1
+NULL open 1
+east done 1
+east open 2
+west done 1
+west open 1
+
+# GROUP BY clause order is a set constraint — output follows the SELECT
+# list, not the clause.
+query TTI
+SELECT region, status, COUNT(*) FROM orders GROUP BY status, region
+----
+NULL done 1
+NULL open 1
+east done 1
+east open 2
+west done 1
+west open 1
+
+# HAVING filters groups after aggregation.
+query TI
+SELECT region, SUM(total) FROM orders GROUP BY region HAVING SUM(total) > 500
+----
+east 900
+west 600
+
+# Compound HAVING; every referenced aggregate must be projected (H1 rule).
+query TII
+SELECT region, COUNT(*), SUM(total) FROM orders GROUP BY region HAVING COUNT(*) > 2 AND SUM(total) > 1
+----
+east 3 900
+
+# ORDER BY resolves into the aggregate output row: an aggregate from the
+# SELECT list, with a group key as tiebreaker.
+query TI
+SELECT region, SUM(total) FROM orders GROUP BY region ORDER BY SUM(total) DESC
+----
+east 900
+west 600
+NULL 67
+
+# WHERE filters input rows BELOW the aggregate; HAVING filters groups
+# above it — both in one query.
+query TI
+SELECT region, COUNT(*) FROM orders WHERE status = 'open' GROUP BY region HAVING COUNT(*) > 1
+----
+east 2
+
+# All aggregate functions through the grouped path.
+query TIIT
+SELECT region, MIN(total), MAX(total), AVG(total) FROM orders GROUP BY region
+----
+NULL 7 60 33.5000
+east 100 500 300.0000
+west 200 400 300.0000
+
+# Whole-table aggregate + HAVING (no GROUP BY) is legal SQL: one row,
+# kept or dropped.
+query I
+SELECT COUNT(*) FROM orders HAVING COUNT(*) > 5
+----
+7
+
+query I
+SELECT COUNT(*) FROM orders HAVING COUNT(*) > 100
+----
+
+# Grouped aggregation over empty input emits zero rows (unlike the
+# whole-table form's single row).
+statement ok
+CREATE TABLE empty_t (k INT PRIMARY KEY, g INT, v INT)
+
+query II
+SELECT g, COUNT(*) FROM empty_t GROUP BY g
+----
+
+query II
+SELECT COUNT(*) FROM empty_t
+----
+0
+
+# The grouped plan shape: Sort above HAVING-Filter above HashAggregate,
+# group segment naming input columns, no trailing Projection.
+query T
+EXPLAIN SELECT region, SUM(total) FROM orders GROUP BY region HAVING SUM(total) > 500 ORDER BY SUM(total) DESC
+----
+Sort[1 DESC]
+Filter
+HashAggregate[group=(1), SUM(3)]
+SeqScan(orders)
+
+# ---- negative space: every unsupported or invalid shape rejects loudly ----
+
+statement error mixed column-and-aggregate projection requires GROUP BY
+SELECT region, COUNT(*) FROM orders
+
+statement error column 'region' must appear in GROUP BY
+SELECT region, COUNT(*) FROM orders GROUP BY status
+
+statement error GROUP BY column 'status' must appear in the SELECT list
+SELECT region, COUNT(*) FROM orders GROUP BY region, status
+
+statement error group columns must precede aggregates in the SELECT list
+SELECT COUNT(*), region FROM orders GROUP BY region
+
+statement error SELECT DISTINCT not supported
+SELECT DISTINCT region FROM orders
+
+statement error GROUP BY without aggregates not supported
+SELECT region FROM orders GROUP BY region
+
+statement error HAVING requires an aggregate in the SELECT list
+SELECT total FROM orders HAVING total > 1
+
+statement error column 'total' in ORDER BY/HAVING must be a group key
+SELECT region, COUNT(*) FROM orders GROUP BY region ORDER BY total
+
+statement error aggregate in ORDER BY/HAVING must also appear in the SELECT list
+SELECT region, COUNT(*) FROM orders GROUP BY region HAVING SUM(total) > 1

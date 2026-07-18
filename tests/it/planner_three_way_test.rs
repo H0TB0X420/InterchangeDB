@@ -144,6 +144,14 @@ const CORPUS: &[&str] = &[
     "SELECT ja_id, jb_id FROM ja JOIN jb ON ja_key = jb_key",
     // Non-equi ON → the memo's D8 fallback path, end to end.
     "SELECT a_val, b_val FROM a JOIN b ON b_a < a_id",
+    // H1 grouped aggregation. The joined query is the load-bearing one:
+    // selinger/memo optimize the join core UNDER the grouped spine, and
+    // the coordinate rule says group keys remap while HAVING/ORDER BY
+    // (aggregate-output space) must not.
+    "SELECT c_b, COUNT(*), SUM(c_val) FROM c GROUP BY c_b",
+    "SELECT b_a, SUM(c_val) FROM b JOIN c ON c_b = b_id GROUP BY b_a",
+    "SELECT c_b, SUM(c_val) FROM c GROUP BY c_b HAVING SUM(c_val) > 10",
+    "SELECT c_b, COUNT(*) FROM c GROUP BY c_b ORDER BY COUNT(*) DESC, c_b ASC",
 ];
 
 fn rows(session: &mut Session<BTreeEngine>, sql: &str) -> Vec<Vec<Value>> {

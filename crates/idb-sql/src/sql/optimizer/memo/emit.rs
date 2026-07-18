@@ -79,6 +79,12 @@ pub(crate) fn emit(
     // interesting-orders payoff.
     let order_by = if root_required.is_some() {
         Vec::new()
+    } else if !query.spine.aggregates.is_empty() {
+        // Grouped/aggregate ORDER BY indexes the aggregate OUTPUT row
+        // (binder coordinate rule) — remap-invariant, pass through.
+        // (`order_by_requirement` already returns None here, so the §7.5
+        // consume path can't fire either.)
+        query.spine.order_by.clone()
     } else {
         query
             .spine
@@ -98,6 +104,7 @@ pub(crate) fn emit(
         residual,
         aggregates,
         order_by,
+        query.spine.having.clone(),
         projection,
         query.spine.limit,
     )

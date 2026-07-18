@@ -134,14 +134,22 @@ where
                 *right_key_col,
             )?))
         }
-        PhysOp::HashAggregate { input, aggregates } => {
+        PhysOp::HashAggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             let child = build_executor(input, engine, catalog)?;
             let agg_fns: Vec<AggregateFn> = aggregates
                 .iter()
                 .cloned()
                 .map(translate_aggregate_spec)
                 .collect();
-            Ok(Box::new(HashAggregate::new(child, agg_fns)?))
+            Ok(Box::new(HashAggregate::new(
+                child,
+                group_by.clone(),
+                agg_fns,
+            )?))
         }
         PhysOp::Sort { input, keys } => {
             let child = build_executor(input, engine, catalog)?;
@@ -217,7 +225,7 @@ fn find_index(indexes: &[IndexHandle], name: &str) -> Result<IndexHandle> {
 }
 
 /// Translate a logical aggregate spec into the executor's aggregate function.
-fn translate_aggregate_spec(spec: AggregateSpec) -> AggregateFn {
+pub(crate) fn translate_aggregate_spec(spec: AggregateSpec) -> AggregateFn {
     match spec {
         AggregateSpec::CountStar => AggregateFn::CountStar,
         AggregateSpec::Count {

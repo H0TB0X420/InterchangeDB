@@ -89,6 +89,44 @@ fn select_shapes_are_equivalent() {
     }
 }
 
+// H1: grouped aggregation — Push runs it as a NATIVE sink (not the
+// bridge), so equivalence here proves the push kernel against the pull
+// operator: duplicate keys, a NULL-key group, HAVING, ORDER BY over
+// aggregate output, and every aggregate function. Both models emit
+// canonical key order, so `assert_equivalent`'s raw (unsorted)
+// comparison is exact — order divergence fails, by design.
+#[test]
+fn grouped_aggregate_is_equivalent() {
+    let (mut s, _dir) = setup();
+    s.execute("CREATE TABLE ev (e_id INT PRIMARY KEY, kind VARCHAR(8), amt BIGINT)")
+        .unwrap();
+    for (id, kind, amt) in [
+        (1, "'a'", 10),
+        (2, "'b'", 20),
+        (3, "'a'", 30),
+        (4, "'b'", 40),
+        (5, "'c'", 50),
+        (6, "NULL", 60),
+        (7, "NULL", 7),
+    ] {
+        s.execute(&format!(
+            "INSERT INTO ev VALUES ({}, {}, {})",
+            id, kind, amt
+        ))
+        .unwrap();
+    }
+    let queries = [
+        "SELECT kind, COUNT(*), SUM(amt) FROM ev GROUP BY kind",
+        "SELECT kind, SUM(amt) FROM ev GROUP BY kind HAVING SUM(amt) > 40",
+        "SELECT kind, COUNT(*) FROM ev GROUP BY kind ORDER BY COUNT(*) DESC, kind ASC",
+        "SELECT kind, MIN(amt), MAX(amt), AVG(amt) FROM ev GROUP BY kind",
+        "SELECT kind, COUNT(*) FROM ev WHERE amt > 15 GROUP BY kind",
+    ];
+    for q in queries {
+        assert_equivalent(&mut s, q);
+    }
+}
+
 #[test]
 fn join_is_equivalent() {
     let (mut s, _dir) = setup();
