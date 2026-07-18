@@ -2,6 +2,8 @@
 //! swappable eviction policies, and the `StorageEngine` impls (B+Tree,
 //! LSM). Depends only on `idb-core`; knows nothing of WAL, transactions,
 //! or SQL.
+pub use engines::default_index_opener;
+
 pub mod buffer;
 pub mod engines;
 pub mod storage;

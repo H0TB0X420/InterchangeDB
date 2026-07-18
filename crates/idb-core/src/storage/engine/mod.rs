@@ -39,6 +39,10 @@
 //! - `LsmEngine` - LSM-tree with compaction (Task 3.4)
 
 use std::ops::RangeBounds;
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::common::ids::{IndexBackend, IndexId};
 
 use crate::common::Result;
 
@@ -282,6 +286,14 @@ impl std::fmt::Display for StorageStatus {
         )
     }
 }
+
+/// Constructs the storage engine for one secondary index. Part of the
+/// contract layer: the catalog stores one of these (injected at
+/// `open_persistent`) so the schema side depends on this signature, never
+/// on engine implementations. The default impl is
+/// `idb-storage::default_index_opener`.
+pub type IndexEngineOpener =
+    Arc<dyn Fn(IndexBackend, IndexId, &Path) -> Result<Arc<dyn StorageEngine>> + Send + Sync>;
 
 #[cfg(test)]
 mod tests {

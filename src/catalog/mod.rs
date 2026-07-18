@@ -8,11 +8,13 @@
 //! - Task 9.6: `Catalog<E>`, constraint helpers.
 
 pub mod constraints;
-pub mod ids;
 pub mod manager;
 pub mod schema;
 pub mod system_tables;
 
-pub use ids::{ColumnId, IndexId, TableId, FIRST_SYSTEM_TABLE_ID, FIRST_USER_TABLE_ID};
-pub use manager::Catalog;
-pub use schema::{ColumnDef, IndexBackend, IndexDef, Schema};
+pub use crate::common::ids;
+pub use crate::common::ids::{
+    ColumnId, IndexBackend, IndexId, TableId, FIRST_SYSTEM_TABLE_ID, FIRST_USER_TABLE_ID,
+};
+pub use manager::{Catalog, IndexEngineOpener, IndexHandle};
+pub use schema::{ColumnDef, IndexDef, Schema};

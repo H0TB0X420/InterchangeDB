@@ -37,8 +37,12 @@ fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
     let database =
         Arc::new(Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap());
     let catalog = Arc::new(
-        Catalog::open_persistent(database.engine_arc().clone(), dir.path().join("indexes"))
-            .unwrap(),
+        Catalog::open_persistent(
+            database.engine_arc().clone(),
+            dir.path().join("indexes"),
+            interchangedb::default_index_opener(),
+        )
+        .unwrap(),
     );
     let mut session = Session::new(database.clone(), catalog.clone());
 

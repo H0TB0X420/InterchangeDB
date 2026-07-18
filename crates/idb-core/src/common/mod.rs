@@ -10,6 +10,8 @@ pub mod error;
 mod frame_id;
 mod page_id;
 
+pub mod ids;
+
 pub use error::{ConstraintRule, Error, Result};
 pub use frame_id::FrameId;
 pub use page_id::PageId;

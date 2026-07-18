@@ -33,8 +33,12 @@ fn slt_db() -> SltDb {
     let database =
         Arc::new(Database::open_with_sync_mode(dir.path(), engine, SyncMode::NoSync).unwrap());
     let catalog = Arc::new(
-        Catalog::open_persistent(database.engine_arc().clone(), dir.path().join("indexes"))
-            .unwrap(),
+        Catalog::open_persistent(
+            database.engine_arc().clone(),
+            dir.path().join("indexes"),
+            interchangedb::default_index_opener(),
+        )
+        .unwrap(),
     );
     SltDb {
         session: Session::new(database, catalog),

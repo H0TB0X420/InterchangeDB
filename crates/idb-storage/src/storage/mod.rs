@@ -8,7 +8,7 @@
 //! - [`engine`] - Storage engine trait and implementations.
 
 mod disk_manager;
-pub mod engine;
+pub use idb_core::storage::engine;
 pub mod page;
 
 pub use disk_manager::{DiskManager, FileDiskManager, MemoryDiskManager};

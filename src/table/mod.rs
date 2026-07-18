@@ -25,27 +25,13 @@ use crate::catalog::constraints::{
     apply_defaults, check_arity, check_nullability, check_pk_not_null, check_type_compat,
     check_type_compat_one, check_value_bounds, check_value_bounds_one,
 };
-use crate::catalog::{IndexDef, IndexId, Schema};
+use crate::catalog::Schema;
 use crate::common::{Error, Result};
 use crate::layout::{DataLayout, LayoutCtx};
 use crate::storage::StorageEngine;
 use crate::types::{keyenc, ColumnType, Value};
 
-/// One index attached to a `Table`. Carries everything needed to write
-/// index entries on every mutation: the column positions to project,
-/// the precomputed `(secondary_cols ++ pk_cols)` type list for key
-/// encoding, and the engine handle that holds the index data.
-///
-/// Constructed by `Catalog` (P12.3) and handed to `Table::with_indexes`.
-#[derive(Clone)]
-pub struct IndexHandle {
-    pub id: IndexId,
-    pub def: IndexDef,
-    pub engine: Arc<dyn StorageEngine>,
-    /// Concatenation of indexed column types + PK column types. Used by
-    /// `encode_key_components` when building each entry's secondary key.
-    pub key_types: Vec<ColumnType>,
-}
+pub use crate::catalog::IndexHandle;
 
 /// Typed row-level access to a single table backed by `engine` with layout `L`.
 pub struct Table<E: StorageEngine, L: DataLayout> {

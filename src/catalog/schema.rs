@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::TableId;
+use crate::common::ids::IndexBackend;
 use crate::common::{Error, Result};
 use crate::types::{ColumnType, Value};
 
@@ -35,43 +36,6 @@ pub struct Schema {
     pub table_id: TableId,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<usize>,
-}
-
-/// Per-index storage backend choice. Persisted in `__sys_indexes` so
-/// reopens can instantiate the right engine. Phase 12 introduces this so
-/// one table can have indexes split across multiple backends — e.g. a
-/// hot lookup index on `BTreeEngine` and a write-heavy log index on
-/// `LsmEngine`.
-///
-/// New variants are added by extending this enum + bumping the
-/// `__sys_indexes` discriminator mapping in
-/// `system_tables::write_index_row` / `read_index_row`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IndexBackend {
-    BTree,
-    Lsm,
-}
-
-impl IndexBackend {
-    /// Stable discriminator used in `__sys_indexes`. Don't renumber; only
-    /// append new variants with new ids.
-    pub fn as_i32(self) -> i32 {
-        match self {
-            IndexBackend::BTree => 0,
-            IndexBackend::Lsm => 1,
-        }
-    }
-
-    pub fn from_i32(v: i32) -> Result<Self> {
-        match v {
-            0 => Ok(IndexBackend::BTree),
-            1 => Ok(IndexBackend::Lsm),
-            other => Err(Error::StorageCorrupted(format!(
-                "unknown IndexBackend discriminator in __sys_indexes: {}",
-                other
-            ))),
-        }
-    }
 }
 
 /// Index declaration: name, target table, indexed columns, uniqueness,

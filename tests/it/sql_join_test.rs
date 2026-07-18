@@ -33,8 +33,14 @@ fn setup_with_indexed_district() -> Setup {
     let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
-    let catalog =
-        Arc::new(Catalog::open_persistent(engine.clone(), dir.path().join("indexes")).unwrap());
+    let catalog = Arc::new(
+        Catalog::open_persistent(
+            engine.clone(),
+            dir.path().join("indexes"),
+            interchangedb::default_index_opener(),
+        )
+        .unwrap(),
+    );
 
     // Warehouse: (w_id PK, w_name).
     catalog

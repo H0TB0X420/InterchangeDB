@@ -24,8 +24,14 @@ fn setup_with_name_index() -> Setup {
     let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
-    let catalog =
-        Arc::new(Catalog::open_persistent(engine.clone(), dir.path().join("indexes")).unwrap());
+    let catalog = Arc::new(
+        Catalog::open_persistent(
+            engine.clone(),
+            dir.path().join("indexes"),
+            interchangedb::default_index_opener(),
+        )
+        .unwrap(),
+    );
 
     let table_id = catalog
         .create_table(

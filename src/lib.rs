@@ -66,6 +66,7 @@ pub mod layout;
 pub use idb_storage::storage;
 
 pub use idb_core::sync_trace;
+pub use idb_storage::default_index_opener;
 
 /// The pluggable `StorageEngine` implementations (B+Tree, LSM).
 pub use idb_storage::engines;

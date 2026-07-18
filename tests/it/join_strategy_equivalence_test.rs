@@ -44,8 +44,14 @@ fn setup() -> Env {
     let dir = tempfile::tempdir().unwrap();
     let dm = MemoryDiskManager::new();
     let engine = Arc::new(BTreeEngine::new(BufferPoolManager::new(256, dm)).unwrap());
-    let catalog =
-        Arc::new(Catalog::open_persistent(engine.clone(), dir.path().join("indexes")).unwrap());
+    let catalog = Arc::new(
+        Catalog::open_persistent(
+            engine.clone(),
+            dir.path().join("indexes"),
+            interchangedb::default_index_opener(),
+        )
+        .unwrap(),
+    );
 
     catalog
         .create_table(

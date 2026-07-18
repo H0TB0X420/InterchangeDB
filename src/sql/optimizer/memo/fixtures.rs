@@ -62,8 +62,14 @@ pub(crate) fn setup() -> Env {
     let dm = FileDiskManager::create(dir.path().join("t.db")).unwrap();
     let bpm = BufferPoolManager::new(256, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
-    let catalog =
-        Arc::new(Catalog::open_persistent(engine.clone(), dir.path().join("indexes")).unwrap());
+    let catalog = Arc::new(
+        Catalog::open_persistent(
+            engine.clone(),
+            dir.path().join("indexes"),
+            crate::default_index_opener(),
+        )
+        .unwrap(),
+    );
 
     let wh_id = catalog
         .create_table(

@@ -27,7 +27,14 @@ fn open_catalog_at(dir: &std::path::Path) -> Arc<Catalog<BTreeEngine>> {
     let dm = MemoryDiskManager::new();
     let bpm = BufferPoolManager::new(64, dm);
     let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
-    Arc::new(Catalog::open_persistent(engine, dir.join("indexes")).unwrap())
+    Arc::new(
+        Catalog::open_persistent(
+            engine,
+            dir.join("indexes"),
+            interchangedb::default_index_opener(),
+        )
+        .unwrap(),
+    )
 }
 
 /// Schema: (w_id PK, w_name, w_region). Two scan candidates: name (single
