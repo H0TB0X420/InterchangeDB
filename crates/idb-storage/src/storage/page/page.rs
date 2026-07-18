@@ -30,7 +30,7 @@ use super::page_header::{PageHeader, PageType};
 ///
 /// # Example
 /// ```
-/// use interchangedb::storage::page::Page;
+/// use idb_storage::storage::page::Page;
 ///
 /// let mut page = Page::new();
 /// page.as_mut_slice()[0] = 0xFF;

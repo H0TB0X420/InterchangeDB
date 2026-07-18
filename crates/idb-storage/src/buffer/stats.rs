@@ -16,7 +16,7 @@ use std::fmt;
 ///
 /// # Example
 /// ```
-/// use interchangedb::BufferPoolStats;
+/// use idb_storage::buffer::BufferPoolStats;
 /// use std::sync::atomic::Ordering;
 ///
 /// let stats = BufferPoolStats::new();
@@ -108,7 +108,7 @@ impl Default for BufferPoolStats {
 ///
 /// # Example
 /// ```
-/// use interchangedb::BufferPoolStats;
+/// use idb_storage::buffer::BufferPoolStats;
 ///
 /// let stats = BufferPoolStats::new();
 /// // ... update stats ...

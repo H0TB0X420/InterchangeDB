@@ -58,19 +58,17 @@
 //! ```
 
 // Core modules
-pub mod buffer;
+pub use idb_storage::buffer;
 pub mod catalog;
 pub use idb_core::common;
 pub mod database;
 pub mod layout;
-pub mod storage;
+pub use idb_storage::storage;
 
-/// Synchronization-primitive shim (parking_lot in prod, shuttle under test).
-pub(crate) use idb_core::sync;
 pub use idb_core::sync_trace;
 
 /// The pluggable `StorageEngine` implementations (B+Tree, LSM).
-pub mod engines;
+pub use idb_storage::engines;
 pub mod execution;
 pub mod session;
 pub mod sql;
