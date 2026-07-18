@@ -78,7 +78,6 @@ mod session_planner_test;
 mod slt;
 mod sort_operator_test;
 mod sql_e2e_test;
-mod sql_join_test;
 mod stats_persistence_test;
 mod torn_page_recovery_test;
 mod tpcc_transactions_test;

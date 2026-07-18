@@ -194,6 +194,13 @@ impl<E: StorageEngine + 'static> Session<E> {
                 columns,
                 primary_key,
             } => self.handle_create_table(name, columns, primary_key),
+            LogicalPlan::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                backend,
+            } => self.handle_create_index(name, table, columns, unique, backend),
             LogicalPlan::Analyze { table } => self.handle_analyze(table),
             // Everything else (Select/Insert/Update/Delete/Explain) needs
             // an engine handle and possibly an implicit txn.
@@ -341,6 +348,54 @@ impl<E: StorageEngine + 'static> Session<E> {
     ///
     /// Reads at AUTO_COMMIT — ANALYZE is observational; no implicit
     /// txn needed and stat rows write straight to the engine.
+    /// `CREATE INDEX`: register the index with the catalog (which builds
+    /// its engine via the injected opener), then backfill entries for
+    /// every row that existed before the index did — scanned at the
+    /// session's transaction scope, same as SELECT. Rows arriving later
+    /// are maintained by the normal mutation paths.
+    fn handle_create_index(
+        &mut self,
+        name: String,
+        table: String,
+        columns: Vec<usize>,
+        unique: bool,
+        backend: crate::catalog::IndexBackend,
+    ) -> Result<QueryResult> {
+        let schema = self.catalog.get_table(&table)?;
+        let index_id = self.catalog.create_index(crate::catalog::IndexDef {
+            name,
+            table_id: schema.table_id,
+            columns,
+            unique,
+            backend,
+        })?;
+
+        let txn_id = match self.current_txn {
+            Some(t) => t,
+            None => crate::txn::TxnId::AUTO_COMMIT,
+        };
+        let txn_engine = self.database.txn_engine_handle(txn_id)?;
+        let handles = self.catalog.indexes_for_table(schema.table_id, &schema)?;
+        let new_index: Vec<_> = handles.into_iter().filter(|h| h.id == index_id).collect();
+        assert_eq!(
+            new_index.len(),
+            1,
+            "created index must resolve to exactly one handle"
+        );
+        let backfill_table = crate::table::Table::with_indexes(
+            Arc::new(txn_engine),
+            schema,
+            crate::layout::RowLayout,
+            new_index,
+        );
+        backfill_table.backfill_indexes()?;
+
+        // Same durability posture as ANALYZE: catalog/index writes don't
+        // go through the WAL, so flush before returning.
+        self.catalog.engine().flush()?;
+        Ok(QueryResult::Ack)
+    }
+
     fn handle_analyze(&mut self, table_name: String) -> Result<QueryResult> {
         // Read through the MVCC layer at AUTO_COMMIT so we see committed
         // user rows (not raw versioned engine bytes) — same pattern as
@@ -394,6 +449,7 @@ fn kind_name(p: &PhysicalPlan) -> &'static str {
     match p {
         PhysicalPlan::Query(_) => "Query",
         PhysicalPlan::CreateTable { .. } => "CreateTable",
+        PhysicalPlan::CreateIndex { .. } => "CreateIndex",
         PhysicalPlan::Analyze { .. } => "Analyze",
         PhysicalPlan::BeginTxn => "BeginTxn",
         PhysicalPlan::CommitTxn => "CommitTxn",

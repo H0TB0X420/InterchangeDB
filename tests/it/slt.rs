@@ -132,3 +132,13 @@ fn slt_aggregate() {
 fn slt_e2e() {
     run_slt("e2e.slt");
 }
+
+#[test]
+fn slt_create_index() {
+    run_slt("create_index.slt");
+}
+
+#[test]
+fn slt_join() {
+    run_slt("join.slt");
+}

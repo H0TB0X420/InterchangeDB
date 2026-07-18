@@ -93,6 +93,20 @@ impl<E: StorageEngine, L: DataLayout> Table<E, L> {
         Ok(())
     }
 
+    /// Write index entries for every EXISTING row into the attached
+    /// indexes. Used once at `CREATE INDEX` time — the session attaches
+    /// only the newly created index, so rows inserted before it existed
+    /// become reachable through it; later mutations maintain it via the
+    /// normal paths. Returns the number of rows backfilled.
+    pub fn backfill_indexes(&self) -> Result<u64> {
+        let mut rows: u64 = 0;
+        for values in self.scan()? {
+            self.put_index_entries(&values)?;
+            rows += 1;
+        }
+        Ok(rows)
+    }
+
     /// Delete secondary entries for `row_values` from every attached index.
     fn delete_index_entries(&self, row_values: &[Value]) -> Result<()> {
         for ix in &self.indexes {

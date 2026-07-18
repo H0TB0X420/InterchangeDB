@@ -58,6 +58,13 @@ pub enum PhysicalPlan {
         columns: Vec<ColumnDef>,
         primary_key: Vec<usize>,
     },
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<usize>,
+        unique: bool,
+        backend: crate::catalog::IndexBackend,
+    },
     /// `ANALYZE TABLE t` (P14.2). Side-effect-only — session handler
     /// scans the table and persists stats; nothing runs through the
     /// operator tree.
@@ -178,6 +185,19 @@ where
     CatE: StorageEngine,
 {
     match logical {
+        LogicalPlan::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            backend,
+        } => Ok(PhysicalPlan::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            backend,
+        }),
         LogicalPlan::CreateTable {
             name,
             columns,
@@ -1175,6 +1195,9 @@ pub(crate) fn render_explain(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::Query(physop) => physop.explain(0),
         PhysicalPlan::CreateTable { name, .. } => format!("CreateTable({})\n", name),
+        PhysicalPlan::CreateIndex { name, table, .. } => {
+            format!("CreateIndex({name} on {table})\n")
+        }
         PhysicalPlan::Analyze { table } => format!("Analyze({})\n", table),
         PhysicalPlan::BeginTxn => "BeginTxn\n".to_string(),
         PhysicalPlan::CommitTxn => "CommitTxn\n".to_string(),

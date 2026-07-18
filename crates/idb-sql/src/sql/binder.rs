@@ -20,7 +20,7 @@ use sqlparser::ast::{
     UnaryOperator, Value as AstValue, Values,
 };
 
-use crate::catalog::{Catalog, ColumnDef, Schema};
+use crate::catalog::{Catalog, ColumnDef, IndexBackend, Schema};
 use crate::common::{Error, Result};
 use crate::sql::ir::expr::{BinaryOp, CompareOp, Expression, Predicate};
 use crate::sql::ir::logical::{AggregateSpec, LogicalPlan, OrderDir};
@@ -88,6 +88,7 @@ impl<E: StorageEngine> Binder<E> {
     pub fn bind(&self, stmt: Statement) -> Result<LogicalPlan> {
         match stmt {
             Statement::CreateTable(ct) => self.bind_create_table(ct),
+            Statement::CreateIndex(ci) => self.bind_create_index(ci),
             Statement::Query(q) => self.bind_query(*q),
             Statement::Insert(ins) => self.bind_insert(ins),
             Statement::Update {
@@ -126,6 +127,84 @@ impl<E: StorageEngine> Binder<E> {
     // -----------------------------------------------------------------------
     // CREATE TABLE
     // -----------------------------------------------------------------------
+
+    /// `CREATE [UNIQUE] INDEX name ON table [USING btree|lsm] (col, …)`.
+    /// Options we don't implement (CONCURRENTLY, IF NOT EXISTS, INCLUDE,
+    /// partial WHERE, per-column DESC / NULLS ordering) are rejected
+    /// loudly — silently ignoring index options would corrupt the user's
+    /// expectations about what the index provides.
+    fn bind_create_index(&self, ci: ast::CreateIndex) -> Result<LogicalPlan> {
+        let name = match &ci.name {
+            Some(n) => object_name_to_string(n),
+            None => {
+                return Err(Error::SqlParse(
+                    "CREATE INDEX requires an index name".into(),
+                ))
+            }
+        };
+        if ci.concurrently || ci.if_not_exists || !ci.include.is_empty() {
+            return Err(Error::SqlParse(
+                "unsupported CREATE INDEX option (CONCURRENTLY / IF NOT EXISTS / INCLUDE)".into(),
+            ));
+        }
+        if ci.nulls_distinct.is_some() || ci.predicate.is_some() {
+            return Err(Error::SqlParse(
+                "unsupported CREATE INDEX option (NULLS DISTINCT / partial WHERE)".into(),
+            ));
+        }
+        let backend = match &ci.using {
+            None => IndexBackend::BTree,
+            Some(id) => match id.value.to_ascii_lowercase().as_str() {
+                "btree" => IndexBackend::BTree,
+                "lsm" => IndexBackend::Lsm,
+                other => {
+                    return Err(Error::SqlParse(format!(
+                        "unknown index backend `{other}`; expected btree or lsm"
+                    )))
+                }
+            },
+        };
+
+        let table = object_name_to_string(&ci.table_name);
+        let schema = self.catalog.get_table(&table)?;
+        let mut columns = Vec::with_capacity(ci.columns.len());
+        for obe in &ci.columns {
+            if obe.asc == Some(false) || obe.nulls_first.is_some() {
+                return Err(Error::SqlParse(
+                    "index columns support neither DESC nor NULLS ordering".into(),
+                ));
+            }
+            let AstExpr::Identifier(ident) = &obe.expr else {
+                return Err(Error::SqlParse(
+                    "index columns must be plain column names".into(),
+                ));
+            };
+            let idx = schema
+                .columns
+                .iter()
+                .position(|c| c.name == ident.value)
+                .ok_or_else(|| {
+                    Error::SqlParse(format!(
+                        "unknown column `{}` in CREATE INDEX on `{table}`",
+                        ident.value
+                    ))
+                })?;
+            columns.push(idx);
+        }
+        if columns.is_empty() {
+            return Err(Error::SqlParse(
+                "CREATE INDEX requires at least one column".into(),
+            ));
+        }
+
+        Ok(LogicalPlan::CreateIndex {
+            name,
+            table,
+            columns,
+            unique: ci.unique,
+            backend,
+        })
+    }
 
     fn bind_create_table(&self, ct: ast::CreateTable) -> Result<LogicalPlan> {
         let name = object_name_to_string(&ct.name);

@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::ColumnDef;
+use crate::catalog::{ColumnDef, IndexBackend};
 use crate::sql::ir::expr::{Expression, Predicate};
 use crate::types::Value;
 
@@ -31,6 +31,18 @@ pub enum LogicalPlan {
         columns: Vec<ColumnDef>,
         /// Column indices that compose the primary key.
         primary_key: Vec<usize>,
+    },
+
+    /// `CREATE [UNIQUE] INDEX name ON table [USING backend] (columns)`.
+    /// Catalog-only like `CreateTable`; the session additionally backfills
+    /// entries for rows that existed before the index.
+    CreateIndex {
+        name: String,
+        table: String,
+        /// Column indices in the target table's schema.
+        columns: Vec<usize>,
+        unique: bool,
+        backend: IndexBackend,
     },
 
     // --- DML (run through executor tree) ----------------------------------

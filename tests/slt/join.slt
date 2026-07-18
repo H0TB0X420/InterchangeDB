@@ -1,0 +1,87 @@
+# JOIN syntax end-to-end. Converted from tests/it/sql_join_test.rs (P13.1)
+# — unlocked by SQL CREATE INDEX. Plan-shape assertions became exact
+# EXPLAIN trees; result assertions use rowsort where ordering is not
+# contractual.
+
+statement ok
+CREATE TABLE warehouse (w_id INT PRIMARY KEY, w_name VARCHAR(20) NOT NULL)
+
+statement ok
+CREATE TABLE district (d_id INT PRIMARY KEY, d_w_id INT NOT NULL, d_name VARCHAR(20) NOT NULL)
+
+statement ok
+CREATE INDEX district_by_w_id ON district (d_w_id)
+
+statement ok
+INSERT INTO warehouse VALUES (1, 'DC1'), (2, 'DC2'), (3, 'DC3')
+
+# w_id=3 has no districts → contributes no inner-join rows.
+statement ok
+INSERT INTO district VALUES (10, 1, 'east'), (11, 1, 'west'), (20, 2, 'only')
+
+# ---- explicit_inner_join_with_indexed_right_picks_inlj ---------------------
+query T
+EXPLAIN SELECT w.w_id, d.d_name FROM warehouse w JOIN district d ON w.w_id = d.d_w_id
+----
+Projection([0, 4])
+IndexNestedLoopJoin(probe via district_by_w_id)
+SeqScan(warehouse)
+<inner: IndexScan on district_by_w_id>
+
+# ---- explicit_inner_join_executes_to_matching_rows -------------------------
+query ITIIT rowsort
+SELECT w.w_id, w.w_name, d.d_id, d.d_w_id, d.d_name FROM warehouse w JOIN district d ON w.w_id = d.d_w_id
+----
+1 DC1 10 1 east
+1 DC1 11 1 west
+2 DC2 20 2 only
+
+# ---- join_with_no_usable_index_falls_back_to_hashjoin ----------------------
+# Self-join on the PK: try_match_inlj only matches secondary indexes, so
+# the equi-key lowers to HashJoin.
+query T
+EXPLAIN SELECT w1.w_name, w2.w_name FROM warehouse w1 JOIN warehouse w2 ON w1.w_id = w2.w_id
+----
+Projection([1, 3])
+HashJoin(outer_key=0, inner_key=0)
+SeqScan(warehouse)
+SeqScan(warehouse)
+
+# ---- implicit_join_with_where_equijoin -------------------------------------
+query IT rowsort
+SELECT w.w_id, d.d_name FROM warehouse w, district d WHERE w.w_id = d.d_w_id
+----
+1 east
+1 west
+2 only
+
+# ---- qualified_projection_picks_correct_tuple_indices ----------------------
+query TT rowsort
+SELECT w.w_name, d.d_name FROM warehouse w JOIN district d ON w.w_id = d.d_w_id
+----
+DC1 east
+DC1 west
+DC2 only
+
+# ---- unqualified_unique_column_resolves_without_qualifier ------------------
+query T rowsort
+SELECT d_name FROM warehouse w JOIN district d ON w.w_id = d.d_w_id
+----
+east
+only
+west
+
+# ---- ambiguous_unqualified_column_errors -----------------------------------
+statement error ambiguous
+SELECT w_id FROM warehouse w1 JOIN warehouse w2 ON w1.w_id = w2.w_id
+
+# ---- three_table_join_chains_left_to_right ---------------------------------
+# w1: 2 districts → 2×2 pairs; w2: 1 district → 1 pair; 5 rows total.
+query III rowsort
+SELECT w.w_id, d1.d_id, d2.d_id FROM warehouse w JOIN district d1 ON w.w_id = d1.d_w_id JOIN district d2 ON w.w_id = d2.d_w_id
+----
+1 10 10
+1 10 11
+1 11 10
+1 11 11
+2 20 20

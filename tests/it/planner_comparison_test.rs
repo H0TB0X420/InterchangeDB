@@ -115,6 +115,7 @@ fn render(p: &PhysicalPlan) -> String {
     match p {
         PhysicalPlan::Query(physop) => physop.explain(0),
         PhysicalPlan::CreateTable { name, .. } => format!("CreateTable({})", name),
+        PhysicalPlan::CreateIndex { name, table, .. } => format!("CreateIndex({name} on {table})"),
         PhysicalPlan::Analyze { table } => format!("Analyze({})", table),
         PhysicalPlan::BeginTxn => "BeginTxn".into(),
         PhysicalPlan::CommitTxn => "CommitTxn".into(),

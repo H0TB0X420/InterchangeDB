@@ -1,0 +1,60 @@
+# CREATE INDEX through the SQL surface — including backfill: rows inserted
+# BEFORE the index exists must be findable through it afterwards.
+
+statement ok
+CREATE TABLE item (i_id INT PRIMARY KEY, i_name VARCHAR(24) NOT NULL, i_price INT NOT NULL)
+
+statement ok
+INSERT INTO item VALUES (1, 'bolt', 5), (2, 'nut', 3), (3, 'washer', 3), (4, 'screw', 7)
+
+# The index arrives after the data — this is the backfill path.
+statement ok
+CREATE INDEX item_by_price ON item (i_price)
+
+# Backfilled entries serve an indexed equality lookup (recheck Filter
+# above the IndexScan per E1 — secondary indexes are unversioned).
+query T
+EXPLAIN SELECT i_name FROM item WHERE i_price = 3
+----
+Projection([1])
+Filter
+IndexScan(item, on item_by_price)
+
+query T rowsort
+SELECT i_name FROM item WHERE i_price = 3
+----
+nut
+washer
+
+# Rows inserted AFTER creation are maintained by the normal insert path.
+statement ok
+INSERT INTO item VALUES (5, 'rivet', 3)
+
+query T rowsort
+SELECT i_name FROM item WHERE i_price = 3
+----
+nut
+rivet
+washer
+
+# UNIQUE syntax is accepted and recorded (enforcement is a recorded gap,
+# matching the insert path); USING selects the backend.
+statement ok
+CREATE UNIQUE INDEX item_by_name ON item (i_name)
+
+statement ok
+CREATE INDEX item_by_price_lsm ON item USING lsm (i_price)
+
+# ---- errors ----------------------------------------------------------------
+
+statement error already exists
+CREATE INDEX item_by_price ON item (i_price)
+
+statement error
+CREATE INDEX nope ON missing_table (x)
+
+statement error
+CREATE INDEX bad_col ON item (not_a_column)
+
+statement error
+CREATE INDEX bad_backend ON item USING quadtree (i_price)

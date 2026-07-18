@@ -17,6 +17,9 @@ pub fn pretty_plan(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::Query(physop) => physop.explain(0),
         PhysicalPlan::CreateTable { name, .. } => format!("CreateTable({})\n", name),
+        PhysicalPlan::CreateIndex { name, table, .. } => {
+            format!("CreateIndex({name} on {table})\n")
+        }
         PhysicalPlan::Analyze { table } => format!("Analyze({})\n", table),
         PhysicalPlan::BeginTxn => "BeginTxn\n".to_string(),
         PhysicalPlan::CommitTxn => "CommitTxn\n".to_string(),
