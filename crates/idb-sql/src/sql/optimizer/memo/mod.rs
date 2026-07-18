@@ -145,61 +145,112 @@ mod tests {
 
     use super::*;
     use crate::buffer::BufferPoolManager;
-    use crate::catalog::Catalog;
-    use crate::database::Database;
+    use crate::catalog::{Catalog, ColumnDef, Schema, TableId};
     use crate::engines::btree::BTreeEngine;
-    use crate::session::Session;
+    use crate::layout::RowLayout;
     use crate::sql::binder::Binder;
     use crate::sql::frontend::parse;
     use crate::sql::optimizer::join_order::{cost_of_order, enumerate_join_orders, RelId};
     use crate::sql::optimizer::selinger::build_join_graph;
-    use crate::storage::FileDiskManager;
+    use crate::sql::optimizer::stats::analyze_table;
+    use crate::storage::MemoryDiskManager;
+    use crate::table::Table;
+    use crate::types::{ColumnType, Value};
+
+    fn int_col(name: &str, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            ty: ColumnType::Int32,
+            nullable,
+            default: None,
+        }
+    }
+
+    fn create(catalog: &Catalog<BTreeEngine>, name: &str, columns: Vec<ColumnDef>) {
+        catalog
+            .create_table(
+                name.into(),
+                Schema {
+                    name: name.into(),
+                    table_id: TableId(0), // assigned by create_table
+                    columns,
+                    primary_key: vec![0],
+                },
+            )
+            .unwrap();
+    }
+
+    fn insert(
+        catalog: &Catalog<BTreeEngine>,
+        engine: &std::sync::Arc<BTreeEngine>,
+        name: &str,
+        rows: Vec<Vec<Value>>,
+    ) {
+        let schema = catalog.get_table(name).unwrap();
+        let table = Table::with_indexes(engine.clone(), schema, RowLayout, Vec::new());
+        for row in rows {
+            table.insert(&row).unwrap();
+        }
+    }
 
     /// The selinger_reorder_test chain (a: 2 rows — b: 4 — c: 8), built
     /// through a real session so stats come from ANALYZE — the same
     /// inputs the Selinger planner sees.
-    fn chain_env() -> (Arc<Catalog<BTreeEngine>>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
-        let bpm = BufferPoolManager::new(512, dm);
-        let engine = BTreeEngine::new(bpm).unwrap();
-        let database = Arc::new(Database::open(dir.path(), engine).unwrap());
-        let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
-        let mut session = Session::new(database.clone(), catalog.clone());
+    fn chain_env() -> Arc<Catalog<BTreeEngine>> {
+        let bpm = BufferPoolManager::new(512, MemoryDiskManager::new());
+        let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
+        let catalog = Arc::new(Catalog::open(engine.clone()).unwrap());
 
-        session
-            .execute("CREATE TABLE a (a_id INT PRIMARY KEY, a_val INT)")
-            .unwrap();
-        session
-            .execute("CREATE TABLE b (b_id INT PRIMARY KEY, b_a INT, b_val INT)")
-            .unwrap();
-        session
-            .execute("CREATE TABLE c (c_id INT PRIMARY KEY, c_b INT, c_val INT)")
-            .unwrap();
-        for a_id in 1..=2 {
-            session
-                .execute(&format!("INSERT INTO a VALUES ({}, {})", a_id, a_id * 100))
-                .unwrap();
-        }
-        for b_id in 1..=4 {
-            let b_a = (b_id - 1) % 2 + 1;
-            session
-                .execute(&format!(
-                    "INSERT INTO b VALUES ({b_id}, {b_a}, {})",
-                    b_id * 10
-                ))
-                .unwrap();
-        }
-        for c_id in 1..=8 {
-            let c_b = (c_id - 1) % 4 + 1;
-            session
-                .execute(&format!("INSERT INTO c VALUES ({c_id}, {c_b}, {c_id})"))
-                .unwrap();
-        }
+        create(
+            &catalog,
+            "a",
+            vec![int_col("a_id", false), int_col("a_val", true)],
+        );
+        create(
+            &catalog,
+            "b",
+            vec![
+                int_col("b_id", false),
+                int_col("b_a", true),
+                int_col("b_val", true),
+            ],
+        );
+        create(
+            &catalog,
+            "c",
+            vec![
+                int_col("c_id", false),
+                int_col("c_b", true),
+                int_col("c_val", true),
+            ],
+        );
+
+        let i32r = |vals: Vec<i32>| vals.into_iter().map(Value::Int32).collect::<Vec<_>>();
+        insert(
+            &catalog,
+            &engine,
+            "a",
+            (1..=2).map(|a| i32r(vec![a, a * 100])).collect(),
+        );
+        insert(
+            &catalog,
+            &engine,
+            "b",
+            (1..=4)
+                .map(|b| i32r(vec![b, (b - 1) % 2 + 1, b * 10]))
+                .collect(),
+        );
+        insert(
+            &catalog,
+            &engine,
+            "c",
+            (1..=8).map(|c| i32r(vec![c, (c - 1) % 4 + 1, c])).collect(),
+        );
+
         for table in ["a", "b", "c"] {
-            session.execute(&format!("ANALYZE TABLE {table}")).unwrap();
+            analyze_table(&*catalog, &*engine, table).unwrap();
         }
-        (catalog, dir)
+        catalog
     }
 
     /// Gate G3 (cost dominance): the memo's bushy space is a superset of
@@ -209,7 +260,7 @@ mod tests {
     /// textual, else textual — `maybe_reorder`'s rule).
     #[test]
     fn g3_memo_winner_never_costs_more_than_selinger_order() {
-        let (catalog, _dir) = chain_env();
+        let catalog = chain_env();
         let binder = Binder::new(catalog.clone());
         let cost_model = DefaultCostModel::new();
         let queries = [
@@ -269,27 +320,23 @@ mod tests {
     /// lazy-creation memo panicked mid-search on exactly this shape.
     #[test]
     fn dense_join_graph_falls_back_instead_of_panicking() {
-        let dir = tempfile::tempdir().unwrap();
-        let dm = FileDiskManager::create(dir.path().join("test.db")).unwrap();
-        let bpm = BufferPoolManager::new(512, dm);
-        let engine = BTreeEngine::new(bpm).unwrap();
-        let database = Arc::new(Database::open(dir.path(), engine).unwrap());
-        let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).unwrap());
-        let mut session = Session::new(database.clone(), catalog.clone());
+        let bpm = BufferPoolManager::new(512, MemoryDiskManager::new());
+        let engine = Arc::new(BTreeEngine::new(bpm).unwrap());
+        let catalog = Arc::new(Catalog::open(engine).unwrap());
 
-        let hub_columns: String = (1..=12).map(|k| format!(", h{k} INT")).collect();
-        session
-            .execute(&format!(
-                "CREATE TABLE hub (h_id INT PRIMARY KEY{hub_columns})"
-            ))
-            .unwrap();
+        let mut hub_cols = vec![int_col("h_id", false)];
+        hub_cols.extend((1..=12).map(|k| int_col(&format!("h{k}"), true)));
+        create(&catalog, "hub", hub_cols);
         let mut sql = String::from("SELECT h_id FROM hub");
         for k in 1..=12 {
-            session
-                .execute(&format!(
-                    "CREATE TABLE s{k} (s{k}_id INT PRIMARY KEY, s{k}_h INT)"
-                ))
-                .unwrap();
+            create(
+                &catalog,
+                &format!("s{k}"),
+                vec![
+                    int_col(&format!("s{k}_id"), false),
+                    int_col(&format!("s{k}_h"), true),
+                ],
+            );
             sql += &format!(" JOIN s{k} ON s{k}_h = h{k}");
         }
 

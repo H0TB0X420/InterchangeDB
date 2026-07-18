@@ -204,6 +204,128 @@ impl QueryStats {
     }
 }
 
+/// ANALYZE's implementation: scan `table_name` through `scan_engine`
+/// (the caller supplies the MVCC-scoped handle), compute row count,
+/// per-column NDV + null counts, and equi-width int histograms, then
+/// persist them via the catalog's stats writers. Lives with the stats
+/// machinery — the planner layer owns both sides of the stats contract;
+/// the session only wraps this in a `QueryResult`.
+pub fn analyze_table<CatE: StorageEngine, E: StorageEngine>(
+    catalog: &crate::catalog::Catalog<CatE>,
+    scan_engine: &E,
+    table_name: &str,
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    use crate::catalog::system_tables::{HISTOGRAM_KIND_EQUI_WIDTH_INT, HISTOGRAM_KIND_NONE};
+    use crate::layout::{DataLayout, LayoutCtx, RowLayout};
+    use crate::types::{ColumnType, Value};
+
+    let schema = catalog.get_table(table_name)?;
+    let table_id = schema.table_id;
+    let column_types = schema.column_types();
+
+    // Per-column aggregators built in lockstep with the schema.
+    let mut row_count: i64 = 0;
+    let mut distinct: Vec<HashSet<Value>> =
+        (0..schema.columns.len()).map(|_| HashSet::new()).collect();
+    let mut null_counts: Vec<i64> = vec![0; schema.columns.len()];
+    // For Int32/Int64 columns additionally track the value sequence so an
+    // equi-width histogram can be built without re-reading the table.
+    let mut int_values: Vec<Option<Vec<i64>>> = schema
+        .columns
+        .iter()
+        .map(|c| match c.ty {
+            ColumnType::Int32 | ColumnType::Int64 => Some(Vec::new()),
+            _ => None,
+        })
+        .collect();
+
+    let ctx = LayoutCtx {
+        column_types: &column_types,
+        table_id,
+    };
+    for row_result in RowLayout.scan_table(scan_engine, ctx) {
+        let (_, values) = row_result?;
+        row_count += 1;
+        for (col_idx, v) in values.iter().enumerate() {
+            if matches!(v, Value::Null) {
+                null_counts[col_idx] += 1;
+            } else {
+                distinct[col_idx].insert(v.clone());
+                if let Some(buf) = int_values[col_idx].as_mut() {
+                    match v {
+                        Value::Int32(n) => buf.push(*n as i64),
+                        Value::Int64(n) => buf.push(*n),
+                        _ => {} // mismatched type — skip
+                    }
+                }
+            }
+        }
+    }
+
+    // Persist table-level row count.
+    catalog.put_table_stats(table_id, &TableStats { row_count })?;
+
+    // Persist per-column NDV + null count + histogram (when applicable).
+    const NUM_BUCKETS: usize = 16;
+    for (col_idx, col_def) in schema.columns.iter().enumerate() {
+        let ndv = distinct[col_idx].len() as i64;
+        let null_count = null_counts[col_idx];
+        let (histogram_kind, histogram_blob) = match (&col_def.ty, &int_values[col_idx]) {
+            (ColumnType::Int32 | ColumnType::Int64, Some(values)) if !values.is_empty() => {
+                let blob = build_equi_width_int_histogram(values, NUM_BUCKETS);
+                (HISTOGRAM_KIND_EQUI_WIDTH_INT, blob)
+            }
+            _ => (HISTOGRAM_KIND_NONE, Vec::new()),
+        };
+        catalog.put_column_stats(
+            table_id,
+            col_idx as u32,
+            &ColumnStats {
+                ndv,
+                null_count,
+                histogram_kind,
+                histogram_blob,
+            },
+        )?;
+    }
+
+    // Flush the writes so they survive a crash before the next
+    // ANALYZE/use. Catalog writes don't go through WAL.
+    catalog.engine().flush()?;
+    Ok(())
+}
+
+/// Equi-width int histogram blob layout (`HISTOGRAM_KIND_EQUI_WIDTH_INT`):
+/// `min:i64 | max:i64 | num_buckets:u16 | counts:[u32; num_buckets]`.
+/// All little-endian. Tight + readable; bumpable via the
+/// `histogram_kind` discriminator if we ever need a richer format.
+fn build_equi_width_int_histogram(values: &[i64], num_buckets: usize) -> Vec<u8> {
+    let min = *values.iter().min().unwrap();
+    let max = *values.iter().max().unwrap();
+    let span = (max - min).max(0) as i128 + 1; // +1: half-open buckets cover [min, max]
+    let mut counts: Vec<u32> = vec![0; num_buckets];
+    for &v in values {
+        let offset = (v - min) as i128;
+        // bucket = floor(offset * num_buckets / span). Clamp to last
+        // bucket if v == max so the high end isn't lost to rounding.
+        let mut b = ((offset * num_buckets as i128) / span) as usize;
+        if b >= num_buckets {
+            b = num_buckets - 1;
+        }
+        counts[b] = counts[b].saturating_add(1);
+    }
+    let mut blob = Vec::with_capacity(8 + 8 + 2 + 4 * num_buckets);
+    blob.extend_from_slice(&min.to_le_bytes());
+    blob.extend_from_slice(&max.to_le_bytes());
+    blob.extend_from_slice(&(num_buckets as u16).to_le_bytes());
+    for c in &counts {
+        blob.extend_from_slice(&c.to_le_bytes());
+    }
+    blob
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

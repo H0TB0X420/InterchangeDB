@@ -40,7 +40,7 @@ use crate::layout::{DataLayout, LayoutCtx, RowLayout};
 use crate::storage::StorageEngine;
 use crate::types::{ColumnType, Value};
 
-pub use crate::storage::engine::IndexEngineOpener;
+pub use crate::storage::IndexEngineOpener;
 
 /// One secondary index, resolved and ready to hand to
 /// `Table::with_indexes`: definition + engine handle + the

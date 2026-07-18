@@ -1,0 +1,22 @@
+[package]
+name = "idb-sql"
+version = "0.1.0"
+edition = "2021"
+
+# THE THESIS: no idb-storage, idb-wal, or idb-txn here. The sql side
+# compiles against the contracts in idb-core alone; test code may
+# construct real engines via dev-dependencies (test-only, not a lib edge).
+[dependencies]
+idb-core = { path = "../idb-core" }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+sqlparser = "0.50"
+
+[dev-dependencies]
+idb-storage = { path = "../idb-storage" }
+tempfile = "3.10"
+
+[lints.clippy]
+all = "warn"

@@ -342,128 +342,18 @@ impl<E: StorageEngine + 'static> Session<E> {
     /// Reads at AUTO_COMMIT — ANALYZE is observational; no implicit
     /// txn needed and stat rows write straight to the engine.
     fn handle_analyze(&mut self, table_name: String) -> Result<QueryResult> {
-        use crate::catalog::system_tables::{
-            ColumnStats, TableStats, HISTOGRAM_KIND_EQUI_WIDTH_INT, HISTOGRAM_KIND_NONE,
-        };
-        use crate::layout::{DataLayout, LayoutCtx, RowLayout};
-        use crate::types::{ColumnType, Value};
-        use std::collections::HashSet;
-
-        let schema = self.catalog.get_table(&table_name)?;
-        let table_id = schema.table_id;
-        let column_types = schema.column_types();
-
-        // Per-column aggregators built in lockstep with the schema.
-        let mut row_count: i64 = 0;
-        let mut distinct: Vec<HashSet<Value>> =
-            (0..schema.columns.len()).map(|_| HashSet::new()).collect();
-        let mut null_counts: Vec<i64> = vec![0; schema.columns.len()];
-        // For Int32/Int64 columns we additionally track min/max + the
-        // value sequence so we can build an equi-width histogram in a
-        // second pass without re-reading the table.
-        let mut int_values: Vec<Option<Vec<i64>>> = schema
-            .columns
-            .iter()
-            .map(|c| match c.ty {
-                ColumnType::Int32 | ColumnType::Int64 => Some(Vec::new()),
-                _ => None,
-            })
-            .collect();
-
         // Read through the MVCC layer at AUTO_COMMIT so we see committed
-        // user rows (not raw versioned engine bytes). Same pattern as
-        // SELECT statements.
+        // user rows (not raw versioned engine bytes) — same pattern as
+        // SELECT. The stats computation itself lives with the planner's
+        // stats machinery: `sql::optimizer::stats::analyze_table`.
         let txn_id = match self.current_txn {
             Some(t) => t,
             None => crate::txn::TxnId::AUTO_COMMIT,
         };
         let txn_engine = self.database.txn_engine_handle(txn_id)?;
-        let ctx = LayoutCtx {
-            column_types: &column_types,
-            table_id,
-        };
-        for row_result in RowLayout.scan_table(&txn_engine, ctx) {
-            let (_, values) = row_result?;
-            row_count += 1;
-            for (col_idx, v) in values.iter().enumerate() {
-                if matches!(v, Value::Null) {
-                    null_counts[col_idx] += 1;
-                } else {
-                    distinct[col_idx].insert(v.clone());
-                    if let Some(buf) = int_values[col_idx].as_mut() {
-                        match v {
-                            Value::Int32(n) => buf.push(*n as i64),
-                            Value::Int64(n) => buf.push(*n),
-                            _ => {} // mismatched type — skip
-                        }
-                    }
-                }
-            }
-        }
-
-        // Persist table-level row count.
-        self.catalog
-            .put_table_stats(table_id, &TableStats { row_count })?;
-
-        // Persist per-column NDV + null count + histogram (when applicable).
-        const NUM_BUCKETS: usize = 16;
-        for (col_idx, col_def) in schema.columns.iter().enumerate() {
-            let ndv = distinct[col_idx].len() as i64;
-            let null_count = null_counts[col_idx];
-            let (histogram_kind, histogram_blob) = match (&col_def.ty, &int_values[col_idx]) {
-                (ColumnType::Int32 | ColumnType::Int64, Some(values)) if !values.is_empty() => {
-                    let blob = build_equi_width_int_histogram(values, NUM_BUCKETS);
-                    (HISTOGRAM_KIND_EQUI_WIDTH_INT, blob)
-                }
-                _ => (HISTOGRAM_KIND_NONE, Vec::new()),
-            };
-            self.catalog.put_column_stats(
-                table_id,
-                col_idx as u32,
-                &ColumnStats {
-                    ndv,
-                    null_count,
-                    histogram_kind,
-                    histogram_blob,
-                },
-            )?;
-        }
-
-        // Flush the writes so they survive a crash before the next
-        // ANALYZE/use. Catalog writes don't go through WAL.
-        self.catalog.engine().flush()?;
-
+        crate::sql::optimizer::stats::analyze_table(&self.catalog, &txn_engine, &table_name)?;
         Ok(QueryResult::Ack)
     }
-}
-
-/// Equi-width int histogram blob layout (`HISTOGRAM_KIND_EQUI_WIDTH_INT`):
-/// `min:i64 | max:i64 | num_buckets:u16 | counts:[u32; num_buckets]`.
-/// All little-endian. Tight + readable; bumpable via the
-/// `histogram_kind` discriminator if we ever need a richer format.
-fn build_equi_width_int_histogram(values: &[i64], num_buckets: usize) -> Vec<u8> {
-    let min = *values.iter().min().unwrap();
-    let max = *values.iter().max().unwrap();
-    let span = (max - min).max(0) as i128 + 1; // +1: half-open buckets cover [min, max]
-    let mut counts: Vec<u32> = vec![0; num_buckets];
-    for &v in values {
-        let offset = (v - min) as i128;
-        // bucket = floor(offset * num_buckets / span). Clamp to last
-        // bucket if v == max so the high end isn't lost to rounding.
-        let mut b = ((offset * num_buckets as i128) / span) as usize;
-        if b >= num_buckets {
-            b = num_buckets - 1;
-        }
-        counts[b] = counts[b].saturating_add(1);
-    }
-    let mut blob = Vec::with_capacity(8 + 8 + 2 + 4 * num_buckets);
-    blob.extend_from_slice(&min.to_le_bytes());
-    blob.extend_from_slice(&max.to_le_bytes());
-    blob.extend_from_slice(&(num_buckets as u16).to_le_bytes());
-    for c in &counts {
-        blob.extend_from_slice(&c.to_le_bytes());
-    }
-    blob
 }
 
 // ---------------------------------------------------------------------------

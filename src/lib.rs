@@ -58,23 +58,23 @@
 //! ```
 
 // Core modules
-pub use idb_storage::buffer;
-pub mod catalog;
 pub use idb_core::common;
+pub use idb_sql::catalog;
+pub use idb_storage::buffer;
 pub mod database;
-pub mod layout;
+pub use idb_sql::layout;
 pub use idb_storage::storage;
 
 pub use idb_core::sync_trace;
 pub use idb_storage::default_index_opener;
 
+pub use idb_sql::execution;
 /// The pluggable `StorageEngine` implementations (B+Tree, LSM).
 pub use idb_storage::engines;
-pub mod execution;
 pub mod session;
-pub mod sql;
-pub mod table;
 pub use idb_core::types;
+pub use idb_sql::sql;
+pub use idb_sql::table;
 pub use idb_txn::txn;
 pub use idb_wal::wal;
 

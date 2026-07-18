@@ -66,7 +66,7 @@ pub(crate) fn setup() -> Env {
         Catalog::open_persistent(
             engine.clone(),
             dir.path().join("indexes"),
-            crate::default_index_opener(),
+            idb_storage::default_index_opener(),
         )
         .unwrap(),
     );

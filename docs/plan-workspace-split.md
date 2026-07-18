@@ -108,6 +108,36 @@ layout + execution?) depending only on idb-core + storage *traits*. The
 compile succeeding IS the thesis test. `database`/`session` stay in the
 facade — they are the composition root and legitimately see everything.
 
+## Pass 2 executed (2026-07) — the thesis holds
+
+Commits: 2a `682c6d6` (knots) · 2b (this commit, `idb-sql`).
+
+**Knot fixes (2a):** `StorageEngine` trait family + `TableId`/`IndexId`/
+`IndexBackend` + the `IndexEngineOpener` signature moved to `idb-core`
+(contract layer); the catalog's index-engine factory inverted to an
+injected opener whose default lives in `idb-storage` and is wired
+explicitly at every `open_persistent` call site; `IndexHandle` rehomed to
+catalog (table→catalog now one-way).
+
+**The extraction (2b):** `crates/idb-sql` = layout + catalog + table +
+sql + execution. Its `[dependencies]`: **idb-core + externals only — no
+idb-storage, no idb-wal, no idb-txn.** That Cargo.toml IS the thesis
+proof: the SQL side compiles against contracts alone. Engine-constructing
+unit tests use dev-dependencies (test-only edges, honestly separate).
+
+**Discovered en route:** ANALYZE's implementation lived in the session;
+its stats computation is planner-side machinery and moved to
+`sql::optimizer::stats::analyze_table` (session now only supplies the
+MVCC-scoped scan handle and wraps the result). The memo G3 gate + dense-
+star tests were rewritten to run natively in `idb-sql` — they never
+needed a Session, only stats and a catalog. A dev-dependency cycle back
+to the facade was tried first and abandoned: Cargo permits it, but the
+crate compiles twice and its types don't unify across the two builds —
+recorded so nobody retries it.
+
+Final shape: facade = `database` + `session` + `bin` + re-exports; five
+crates below it; every public path unchanged through both passes.
+
 ## Non-goals
 
 Renaming public API, cargo-hakari (revisit once multi-crate feature drift
