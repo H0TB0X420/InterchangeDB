@@ -1,0 +1,86 @@
+# Aggregates through the full pipeline. Converted from
+# tests/it/sql_aggregate_test.rs — same schema, same rows, same
+# assertions (including the error-message contracts), expressed as data.
+
+statement ok
+CREATE TABLE payments (id INT PRIMARY KEY, amount BIGINT NOT NULL, price DECIMAL(10, 2) NOT NULL)
+
+statement ok
+INSERT INTO payments VALUES (1, 10, 1.00), (2, 30, 2.50), (3, 20, 1.00)
+
+# count_star_returns_row_count
+query I
+SELECT COUNT(*) FROM payments
+----
+3
+
+# count_col_returns_non_null_count
+query I
+SELECT COUNT(amount) FROM payments
+----
+3
+
+# count_distinct_returns_unique_count — prices 1.00, 2.50, 1.00 → 2 distinct
+query I
+SELECT COUNT(DISTINCT price) FROM payments
+----
+2
+
+# sum_returns_total — 10 + 30 + 20
+query I
+SELECT SUM(amount) FROM payments
+----
+60
+
+# min_and_max_return_extremes
+query I
+SELECT MIN(amount) FROM payments
+----
+10
+
+query I
+SELECT MAX(amount) FROM payments
+----
+30
+
+# avg_returns_decimal_scale_4 — 60 / 3 at AVG's fixed scale 4
+query R
+SELECT AVG(amount) FROM payments
+----
+20.0000
+
+# aggregate_with_filter_runs_after_where
+query I
+SELECT SUM(amount) FROM payments WHERE id = 1
+----
+10
+
+# aggregate_filtered_to_empty_returns_null — SQL: SUM over zero rows is NULL
+query I
+SELECT SUM(amount) FROM payments WHERE id = 999
+----
+NULL
+
+# multiple_aggregates_in_one_query
+query IIII
+SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM payments
+----
+3 60 10 30
+
+# mixed_column_and_aggregate_errors_without_group_by
+statement error GROUP BY
+SELECT id, COUNT(*) FROM payments
+
+# unsupported_function_errors — no scalar functions yet
+statement error
+SELECT UPPER(amount) FROM payments
+
+# sum_distinct_unsupported_errors
+statement error DISTINCT
+SELECT SUM(DISTINCT amount) FROM payments
+
+# count_with_qualified_column_resolves
+query I
+SELECT COUNT(payments.amount) FROM payments
+----
+3

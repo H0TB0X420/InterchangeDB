@@ -40,6 +40,8 @@ tempfile = "3.10"
 goldenscript = "0.7"
 test_each_file = "0.3"
 testkit = { path = "testkit" }
+sqllogictest = "0.28"
+futures = "0.3"
 
 # Integration tests are two explicit harnesses (build-times P2): every
 # former tests/*.rs file was its own binary, so a one-line src/ edit

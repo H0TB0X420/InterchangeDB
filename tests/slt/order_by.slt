@@ -1,0 +1,75 @@
+# ORDER BY through the full parse → bind → plan → execute pipeline.
+# Converted from tests/it/sql_order_by_test.rs (P13.6) — same schema, same
+# scrambled inserts, same assertions, expressed as data. The Rust suite
+# asserted only the id column; these blocks assert full rows (stronger).
+
+statement ok
+CREATE TABLE customer (id INT PRIMARY KEY, last VARCHAR(20) NOT NULL, first VARCHAR(20))
+
+# Scrambled insert order so result-order assertions exercise Sort.
+statement ok
+INSERT INTO customer VALUES (3, 'smith', 'c'), (1, 'jones', 'a'), (2, 'kim', 'b'), (4, 'kim', NULL)
+
+# order_by_single_column_asc
+query ITT
+SELECT * FROM customer ORDER BY id ASC
+----
+1 jones a
+2 kim b
+3 smith c
+4 kim NULL
+
+# order_by_single_column_desc
+query ITT
+SELECT * FROM customer ORDER BY id DESC
+----
+4 kim NULL
+3 smith c
+2 kim b
+1 jones a
+
+# order_by_default_direction_is_asc
+query ITT
+SELECT * FROM customer ORDER BY id
+----
+1 jones a
+2 kim b
+3 smith c
+4 kim NULL
+
+# order_by_two_keys_breaks_ties — the two kim rows tie on last; first
+# tiebreaks, and NULLs sort last under ASC (E8).
+query ITT
+SELECT * FROM customer ORDER BY last ASC, first ASC
+----
+1 jones a
+2 kim b
+4 kim NULL
+3 smith c
+
+# order_by_with_limit_takes_top_n
+query ITT
+SELECT * FROM customer ORDER BY id DESC LIMIT 2
+----
+4 kim NULL
+3 smith c
+
+# order_by_with_where_runs_after_filter
+query ITT
+SELECT * FROM customer WHERE last = 'kim' ORDER BY id ASC
+----
+2 kim b
+4 kim NULL
+
+# order_by_unknown_column_errors
+statement error
+SELECT * FROM customer ORDER BY nonexistent ASC
+
+# order_by_with_qualified_column
+query ITT
+SELECT * FROM customer ORDER BY customer.id ASC
+----
+1 jones a
+2 kim b
+3 smith c
+4 kim NULL
