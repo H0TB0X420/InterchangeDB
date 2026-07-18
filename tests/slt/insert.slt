@@ -1,0 +1,74 @@
+# Column-list INSERT + the INTEGER type alias — the two dialect features
+# the SQLite corpus probe blamed for its statement-1 failure. The setup
+# statements below are select1.test's opening INSERTs verbatim (every
+# column-order permutation); only the PRIMARY KEY clause is ours, because
+# PK-less tables remain the one real corpus blocker. Goal: prove these
+# features work and pin their semantics (reorder, NULL-fill, arity and
+# unknown-column errors).
+
+statement ok
+CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER, d INTEGER, e INTEGER)
+
+statement ok
+INSERT INTO t1(e,c,b,d,a) VALUES(103,102,100,101,104)
+
+statement ok
+INSERT INTO t1(a,c,d,e,b) VALUES(107,106,108,109,105)
+
+statement ok
+INSERT INTO t1(e,d,b,a,c) VALUES(110,114,112,111,113)
+
+statement ok
+INSERT INTO t1(d,c,e,a,b) VALUES(116,119,117,115,118)
+
+statement ok
+INSERT INTO t1(c,d,b,e,a) VALUES(123,122,124,120,121)
+
+statement ok
+INSERT INTO t1(a,d,b,e,c) VALUES(127,128,129,126,125)
+
+statement ok
+INSERT INTO t1(e,c,a,d,b) VALUES(132,134,131,133,130)
+
+statement ok
+INSERT INTO t1(a,d,b,e,c) VALUES(138,136,139,135,137)
+
+statement ok
+INSERT INTO t1(e,c,d,a,b) VALUES(144,141,140,142,143)
+
+# Every value must land in its named column, not its positional slot —
+# full rows in schema order prove the reorder.
+query IIIII
+SELECT a, b, c, d, e FROM t1 ORDER BY a
+----
+104 100 102 101 103
+107 105 106 108 109
+111 112 113 114 110
+115 118 119 116 117
+121 124 123 122 120
+127 129 125 128 126
+131 130 134 133 132
+138 139 137 136 135
+142 143 141 140 144
+
+query I
+SELECT COUNT(*) FROM t1
+----
+9
+
+# Omitted columns fill with NULL (column-list semantics).
+statement ok
+INSERT INTO t1(a) VALUES(200)
+
+query IIIII
+SELECT a, b, c, d, e FROM t1 WHERE a = 200
+----
+200 NULL NULL NULL NULL
+
+# Negative space: value count must match the column list, not the table.
+statement error INSERT row arity 3 doesn't match column list arity 2
+INSERT INTO t1(a,b) VALUES(300,1,2)
+
+# Negative space: names in the list must exist.
+statement error column 'z' not found in table 't1'
+INSERT INTO t1(z) VALUES(1)

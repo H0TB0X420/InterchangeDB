@@ -147,3 +147,8 @@ fn slt_join() {
 fn slt_unique() {
     run_slt("unique.slt");
 }
+
+#[test]
+fn slt_insert() {
+    run_slt("insert.slt");
+}
