@@ -3,7 +3,7 @@
 # support crate (config registry, matrix macros, fault injection, workloads).
 # `fuzz/` is cargo-fuzz's own nested workspace and must be excluded so Cargo
 # doesn't try to absorb it.
-members = [".", "crates/idb-core", "crates/idb-storage", "testkit"]
+members = [".", "crates/idb-core", "crates/idb-storage", "crates/idb-wal", "crates/idb-txn", "testkit"]
 exclude = ["fuzz"]
 
 [package]
@@ -21,6 +21,8 @@ path = "src/lib.rs"
 [dependencies]
 idb-core = { path = "crates/idb-core" }
 idb-storage = { path = "crates/idb-storage" }
+idb-wal = { path = "crates/idb-wal" }
+idb-txn = { path = "crates/idb-txn" }
 thiserror = "1.0"
 parking_lot = "0.12"
 crc32fast = "1.3"

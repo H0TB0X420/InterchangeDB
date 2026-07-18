@@ -73,9 +73,9 @@ pub mod execution;
 pub mod session;
 pub mod sql;
 pub mod table;
-pub mod txn;
 pub use idb_core::types;
-pub mod wal;
+pub use idb_txn::txn;
+pub use idb_wal::wal;
 
 // Re-export commonly used items at crate root for convenience
 pub use common::config::PAGE_SIZE;
