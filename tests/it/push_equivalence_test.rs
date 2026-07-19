@@ -270,6 +270,32 @@ fn correlated_filters_are_equivalent() {
 }
 
 #[test]
+fn derived_table_subqueries_are_equivalent() {
+    let (mut s, _dir) = setup();
+    // Q22's shape (H4d): a derived table whose inner query carries BOTH an
+    // uncorrelated scalar subquery (baked to a literal per-plan) AND a
+    // correlated NOT EXISTS (a per-outer-row evaluator), with the outer query
+    // grouping a plain derived column and aggregating. The session resolves the
+    // derived's subqueries against the same engine handle for BOTH models; the
+    // shared build path threads the same global slices, so pull and push must
+    // agree row for row over the whole composition.
+    assert_equivalent(
+        &mut s,
+        "SELECT bucket, COUNT(*), SUM(i_price) FROM ( \
+           SELECT i_price / 100 AS bucket, i_price FROM item \
+           WHERE i_price > (SELECT AVG(i_price) FROM item) \
+             AND NOT EXISTS (SELECT * FROM stock WHERE s_id = i_id) \
+         ) AS d GROUP BY bucket ORDER BY bucket",
+    );
+    // A derived table with just its own scalar subquery (baked), no correlation.
+    assert_equivalent(
+        &mut s,
+        "SELECT hi FROM (SELECT i_price AS hi FROM item \
+           WHERE i_price >= (SELECT MAX(i_price) FROM item)) AS d ORDER BY hi",
+    );
+}
+
+#[test]
 fn dml_round_trips_through_push() {
     // DML delegates to the shared operator builder, so running it under Push
     // mutates exactly as under Volcano. Apply an UPDATE in Push mode, then

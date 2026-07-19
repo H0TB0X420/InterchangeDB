@@ -247,3 +247,86 @@ ORDER BY l_shipmode
 ----
 MAIL 1
 SHIP 1
+
+# ============================================================================
+# SUBSTRING(<input> FROM <start> FOR <length>)  (H4d — Q22's country code)
+#
+# start is 1-based; length is the MAX character count. Char-correct: it slices
+# by chars(), never bytes, so multi-byte input is honest. NULL in -> NULL out;
+# a start past the end yields the empty string; a length past the end clamps.
+# ============================================================================
+
+statement ok
+CREATE TABLE sub_t (id INT PRIMARY KEY, s VARCHAR(16), code CHAR(6), n INT)
+
+# id2's s = 'aébc' is 4 CHARACTERS but 5 BYTES (é is two bytes) — the
+# char-vs-byte discriminator. id3's s is NULL.
+statement ok
+INSERT INTO sub_t VALUES
+  (1, 'apple',  'US-abc', 42),
+  (2, 'aébc',   'FR-xyz', 7),
+  (3, NULL,     'DE-123', 1)
+
+# ---- basic: first 3 chars of a VARCHAR --------------------------------------
+query T
+SELECT SUBSTRING(s FROM 1 FOR 3) FROM sub_t WHERE id = 1
+----
+app
+
+# ---- basic over a CHAR column (the c_phone shape) ---------------------------
+query T
+SELECT SUBSTRING(code FROM 1 FOR 2) FROM sub_t WHERE id = 1
+----
+US
+
+# ---- char-correct over multi-byte input ------------------------------------
+# 'aébc' chars = [a, é, b, c]. FROM 2 FOR 2 = [é, b] = 'éb'. A byte-indexed
+# slice at offset 2 would land INSIDE é's two-byte encoding and corrupt it.
+query T
+SELECT SUBSTRING(s FROM 2 FOR 2) FROM sub_t WHERE id = 2
+----
+éb
+
+# ---- NULL input -> NULL -----------------------------------------------------
+query T
+SELECT SUBSTRING(s FROM 1 FOR 2) FROM sub_t WHERE id = 3
+----
+NULL
+
+# ---- start past the end -> empty string -------------------------------------
+query T
+SELECT SUBSTRING(s FROM 10 FOR 2) FROM sub_t WHERE id = 1
+----
+(empty)
+
+# ---- length past the end clamps to the tail ---------------------------------
+# 'apple' chars = [a,p,p,l,e]; FROM 4 FOR 10 = [l, e] = 'le'.
+query T
+SELECT SUBSTRING(s FROM 4 FOR 10) FROM sub_t WHERE id = 1
+----
+le
+
+# ---- FOR 0 -> empty string --------------------------------------------------
+# A zero length takes no characters (`take(0)`), so the result is the empty
+# string — legal, not an error (only start < 1 is rejected).
+query T
+SELECT SUBSTRING(s FROM 1 FOR 0) FROM sub_t WHERE id = 1
+----
+(empty)
+
+# ---- error contracts --------------------------------------------------------
+# FROM is 1-based; 0 is not a valid position.
+statement error 1-based
+SELECT SUBSTRING(s FROM 0 FOR 2) FROM sub_t
+
+# FROM must be a literal integer (a column has no bind-time value).
+statement error must be a literal integer
+SELECT SUBSTRING(s FROM n FOR 2) FROM sub_t
+
+# FOR is required (Q22 always has both; unbounded-length is a separate shape).
+statement error without FOR not supported
+SELECT SUBSTRING(s FROM 1) FROM sub_t
+
+# The input must be a string (VARCHAR/CHAR).
+statement error VARCHAR/CHAR input
+SELECT SUBSTRING(n FROM 1 FOR 2) FROM sub_t

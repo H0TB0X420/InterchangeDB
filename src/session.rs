@@ -39,7 +39,7 @@ use crate::database::Database;
 use crate::execution::{ExecModel, Tuple};
 use crate::sql::binder::Binder;
 use crate::sql::frontend::parse;
-use crate::sql::ir::logical::LogicalPlan;
+use crate::sql::ir::logical::{DerivedTable, LogicalPlan};
 use crate::sql::planner::{PhysicalPlan, Planner};
 use crate::sql::workload_log::WorkloadLog;
 use crate::sql::{CorrelatedEvaluator, InSubquerySet};
@@ -242,15 +242,17 @@ impl<E: StorageEngine + 'static> Session<E> {
             }
         };
 
-        // Resolve uncorrelated subqueries against THIS engine handle (same
-        // snapshot) BEFORE planning: run each scalar subquery and splice its
-        // value as a literal, and materialize each IN/EXISTS subquery into a
-        // set the executor build captures. SELECT-shaped only — EXPLAIN renders
-        // subqueries in the planner (never executing them) and DML has none, so
-        // both pass through with empty sets.
-        let (logical, in_sets) = if is_select_shape {
-            match self.resolve_select_subqueries(logical, &engine_handle) {
-                Ok(pair) => pair,
+        // Resolve subqueries against THIS engine handle (same snapshot) BEFORE
+        // planning — the SELECT's own AND every derived table's, bottom-up
+        // (H4d): run each scalar subquery and splice its value as a literal,
+        // materialize each IN/EXISTS subquery into a set, and build each
+        // correlated template into a per-outer-row evaluator, all captured by
+        // the executor build. SELECT-shaped only — EXPLAIN renders subqueries in
+        // the planner (never executing them) and DML has none, so both pass
+        // through with empty slices.
+        let (logical, in_sets, correlated) = if is_select_shape {
+            match self.resolve_subqueries(logical, &engine_handle) {
+                Ok(triple) => triple,
                 Err(e) => {
                     if implicit {
                         let _ = self.database.txn_abort(txn_id);
@@ -259,13 +261,8 @@ impl<E: StorageEngine + 'static> Session<E> {
                 }
             }
         } else {
-            (logical, Vec::new())
+            (logical, Vec::new(), Vec::new())
         };
-
-        // Build the per-outer-row correlated evaluators BEFORE planning consumes
-        // the logical plan (the planner drops `correlated_subqueries` like the
-        // other subquery lists); each captures this same engine handle.
-        let correlated = self.build_correlated_evaluators(&logical, &engine_handle);
 
         let physical = match self.planner.plan(logical, &self.catalog) {
             Ok(p) => p,
@@ -335,8 +332,89 @@ impl<E: StorageEngine + 'static> Session<E> {
     }
 
     // -----------------------------------------------------------------------
-    // Uncorrelated subquery resolution (H4b)
+    // Statement subquery resolution (H4b uncorrelated, H4c correlated,
+    // H4d recursion into derived tables)
     // -----------------------------------------------------------------------
+
+    /// Resolve ALL of a statement's subqueries — the SELECT's own AND every
+    /// derived table's, bottom-up (H4d) — against `engine` (one MVCC snapshot).
+    /// Returns the fully-resolved plan plus the statement-global IN/EXISTS sets
+    /// and correlated evaluators the executor build captures.
+    ///
+    /// Three layers, reusing the H4b/H4c primitives per plan:
+    /// - Scalar subqueries are run and spliced as literals PER-PLAN — each
+    ///   Select's `SubqueryResult` slots bind to ITS OWN values (the per-Select
+    ///   namespace). Two derived tables' identically-numbered scalar slots never
+    ///   collide because each is baked against its own values here, before the
+    ///   outer plan ever sees a literal (`substitute_subquery_results` no longer
+    ///   recurses into `derived` — the fix that keeps the namespaces apart).
+    /// - IN/EXISTS sets and correlated evaluators are STATEMENT-GLOBAL slices;
+    ///   each derived table's are appended after the enclosing Select's own.
+    ///   A derived plan's slots are 0-based into its own lists, so they index
+    ///   the global slice correctly ONLY while that slice is still empty (a
+    ///   single runtime source). Two runtime sources across the derived boundary
+    ///   (the outer AND a derived, or two sibling derived tables, both filtering
+    ///   on an IN/EXISTS or a correlated form) would require renumbering the
+    ///   0-based slots; rather than risk a mis-indexed slice we reject that
+    ///   loudly — a recorded lever, never silent wrong results. No target query
+    ///   (Q22's outer carries no subqueries) needs it.
+    fn resolve_subqueries<H>(
+        &self,
+        logical: LogicalPlan,
+        engine: &Arc<H>,
+    ) -> Result<(LogicalPlan, Vec<InSubquerySet>, Vec<CorrelatedEvaluator>)>
+    where
+        H: StorageEngine + 'static,
+    {
+        // 1. THIS Select's OWN scalars (baked to literals) + OWN IN/EXISTS sets.
+        let (mut logical, mut in_sets) = self.resolve_select_subqueries(logical, engine)?;
+        // 2. THIS Select's OWN correlated templates → per-outer-row evaluators.
+        let mut correlated = self.build_correlated_evaluators(&logical, engine);
+
+        // 3. Recurse into derived tables (bottom-up), appending their resolved
+        //    global slices. Take them out, resolve each, put them back resolved.
+        let derived = match &mut logical {
+            LogicalPlan::Select { derived, .. } => std::mem::take(derived),
+            // Only a SELECT carries derived tables; every other shape is done.
+            _ => Vec::new(),
+        };
+        if !derived.is_empty() {
+            let mut resolved_derived = Vec::with_capacity(derived.len());
+            for d in derived {
+                let (dp, d_in, d_corr) = self.resolve_subqueries(*d.plan, engine)?;
+                // The derived's 0-based slots index the global slice correctly
+                // only while it is still empty — see the method doc. Both sides
+                // non-empty ⇒ renumbering required ⇒ loud rejection.
+                if !d_in.is_empty() && !in_sets.is_empty() {
+                    return Err(Error::SqlParse(
+                        "session: IN/EXISTS subqueries in BOTH a derived table and its enclosing \
+                         query (or a sibling derived table) are not supported (recorded lever)"
+                            .into(),
+                    ));
+                }
+                if !d_corr.is_empty() && !correlated.is_empty() {
+                    return Err(Error::SqlParse(
+                        "session: correlated subqueries in BOTH a derived table and its enclosing \
+                         query (or a sibling derived table) are not supported (recorded lever)"
+                            .into(),
+                    ));
+                }
+                in_sets.extend(d_in);
+                correlated.extend(d_corr);
+                resolved_derived.push(DerivedTable {
+                    alias: d.alias,
+                    plan: Box::new(dp),
+                    schema: d.schema,
+                });
+            }
+            match &mut logical {
+                LogicalPlan::Select { derived, .. } => *derived = resolved_derived,
+                // `derived` was non-empty above, so `logical` IS a Select.
+                _ => unreachable!("derived tables came from a Select"),
+            }
+        }
+        Ok((logical, in_sets, correlated))
+    }
 
     /// Resolve a SELECT's uncorrelated subqueries against `engine` (the same
     /// snapshot the outer query reads): run each scalar subquery and substitute
@@ -397,8 +475,7 @@ impl<E: StorageEngine + 'static> Session<E> {
     where
         H: StorageEngine + 'static,
     {
-        let (resolved, in_sets) = self.resolve_select_subqueries(logical, engine)?;
-        let correlated = self.build_correlated_evaluators(&resolved, engine);
+        let (resolved, in_sets, correlated) = self.resolve_subqueries(logical, engine)?;
         let physical = self.planner.plan(resolved, &self.catalog)?;
         match physical {
             PhysicalPlan::Query(physop) => {

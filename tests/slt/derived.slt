@@ -136,3 +136,128 @@ SELECT e_id, salary FROM (SELECT e_id, salary FROM emp) AS emp ORDER BY e_id
 3 300
 4 400
 5 500
+
+# ===========================================================================
+# H4d — subqueries INSIDE a derived table.
+#
+# A derived table's inner Select may now carry its OWN scalar / IN / correlated
+# subqueries. The session's subquery resolution recurses into `derived`
+# bottom-up: each derived Select's subqueries resolve/materialize/evaluate
+# against the same statement engine handle before its DerivedScan runs. The
+# per-Select slot namespaces stay apart — scalar results are baked per-plan;
+# the IN/correlated global slices append each derived's after the enclosing
+# Select's own.
+# ===========================================================================
+
+# A department with no employees, to make the correlated-EXISTS discriminating.
+statement ok
+INSERT INTO dept VALUES (40, 'hr')
+
+# ---- derived table with its own SCALAR subquery ----------------------------
+# The inner query's WHERE compares against an uncorrelated scalar AVG:
+# AVG(salary) over emp = (100+200+300+400+500)/5 = 300.0000; salary > 300 keeps
+# 400 and 500. The scalar is resolved (run + spliced as a literal) INSIDE the
+# derived plan before its DerivedScan runs.
+query I
+SELECT hi FROM (SELECT salary AS hi FROM emp WHERE salary > (SELECT AVG(salary) FROM emp)) AS d
+  ORDER BY hi
+----
+400
+500
+
+# ---- derived table with its own correlated EXISTS (its OWN scope) ----------
+# The NOT-yet: EXISTS correlates to the derived's own FROM (`dept`), one level,
+# fully inside the inner Select — `emp.dept = d_id` binds `d_id` to the derived
+# plan's own `dept` row (H4c machinery, one level down). Depts 10/20/30 have
+# employees; dept 40 ('hr') has none, so it is excluded.
+query T
+SELECT dname FROM (
+  SELECT d_name AS dname FROM dept WHERE EXISTS (SELECT * FROM emp WHERE dept = d_id)
+) AS d ORDER BY dname
+----
+eng
+ops
+sales
+
+# ---- TWO derived tables, EACH with its own scalar subquery (namespace) ------
+# Both derived plans use `SubqueryResult(0)` into their OWN `scalar_subqueries`
+# list — identically numbered, DIFFERENT queries. Per-plan baking resolves each
+# against its own value (MAX=500 for `a`, MIN=100 for `b`), so the slots never
+# collide. `a` keeps salary >= 500 → {500}; `b` keeps salary <= 100 → {100}.
+query II
+SELECT a.hi, b.lo FROM
+  (SELECT salary AS hi FROM emp WHERE salary >= (SELECT MAX(salary) FROM emp)) AS a,
+  (SELECT salary AS lo FROM emp WHERE salary <= (SELECT MIN(salary) FROM emp)) AS b
+----
+500 100
+
+# ---- correlation from INSIDE a derived table to the OUTER statement: reject -
+# A subquery inside the derived `sub` references `outer_e.e_id` — a column of
+# the OUTER statement, two levels out from the EXISTS. The derived table is
+# bound in a FRESH scope (no enclosing columns), so `outer_e` is not visible
+# inside it: the reference is a loud "not in FROM scope" (unchanged contract).
+statement error not in FROM scope
+SELECT e_id FROM emp AS outer_e, (
+  SELECT d_id FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.dept = outer_e.e_id)
+) AS sub
+
+# ---- runtime subqueries on BOTH sides of the derived boundary: reject -------
+# The outer query filters on a correlated EXISTS AND the derived table filters
+# on its own correlated EXISTS — two runtime sources whose 0-based slots would
+# collide in the statement-global slice. Renumbering is a recorded lever, so
+# this is a loud rejection rather than a mis-indexed slice (never silent wrong
+# results).
+statement error correlated subqueries in BOTH a derived table and its enclosing
+SELECT e_id FROM emp,
+  (SELECT d_id FROM dept d1 WHERE EXISTS (SELECT * FROM emp e2 WHERE e2.dept = d1.d_id)) AS sub
+WHERE EXISTS (SELECT * FROM dept d3 WHERE d3.d_id = emp.dept)
+
+# ---- EXPLAIN of a Q22-shaped statement (subquery buried in the derived) ------
+# The outer SELECT carries NO subqueries of its own — the scalar AVG lives
+# entirely inside the derived `d`. EXPLAIN recurses into `derived` to render the
+# subquery trailer; `(in d)` names the derived table it belongs to (before this
+# recursion EXPLAIN was blind to it and emitted no trailer at all). The scalar
+# is a resolved literal at run time, but EXPLAIN plans the raw template, so the
+# trailer shows the AVG aggregate plan.
+query T
+EXPLAIN SELECT hi FROM
+  (SELECT salary AS hi FROM emp WHERE salary > (SELECT AVG(salary) FROM emp)) AS d
+  ORDER BY hi
+----
+Projection([0])
+Sort[0 ASC]
+DerivedScan(d)
+Projection([2])
+Filter
+SeqScan(emp)
+Subquery[0] (in d):
+HashAggregate[AVG(c2)]
+SeqScan(emp)
+
+# ---- derived-INSIDE-derived with a runtime IN at the INNER level ------------
+# Two nested derived tables; only the innermost carries a runtime subquery
+# (`dept IN (SELECT d_id ... WHERE d_name = 'eng')`). 'eng' is d_id 10, whose
+# employees are e_id 1 (salary 100) and 2 (salary 200) — the single-source slot
+# space stays uncollided, so the IN materializes and filters cleanly.
+query I
+SELECT x FROM (
+  SELECT hi AS x FROM (
+    SELECT salary AS hi FROM emp WHERE dept IN (SELECT d_id FROM dept WHERE d_name = 'eng')
+  ) AS d1
+) AS d0 ORDER BY x
+----
+100
+200
+
+# ---- runtime subqueries at BOTH derived levels: reject ----------------------
+# The inner derived `d1` carries an IN AND its enclosing derived `d0` carries
+# its own IN — two runtime sources whose 0-based slots would collide in the
+# statement-global slice. Same recorded-lever rejection as the outer/derived
+# case above, one level deeper (never a mis-indexed slice).
+statement error IN/EXISTS subqueries in BOTH a derived table
+SELECT x FROM (
+  SELECT hi AS x FROM (
+    SELECT salary AS hi FROM emp WHERE dept IN (SELECT d_id FROM dept WHERE d_name = 'eng')
+  ) AS d1
+  WHERE hi IN (SELECT salary FROM emp WHERE dept = 10)
+) AS d0 ORDER BY x

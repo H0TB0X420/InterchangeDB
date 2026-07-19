@@ -242,6 +242,13 @@ const CORPUS: &[&str] = &[
     // alias `(g, s)`.
     "SELECT g, COUNT(*) FROM (SELECT c_b, SUM(c_val) FROM c GROUP BY c_b) AS t (g, s) \
      WHERE s > 5 GROUP BY g",
+    // H4d subquery INSIDE a derived table (Q22's shape). The derived's own
+    // scalar subquery is resolved (run + baked to a literal) per-plan by the
+    // session recursing into `derived`; every planner then bails on the derived
+    // table to the shared rule-based lowering, so all three return the same rows
+    // over the identical plan. The outer groups a plain derived column.
+    "SELECT g, COUNT(*) FROM (SELECT c_b AS g FROM c WHERE c_val > (SELECT AVG(c_val) FROM c)) \
+     AS d GROUP BY g",
     // H4b uncorrelated subqueries. The session resolves each subquery BEFORE
     // planning (scalar → spliced literal, IN → materialized set), so the
     // resolution is planner-independent and all three must agree on rows. The

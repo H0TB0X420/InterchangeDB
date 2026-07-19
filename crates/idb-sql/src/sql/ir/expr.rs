@@ -115,6 +115,20 @@ pub enum Expression {
         subquery: usize,
         outer_cols: Vec<usize>,
     },
+    /// `SUBSTRING(<input> FROM <start> FOR <length>)` (H4d — Q22's
+    /// `SUBSTRING(c_phone FROM 1 FOR 2)`). `start` is 1-based per SQL (the
+    /// binder asserts `start >= 1` and rejects a non-literal / non-integer
+    /// FROM-or-FOR before constructing this); `length` is the MAX character
+    /// count of the result (a short tail underfills it). The binder proves
+    /// `input` infers `Varchar`/`Char`, so the runtime handles only the string
+    /// domain (NULL → NULL). Char-correct by construction: it slices by
+    /// `chars()`, never bytes (the LIKE lesson), so multi-byte input is honest.
+    /// Appended LAST for bincode discriminant stability.
+    Substring {
+        input: Box<Expression>,
+        start: usize,
+        length: usize,
+    },
 }
 
 /// Arithmetic operator for `Expression::BinaryOp`.
@@ -397,6 +411,26 @@ impl Expression {
                     _ => Value::Null,
                 })
             }
+            Expression::Substring {
+                input,
+                start,
+                length,
+            } => {
+                let i = input.compile();
+                Box::new(move |t| match i(t) {
+                    // Char and Varchar are one string domain (see `compare_sql`);
+                    // the result is always a Varchar (its length is dynamic).
+                    Value::Varchar(s) | Value::Char(s) => {
+                        Value::Varchar(substring_chars(&s, start, length))
+                    }
+                    // NULL in → NULL out.
+                    Value::Null => Value::Null,
+                    // The binder proves the input is Varchar/Char, so this is
+                    // unreachable; stay total as NULL rather than mis-slice a
+                    // non-string value.
+                    _ => Value::Null,
+                })
+            }
             Expression::Case {
                 branches,
                 else_expr,
@@ -473,6 +507,15 @@ impl Expression {
             Expression::ExtractYear(arg) => Ok(Expression::ExtractYear(Box::new(
                 arg.substitute_params(params)?,
             ))),
+            Expression::Substring {
+                input,
+                start,
+                length,
+            } => Ok(Expression::Substring {
+                input: Box::new(input.substitute_params(params)?),
+                start,
+                length,
+            }),
             Expression::Case {
                 branches,
                 else_expr,
@@ -538,6 +581,15 @@ impl Expression {
             Expression::ExtractYear(arg) => Ok(Expression::ExtractYear(Box::new(
                 arg.substitute_subquery_results(values)?,
             ))),
+            Expression::Substring {
+                input,
+                start,
+                length,
+            } => Ok(Expression::Substring {
+                input: Box::new(input.substitute_subquery_results(values)?),
+                start,
+                length,
+            }),
             Expression::Case {
                 branches,
                 else_expr,
@@ -601,6 +653,15 @@ impl Expression {
             Expression::ExtractYear(arg) => Ok(Expression::ExtractYear(Box::new(
                 arg.substitute_outer_refs(values)?,
             ))),
+            Expression::Substring {
+                input,
+                start,
+                length,
+            } => Ok(Expression::Substring {
+                input: Box::new(input.substitute_outer_refs(values)?),
+                start,
+                length,
+            }),
             Expression::Case {
                 branches,
                 else_expr,
@@ -660,6 +721,22 @@ impl Expression {
                 Some(ColumnType::Date) => Some(ColumnType::Int32),
                 _ => None,
             },
+            // SUBSTRING over a Varchar/Char is a `Varchar` of AT MOST `length`
+            // characters — the honest upper bound is `Varchar(length)` (a
+            // shorter tail simply underfills it; the length is otherwise dynamic
+            // and a `Value` can't recover it). Over anything else it is
+            // uninferable (`None`), which the binder turns into a loud error at
+            // bind, so a non-string SUBSTRING never silently mistypes an
+            // aggregate / derived-column downstream.
+            Expression::Substring { input, length, .. } => {
+                match input.column_type(column_types) {
+                    Some(ColumnType::Varchar(_)) | Some(ColumnType::Char(_)) => Some(
+                        // Column lengths are `u16`; clamp the honest upper bound.
+                        ColumnType::Varchar((*length).min(u16::MAX as usize) as u16),
+                    ),
+                    _ => None,
+                }
+            }
             // A CASE has a single well-defined type only if the result
             // branches that CARRY a type (and the ELSE, when present) agree on
             // the SAME type — that type is the CASE's type. A bare NULL-literal
@@ -835,6 +912,11 @@ impl std::fmt::Display for Expression {
                 write!(f, "({} {} {})", left, symbol, right)
             }
             Expression::ExtractYear(arg) => write!(f, "EXTRACT(YEAR FROM {})", arg),
+            Expression::Substring {
+                input,
+                start,
+                length,
+            } => write!(f, "SUBSTRING({} FROM {} FOR {})", input, start, length),
             // `Predicate` has no `Display`, so we render a compact,
             // deterministic summary rather than the full WHEN/THEN tree:
             // the branch count plus an `, else` marker when an ELSE is
@@ -1049,6 +1131,7 @@ fn expr_contains_correlated(expr: &Expression) -> bool {
             expr_contains_correlated(left) || expr_contains_correlated(right)
         }
         Expression::ExtractYear(arg) => expr_contains_correlated(arg),
+        Expression::Substring { input, .. } => expr_contains_correlated(input),
         Expression::Case {
             branches,
             else_expr,
@@ -1059,6 +1142,23 @@ fn expr_contains_correlated(expr: &Expression) -> bool {
                 || else_expr.as_deref().is_some_and(expr_contains_correlated)
         }
     }
+}
+
+/// Char-correct SQL `SUBSTRING(s FROM start FOR length)`: `start` is 1-based
+/// (the binder guarantees `start >= 1`); take up to `length` characters from
+/// there. A `start` past the end yields the empty string, and a `length`
+/// running past the end is clamped by `take` (a short tail is fine). Slices by
+/// `chars()`, never bytes, so multi-byte input is honest (the LIKE lesson).
+fn substring_chars(s: &str, start: usize, length: usize) -> String {
+    // Hard assert (not debug): `start - 1` below would wrap silently in release
+    // on a corrupt `start == 0`. This runs per row, but `start` is a
+    // compile-time-constant `usize` captured by the closure (a literal the
+    // binder proved `>= 1`), so it is a cheap constant check — crash-on-
+    // corruption is the right call at this cost profile.
+    assert!(start >= 1, "SUBSTRING start is 1-based (binder-guaranteed)");
+    // 1-based → 0-based character offset.
+    let begin = start - 1;
+    s.chars().skip(begin).take(length).collect()
 }
 
 impl Predicate {
@@ -1188,17 +1288,16 @@ impl Predicate {
                 subquery,
                 negated,
             } => {
-                // Capture this leaf's materialized set. A missing slot means
-                // the sets weren't threaded (e.g. a stray `InSubquery` reached
-                // the zero-arg `compile`); stay total by treating it as an
-                // empty set — flagged in debug like the `Parameter` arm.
+                // Capture this leaf's materialized set at build time.
+                // Binder-established invariant: the statement's `InSubquery`
+                // sets are threaded whenever an `InSubquery` leaf is present, so
+                // `subqueries[subquery]` MUST resolve. A missing slot is
+                // corruption (a stray `InSubquery` reached the zero-arg
+                // `compile`) — crash rather than silently treat it as an empty
+                // set and drop every row in release (mirrors the
+                // `CorrelatedExists` arm below).
                 let set = subqueries.get(subquery).cloned().unwrap_or_else(|| {
-                    debug_assert!(
-                        false,
-                        "InSubquery slot {} has no materialized set",
-                        subquery
-                    );
-                    InSubquerySet::default()
+                    unreachable!("InSubquery slot {subquery} has no materialized set")
                 });
                 match expr {
                     // `[NOT] EXISTS`: a statement constant — true iff the
@@ -1810,6 +1909,90 @@ mod tests {
         // A folded date literal renders as its source form (EXPLAIN readability).
         assert_eq!(lit(Value::Date(8766)).to_string(), "DATE '1994-01-01'");
         assert_eq!(lit(Value::Date(-1)).to_string(), "DATE '1969-12-31'");
+    }
+
+    // ---- Substring ----
+
+    fn substring(input: Expression, start: usize, length: usize) -> Expression {
+        Expression::Substring {
+            input: Box::new(input),
+            start,
+            length,
+        }
+    }
+
+    #[test]
+    fn substring_is_char_correct_and_1_based() {
+        // 'aébc' is 4 CHARACTERS / 5 BYTES; FROM 2 FOR 2 must take [é, b] = "éb"
+        // (a byte slice at offset 2 would split é's two-byte encoding).
+        let f = substring(col(0), 2, 2).compile();
+        assert_eq!(
+            f(&vec![Value::Varchar("aébc".into())]),
+            Value::Varchar("éb".into())
+        );
+        // 1-based FROM: FROM 1 is the first char.
+        let g = substring(col(0), 1, 3).compile();
+        assert_eq!(
+            g(&vec![Value::Varchar("apple".into())]),
+            Value::Varchar("app".into())
+        );
+        // Char and Varchar are one domain — a Char input yields a Varchar.
+        assert_eq!(
+            g(&vec![Value::Char("apple".into())]),
+            Value::Varchar("app".into())
+        );
+    }
+
+    #[test]
+    fn substring_edges_null_past_end_and_clamp() {
+        // NULL in → NULL out.
+        let f = substring(col(0), 1, 2).compile();
+        assert_eq!(f(&vec![Value::Null]), Value::Null);
+        // Start past the end → the empty string.
+        let past = substring(col(0), 10, 2).compile();
+        assert_eq!(
+            past(&vec![Value::Varchar("apple".into())]),
+            Value::Varchar(String::new())
+        );
+        // Length past the end clamps to the tail: 'apple' FROM 4 FOR 10 = "le".
+        let clamp = substring(col(0), 4, 10).compile();
+        assert_eq!(
+            clamp(&vec![Value::Varchar("apple".into())]),
+            Value::Varchar("le".into())
+        );
+        // FOR 0 → the empty string (a zero length takes no characters). Legal,
+        // not an error — only start < 1 is rejected.
+        let zero = substring(col(0), 1, 0).compile();
+        assert_eq!(
+            zero(&vec![Value::Varchar("apple".into())]),
+            Value::Varchar(String::new())
+        );
+    }
+
+    #[test]
+    fn substring_type_is_varchar_over_strings_only() {
+        // Over Varchar/Char → Varchar(length); over anything else → None (the
+        // binder turns that into a loud error, so it never mistypes downstream).
+        assert_eq!(
+            substring(col(0), 1, 2).column_type(&[ColumnType::Varchar(15)]),
+            Some(ColumnType::Varchar(2))
+        );
+        assert_eq!(
+            substring(col(0), 1, 2).column_type(&[ColumnType::Char(15)]),
+            Some(ColumnType::Varchar(2))
+        );
+        assert_eq!(
+            substring(col(0), 1, 2).column_type(&[ColumnType::Int32]),
+            None
+        );
+    }
+
+    #[test]
+    fn substring_display() {
+        assert_eq!(
+            substring(col(3), 1, 2).to_string(),
+            "SUBSTRING(c3 FROM 1 FOR 2)"
+        );
     }
 
     // ---- Predicate ----

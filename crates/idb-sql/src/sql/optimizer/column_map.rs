@@ -149,6 +149,17 @@ impl ColumnRemap {
             Expression::ExtractYear(arg) => {
                 Expression::ExtractYear(Box::new(self.apply_expression(*arg)))
             }
+            // Remap columns inside the SUBSTRING input; `start`/`length` are
+            // constants, not column references.
+            Expression::Substring {
+                input,
+                start,
+                length,
+            } => Expression::Substring {
+                input: Box::new(self.apply_expression(*input)),
+                start,
+                length,
+            },
             // Remap columns inside BOTH the branch conditions (via
             // `apply_predicate`) and the branch/else results.
             Expression::Case {

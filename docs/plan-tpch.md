@@ -423,6 +423,28 @@ Gates: per-stage query unlocks (see demand map); parity suite runs the
 unlocked queries across all planners (identical *results*; plan shapes may
 legitimately differ only in the join core).
 
+**H4d executed (2026-07-19).** Q22's last mile: a minimal char-correct
+`Expression::Substring` (1-based literal FROM/FOR, `Varchar(length)`
+upper-bound type, empty-string past-end semantics — the LIKE lesson
+applied from birth), and the derived-table subquery restriction lifted —
+`Session::resolve_subqueries` recurses bottom-up into `DerivedScan`
+plans, reusing the H4b/H4c resolution per plan node. Namespace design:
+scalar results bake PER-PLAN (`substitute_subquery_results` deliberately
+does not recurse into derived — two derived tables each using slot 0
+resolve against their own values, test-pinned); runtime IN/correlated
+slices allow a single source across the derived boundary and reject any
+multi-source composition loudly (recorded lever — no target query needs
+renumbering). **Q22 runs FULL VERBATIM → 22/22 capability.** Review:
+zero live defects — the slot scheme was verified by induction at
+arbitrary nesting depth; six hardening fixes pre-commit (the InSubquery
+missing-slot arm now crashes instead of silently empty-setting in
+release — the H4c crash-rule applied to its last holdout; EXPLAIN now
+renders derived-internal subqueries with alias provenance;
+derived-in-derived regression pins; comment honesty; FOR 0 pin; hard
+assert in substring_chars). Tests 1390 → 1395. Draws: multi-source
+runtime subqueries across the derived boundary (lever); EXPLAIN
+subquery ordinals are render-order, provenance via label.
+
 ### H5 — the harness
 
 `bin/tpch` in the TPC-C driver's mold: deterministic seeded dbgen-style

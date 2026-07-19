@@ -1,33 +1,74 @@
-# TPC-H Q22 (CORE) — Global Sales Opportunity (H4c), on a micro-fixture.
+# TPC-H Q22 — Global Sales Opportunity — on a hand-computed micro-fixture.
 #
-# NOTE (recorded deviation — Q22 is NOT verbatim this phase): verbatim Q22
-# additionally needs (1) SUBSTRING(c_phone FROM 1 FOR 2), (2) a FROM-subquery
-# that itself carries these subqueries, and (3) GROUP BY on that substring
-# EXPRESSION — three features OUTSIDE correlation, each a recorded lever
-# (subqueries-in-derived-tables, expression GROUP BY keys, SUBSTRING). This gate
-# exercises Q22's correlated CORE: customers with an above-average account
-# balance and NO orders — the correlated NOT EXISTS composed with the
-# uncorrelated scalar AVG that Q22 is built on.
+# Q22 is the last mile to 22/22 (H4d). It composes three features INSIDE a
+# derived table (`custsale`): (1) SUBSTRING(c_phone FROM 1 FOR 2) as a country
+# code, (2) an uncorrelated scalar AVG subquery, and (3) a correlated NOT EXISTS
+# — all one level deep, fully inside the inner Select. The outer query only
+# groups a PLAIN derived column (`cntrycode`) and aggregates. The derived
+# table's own subqueries are resolved by the session recursing into `derived`
+# bottom-up (`Session::resolve_subqueries`).
 
 statement ok
-CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_acctbal DECIMAL(12,2))
+CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_phone CHAR(15), c_acctbal DECIMAL(12,2))
 
 statement ok
 CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_custkey INT)
 
+# c_phone's first two characters are the country code. The Q22 list is
+# ('13','31','23','29','30','18','17'). Fixture (custkey, phone-prefix, acctbal):
+#   1  '13'   700.00   in-list, positive, no order
+#   2  '13'   600.00   in-list, positive, no order
+#   3  '17'   700.00   in-list, positive, no order
+#   4  '31'   300.00   in-list, positive, no order
+#   5  '23'   200.00   in-list, positive, no order
+#   6  '13'   800.00   in-list, positive, HAS an order
+#   7  '99'  9000.00   NOT in-list  → excluded from AVG and from the WHERE
+#   8  '13'  -100.00   in-list, NEGATIVE → excluded from AVG (c_acctbal>0)
 statement ok
-INSERT INTO customer VALUES (1, 100.00), (2, 500.00), (3, 600.00), (4, -50.00)
+INSERT INTO customer VALUES
+  (1, '13-111-222-3333', 700.00),
+  (2, '13-222-333-4444', 600.00),
+  (3, '17-333-444-5555', 700.00),
+  (4, '31-444-555-6666', 300.00),
+  (5, '23-555-666-7777', 200.00),
+  (6, '13-666-777-8888', 800.00),
+  (7, '99-777-888-9999', 9000.00),
+  (8, '13-888-999-0000', -100.00)
 
+# Only customer 6 has an order, so the correlated NOT EXISTS excludes only it.
 statement ok
-INSERT INTO orders VALUES (10, 2)
+INSERT INTO orders VALUES (100, 6)
 
-# AVG over positive balances = (100+500+600)/3 = 400.00. Above-average and no
-# orders: cust 2 (500) has an order; cust 3 (600) qualifies; cust 1/4 below.
-query IR
-SELECT c_custkey, c_acctbal
-FROM customer
-WHERE c_acctbal > (SELECT AVG(c_acctbal) FROM customer WHERE c_acctbal > 0.00)
-  AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)
-ORDER BY c_custkey
+# ---- Q22 VERBATIM ----------------------------------------------------------
+#
+# Step 1 — the scalar AVG threshold: AVG(c_acctbal) over customers with
+# c_acctbal > 0 AND cntrycode IN the list. Eligible balances:
+#   700 (c1) + 600 (c2) + 700 (c3) + 300 (c4) + 200 (c5) + 800 (c6) = 3300
+#   c7 excluded ('99' not in list); c8 excluded (-100 not > 0).
+#   AVG = 3300 / 6 = 550.00
+#
+# Step 2 — the derived table `custsale`: cntrycode IN list AND
+# c_acctbal > 550.00 AND NOT EXISTS(order). Survivors:
+#   c1 '13' 700 (>550, no order)      keep
+#   c2 '13' 600 (>550, no order)      keep
+#   c3 '17' 700 (>550, no order)      keep
+#   c4 '31' 300 (not >550)            drop
+#   c5 '23' 200 (not >550)            drop
+#   c6 '13' 800 (>550) but HAS order  drop (NOT EXISTS is false)
+#   c7 '99' (not in list)             drop
+#   c8 '13' -100 (not >550)           drop
+#
+# Step 3 — GROUP BY cntrycode, ORDER BY cntrycode:
+#   '13': numcust 2, totacctbal 700 + 600 = 1300.00
+#   '17': numcust 1, totacctbal 700.00
+query TIR
+SELECT cntrycode, COUNT(*) AS numcust, SUM(c_acctbal) AS totacctbal FROM (
+  SELECT SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal FROM customer
+  WHERE SUBSTRING(c_phone FROM 1 FOR 2) IN ('13','31','23','29','30','18','17')
+    AND c_acctbal > (SELECT AVG(c_acctbal) FROM customer WHERE c_acctbal > 0.00
+                     AND SUBSTRING(c_phone FROM 1 FOR 2) IN ('13','31','23','29','30','18','17'))
+    AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)
+) AS custsale GROUP BY cntrycode ORDER BY cntrycode
 ----
-3 600.00
+13 2 1300.00
+17 1 700.00

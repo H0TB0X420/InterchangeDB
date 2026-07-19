@@ -518,20 +518,16 @@ impl LogicalPlan {
                 having,
                 limit,
             } => {
-                // The binder forbids a subquery inside a derived table's inner
-                // query, so a derived subplan carries no `SubqueryResult` — the
-                // recursion is a no-op there, kept only for structural parity
-                // with `substitute_params`.
-                let derived = derived
-                    .into_iter()
-                    .map(|d| {
-                        Ok::<DerivedTable, crate::common::Error>(DerivedTable {
-                            alias: d.alias,
-                            plan: Box::new(d.plan.substitute_subquery_results(values)?),
-                            schema: d.schema,
-                        })
-                    })
-                    .collect::<crate::common::Result<Vec<_>>>()?;
+                // H4d: `values` are THIS Select's OWN scalar-subquery results,
+                // indexed by ITS OWN `SubqueryResult` slots — a per-Select
+                // namespace. A derived table's inner Select has its OWN
+                // `scalar_subqueries` list and its OWN slot numbering, resolved
+                // separately (`Session::resolve_subqueries` recurses into
+                // `derived` bottom-up, baking each derived plan against its own
+                // values). So DO NOT recurse into `derived` here — substituting
+                // this Select's values into a derived plan's identically-numbered
+                // slots would splice the wrong subquery result (the namespace
+                // collision). Carry `derived` through untouched.
                 let joins = joins
                     .into_iter()
                     .map(|j| {
@@ -588,13 +584,14 @@ impl LogicalPlan {
     /// lives wherever the inner query's expressions do — its WHERE `filter`,
     /// join `ON`s, `HAVING`, aggregate arguments, and `select_list`. A correlated
     /// template's own subquery lists (`scalar_subqueries` / `in_subqueries` /
-    /// `correlated_subqueries`) and derived tables are EMPTY — the binder rejects
-    /// a subquery nested inside a correlated one
-    /// (`reject_nested_subqueries_in_correlated`), so there is nothing to recurse
-    /// into and the session's evaluator runs this template with empty sets;
-    /// `projection` / `order_by` are plain indices with no `OuterRef`. A
-    /// non-SELECT template is a binder bug — every correlated subquery binds to a
-    /// SELECT.
+    /// `correlated_subqueries`) are EMPTY — the binder rejects a subquery nested
+    /// inside a correlated one (`reject_nested_subqueries_in_correlated`), so the
+    /// session's evaluator runs this template with empty sets. A `derived` table
+    /// MAY be present, but the binder proves it is subquery-free
+    /// (`plan_contains_any_subquery`) and bound in a fresh scope, so it carries no
+    /// `OuterRef` — nothing to recurse into either. `projection` / `order_by` are
+    /// plain indices with no `OuterRef`. A non-SELECT template is a binder bug —
+    /// every correlated subquery binds to a SELECT.
     pub fn substitute_outer_refs(self, values: &[Value]) -> Result<LogicalPlan> {
         match self {
             LogicalPlan::Select {
@@ -645,8 +642,13 @@ impl LogicalPlan {
                 Ok(LogicalPlan::Select {
                     table,
                     joins,
-                    // Templates never carry these (multi-level correlation and
-                    // subqueries-in-templates are binder-rejected); pass through.
+                    // A template's own subquery lists are always empty
+                    // (subqueries-in-templates are binder-rejected). `derived`
+                    // MAY hold a plain derived table, but the binder proves it is
+                    // subquery-free (`plan_contains_any_subquery`) and
+                    // fresh-scoped, so it cannot carry an `OuterRef` — the
+                    // pass-through is sound for that reason, not because the field
+                    // is always empty.
                     derived,
                     scalar_subqueries,
                     in_subqueries,

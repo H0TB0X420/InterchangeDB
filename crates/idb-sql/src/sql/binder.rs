@@ -1036,34 +1036,21 @@ impl<E: StorageEngine> Binder<E> {
                 }
 
                 // Bind the inner query in a fresh scope (no enclosing columns,
-                // so it cannot correlate to the outer query) and compute its
+                // so it — AND any subquery inside it — cannot correlate to the
+                // OUTER statement's scope; such a reference is "column not found
+                // in scope", the unchanged loud rejection) and compute its
                 // output columns (types + per-item `AS` names).
+                //
+                // H4d: a derived table's inner query MAY now carry its own
+                // scalar / IN / EXISTS / correlated subqueries — the session's
+                // subquery resolution recurses into `derived` plans bottom-up
+                // (`Session::resolve_subqueries`), resolving each against the same
+                // statement engine handle before its `DerivedScan` runs. Its
+                // correlated forms correlate WITHIN the derived plan's own scope
+                // (Q22's `NOT EXISTS … o_custkey = c_custkey` references the
+                // derived's own `customer`), which the fresh scope handles like
+                // any other query.
                 let bound = self.bind_select_query(*subquery, depth + 1, Vec::new())?;
-                // A derived table's inner query is materialized at executor
-                // build time (a `DerivedScan` leaf), NOT through the session's
-                // subquery-resolution pass — so a scalar/IN/EXISTS or correlated
-                // subquery INSIDE it would never have its set / evaluator built.
-                // Reject loudly rather than silently mis-evaluate (recorded
-                // lever: subqueries inside a derived table — the last blocker for
-                // Q22 verbatim, see docs).
-                if let LogicalPlan::Select {
-                    scalar_subqueries,
-                    in_subqueries,
-                    correlated_subqueries,
-                    ..
-                } = &bound.plan
-                {
-                    if !scalar_subqueries.is_empty()
-                        || !in_subqueries.is_empty()
-                        || !correlated_subqueries.is_empty()
-                    {
-                        return Err(Error::SqlParse(
-                            "binder: subqueries inside a derived table (FROM-subquery) are not \
-                             supported yet"
-                                .into(),
-                        ));
-                    }
-                }
                 let mut columns = bound.derived_columns()?;
 
                 // Column-list alias `AS d (c1, c2, …)` (Q13 verbatim): a
@@ -2144,6 +2131,23 @@ fn decimal_from_str(s: &str, scale: u8) -> Result<Decimal> {
 
 // -------- expression binding (in-WHERE / RHS-of-SET) -----------------------
 
+/// Parse an AST expression that MUST be a non-negative integer literal into a
+/// `usize` (SUBSTRING's FROM / FOR). A non-literal or non-integer is a loud,
+/// named refusal — there is no bind-time value to fold, so guessing would be a
+/// silent wrong answer. `context` names the position in the error.
+fn literal_usize(e: &AstExpr, context: &str) -> Result<usize> {
+    match e {
+        AstExpr::Value(AstValue::Number(n, _)) => n.parse::<usize>().map_err(|err| {
+            Error::SqlParse(format!(
+                "binder: {context} must be a non-negative integer: {err}"
+            ))
+        }),
+        other => Err(Error::SqlParse(format!(
+            "binder: {context} must be a literal integer, got {other:?}"
+        ))),
+    }
+}
+
 fn bind_expression<E: StorageEngine>(
     scope: &Scope,
     e: AstExpr,
@@ -2276,6 +2280,59 @@ fn bind_expression<E: StorageEngine>(
         AstExpr::Interval(_) => Err(Error::SqlParse(
             "binder: INTERVAL is only supported as `DATE '…' ± INTERVAL '…' DAY|MONTH|YEAR`".into(),
         )),
+        // `SUBSTRING(<input> FROM <start> FOR <length>)` (H4d — Q22). FROM and
+        // FOR must be literal integers (a non-literal offset/length has no
+        // bind-time value to fold — refuse loudly rather than guess); FROM is
+        // 1-based per SQL (assert `start >= 1`); a missing FOR is refused (Q22
+        // always has both, and an unbounded-length SUBSTRING is a separate
+        // shape). The input must infer Varchar/Char, or it is a loud error —
+        // the runtime handles only the string domain.
+        AstExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let start = match substring_from {
+                Some(from) => literal_usize(&from, "SUBSTRING FROM")?,
+                None => {
+                    return Err(Error::SqlParse(
+                        "binder: SUBSTRING without FROM not supported".into(),
+                    ))
+                }
+            };
+            // FROM is 1-based per SQL; a 0 (or the absurd, but `literal_usize`
+            // already excludes negatives) has no valid position.
+            if start == 0 {
+                return Err(Error::SqlParse(
+                    "binder: SUBSTRING FROM is 1-based (start must be >= 1)".into(),
+                ));
+            }
+            let length = match substring_for {
+                Some(for_len) => literal_usize(&for_len, "SUBSTRING FOR")?,
+                None => {
+                    return Err(Error::SqlParse(
+                        "binder: SUBSTRING without FOR not supported".into(),
+                    ))
+                }
+            };
+            let input = bind_expression(scope, *expr, binder)?;
+            // Bind-time typing: SUBSTRING is defined only over a string input.
+            // Refuse anything else here rather than let the runtime silently
+            // return NULL for every row.
+            match input.column_type(&scope_column_types(scope)) {
+                Some(ColumnType::Varchar(_)) | Some(ColumnType::Char(_)) => {
+                    Ok(Expression::Substring {
+                        input: Box::new(input),
+                        start,
+                        length,
+                    })
+                }
+                other => Err(Error::SqlParse(format!(
+                    "binder: SUBSTRING requires a VARCHAR/CHAR input, got {other:?}"
+                ))),
+            }
+        }
         AstExpr::Case {
             operand,
             conditions,
@@ -2929,25 +2986,43 @@ fn reject_unsupported_subqueries<E: StorageEngine>(
 /// a correlated subquery. This enforces the invariant `substitute_outer_refs`
 /// relies on (a template's own subquery lists are empty).
 fn reject_nested_subqueries_in_correlated(plan: &LogicalPlan) -> Result<()> {
+    // A correlated template must be subquery-free at EVERY level: the per-outer-
+    // row evaluator plans + runs it with no materialized sets and no nested
+    // evaluators, so a subquery inside it has no home. H4d lifted the
+    // derived-table restriction only for TOP-level statements (whose session
+    // resolution recurses into `derived`); a correlated template gets no such
+    // recursion, so a subquery hiding inside a derived table it contains is
+    // caught here too (a plain derived table — no subqueries of its own — stays
+    // legal inside a correlated template).
+    if plan_contains_any_subquery(plan) {
+        return Err(Error::SqlParse(
+            "binder: a correlated subquery whose inner query itself contains a subquery is \
+             not supported yet"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// True if `plan` — or any derived table nested within it, recursively — carries
+/// its own scalar / IN / correlated subquery. Drives
+/// `reject_nested_subqueries_in_correlated`.
+fn plan_contains_any_subquery(plan: &LogicalPlan) -> bool {
     if let LogicalPlan::Select {
         scalar_subqueries,
         in_subqueries,
         correlated_subqueries,
+        derived,
         ..
     } = plan
     {
-        if !scalar_subqueries.is_empty()
+        !scalar_subqueries.is_empty()
             || !in_subqueries.is_empty()
             || !correlated_subqueries.is_empty()
-        {
-            return Err(Error::SqlParse(
-                "binder: a correlated subquery whose inner query itself contains a subquery is \
-                 not supported yet"
-                    .into(),
-            ));
-        }
+            || derived.iter().any(|d| plan_contains_any_subquery(&d.plan))
+    } else {
+        false
     }
-    Ok(())
 }
 
 /// Bind a comparison `left <op> right` with O13 operand narrowing — the

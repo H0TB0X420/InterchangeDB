@@ -222,9 +222,16 @@ where
             let subplans = subquery_plans_of(&inner);
             let inner_phys = plan_inner(*inner, catalog, selection)?;
             let mut text = render_explain(&inner_phys);
-            for (i, sub) in subplans.into_iter().enumerate() {
+            for (i, (label, sub)) in subplans.into_iter().enumerate() {
                 let sub_phys = plan_inner(sub, catalog, selection)?;
-                text.push_str(&format!("Subquery[{}]:\n{}", i, render_explain(&sub_phys)));
+                // Label the provenance so a derived table's subqueries are
+                // distinguishable from the outer SELECT's own (`(in <alias>)`).
+                let header = match label {
+                    None => format!("Subquery[{}]:\n", i),
+                    Some(alias) => format!("Subquery[{}] (in {}):\n", i, alias),
+                };
+                text.push_str(&header);
+                text.push_str(&render_explain(&sub_phys));
             }
             Ok(PhysicalPlan::Explain(text))
         }
@@ -1093,6 +1100,9 @@ fn columns_in_expr(expr: &Expression, out: &mut Vec<usize>) {
             columns_in_expr(right, out);
         }
         Expression::ExtractYear(arg) => columns_in_expr(arg, out),
+        // SUBSTRING references whatever columns its input does; `start`/`length`
+        // are constants.
+        Expression::Substring { input, .. } => columns_in_expr(input, out),
         // A CASE references columns in its branch conditions (via
         // `referenced_columns`) and its branch/else results.
         Expression::Case {
@@ -1379,6 +1389,17 @@ fn shift_expr(expr: Expression, delta: isize) -> Expression {
             right: Box::new(shift_expr(*right, delta)),
         },
         Expression::ExtractYear(arg) => Expression::ExtractYear(Box::new(shift_expr(*arg, delta))),
+        // Shift columns inside the SUBSTRING input; `start`/`length` are
+        // constants in a different (character-offset) space — never shifted.
+        Expression::Substring {
+            input,
+            start,
+            length,
+        } => Expression::Substring {
+            input: Box::new(shift_expr(*input, delta)),
+            start,
+            length,
+        },
         Expression::Case {
             branches,
             else_expr,
@@ -1630,24 +1651,46 @@ where
 /// the `PhysOp` IR directly (engine-free — no build, no scan); for descriptors
 /// it emits a one-line summary.
 /// `pub(crate)`: the memo planner renders its own EXPLAIN arm (T17-A.6).
-/// The inner plans of every subquery a `SELECT` carries (scalar first, then
-/// IN/EXISTS, then correlated), in slot order — the plans EXPLAIN renders under
-/// `Subquery[i]:` headers. Empty for any non-`SELECT` or a `SELECT` with no
+/// The inner plans of every subquery reachable from a `SELECT`, each paired
+/// with a provenance label: `None` for a subquery on the statement's OWN SELECT,
+/// `Some(alias)` for one buried inside a derived table `alias`. Order is
+/// deterministic and depth-first: the SELECT's own subqueries first (scalar,
+/// then IN/EXISTS, then correlated), then each derived table in FROM order,
+/// recursing into its plan. Empty for any non-`SELECT` or a `SELECT` with no
 /// subqueries. A correlated template still carries its `OuterRef` placeholders
 /// (rendered as `outer{k}`), so EXPLAIN shows the correlation shape unresolved.
-fn subquery_plans_of(logical: &LogicalPlan) -> Vec<LogicalPlan> {
+///
+/// Recursing into `derived` is what makes a Q22-shaped statement — every
+/// subquery buried in the derived, the outer SELECT carrying none — render its
+/// `Subquery[i]` trailers at all (EXPLAIN was blind to them before).
+fn subquery_plans_of(logical: &LogicalPlan) -> Vec<(Option<String>, LogicalPlan)> {
     match logical {
         LogicalPlan::Select {
+            derived,
             scalar_subqueries,
             in_subqueries,
             correlated_subqueries,
             ..
-        } => scalar_subqueries
-            .iter()
-            .chain(in_subqueries.iter())
-            .chain(correlated_subqueries.iter())
-            .cloned()
-            .collect(),
+        } => {
+            let mut plans: Vec<(Option<String>, LogicalPlan)> = scalar_subqueries
+                .iter()
+                .chain(in_subqueries.iter())
+                .chain(correlated_subqueries.iter())
+                .map(|plan| (None, plan.clone()))
+                .collect();
+            for table in derived {
+                for (inner_label, plan) in subquery_plans_of(&table.plan) {
+                    // The subquery lives inside this derived table; a deeper
+                    // `inner_label` extends the provenance path (`d0 > d1`).
+                    let label = match inner_label {
+                        None => table.alias.clone(),
+                        Some(inner) => format!("{} > {}", table.alias, inner),
+                    };
+                    plans.push((Some(label), plan));
+                }
+            }
+            plans
+        }
         _ => Vec::new(),
     }
 }
