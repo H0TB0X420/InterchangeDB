@@ -116,7 +116,24 @@ fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
         session.execute(sql).unwrap();
     }
 
-    for table in ["a", "b", "c", "ja", "jb"] {
+    // Date-bearing table for the H3.2 date-range parity query: a DATE column
+    // gets an equi-width histogram over its day-counts (stats.rs), so all
+    // three planners cost the range predicate off real selectivity, not the
+    // default constant.
+    session
+        .execute("CREATE TABLE dt (dt_id INT PRIMARY KEY, dt_date DATE)")
+        .unwrap();
+    for sql in [
+        "INSERT INTO dt VALUES (1, DATE '1993-06-15')",
+        "INSERT INTO dt VALUES (2, DATE '1994-01-01')",
+        "INSERT INTO dt VALUES (3, DATE '1994-07-04')",
+        "INSERT INTO dt VALUES (4, DATE '1995-12-31')",
+        "INSERT INTO dt VALUES (5, DATE '1998-09-02')",
+    ] {
+        session.execute(sql).unwrap();
+    }
+
+    for table in ["a", "b", "c", "ja", "jb", "dt"] {
         session.execute(&format!("ANALYZE TABLE {table}")).unwrap();
     }
     (session, dir)
@@ -175,6 +192,12 @@ const CORPUS: &[&str] = &[
     // reorder UNTOUCHED — a wrongful remap here would corrupt the display.
     "SELECT a_val + c_val FROM c JOIN b ON c_b = b_id JOIN a ON b_a = a_id WHERE c_val < 3",
     "SELECT a_val, SUM(c_val) - COUNT(*) FROM c JOIN b ON c_b = b_id JOIN a ON b_a = a_id GROUP BY a_val",
+    // H3.2 date-range predicate: dates compare to dates. This entry asserts
+    // only that all three planners return the SAME rows (dt_id 2, 3) — results
+    // parity. The histogram-derived range selectivity itself is asserted in the
+    // selectivity and ANALYZE unit tests (date_range_uses_histogram_not_fallback,
+    // analyze_builds_equi_width_histogram_for_date_columns), not here.
+    "SELECT dt_id FROM dt WHERE dt_date >= DATE '1994-01-01' AND dt_date < DATE '1995-01-01'",
 ];
 
 fn rows(session: &mut Session<BTreeEngine>, sql: &str) -> Vec<Vec<Value>> {

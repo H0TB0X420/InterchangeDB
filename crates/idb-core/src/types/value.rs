@@ -23,6 +23,10 @@ pub enum ColumnType {
     Decimal { precision: u8, scale: u8 },
     Timestamp,
     Boolean,
+    // NOTE (serde): `Date` is appended so bincode's variant discriminants for
+    // the pre-existing variants stay stable — old persisted catalogs still
+    // decode. Every new variant here MUST go last for the same reason.
+    Date,
 }
 
 /// A runtime value, tagged with its type. `Null` is its own variant rather
@@ -39,6 +43,14 @@ pub enum Value {
     Timestamp(i64), // microseconds since Unix epoch
     Boolean(bool),
     Null,
+    /// A calendar date, stored as days since 1970-01-01 (see `types::civil`).
+    /// A dedicated variant (not a reused `Timestamp`) keeps the key encoding
+    /// four bytes narrower and the display honest (no midnight-µs suffix).
+    //
+    // NOTE (serde): appended AFTER `Null` so every pre-existing variant's
+    // bincode discriminant is unchanged — old persisted rows still decode.
+    // New variants MUST go last here for the same reason.
+    Date(i32),
 }
 
 impl Value {
@@ -62,6 +74,7 @@ impl Value {
             (Value::Decimal(d), ColumnType::Decimal { scale, .. }) => d.scale() == *scale,
             (Value::Timestamp(_), ColumnType::Timestamp) => true,
             (Value::Boolean(_), ColumnType::Boolean) => true,
+            (Value::Date(_), ColumnType::Date) => true,
             _ => false,
         }
     }
@@ -90,6 +103,7 @@ impl Value {
             }),
             Value::Timestamp(_) => Some(ColumnType::Timestamp),
             Value::Boolean(_) => Some(ColumnType::Boolean),
+            Value::Date(_) => Some(ColumnType::Date),
         }
     }
 }
@@ -128,6 +142,10 @@ impl Value {
             (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
             (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
             (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+            // Date compares only against Date (days since epoch, so numeric
+            // order IS calendar order). No implicit Date↔Int/Timestamp
+            // coercion — a mismatched pair falls through to `None` (UNKNOWN).
+            (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
             (Value::Decimal(a), Value::Decimal(b)) => Some(compare_decimals(a, b)),
             (Value::Int32(a), Value::Decimal(d)) => Some(compare_int_decimal(*a as i64, d)),
             (Value::Int64(a), Value::Decimal(d)) => Some(compare_int_decimal(*a, d)),
@@ -516,6 +534,11 @@ mod tests {
             Value::Varchar("5".into()),
             Value::Char("5".into()),
             Value::Boolean(true),
+            // A pair of distinct dates, one pre-1970, so the invariant covers
+            // DATE: dates equal-match only each other (never Int64/Timestamp of
+            // the same numeric magnitude), and only when their day-counts match.
+            Value::Date(8766), // 1994-01-01
+            Value::Date(-1),   // 1969-12-31 (pre-epoch)
         ];
         for a in &values {
             for b in &values {
@@ -610,12 +633,43 @@ mod tests {
             Value::Timestamp(1_700_000_000_000_000),
             Value::Boolean(true),
             Value::Null,
+            Value::Date(8766), // 1994-01-01
+            Value::Date(-1),   // 1969-12-31 (pre-epoch negative)
         ];
         for v in &cases {
             let bytes = bincode::serialize(v).unwrap();
             let back: Value = bincode::deserialize(&bytes).unwrap();
             assert_eq!(&back, v, "value roundtrip failed for {:?}", v);
         }
+    }
+
+    /// The serde-additivity guarantee, made concrete: appending `Date` after
+    /// `Null` must NOT move any pre-existing variant's bincode discriminant.
+    /// A blob captured before `Date` existed still decodes to the same value.
+    /// (bincode tags enum variants by declaration index, so a mid-enum insert
+    /// would silently remap old data — this pins the append.)
+    #[test]
+    fn serde_pre_date_discriminants_are_stable() {
+        // Discriminants for the variants present before `Date` was added.
+        let pre_date: [(u32, Value); 5] = [
+            (0, Value::Int32(7)),
+            (1, Value::Int64(7)),
+            (6, Value::Timestamp(7)),
+            (7, Value::Boolean(true)),
+            (8, Value::Null),
+        ];
+        for (tag, value) in &pre_date {
+            assert_eq!(
+                bincode::serialize(value).unwrap()[0..4],
+                tag.to_le_bytes(),
+                "discriminant for {value:?} shifted — serde additivity broken"
+            );
+        }
+        // And `Date` itself takes the next free tag (9), after `Null` (8).
+        assert_eq!(
+            bincode::serialize(&Value::Date(0)).unwrap()[0..4],
+            9u32.to_le_bytes()
+        );
     }
 
     /// ColumnType serde roundtrip — covers the types we'll persist into
@@ -634,11 +688,34 @@ mod tests {
             },
             ColumnType::Timestamp,
             ColumnType::Boolean,
+            ColumnType::Date,
         ];
         for ty in &cases {
             let bytes = bincode::serialize(ty).unwrap();
             let back: ColumnType = bincode::deserialize(&bytes).unwrap();
             assert_eq!(&back, ty, "column type roundtrip failed for {:?}", ty);
         }
+    }
+
+    /// Date value ↔ type agreement and the comparison contract: Date orders
+    /// against Date by day count (= calendar order); Date vs any other type is
+    /// UNKNOWN (no implicit coercion), matching `compare_sql`'s `None`.
+    #[test]
+    fn date_matches_type_and_compares_date_only() {
+        use std::cmp::Ordering::*;
+        assert!(Value::Date(0).matches(&ColumnType::Date));
+        assert!(!Value::Date(0).matches(&ColumnType::Timestamp));
+        assert!(!Value::Int32(0).matches(&ColumnType::Date));
+        assert_eq!(Value::Date(0).type_of(), Some(ColumnType::Date));
+
+        assert_eq!(
+            Value::Date(8766).compare_sql(&Value::Date(8766)),
+            Some(Equal)
+        );
+        assert_eq!(Value::Date(-1).compare_sql(&Value::Date(0)), Some(Less));
+        assert_eq!(Value::Date(1).compare_sql(&Value::Date(0)), Some(Greater));
+        // No Date↔Int / Date↔Timestamp coercion — UNKNOWN, never a silent match.
+        assert_eq!(Value::Date(0).compare_sql(&Value::Int32(0)), None);
+        assert_eq!(Value::Date(0).compare_sql(&Value::Timestamp(0)), None);
     }
 }

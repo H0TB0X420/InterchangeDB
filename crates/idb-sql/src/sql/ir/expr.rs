@@ -51,6 +51,10 @@ pub enum Expression {
         left: Box<Expression>,
         right: Box<Expression>,
     },
+    /// `EXTRACT(YEAR FROM <date-expr>)` — the calendar year of a `Date`
+    /// argument, as an `Int32`. The binder proves the argument infers `Date`
+    /// before constructing this, so the runtime path is total by design.
+    ExtractYear(Box<Expression>),
 }
 
 /// Arithmetic operator for `Expression::BinaryOp`.
@@ -118,6 +122,17 @@ impl Expression {
                 let r = right.compile();
                 Box::new(move |t| eval_binary_op(op, l(t), r(t)))
             }
+            Expression::ExtractYear(arg) => {
+                let a = arg.compile();
+                Box::new(move |t| match a(t) {
+                    Value::Date(days) => Value::Int32(crate::types::civil::ymd_from_days(days).0),
+                    // NULL in, NULL out.
+                    Value::Null => Value::Null,
+                    // Unreachable given the binder's Date-typing check, but the
+                    // closure stays total: any non-Date value yields NULL.
+                    _ => Value::Null,
+                })
+            }
         }
     }
 
@@ -146,6 +161,9 @@ impl Expression {
                 left: Box::new(left.substitute_params(params)?),
                 right: Box::new(right.substitute_params(params)?),
             }),
+            Expression::ExtractYear(arg) => Ok(Expression::ExtractYear(Box::new(
+                arg.substitute_params(params)?,
+            ))),
         }
     }
 
@@ -168,6 +186,13 @@ impl Expression {
                 let r = right.column_type(column_types)?;
                 infer_binary_op_type(*op, l, r)
             }
+            // EXTRACT(YEAR FROM Date) is Int32; anything but a Date argument is
+            // uninferable (`None`) — the binder turns that into a loud error at
+            // its build sites, so this never silently mistypes an aggregate.
+            Expression::ExtractYear(arg) => match arg.column_type(column_types) {
+                Some(ColumnType::Date) => Some(ColumnType::Int32),
+                _ => None,
+            },
         }
     }
 }
@@ -241,6 +266,13 @@ impl std::fmt::Display for Expression {
             Expression::Literal(Value::Int32(n)) => write!(f, "{}", n),
             Expression::Literal(Value::Int64(n)) => write!(f, "{}", n),
             Expression::Literal(Value::Null) => write!(f, "NULL"),
+            // Render a folded date as its source literal (`DATE 'YYYY-MM-DD'`)
+            // so EXPLAIN over a bind-time-folded date is readable and pins the
+            // exact folded day — the folding-proof the H3.2 slt gate asserts.
+            Expression::Literal(Value::Date(days)) => {
+                let (y, m, d) = crate::types::civil::ymd_from_days(*days);
+                write!(f, "DATE '{y:04}-{m:02}-{d:02}'")
+            }
             // `Value` has no `Display`; Debug is the honest fallback.
             Expression::Literal(v) => write!(f, "{:?}", v),
             // 1-based to match SQL's `$1` placeholder syntax.
@@ -254,6 +286,7 @@ impl std::fmt::Display for Expression {
                 };
                 write!(f, "({} {} {})", left, symbol, right)
             }
+            Expression::ExtractYear(arg) => write!(f, "EXTRACT(YEAR FROM {})", arg),
         }
     }
 }
@@ -703,6 +736,44 @@ mod tests {
         let inner = binop(BinaryOp::Sub, lit(Value::Int64(1)), col(3));
         let outer = binop(BinaryOp::Mul, col(2), inner);
         assert_eq!(outer.to_string(), "(c2 * (1 - c3))");
+    }
+
+    // ---- ExtractYear ----
+
+    fn extract_year(arg: Expression) -> Expression {
+        Expression::ExtractYear(Box::new(arg))
+    }
+
+    #[test]
+    fn extract_year_compiles_over_date_and_null() {
+        // 8766 = 1994-01-01, 10561 = 1998-12-01 — the year is the civil year.
+        let f = extract_year(col(0)).compile();
+        assert_eq!(f(&vec![Value::Date(8766)]), Value::Int32(1994));
+        assert_eq!(f(&vec![Value::Date(10561)]), Value::Int32(1998));
+        // Pre-epoch date: -1 = 1969-12-31.
+        assert_eq!(f(&vec![Value::Date(-1)]), Value::Int32(1969));
+        // NULL in → NULL out.
+        assert_eq!(f(&vec![Value::Null]), Value::Null);
+    }
+
+    #[test]
+    fn extract_year_type_is_int32_only_over_date() {
+        // Arg infers Date → Int32; arg infers anything else → None (the binder
+        // turns that None into a loud error, so it never mistypes downstream).
+        assert_eq!(
+            extract_year(col(0)).column_type(&[ColumnType::Date]),
+            Some(ColumnType::Int32)
+        );
+        assert_eq!(extract_year(col(0)).column_type(&[ColumnType::Int64]), None);
+        assert_eq!(extract_year(lit(Value::Null)).column_type(&[]), None);
+    }
+
+    #[test]
+    fn extract_year_display() {
+        assert_eq!(extract_year(col(3)).to_string(), "EXTRACT(YEAR FROM c3)");
+        // A folded date literal renders as its source form (EXPLAIN readability).
+        assert_eq!(lit(Value::Date(8766)).to_string(), "DATE '1994-01-01'");
+        assert_eq!(lit(Value::Date(-1)).to_string(), "DATE '1969-12-31'");
     }
 
     // ---- Predicate ----

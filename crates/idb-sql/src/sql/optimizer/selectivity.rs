@@ -250,6 +250,9 @@ fn value_to_i64(v: &Value) -> Option<i64> {
     match v {
         Value::Int32(n) => Some(*n as i64),
         Value::Int64(n) => Some(*n),
+        // Date histograms are keyed by day-count, so a Date literal maps to
+        // its i64 days for the same bucket math (see `analyze_table`).
+        Value::Date(days) => Some(*days as i64),
         _ => None,
     }
 }
@@ -351,6 +354,28 @@ mod tests {
             (s - 0.5).abs() < 0.15,
             "expected ~0.5 at midpoint, got {}",
             s
+        );
+    }
+
+    #[test]
+    fn date_range_uses_histogram_not_fallback() {
+        // A DATE column's histogram is an equi-width-INT histogram over
+        // day-counts (see `analyze_table`), so a `Value::Date` literal drives
+        // the same bucket math via `value_to_i64`. 16 consecutive days
+        // [8760, 8775] with one row each; `col < DATE(8768)` cuts the 16-day
+        // span at day 8 → fraction 8/16. The point of the test is that the
+        // range estimate is the histogram-DERIVED fraction, not the
+        // `RANGE_FALLBACK` constant a missing/mismatched histogram would yield.
+        let stats = vec![stats_with_hist(16, 8760, 8775, &[1; 16])];
+        let p = cmp_pred(CompareOp::Lt, 0, Value::Date(8768));
+        let s = estimate_predicate_selectivity(&p, &stats);
+        assert!(
+            (s - 0.5).abs() < 0.05,
+            "expected ~0.5 histogram fraction for a date range, got {s}"
+        );
+        assert!(
+            (s - RANGE_FALLBACK).abs() > 1e-6,
+            "date range fell back to RANGE_FALLBACK ({RANGE_FALLBACK}); histogram unused"
         );
     }
 

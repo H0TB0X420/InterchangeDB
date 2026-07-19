@@ -164,6 +164,12 @@ fn encode_value(ty: &ColumnType, value: &Value, out: &mut Vec<u8>) -> Result<()>
             out.extend_from_slice(&n.to_le_bytes());
             Ok(())
         }
+        (ColumnType::Date, Value::Date(days)) => {
+            // Days since epoch as a 4-byte i32 — the row-store mirror of the
+            // Int32 arm (the key encoder handles order preservation separately).
+            out.extend_from_slice(&days.to_le_bytes());
+            Ok(())
+        }
         (ColumnType::Boolean, Value::Boolean(b)) => {
             out.push(if *b { 0x01 } else { 0x00 });
             Ok(())
@@ -238,6 +244,15 @@ fn decode_value(ty: &ColumnType, bytes: &[u8]) -> Result<(Value, usize)> {
             }
             let n = i32::from_le_bytes(bytes[..4].try_into().unwrap());
             Ok((Value::Int32(n), 4))
+        }
+        ColumnType::Date => {
+            if bytes.len() < 4 {
+                return Err(Error::StorageCorrupted(
+                    "tuple::decode Date: need 4 bytes".into(),
+                ));
+            }
+            let days = i32::from_le_bytes(bytes[..4].try_into().unwrap());
+            Ok((Value::Date(days), 4))
         }
         ColumnType::Int64 => {
             if bytes.len() < 8 {
@@ -346,7 +361,7 @@ fn decode_value(ty: &ColumnType, bytes: &[u8]) -> Result<(Value, usize)> {
 /// over preceding columns.
 fn value_byte_size(ty: &ColumnType, bytes: &[u8]) -> Result<usize> {
     match ty {
-        ColumnType::Int32 => Ok(4),
+        ColumnType::Int32 | ColumnType::Date => Ok(4),
         ColumnType::Int64 | ColumnType::Timestamp | ColumnType::Decimal { .. } => Ok(8),
         ColumnType::Boolean => Ok(1),
         ColumnType::Char(n) => Ok(*n as usize),
@@ -393,6 +408,24 @@ mod tests {
             Value::Varchar("hello".into()),
             Value::Bytes(vec![0x00, 0x01, 0xFF]),
         ]
+    }
+
+    /// Date round-trips through the row-store tuple codec as a 4-byte i32,
+    /// alongside a non-Date column so column-skipping over a fixed-width Date
+    /// is exercised. Kept separate from `all_types_*` so the null-bitmap-width
+    /// goldens in those tests stay pinned to their original column count.
+    #[test]
+    fn date_column_roundtrips() {
+        let schema = vec![ColumnType::Date, ColumnType::Int32];
+        let row = vec![Value::Date(-1), Value::Int32(42)]; // 1969-12-31, then 42
+        let encoded = encode(&schema, &row).unwrap();
+        let decoded = decode(&schema, &encoded).unwrap();
+        assert_eq!(decoded, row);
+        // Skip past the Date to read the second column directly.
+        assert_eq!(
+            decode_column(&schema, &encoded, 1).unwrap(),
+            Value::Int32(42)
+        );
     }
 
     /// Encode + decode a multi-column row touching every supported type.

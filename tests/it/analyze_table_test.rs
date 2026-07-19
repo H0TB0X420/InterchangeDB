@@ -110,6 +110,51 @@ fn analyze_writes_equi_width_histogram_for_int_columns() {
 }
 
 #[test]
+fn analyze_builds_equi_width_histogram_for_date_columns() {
+    // A DATE column is analyzed exactly like an integer one: the histogram is
+    // equi-width-INT over the day-counts, a NULL date is EXCLUDED from the
+    // histogram and counted in null_count instead. Day-counts: 1970-01-01 = 0
+    // (epoch) and 1994-01-01 = 8766 bracket the range; 1985-01-01 sits between;
+    // row 4 is NULL.
+    let (mut s, cat, _d) = setup();
+    s.execute("CREATE TABLE t (id INT PRIMARY KEY, d DATE)")
+        .unwrap();
+    s.execute("INSERT INTO t VALUES (1, DATE '1970-01-01')")
+        .unwrap();
+    s.execute("INSERT INTO t VALUES (2, DATE '1985-01-01')")
+        .unwrap();
+    s.execute("INSERT INTO t VALUES (3, DATE '1994-01-01')")
+        .unwrap();
+    s.execute("INSERT INTO t VALUES (4, NULL)").unwrap();
+    s.execute("ANALYZE TABLE t").unwrap();
+
+    let tid = table_id(&cat, "t");
+    let c = cat.get_column_stats(tid, 1).unwrap().unwrap();
+    // Same discriminator as an INT column — dates reuse the int histogram.
+    assert_eq!(c.histogram_kind, HISTOGRAM_KIND_EQUI_WIDTH_INT);
+    assert!(!c.histogram_blob.is_empty());
+    // The NULL date is excluded from the histogram and counted separately.
+    assert_eq!(c.null_count, 1);
+
+    // Header: min/max are day-counts over the NON-NULL dates only.
+    let min = i64::from_le_bytes(c.histogram_blob[0..8].try_into().unwrap());
+    let max = i64::from_le_bytes(c.histogram_blob[8..16].try_into().unwrap());
+    let nb = u16::from_le_bytes(c.histogram_blob[16..18].try_into().unwrap()) as usize;
+    assert_eq!(min, 0); // 1970-01-01, the epoch day.
+    assert_eq!(max, 8766); // 1994-01-01.
+
+    // Bucket counts sum to the non-null row count (3), NOT the 4 total rows —
+    // the NULL never enters a bucket.
+    let mut total: u32 = 0;
+    for b in 0..nb {
+        let off = 18 + b * 4;
+        let cnt = u32::from_le_bytes(c.histogram_blob[off..off + 4].try_into().unwrap());
+        total = total.saturating_add(cnt);
+    }
+    assert_eq!(total, 3);
+}
+
+#[test]
 fn analyze_skips_histogram_for_non_int_columns() {
     let (mut s, cat, _d) = setup();
     s.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))")

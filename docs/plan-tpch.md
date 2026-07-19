@@ -203,6 +203,32 @@ FIXED. Gains: tests 1328 → 1331; Q14 runs verbatim. Draws: none new;
 Decimal Mul at extreme scale pairs now errs loudly at bind/build instead
 of silently NULLing at runtime.
 
+**H3.2 executed (2026-07-18).** `Value::Date(i32 days)` + `ColumnType::Date`
+(appended last in both enums — bincode tag stability pinned by a
+raw-bytes test, old catalogs decode unchanged); dependency-free civil
+calendar (`types/civil.rs`, Hinnant algorithms, anchors hand-verified in
+review incl. era/negative-day arithmetic); strict `DATE 'YYYY-MM-DD'`
+literals; bind-time INTERVAL folding (DAY exact; MONTH/YEAR clamped —
+subtraction is negate-then-fold, proven for the borrow cases; Q1's
+`- INTERVAL '90' DAY` folds to `DATE '1998-09-02'`, EXPLAIN-pinned);
+`Expression::ExtractYear` (YEAR only, bind-time Date-typed, total at
+runtime); key encoding mirrors Int32 with cross-epoch order property
+tests; Date columns joined the int-histogram ANALYZE/selectivity path
+(~4 mechanical lines). Review found ZERO functional defects — five
+coverage/DX findings fixed pre-commit: the cargo-fuzz ColumnType mirror
+had silently missed Date (manual-sync warning added), Date
+histogram/ANALYZE now asserted end-to-end (an overclaiming test comment
+honestied), the WHERE-side fold tests gained boundary-straddling rows
+(±1-day regressions now flip result sets), join-key property grid +
+Date, and the fold error split (non-Date operand vs non-literal date).
+Checking the fuzz crate also surfaced pre-existing breakage: two fuzz
+targets still imported `index::lsm` paths dead since the workspace
+split — repaired in a separate commit. Gains: tests 1345 → 1347 (+14
+from the phase itself); every TPC-H date predicate shape (Q1's window,
+range scans, EXTRACT in projections/aggregate args) now runs. Draws:
+expression GROUP BY keys (Q7/Q8/Q9's `EXTRACT` grouping) remain a
+recorded separate increment; INTERVAL only folds against literal dates.
+
 - DATE: **decided 2026-07-18** — new `Value::Date(i32 days)` with its own
   `ColumnType`, order-preserving key encoding, and display. TPC-H compares
   dates to dates; a distinct type keeps encoding and rendering honest

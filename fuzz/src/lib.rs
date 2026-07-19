@@ -11,6 +11,12 @@ use interchangedb::types::{ColumnType, Decimal};
 /// `Arbitrary`-derivable mirror of `ColumnType`. Width/precision/scale fields
 /// are taken raw (unclamped) on purpose — the decoders must tolerate any
 /// value, so feeding them junk widths is exactly the point.
+///
+/// This is a HAND-MAINTAINED mirror: nothing forces it to stay in sync with
+/// `ColumnType`. Every new `ColumnType` variant MUST be added here (and to the
+/// `From` impl below), or the fuzzer can never generate schemas of that type
+/// and the corresponding decode arms stay unreachable from coverage-guided
+/// fuzzing.
 #[derive(Arbitrary, Debug, Clone)]
 pub enum FuzzColumnType {
     Int32,
@@ -21,6 +27,7 @@ pub enum FuzzColumnType {
     Decimal { precision: u8, scale: u8 },
     Timestamp,
     Boolean,
+    Date,
 }
 
 impl From<&FuzzColumnType> for ColumnType {
@@ -45,6 +52,7 @@ impl From<&FuzzColumnType> for ColumnType {
             }
             FuzzColumnType::Timestamp => ColumnType::Timestamp,
             FuzzColumnType::Boolean => ColumnType::Boolean,
+            FuzzColumnType::Date => ColumnType::Date,
         }
     }
 }

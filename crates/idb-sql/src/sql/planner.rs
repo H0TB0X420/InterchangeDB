@@ -896,6 +896,7 @@ fn columns_in_expr(expr: &Expression, out: &mut Vec<usize>) {
             columns_in_expr(left, out);
             columns_in_expr(right, out);
         }
+        Expression::ExtractYear(arg) => columns_in_expr(arg, out),
     }
 }
 
@@ -1043,6 +1044,7 @@ fn shift_expr(expr: Expression, delta: isize) -> Expression {
             left: Box::new(shift_expr(*left, delta)),
             right: Box::new(shift_expr(*right, delta)),
         },
+        Expression::ExtractYear(arg) => Expression::ExtractYear(Box::new(shift_expr(*arg, delta))),
     }
 }
 

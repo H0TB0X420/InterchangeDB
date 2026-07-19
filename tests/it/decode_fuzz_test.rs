@@ -44,6 +44,7 @@ fn arb_column_type() -> impl Strategy<Value = ColumnType> {
         Just(ColumnType::Int64),
         Just(ColumnType::Boolean),
         Just(ColumnType::Timestamp),
+        Just(ColumnType::Date),
         // scale <= precision <= 18 (Decimal is i64-backed, max scale 18).
         (0u8..=18).prop_flat_map(|scale| {
             (scale.max(1)..=18).prop_map(move |precision| ColumnType::Decimal { precision, scale })
@@ -67,6 +68,7 @@ fn arb_value(ty: ColumnType) -> BoxedStrategy<Value> {
         ColumnType::Int64 => any::<i64>().prop_map(Value::Int64).boxed(),
         ColumnType::Boolean => any::<bool>().prop_map(Value::Boolean).boxed(),
         ColumnType::Timestamp => any::<i64>().prop_map(Value::Timestamp).boxed(),
+        ColumnType::Date => any::<i32>().prop_map(Value::Date).boxed(),
         ColumnType::Decimal { scale, .. } => any::<i64>()
             .prop_map(move |m| Value::Decimal(Decimal::from_i64_with_scale(m, scale)))
             .boxed(),
@@ -114,6 +116,11 @@ fn arb_ordered_pair() -> impl Strategy<Value = (ColumnType, Value, Value)> {
             Value::Timestamp(a),
             Value::Timestamp(b)
         )),
+        (any::<i32>(), any::<i32>()).prop_map(|(a, b)| (
+            ColumnType::Date,
+            Value::Date(a),
+            Value::Date(b)
+        )),
     ]
 }
 
@@ -123,6 +130,7 @@ fn numeric_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Int32(x), Value::Int32(y)) => x.cmp(y),
         (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
         _ => unreachable!("arb_ordered_pair only yields matching numeric variants"),
     }
 }

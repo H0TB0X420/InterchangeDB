@@ -1,0 +1,217 @@
+# H3.2: the DATE type — literals, range predicates, bind-time INTERVAL
+# folding, and EXTRACT(YEAR). Every date value renders as zero-padded
+# `YYYY-MM-DD` (a Text column). Dates compare only against dates (no implicit
+# Int/Timestamp coercion), and every date EXPRESSION here is literal-only, so
+# `DATE '…' ± INTERVAL '…' unit` folds to a plain literal at bind time.
+
+statement ok
+CREATE TABLE orders (o_id INT PRIMARY KEY, o_date DATE, o_val INT)
+
+# 1994-01-01 appears twice (o2, o7) so a GROUP BY key carries count 2; o6 has
+# a NULL date to exercise skip/group/order-null semantics.
+#
+# o8..o11 are BOUNDARY rows for the bind-time INTERVAL-fold WHERE tests further
+# down. Each sits one day to a side of a folded boundary, so a ±1-day drift in
+# the fold flips the row set — without them the nearest row is weeks away and a
+# one-day regression would be invisible:
+#   o8=1994-09-02, o9=1994-09-03 straddle 1994-09-02 (= 1994-12-01 − 90 days).
+#   o10=1994-12-31, o11=1995-01-01 straddle 1995-01-01 (= 1994-01-01 + 1 YEAR).
+statement ok
+INSERT INTO orders VALUES
+  (1, DATE '1993-06-15', 10),
+  (2, DATE '1994-01-01', 20),
+  (3, DATE '1994-07-04', 30),
+  (4, DATE '1995-12-31', 40),
+  (5, DATE '1998-09-02', 50),
+  (6, NULL, 60),
+  (7, DATE '1994-01-01', 70),
+  (8, DATE '1994-09-02', 80),
+  (9, DATE '1994-09-03', 90),
+  (10, DATE '1994-12-31', 100),
+  (11, DATE '1995-01-01', 110)
+
+statement ok
+ANALYZE TABLE orders
+
+# ---- date literals render as YYYY-MM-DD -----------------------------------
+
+query IT
+SELECT o_id, o_date FROM orders ORDER BY o_date, o_id
+----
+1 1993-06-15
+2 1994-01-01
+7 1994-01-01
+3 1994-07-04
+8 1994-09-02
+9 1994-09-03
+10 1994-12-31
+11 1995-01-01
+4 1995-12-31
+5 1998-09-02
+6 NULL
+
+# ---- range predicates (>=, <, =) — dates compared to dates ----------------
+
+# Half-open year window [1994-01-01, 1995-01-01): every 1994 row — o2, o3, o7
+# plus boundary rows o8, o9, o10 — but NOT o11 (1995-01-01 is excluded by the
+# strict upper bound). NULL date (o6) never satisfies a comparison.
+query I
+SELECT o_id FROM orders
+WHERE o_date >= DATE '1994-01-01' AND o_date < DATE '1995-01-01'
+ORDER BY o_id
+----
+2
+3
+7
+8
+9
+10
+
+query I
+SELECT o_id FROM orders WHERE o_date = DATE '1994-07-04'
+----
+3
+
+query I
+SELECT o_id FROM orders WHERE o_date < DATE '1994-01-01'
+----
+1
+
+# ---- bind-time INTERVAL folding (the TPC-H Q1 shape) ----------------------
+
+# `DATE '1994-12-01' - INTERVAL '90' DAY` folds to 1994-09-02 AT BIND TIME, so
+# the predicate the executor sees is `o_date <= DATE '1994-09-02'`. o8 sits AT
+# the boundary (included), o9 one day past it (excluded): a ±1-day fold drift
+# changes this row set.
+#   ≤ 1994-09-02: o1(1993-06-15), o2/o7(1994-01-01), o3(1994-07-04), o8(1994-09-02).
+query I
+SELECT o_id FROM orders
+WHERE o_date <= DATE '1994-12-01' - INTERVAL '90' DAY
+ORDER BY o_id
+----
+1
+2
+3
+7
+8
+
+# YEAR interval in a predicate: `DATE '1994-01-01' + INTERVAL '1' YEAR` =
+# 1995-01-01. o11 sits AT the boundary (included), o10 one day before it
+# (excluded): a ±1-day fold drift changes this row set.
+#   ≥ 1995-01-01: o11(1995-01-01), o4(1995-12-31), o5(1998-09-02).
+query I
+SELECT o_id FROM orders
+WHERE o_date >= DATE '1994-01-01' + INTERVAL '1' YEAR
+ORDER BY o_id
+----
+4
+5
+11
+
+# EXPLAIN pins the FOLDED literal: the Compute item is the concrete
+# `DATE '1998-09-02'` (= 1998-12-01 − 90 days), proving the fold happened at
+# bind time — the planner never sees the INTERVAL.
+query T
+EXPLAIN SELECT o_id, DATE '1998-12-01' - INTERVAL '90' DAY FROM orders
+----
+Compute[c0, DATE '1998-09-02']
+SeqScan(orders)
+
+# MONTH interval with day-of-month CLAMP: 1996-01-31 + 1 MONTH targets
+# February, which has no 31st, so SQL pins it to the month's last valid day.
+# 1996 is a leap year → 1996-02-29 (not 28).
+query T
+EXPLAIN SELECT o_id, DATE '1996-01-31' + INTERVAL '1' MONTH FROM orders
+----
+Compute[c0, DATE '1996-02-29']
+SeqScan(orders)
+
+# Non-clamping MONTH and a plain-old YEAR shift, pinned via projection.
+query T
+EXPLAIN SELECT o_id, DATE '1994-01-15' + INTERVAL '2' MONTH FROM orders
+----
+Compute[c0, DATE '1994-03-15']
+SeqScan(orders)
+
+# ---- EXTRACT(YEAR) --------------------------------------------------------
+
+# In a projection: NULL date → NULL year (EXTRACT is NULL-total).
+query II
+SELECT o_id, EXTRACT(YEAR FROM o_date) FROM orders ORDER BY o_id
+----
+1 1993
+2 1994
+3 1994
+4 1995
+5 1998
+6 NULL
+7 1994
+8 1994
+9 1994
+10 1994
+11 1995
+
+# In aggregate arguments: MAX/MIN over the extracted year, and SUM (NULL
+# skipped). Non-null years 1993 + 1994·6 (o2,o3,o7,o8,o9,o10) + 1995·2 (o4,o11)
+# + 1998 = 19945.
+query III
+SELECT MAX(EXTRACT(YEAR FROM o_date)), MIN(EXTRACT(YEAR FROM o_date)), SUM(EXTRACT(YEAR FROM o_date)) FROM orders
+----
+1998 1993 19945
+
+# EXTRACT(YEAR FROM col) renders in EXPLAIN as its Display form.
+query T
+EXPLAIN SELECT o_id, EXTRACT(YEAR FROM o_date) FROM orders
+----
+Compute[c0, EXTRACT(YEAR FROM c1)]
+SeqScan(orders)
+
+# ---- date as a plain-column GROUP BY key ----------------------------------
+
+# Grouping on the DATE column itself; the NULL date forms its own group and
+# sorts last under ASC (NULL = +∞, the Postgres/DB2 default).
+query TI
+SELECT o_date, COUNT(*) FROM orders GROUP BY o_date ORDER BY o_date
+----
+1993-06-15 1
+1994-01-01 2
+1994-07-04 1
+1994-09-02 1
+1994-09-03 1
+1994-12-31 1
+1995-01-01 1
+1995-12-31 1
+1998-09-02 1
+NULL 1
+
+# ---- error contracts ------------------------------------------------------
+
+# Malformed literal: not YYYY-MM-DD.
+statement error strict YYYY-MM-DD
+SELECT o_id FROM orders WHERE o_date = DATE 'not-a-date'
+
+# Well-formed but not a real calendar date (Feb has no 30th).
+statement error not a real calendar date
+SELECT o_id FROM orders WHERE o_date = DATE '1994-02-30'
+
+# Non-leap-century Feb 29 (1900 is ÷100 but not ÷400).
+statement error not a real calendar date
+SELECT o_id FROM orders WHERE o_date = DATE '1900-02-29'
+
+# EXTRACT field other than YEAR is a named refusal.
+statement error EXTRACT\(MONTH\) not supported
+SELECT EXTRACT(MONTH FROM o_date) FROM orders
+
+# EXTRACT over a non-DATE argument is refused at bind time.
+statement error requires a DATE argument
+SELECT EXTRACT(YEAR FROM o_val) FROM orders
+
+# INTERVAL against a DATE column: the left IS a DATE expression, just not a
+# literal one — only literal DATEs fold. (Distinct refusal from the next case.)
+statement error DATE expression but not a literal one
+SELECT o_id FROM orders WHERE o_date < o_date + INTERVAL '1' DAY
+
+# INTERVAL against a left operand that isn't a DATE expression at all
+# (`1 + INTERVAL …`): a distinct, separately-worded refusal.
+statement error left operand is not a DATE expression
+SELECT o_id FROM orders WHERE o_date < 1 + INTERVAL '1' DAY

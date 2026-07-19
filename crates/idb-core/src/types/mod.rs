@@ -10,6 +10,7 @@
 //! - Task 9.1 (later): methods, decimal arithmetic, serde, full constructors.
 //! - Task 9.2 (later): tuple encoding for row-store storage values.
 
+pub mod civil;
 pub mod decimal;
 pub mod keyenc;
 pub mod tuple;

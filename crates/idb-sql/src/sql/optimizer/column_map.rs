@@ -125,6 +125,9 @@ impl ColumnRemap {
                 left: Box::new(self.apply_expression(*left)),
                 right: Box::new(self.apply_expression(*right)),
             },
+            Expression::ExtractYear(arg) => {
+                Expression::ExtractYear(Box::new(self.apply_expression(*arg)))
+            }
         }
     }
 

@@ -84,6 +84,14 @@ fn encode_one(value: &Value, ty: &ColumnType, out: &mut Vec<u8>) -> Result<()> {
             encode_int32(*n, out);
             Ok(())
         }
+        (Value::Date(days), ColumnType::Date) => {
+            // Date = days since 1970-01-01 (i32). Days-since-epoch order IS
+            // calendar order, so the same sign-flipped big-endian encoding as
+            // Int32 gives order-preserving date keys for free.
+            out.push(PRESENT_SENTINEL);
+            encode_int32(*days, out);
+            Ok(())
+        }
         (Value::Boolean(b), ColumnType::Boolean) => {
             out.push(PRESENT_SENTINEL);
             encode_boolean(*b, out);
@@ -149,6 +157,10 @@ fn decode_one(bytes: &[u8], ty: &ColumnType) -> Result<(Value, usize)> {
         ColumnType::Int32 => {
             let (n, consumed) = decode_int32(body)?;
             Ok((Value::Int32(n), 1 + consumed))
+        }
+        ColumnType::Date => {
+            let (days, consumed) = decode_int32(body)?;
+            Ok((Value::Date(days), 1 + consumed))
         }
         ColumnType::Boolean => {
             let (b, consumed) = decode_boolean(body)?;
@@ -453,6 +465,31 @@ mod tests {
                 window[1]
             );
         }
+    }
+
+    /// Date rides the Int32 encoding, so it inherits the sign-boundary
+    /// ordering: pre-epoch negatives sort before day 0, and byte-lex order
+    /// tracks calendar order. Round-trip pins the decode arm reads back a
+    /// `Date`, not an `Int32`, from identical bytes.
+    #[test]
+    fn date_roundtrip_and_order_across_epoch() {
+        // -1 = 1969-12-31, 0 = 1970-01-01, 8766 = 1994-01-01, 10561 = 1998-12-01.
+        let days = [i32::MIN, -366, -1, 0, 8766, 10561, i32::MAX];
+        let mut last: Option<Vec<u8>> = None;
+        for d in days {
+            let v = Value::Date(d);
+            let bytes = encode_key_components(&[&v], &[ColumnType::Date]).unwrap();
+            let back = decode_key_components(&bytes, &[ColumnType::Date]).unwrap();
+            assert_eq!(back, vec![Value::Date(d)], "date roundtrip failed for {d}");
+            if let Some(prev) = &last {
+                assert!(prev < &bytes, "date byte order broken at {d}");
+            }
+            last = Some(bytes);
+        }
+        // Same bytes as the Int32 encoding of the same day count (shared trick).
+        let as_date = encode_key_components(&[&Value::Date(8766)], &[ColumnType::Date]).unwrap();
+        let as_int = encode_key_components(&[&Value::Int32(8766)], &[ColumnType::Int32]).unwrap();
+        assert_eq!(as_date, as_int, "Date must share Int32's byte encoding");
     }
 
     /// NULL must sort strictly before any present value. This is the

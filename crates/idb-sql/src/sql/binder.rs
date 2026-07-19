@@ -1319,6 +1319,19 @@ fn insert_value_expr(e: AstExpr, target_ty: &ColumnType) -> Result<Expression> {
 
 /// Convert an AST expression that must be a literal (used by INSERT VALUES).
 fn literal_from_expr(e: AstExpr, target_ty: &ColumnType) -> Result<Value> {
+    // A `DATE 'YYYY-MM-DD'` literal binds only against a Date target column.
+    if let AstExpr::TypedString {
+        data_type: AstDataType::Date,
+        value,
+    } = &e
+    {
+        if !matches!(target_ty, ColumnType::Date) {
+            return Err(Error::SqlParse(format!(
+                "binder: DATE literal '{value}' cannot bind to column type {target_ty:?}"
+            )));
+        }
+        return Ok(Value::Date(parse_date_literal(value)?));
+    }
     let inner = match e {
         AstExpr::Value(v) => v,
         // Unary minus on a number literal — handle `-5`.
@@ -1403,6 +1416,12 @@ fn decimal_from_str(s: &str, scale: u8) -> Result<Decimal> {
 // -------- expression binding (in-WHERE / RHS-of-SET) -----------------------
 
 fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
+    // DATE literals and `date_literal ± INTERVAL 'n' DAY|MONTH|YEAR` fold to a
+    // plain `Value::Date` here, at bind time — planners and executors then see
+    // an ordinary literal, with zero date-arithmetic machinery downstream.
+    if let Some(days) = fold_date_expr(&e)? {
+        return Ok(Expression::Literal(Value::Date(days)));
+    }
     match e {
         AstExpr::Value(AstValue::Placeholder(s)) => {
             // P13.7: SQL parameter placeholder. Accept both `?` (anonymous,
@@ -1506,6 +1525,29 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
                 right: Box::new(r),
             })
         }
+        AstExpr::Extract { field, expr, .. } => {
+            // Only YEAR is supported; other fields are a loud, named refusal.
+            if !matches!(field, ast::DateTimeField::Year) {
+                return Err(Error::SqlParse(format!(
+                    "binder: EXTRACT({field}) not supported (only YEAR)"
+                )));
+            }
+            let arg = bind_expression(scope, *expr)?;
+            // Bind-time typing: EXTRACT(YEAR FROM …) is defined only over a
+            // DATE argument. Refuse anything else here rather than let the
+            // runtime silently return NULL.
+            match arg.column_type(&scope_column_types(scope)) {
+                Some(ColumnType::Date) => Ok(Expression::ExtractYear(Box::new(arg))),
+                other => Err(Error::SqlParse(format!(
+                    "binder: EXTRACT(YEAR FROM …) requires a DATE argument, got {other:?}"
+                ))),
+            }
+        }
+        // A bare INTERVAL (not folded into a literal DATE above) has no runtime
+        // type in this engine — refuse it loudly with the supported shape.
+        AstExpr::Interval(_) => Err(Error::SqlParse(
+            "binder: INTERVAL is only supported as `DATE '…' ± INTERVAL '…' DAY|MONTH|YEAR`".into(),
+        )),
         AstExpr::Nested(inner) => bind_expression(scope, *inner),
         other => Err(Error::SqlParse(format!(
             "binder: expression shape unsupported: {:?}",
@@ -1611,6 +1653,215 @@ fn ast_value_to_value_unconstrained(v: AstValue) -> Result<Value> {
             other
         ))),
     }
+}
+
+// -------- DATE literals, INTERVAL folding ----------------------------------
+
+/// The three `INTERVAL` units we fold. DAY shifts the day count directly;
+/// MONTH/YEAR decompose to civil (y, m, d) and shift the month, clamping the
+/// day into the target month.
+enum IntervalUnit {
+    Day,
+    Month,
+    Year,
+}
+
+/// Try to fold an AST expression to a `Date` day-count at bind time.
+///
+/// - `Ok(Some(days))` — a `DATE 'YYYY-MM-DD'` literal, or a
+///   `date_literal ± INTERVAL 'n' DAY|MONTH|YEAR` chain (folded recursively,
+///   so `date … - interval … + interval …` works). Every TPC-H date
+///   expression is literal-only, so planners only ever see a `Value::Date`.
+/// - `Ok(None)` — not a date-shaped expression; the caller binds it normally.
+/// - `Err` — date-shaped but malformed, or `INTERVAL` in an unsupported
+///   position (loud, naming the limitation).
+fn fold_date_expr(e: &AstExpr) -> Result<Option<i32>> {
+    match e {
+        AstExpr::TypedString {
+            data_type: AstDataType::Date,
+            value,
+        } => Ok(Some(parse_date_literal(value)?)),
+        AstExpr::Nested(inner) => fold_date_expr(inner),
+        AstExpr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus) =>
+        {
+            match fold_date_expr(left)? {
+                // Literal date on the left: the right MUST be an INTERVAL.
+                Some(base) => {
+                    let iv = match &**right {
+                        AstExpr::Interval(iv) => iv,
+                        other => {
+                            return Err(Error::SqlParse(format!(
+                                "binder: DATE arithmetic expects an INTERVAL operand, got {other:?}"
+                            )))
+                        }
+                    };
+                    let (amount, unit) = interval_amount(iv)?;
+                    let signed = if matches!(op, BinaryOperator::Minus) {
+                        -amount
+                    } else {
+                        amount
+                    };
+                    Ok(Some(apply_interval(base, signed, unit)?))
+                }
+                // Left didn't fold to a literal DATE. An INTERVAL on the right
+                // still makes this DATE-arithmetic shaped, but the left is
+                // unusable — split the diagnostic so the two failure modes read
+                // differently:
+                //   - the left references a column (`o_date + INTERVAL …`): it
+                //     may well be DATE-typed, but only *literal* dates fold at
+                //     bind time.
+                //   - the left is anything else (`1 + INTERVAL …`): it isn't a
+                //     DATE expression at all.
+                None => {
+                    if matches!(**right, AstExpr::Interval(_)) {
+                        let left_is_column = matches!(
+                            **left,
+                            AstExpr::Identifier(_) | AstExpr::CompoundIdentifier(_)
+                        );
+                        if left_is_column {
+                            Err(Error::SqlParse(
+                                "binder: INTERVAL arithmetic requires a literal DATE operand \
+                                 (`DATE '…' ± INTERVAL '…' DAY|MONTH|YEAR`); the left side is a \
+                                 DATE expression but not a literal one"
+                                    .into(),
+                            ))
+                        } else {
+                            Err(Error::SqlParse(
+                                "binder: INTERVAL arithmetic requires a literal DATE operand \
+                                 (`DATE '…' ± INTERVAL '…' DAY|MONTH|YEAR`); the left operand is \
+                                 not a DATE expression"
+                                    .into(),
+                            ))
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                }
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Parse a strict `YYYY-MM-DD` date literal to days-since-epoch. Validates the
+/// calendar via the civil round-trip (a day that normalizes forward — e.g.
+/// 1900-02-29 → 1900-03-01 — isn't a real date and is rejected). Malformed
+/// input is a loud error, never a silent coercion.
+fn parse_date_literal(value: &str) -> Result<i32> {
+    let bytes = value.as_bytes();
+    // Exactly 10 chars, dashes at [4] and [7], digits everywhere else.
+    let well_formed = bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, &b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !well_formed {
+        return Err(Error::SqlParse(format!(
+            "invalid DATE literal '{value}': expected strict YYYY-MM-DD"
+        )));
+    }
+    // Slices are ASCII-digit-validated above, so these parses cannot fail.
+    let year: i32 = value[0..4].parse().unwrap();
+    let month: u32 = value[5..7].parse().unwrap();
+    let day: u32 = value[8..10].parse().unwrap();
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(Error::SqlParse(format!(
+            "invalid DATE literal '{value}': month/day out of range"
+        )));
+    }
+    let days = crate::types::civil::days_from_ymd(year, month, day);
+    if crate::types::civil::ymd_from_days(days) != (year, month, day) {
+        return Err(Error::SqlParse(format!(
+            "invalid DATE literal '{value}': not a real calendar date"
+        )));
+    }
+    Ok(days)
+}
+
+/// Extract the signed amount and unit from a sqlparser `INTERVAL` node. Only
+/// integer-literal amounts and DAY/MONTH/YEAR units fold; anything else is a
+/// loud error (matching the "fold at bind time, else refuse" contract).
+fn interval_amount(iv: &ast::Interval) -> Result<(i64, IntervalUnit)> {
+    let amount = match &*iv.value {
+        AstExpr::Value(AstValue::SingleQuotedString(s))
+        | AstExpr::Value(AstValue::Number(s, _)) => s
+            .trim()
+            .parse::<i64>()
+            .map_err(|e| Error::SqlParse(format!("invalid INTERVAL amount '{s}': {e}")))?,
+        other => {
+            return Err(Error::SqlParse(format!(
+                "binder: INTERVAL amount must be an integer literal, got {other:?}"
+            )))
+        }
+    };
+    let unit = match &iv.leading_field {
+        Some(ast::DateTimeField::Day) => IntervalUnit::Day,
+        Some(ast::DateTimeField::Month) => IntervalUnit::Month,
+        Some(ast::DateTimeField::Year) => IntervalUnit::Year,
+        other => {
+            return Err(Error::SqlParse(format!(
+                "binder: INTERVAL unit {other:?} not supported (DAY, MONTH, YEAR only)"
+            )))
+        }
+    };
+    Ok((amount, unit))
+}
+
+/// Apply a signed interval to a day count. DAY is exact addition. MONTH/YEAR
+/// decompose to civil (y, m, d), shift the absolute month index, then clamp
+/// the day into the target month: `1996-01-31 + 1 MONTH = 1996-02-29`
+/// (February has no 31st, so SQL pins it to the month's last valid day).
+fn apply_interval(base_days: i32, signed_amount: i64, unit: IntervalUnit) -> Result<i32> {
+    match unit {
+        IntervalUnit::Day => {
+            let delta = i32::try_from(signed_amount).map_err(|_| interval_overflow())?;
+            base_days.checked_add(delta).ok_or_else(interval_overflow)
+        }
+        IntervalUnit::Month => add_months(base_days, signed_amount),
+        IntervalUnit::Year => add_months(
+            base_days,
+            signed_amount
+                .checked_mul(12)
+                .ok_or_else(interval_overflow)?,
+        ),
+    }
+}
+
+/// Shift a day count by `delta_months`, clamping the day-of-month (see
+/// `apply_interval` for the clamp rule).
+fn add_months(base_days: i32, delta_months: i64) -> Result<i32> {
+    let (year, month, day) = crate::types::civil::ymd_from_days(base_days);
+    // Absolute 0-based month index (year*12 + month-1), shifted, then split
+    // back with Euclidean division so negative deltas borrow correctly.
+    let total = (year as i64) * 12 + (month as i64 - 1) + delta_months;
+    let new_year = i32::try_from(total.div_euclid(12)).map_err(|_| interval_overflow())?;
+    let new_month = (total.rem_euclid(12)) as u32 + 1;
+    let clamped_day = day.min(last_day_of_month(new_year, new_month));
+    Ok(crate::types::civil::days_from_ymd(
+        new_year,
+        new_month,
+        clamped_day,
+    ))
+}
+
+/// The last valid day of `(year, month)` — computed as the day before the
+/// first of the following month, so leap Februaries fall out for free.
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_of_next = crate::types::civil::days_from_ymd(next_year, next_month, 1);
+    crate::types::civil::ymd_from_days(first_of_next - 1).2
+}
+
+fn interval_overflow() -> Error {
+    Error::SqlParse("INTERVAL arithmetic overflowed the DATE range".into())
 }
 
 // -------- predicate binding -------------------------------------------------
@@ -1745,6 +1996,7 @@ fn map_data_type(t: &AstDataType) -> Result<ColumnType> {
             Ok(ColumnType::Decimal { precision, scale })
         }
         AstDataType::Timestamp(_, _) => Ok(ColumnType::Timestamp),
+        AstDataType::Date => Ok(ColumnType::Date),
         other => Err(Error::SqlParse(format!(
             "binder: data type {:?} unsupported",
             other

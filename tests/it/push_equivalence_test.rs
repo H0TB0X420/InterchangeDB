@@ -169,6 +169,30 @@ fn grouped_aggregate_is_equivalent() {
     );
 }
 
+// H3.2: a DATE query — range predicate over a folded INTERVAL literal, plus
+// EXTRACT(YEAR) in the display — runs identically under both models. The date
+// filter and the ExtractYear Compute both flow through the shared operator
+// build, so this pins Push against Volcano on the new date surface.
+#[test]
+fn date_query_is_equivalent() {
+    let (mut s, _dir) = setup();
+    s.execute("CREATE TABLE dorders (d_id INT PRIMARY KEY, d_date DATE)")
+        .unwrap();
+    for sql in [
+        "INSERT INTO dorders VALUES (1, DATE '1993-06-15')",
+        "INSERT INTO dorders VALUES (2, DATE '1994-01-01')",
+        "INSERT INTO dorders VALUES (3, DATE '1994-07-04')",
+        "INSERT INTO dorders VALUES (4, DATE '1998-09-02')",
+    ] {
+        s.execute(sql).unwrap();
+    }
+    assert_equivalent(
+        &mut s,
+        "SELECT d_id, EXTRACT(YEAR FROM d_date) FROM dorders \
+         WHERE d_date <= DATE '1994-12-01' - INTERVAL '90' DAY ORDER BY d_id",
+    );
+}
+
 #[test]
 fn join_is_equivalent() {
     let (mut s, _dir) = setup();

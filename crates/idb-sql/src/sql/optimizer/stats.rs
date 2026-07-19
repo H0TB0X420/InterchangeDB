@@ -236,7 +236,9 @@ pub fn analyze_table<CatE: StorageEngine, E: StorageEngine>(
         .columns
         .iter()
         .map(|c| match c.ty {
-            ColumnType::Int32 | ColumnType::Int64 => Some(Vec::new()),
+            // Date is an i32 day-count — its histogram is built over those
+            // days, so date-range predicates get real selectivity.
+            ColumnType::Int32 | ColumnType::Int64 | ColumnType::Date => Some(Vec::new()),
             _ => None,
         })
         .collect();
@@ -257,6 +259,7 @@ pub fn analyze_table<CatE: StorageEngine, E: StorageEngine>(
                     match v {
                         Value::Int32(n) => buf.push(*n as i64),
                         Value::Int64(n) => buf.push(*n),
+                        Value::Date(days) => buf.push(*days as i64),
                         _ => {} // mismatched type — skip
                     }
                 }
@@ -273,7 +276,9 @@ pub fn analyze_table<CatE: StorageEngine, E: StorageEngine>(
         let ndv = distinct[col_idx].len() as i64;
         let null_count = null_counts[col_idx];
         let (histogram_kind, histogram_blob) = match (&col_def.ty, &int_values[col_idx]) {
-            (ColumnType::Int32 | ColumnType::Int64, Some(values)) if !values.is_empty() => {
+            (ColumnType::Int32 | ColumnType::Int64 | ColumnType::Date, Some(values))
+                if !values.is_empty() =>
+            {
                 let blob = build_equi_width_int_histogram(values, NUM_BUCKETS);
                 (HISTOGRAM_KIND_EQUI_WIDTH_INT, blob)
             }

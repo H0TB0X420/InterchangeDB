@@ -64,6 +64,11 @@ fn value_text(v: &Value) -> String {
         }
         Value::Bytes(b) => format!("{b:02x?}"),
         Value::Timestamp(us) => us.to_string(),
+        // Zero-padded `YYYY-MM-DD` from the day-count (see `types::civil`).
+        Value::Date(days) => {
+            let (y, m, d) = interchangedb::types::civil::ymd_from_days(*days);
+            format!("{y:04}-{m:02}-{d:02}")
+        }
         // mantissa * 10^(-scale), rendered with an explicit decimal point.
         Value::Decimal(d) => {
             let digits = d.mantissa().abs().to_string();
@@ -84,7 +89,8 @@ fn value_text(v: &Value) -> String {
 fn column_code(ty: &ColumnType) -> DefaultColumnType {
     match ty {
         ColumnType::Int32 | ColumnType::Int64 => DefaultColumnType::Integer,
-        ColumnType::Varchar(_) | ColumnType::Char(_) => DefaultColumnType::Text,
+        // Date renders as `YYYY-MM-DD` text, so it takes the text column code.
+        ColumnType::Varchar(_) | ColumnType::Char(_) | ColumnType::Date => DefaultColumnType::Text,
         _ => DefaultColumnType::Any,
     }
 }
@@ -166,4 +172,9 @@ fn slt_aggregate_expr() {
 #[test]
 fn slt_computed_select() {
     run_slt("computed_select.slt");
+}
+
+#[test]
+fn slt_date() {
+    run_slt("date.slt");
 }
