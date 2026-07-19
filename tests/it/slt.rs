@@ -200,8 +200,43 @@ fn slt_subquery() {
 }
 
 #[test]
+fn slt_correlated() {
+    run_slt("correlated.slt");
+}
+
+#[test]
 fn slt_tpch_subquery() {
     run_slt("tpch_subquery.slt");
+}
+
+#[test]
+fn slt_tpch_q2() {
+    run_slt("tpch_q2.slt");
+}
+
+#[test]
+fn slt_tpch_q4() {
+    run_slt("tpch_q4.slt");
+}
+
+#[test]
+fn slt_tpch_q17() {
+    run_slt("tpch_q17.slt");
+}
+
+#[test]
+fn slt_tpch_q20() {
+    run_slt("tpch_q20.slt");
+}
+
+#[test]
+fn slt_tpch_q21() {
+    run_slt("tpch_q21.slt");
+}
+
+#[test]
+fn slt_tpch_q22() {
+    run_slt("tpch_q22.slt");
 }
 
 #[test]

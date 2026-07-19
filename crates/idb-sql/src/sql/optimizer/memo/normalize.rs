@@ -151,8 +151,14 @@ pub(crate) fn normalize<CatE: StorageEngine>(
         // columns — a valid rewrite, since the materialized set is a statement
         // constant, so the filter is genuinely table-local; only a
         // cross-relation or constant-probe `InSubquery` lands in the `residual`.
+        // A correlated conjunct (H4c) routes identically — `referenced_columns`
+        // reports its `outer_cols`, so a `CorrelatedExists`/`CorrelatedScalar`
+        // spanning >1 relation lands in the `residual` (the spine Filter),
+        // remapped textual→physical like any residual; the per-row evaluators
+        // are threaded to build by the session, independent of the planner.
         scalar_subqueries: _,
         in_subqueries: _,
+        correlated_subqueries: _,
         projection,
         aggregates,
         select_list,

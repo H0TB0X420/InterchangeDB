@@ -12,6 +12,7 @@
 //! Each unsupported variant errors with a descriptive message so the
 //! caller learns *which* shape the binder rejected.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use sqlparser::ast::{
@@ -60,21 +61,35 @@ pub struct Binder<E: StorageEngine> {
 /// match the schema's column order directly (`column_offset == 0`).
 struct Scope {
     tables: Vec<ScopedTable>,
-    /// Column names resolvable in ENCLOSING scopes (H4b correlation
-    /// detection). A subquery is bound in a FRESH scope; if it references a
-    /// column absent from its own `tables` but present here, it is a
-    /// correlated reference — unsupported this phase, rejected with the column
-    /// named. Never used for RESOLUTION (uncorrelated by construction), only to
-    /// turn a "column not found" into the precise "correlated" diagnosis.
+    /// Columns visible from ENCLOSING scopes, for correlation resolution (H4c).
+    /// A subquery is bound in a FRESH scope; a reference its own `tables` cannot
+    /// resolve is looked up here. A LEVEL-1 hit (the immediate enclosing query)
+    /// binds to `Expression::OuterRef`, recording the outer index into
+    /// `outer_refs`; a level-≥2 hit is the loud "multi-level correlation"
+    /// refusal (TPC-H never needs it); a miss is the plain "column not found".
     /// Empty for every top-level statement (no enclosing scope).
-    correlated_names: Vec<String>,
-    /// Table/alias QUALIFIERS exposed by ENCLOSING scopes. A qualified ref
-    /// `q.col` whose `q` matches one of these is a correlated reference
-    /// (unsupported); a `q` matching NOTHING — this scope or any enclosing —
-    /// is a typo, always the plain "not in FROM scope" error. Keyed on the
-    /// QUALIFIER (not the column name), so `outer_col`-shaped typos aren't
-    /// misdiagnosed as correlation. Empty for every top-level statement.
-    correlated_qualifiers: Vec<String>,
+    correlated_columns: Vec<OuterColumn>,
+    /// Accumulator: the OUTER tuple-global indices this scope's correlated
+    /// references resolved to, in first-reference order (deduped). Interior-
+    /// mutable because column resolution runs behind `&Scope`. On completion it
+    /// becomes the correlating form's `outer_cols`, and `OuterRef(k)` indexes
+    /// position `k` here. Empty unless this scope made a correlated reference.
+    outer_refs: RefCell<Vec<usize>>,
+}
+
+/// A column visible from an ENCLOSING scope, for correlation resolution (H4c).
+/// `outer_index` is its tuple-global index in the IMMEDIATE enclosing scope;
+/// it is meaningful only at `level == 1`, the sole correlation level supported
+/// (a level-≥2 reference is rejected before the index is read).
+#[derive(Clone)]
+struct OuterColumn {
+    /// The exposed relation name (alias if aliased, else table name) the column
+    /// belongs to in its enclosing scope — for qualified `q.col` resolution.
+    qualifier: String,
+    name: String,
+    outer_index: usize,
+    /// 1 = the immediate enclosing query; 2+ = an outer-outer scope.
+    level: usize,
 }
 
 /// Statement-level accumulator threaded through predicate/comparison binding
@@ -88,6 +103,11 @@ struct SubqueryCtx<'a, E: StorageEngine> {
     depth: usize,
     scalar_subqueries: Vec<LogicalPlan>,
     in_subqueries: Vec<LogicalPlan>,
+    /// Correlated subquery templates (H4c) collected from this SELECT's
+    /// WHERE / compare positions, indexed by the `subquery` field of the
+    /// `CorrelatedExists` / `CorrelatedScalar` that references them. Each still
+    /// carries `OuterRef` placeholders for the outer columns it correlates on.
+    correlated_subqueries: Vec<LogicalPlan>,
 }
 
 impl<'a, E: StorageEngine> SubqueryCtx<'a, E> {
@@ -97,6 +117,7 @@ impl<'a, E: StorageEngine> SubqueryCtx<'a, E> {
             depth,
             scalar_subqueries: Vec::new(),
             in_subqueries: Vec::new(),
+            correlated_subqueries: Vec::new(),
         }
     }
 }
@@ -128,6 +149,13 @@ struct BoundSelect {
     /// columns (`Some` overrides the derived-schema default name; `None`
     /// keeps it). Empty for `SELECT *` (no items to name).
     output_aliases: Vec<Option<String>>,
+    /// The OUTER tuple-global column indices this SELECT correlated on (H4c),
+    /// in `OuterRef` slot order — the `outer_cols` of the correlating form. EMPTY
+    /// when the SELECT is uncorrelated (every subquery and top-level query);
+    /// non-empty only when bound as a correlated subquery that referenced its
+    /// enclosing scope. The caller (scalar / EXISTS binder) uses non-emptiness to
+    /// route the subquery to the correlated IR instead of the uncorrelated H4b IR.
+    outer_cols: Vec<usize>,
 }
 
 impl BoundSelect {
@@ -165,38 +193,52 @@ impl Scope {
                 schema,
                 column_offset: 0,
             }],
-            correlated_names: Vec::new(),
-            correlated_qualifiers: Vec::new(),
+            correlated_columns: Vec::new(),
+            outer_refs: RefCell::new(Vec::new()),
         }
     }
 
-    /// Every column name this scope can RESOLVE (its own tables' columns),
-    /// plus the names it inherited from enclosing scopes — the set a nested
-    /// subquery consults to distinguish a genuine unknown column from a
-    /// correlated outer reference.
-    fn resolvable_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .tables
-            .iter()
-            .flat_map(|t| t.schema.columns.iter().map(|c| c.name.clone()))
-            .collect();
-        names.extend(self.correlated_names.iter().cloned());
-        names
+    /// The `correlated_columns` a nested subquery bound inside this scope
+    /// inherits (H4c): every column of THIS scope's own tables at LEVEL 1
+    /// (correlatable — a reference to one binds to `OuterRef`), plus the columns
+    /// this scope itself inherited, at their level + 1 (a reference to one is
+    /// multi-level and rejected). The level-1 `outer_index` is the column's
+    /// tuple-global position in THIS scope — the coordinate space the outer
+    /// query's Filter runs on.
+    fn child_correlated_columns(&self) -> Vec<OuterColumn> {
+        let mut columns = Vec::new();
+        for t in &self.tables {
+            let qualifier = t.alias.clone().unwrap_or_else(|| t.table_name.clone());
+            for (local, c) in t.schema.columns.iter().enumerate() {
+                columns.push(OuterColumn {
+                    qualifier: qualifier.clone(),
+                    name: c.name.clone(),
+                    outer_index: t.column_offset + local,
+                    level: 1,
+                });
+            }
+        }
+        // Inherited columns move one level further out.
+        for oc in &self.correlated_columns {
+            columns.push(OuterColumn {
+                level: oc.level + 1,
+                ..oc.clone()
+            });
+        }
+        columns
     }
 
-    /// Every table/alias QUALIFIER a nested subquery could see in enclosing
-    /// scopes: this scope's own exposed relation names (its alias if aliased,
-    /// else its table name) plus the qualifiers it inherited. A subquery
-    /// consults this to tell a correlated `outer_tbl.col` reference
-    /// (unsupported) from a simple typo'd qualifier ("not in FROM scope").
-    fn resolvable_qualifiers(&self) -> Vec<String> {
-        let mut quals: Vec<String> = self
-            .tables
-            .iter()
-            .map(|t| t.alias.clone().unwrap_or_else(|| t.table_name.clone()))
-            .collect();
-        quals.extend(self.correlated_qualifiers.iter().cloned());
-        quals
+    /// Record a correlated reference to outer tuple-global index `outer_index`,
+    /// returning its positional slot `k` in `outer_refs` (deduped — a column
+    /// referenced twice reuses one slot). `OuterRef(k)` will read it.
+    fn record_outer_ref(&self, outer_index: usize) -> usize {
+        let mut refs = self.outer_refs.borrow_mut();
+        if let Some(k) = refs.iter().position(|&i| i == outer_index) {
+            k
+        } else {
+            refs.push(outer_index);
+            refs.len() - 1
+        }
     }
 
     /// Append another table to the scope. The new table's
@@ -485,23 +527,21 @@ impl<E: StorageEngine> Binder<E> {
         // schema ingredients (`input` / `output_aliases`) are discarded, so a
         // top-level query never runs the output-typing pass — its type errors
         // stay at executor build time, exactly as before.
-        Ok(self.bind_select_query(q, 0, Vec::new(), Vec::new())?.plan)
+        Ok(self.bind_select_query(q, 0, Vec::new())?.plan)
     }
 
     /// Bind a SELECT body, returning the plan plus what a derived table needs
     /// to type its output schema. `depth` is the FROM-subquery / subquery
     /// nesting level (0 = top level); each derived table or subquery recurses
-    /// at `depth + 1`, bounded by `MAX_DERIVED_DEPTH`. `correlated_names` /
-    /// `correlated_qualifiers` are the column names / table-alias qualifiers
-    /// resolvable in ENCLOSING scopes — non-empty only when this is a subquery,
-    /// and used purely to diagnose a correlated reference (this phase binds
-    /// uncorrelated subqueries only).
+    /// at `depth + 1`, bounded by `MAX_DERIVED_DEPTH`. `correlated_columns` are
+    /// the columns resolvable in ENCLOSING scopes — non-empty only when this is
+    /// a subquery; a reference to a level-1 one binds to `OuterRef` (H4c), a
+    /// level-≥2 one is the multi-level refusal.
     fn bind_select_query(
         &self,
         q: Query,
         depth: usize,
-        correlated_names: Vec<String>,
-        correlated_qualifiers: Vec<String>,
+        correlated_columns: Vec<OuterColumn>,
     ) -> Result<BoundSelect> {
         let limit = match q.limit {
             Some(AstExpr::Value(AstValue::Number(n, _))) => {
@@ -551,8 +591,8 @@ impl<E: StorageEngine> Binder<E> {
         // entries in `joins`.
         let mut scope = Scope {
             tables: Vec::new(),
-            correlated_names,
-            correlated_qualifiers,
+            correlated_columns,
+            outer_refs: RefCell::new(Vec::new()),
         };
         let mut joined_tables: Vec<(String, Option<String>, Option<AstExpr>, JoinKind)> =
             Vec::new();
@@ -839,6 +879,7 @@ impl<E: StorageEngine> Binder<E> {
             derived,
             scalar_subqueries: ctx.scalar_subqueries,
             in_subqueries: ctx.in_subqueries,
+            correlated_subqueries: ctx.correlated_subqueries,
             projection,
             aggregates,
             select_list,
@@ -847,18 +888,24 @@ impl<E: StorageEngine> Binder<E> {
             having,
             limit,
         };
+        // The correlated references THIS SELECT made to its enclosing scope, in
+        // `OuterRef` slot order — empty unless it was a correlated subquery.
+        let outer_cols = scope.outer_refs.into_inner();
         Ok(BoundSelect {
             plan,
             input,
             output_aliases,
+            outer_cols,
         })
     }
 
-    /// Bind an uncorrelated subquery's inner query in a FRESH scope, depth-
-    /// bounded. `outer.resolvable_names()` travels into the inner scope for
-    /// correlation DETECTION only (a reference to one becomes the loud
-    /// "correlated subqueries not yet supported" error). Shared by the scalar,
-    /// IN, and EXISTS binders below.
+    /// Bind a subquery's inner query in a FRESH scope, depth-bounded, with the
+    /// enclosing scope's `child_correlated_columns()` travelling in for
+    /// correlation resolution (H4c): a reference to a level-1 enclosing column
+    /// binds to `OuterRef` and records into the inner scope's `outer_refs`; a
+    /// level-≥2 reference is the multi-level refusal. The returned
+    /// `BoundSelect.outer_cols` is empty iff the subquery is uncorrelated.
+    /// Shared by the scalar, IN, and EXISTS binders below.
     fn bind_subquery_inner(
         &self,
         subquery: Query,
@@ -871,23 +918,18 @@ impl<E: StorageEngine> Binder<E> {
                 MAX_DERIVED_DEPTH
             )));
         }
-        self.bind_select_query(
-            subquery,
-            depth + 1,
-            outer.resolvable_names(),
-            outer.resolvable_qualifiers(),
-        )
+        self.bind_select_query(subquery, depth + 1, outer.child_correlated_columns())
     }
 
-    /// Uncorrelated scalar subquery (a compare or HAVING operand). Asserts
-    /// exactly one output column; the caller allocates a slot and emits
-    /// `Expression::SubqueryResult(slot)`.
+    /// Scalar subquery (a compare or HAVING operand), correlated or not.
+    /// Asserts exactly one output column; the caller reads `outer_cols` to route
+    /// it to `SubqueryResult` (uncorrelated) or `CorrelatedScalar` (correlated).
     fn bind_scalar_subquery(
         &self,
         subquery: Query,
         outer: &Scope,
         depth: usize,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<BoundSelect> {
         let bound = self.bind_subquery_inner(subquery, outer, depth)?;
         let column_count = bound.derived_columns()?.len();
         if column_count != 1 {
@@ -896,12 +938,13 @@ impl<E: StorageEngine> Binder<E> {
                 column_count
             )));
         }
-        Ok(bound.plan)
+        Ok(bound)
     }
 
-    /// Uncorrelated `IN` subquery. Asserts exactly one output column (the
-    /// value set the probe matches against); the caller emits
-    /// `Predicate::InSubquery`.
+    /// `IN` subquery. Asserts exactly one output column (the value set the probe
+    /// matches against). Only the UNCORRELATED form is supported (H4b) — a
+    /// correlated IN would need a per-row set the `InSubquery` machinery has no
+    /// place for, so it is a loud, named refusal (TPC-H never needs it).
     fn bind_in_subquery(
         &self,
         subquery: Query,
@@ -916,27 +959,32 @@ impl<E: StorageEngine> Binder<E> {
                 column_count
             )));
         }
+        if !bound.outer_cols.is_empty() {
+            return Err(Error::SqlParse(
+                "binder: correlated IN subqueries are not supported (rewrite as EXISTS)".into(),
+            ));
+        }
         Ok(bound.plan)
     }
 
-    /// Uncorrelated `EXISTS` subquery. No output-arity constraint — EXISTS
-    /// only observes whether ANY row survives — so cap the inner plan at one
-    /// row, letting materialization early-exit at the first row.
+    /// `EXISTS` subquery (correlated or not). No output-arity constraint —
+    /// EXISTS only observes whether ANY row survives — so cap the inner plan at
+    /// one row, letting materialization / per-row execution early-exit at the
+    /// first row. The caller reads `outer_cols` to route it.
     fn bind_exists_subquery(
         &self,
         subquery: Query,
         outer: &Scope,
         depth: usize,
-    ) -> Result<LogicalPlan> {
-        let bound = self.bind_subquery_inner(subquery, outer, depth)?;
-        let mut plan = bound.plan;
-        if let LogicalPlan::Select { limit, .. } = &mut plan {
+    ) -> Result<BoundSelect> {
+        let mut bound = self.bind_subquery_inner(subquery, outer, depth)?;
+        if let LogicalPlan::Select { limit, .. } = &mut bound.plan {
             *limit = Some(match *limit {
                 Some(existing) => existing.min(1),
                 None => 1,
             });
         }
-        Ok(plan)
+        Ok(bound)
     }
 
     /// Resolve one FROM `TableFactor` into a scope entry
@@ -987,23 +1035,28 @@ impl<E: StorageEngine> Binder<E> {
                     )));
                 }
 
-                // Bind the inner query in a fresh scope (uncorrelated, no
-                // enclosing names) and compute its output columns (types +
-                // per-item `AS` names).
-                let bound = self.bind_select_query(*subquery, depth + 1, Vec::new(), Vec::new())?;
+                // Bind the inner query in a fresh scope (no enclosing columns,
+                // so it cannot correlate to the outer query) and compute its
+                // output columns (types + per-item `AS` names).
+                let bound = self.bind_select_query(*subquery, depth + 1, Vec::new())?;
                 // A derived table's inner query is materialized at executor
                 // build time (a `DerivedScan` leaf), NOT through the session's
-                // subquery-resolution pass — so a scalar/IN/EXISTS subquery
-                // INSIDE it would never have its parameter/set resolved. Reject
-                // loudly rather than silently mis-evaluate (recorded lever:
-                // subqueries inside a derived table).
+                // subquery-resolution pass — so a scalar/IN/EXISTS or correlated
+                // subquery INSIDE it would never have its set / evaluator built.
+                // Reject loudly rather than silently mis-evaluate (recorded
+                // lever: subqueries inside a derived table — the last blocker for
+                // Q22 verbatim, see docs).
                 if let LogicalPlan::Select {
                     scalar_subqueries,
                     in_subqueries,
+                    correlated_subqueries,
                     ..
                 } = &bound.plan
                 {
-                    if !scalar_subqueries.is_empty() || !in_subqueries.is_empty() {
+                    if !scalar_subqueries.is_empty()
+                        || !in_subqueries.is_empty()
+                        || !correlated_subqueries.is_empty()
+                    {
                         return Err(Error::SqlParse(
                             "binder: subqueries inside a derived table (FROM-subquery) are not \
                              supported yet"
@@ -1259,10 +1312,10 @@ fn object_name_to_string(n: &ObjectName) -> String {
         .join(".")
 }
 
-/// Resolve an unqualified column name to a tuple-global index. Errors
-/// on "not found" and "ambiguous" (column present in multiple scoped
-/// tables — caller must use the qualified `t.col` form to disambiguate).
-fn column_index(scope: &Scope, name: &str) -> Result<usize> {
+/// Resolve `name` against THIS scope's tables only. `Ok(Some(idx))` on a unique
+/// local hit, `Ok(None)` on no local hit (the caller decides: correlated, or a
+/// genuine miss), `Err` on ambiguity across joined tables.
+fn local_column_index(scope: &Scope, name: &str) -> Result<Option<usize>> {
     let mut hits: Vec<usize> = Vec::new();
     for t in &scope.tables {
         if let Some(local) = t.schema.columns.iter().position(|c| c.name == name) {
@@ -1270,23 +1323,8 @@ fn column_index(scope: &Scope, name: &str) -> Result<usize> {
         }
     }
     match hits.len() {
-        0 => {
-            // A miss that the ENCLOSING scope could resolve is a correlated
-            // reference — unsupported this phase. Name the column so the
-            // limitation is actionable (H4b handles uncorrelated forms only).
-            if scope.correlated_names.iter().any(|n| n == name) {
-                return Err(Error::SqlParse(format!(
-                    "correlated subqueries not yet supported: column '{}' refers to an outer query",
-                    name
-                )));
-            }
-            let names: Vec<String> = scope.tables.iter().map(|t| t.table_name.clone()).collect();
-            Err(Error::SqlParse(format!(
-                "column '{}' not found in scope (tables: {:?})",
-                name, names
-            )))
-        }
-        1 => Ok(hits[0]),
+        0 => Ok(None),
+        1 => Ok(Some(hits[0])),
         _ => Err(Error::SqlParse(format!(
             "column '{}' is ambiguous across joined tables — qualify it (e.g. `t.{}`)",
             name, name
@@ -1294,10 +1332,60 @@ fn column_index(scope: &Scope, name: &str) -> Result<usize> {
     }
 }
 
-/// Resolve a qualified column reference (`table_or_alias.col`) to a
-/// tuple-global index. Alias matches take precedence over table-name
-/// matches (matches SQL's standard scoping rule).
+/// Resolve an unqualified column name to a tuple-global index — for NON-
+/// expression positions (GROUP BY / ORDER BY / aggregate argument) that have no
+/// `OuterRef` to bind to. A correlated reference there is a loud refusal (it is
+/// legal only in a WHERE/ON comparison — see `resolve_ref`).
+fn column_index(scope: &Scope, name: &str) -> Result<usize> {
+    if let Some(idx) = local_column_index(scope, name)? {
+        return Ok(idx);
+    }
+    if scope.correlated_columns.iter().any(|c| c.name == name) {
+        return Err(Error::SqlParse(format!(
+            "correlated reference to column '{}' is only supported in a WHERE/ON comparison, \
+             not in this position",
+            name
+        )));
+    }
+    let names: Vec<String> = scope.tables.iter().map(|t| t.table_name.clone()).collect();
+    Err(Error::SqlParse(format!(
+        "column '{}' not found in scope (tables: {:?})",
+        name, names
+    )))
+}
+
+/// Resolve a qualified column reference (`table_or_alias.col`) to a tuple-global
+/// index — the NON-expression-position mirror of `column_index`.
 fn column_index_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<usize> {
+    if let Some(idx) = local_column_index_qualified(scope, qualifier, name)? {
+        return Ok(idx);
+    }
+    if scope
+        .correlated_columns
+        .iter()
+        .any(|c| c.qualifier == qualifier)
+    {
+        return Err(Error::SqlParse(format!(
+            "correlated reference to column '{}.{}' is only supported in a WHERE/ON comparison, \
+             not in this position",
+            qualifier, name
+        )));
+    }
+    Err(Error::SqlParse(format!(
+        "table or alias '{}' not in FROM scope",
+        qualifier
+    )))
+}
+
+/// Resolve `qualifier.name` against THIS scope's tables only. `Ok(Some(idx))` on
+/// a hit, `Ok(None)` when the qualifier names no local relation, `Err` when the
+/// qualifier IS local but lacks the column. Alias matches take precedence over
+/// table-name matches (standard SQL scoping).
+fn local_column_index_qualified(
+    scope: &Scope,
+    qualifier: &str,
+    name: &str,
+) -> Result<Option<usize>> {
     for t in &scope.tables {
         let matches_qualifier = t.alias.as_deref() == Some(qualifier) || t.table_name == qualifier;
         if matches_qualifier {
@@ -1312,25 +1400,97 @@ fn column_index_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<
                         name, qualifier
                     ))
                 })?;
-            return Ok(t.column_offset + local);
+            return Ok(Some(t.column_offset + local));
         }
     }
-    // A qualified reference is correlated only when its QUALIFIER resolves to
-    // an enclosing scope's table/alias (e.g. `WHERE o.x = (SELECT … WHERE
-    // t.y = o.z)` — `o` is the outer relation). Keying on the qualifier, not
-    // the column name, is the fix: a typo'd qualifier whose column name happens
-    // to match an outer column (`zzz.b` where `b` exists outside) is a plain
-    // scope error, never a correlation misdiagnosis.
-    if scope.correlated_qualifiers.iter().any(|q| q == qualifier) {
+    Ok(None)
+}
+
+/// Resolve an unqualified column reference in an EXPRESSION position (WHERE / ON
+/// / a compare operand). A local hit binds to `Column`; a miss the IMMEDIATE
+/// enclosing scope resolves binds to `OuterRef` (H4c, recording the outer
+/// index); a miss only an outer-outer scope resolves is the multi-level refusal;
+/// any other miss is "column not found".
+fn resolve_ref(scope: &Scope, name: &str) -> Result<Expression> {
+    if let Some(idx) = local_column_index(scope, name)? {
+        return Ok(Expression::Column(idx));
+    }
+    let matches: Vec<&OuterColumn> = scope
+        .correlated_columns
+        .iter()
+        .filter(|c| c.name == name)
+        .collect();
+    resolve_correlated_ref(scope, &matches, name)
+}
+
+/// Resolve a qualified column reference (`qualifier.name`) in an EXPRESSION
+/// position — the qualified mirror of `resolve_ref`.
+fn resolve_ref_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<Expression> {
+    if let Some(idx) = local_column_index_qualified(scope, qualifier, name)? {
+        return Ok(Expression::Column(idx));
+    }
+    // Not local. If the qualifier names no enclosing relation at all it is a
+    // typo (never a correlation misdiagnosis — keyed on the qualifier).
+    if !scope
+        .correlated_columns
+        .iter()
+        .any(|c| c.qualifier == qualifier)
+    {
         return Err(Error::SqlParse(format!(
-            "correlated subqueries not yet supported: column '{}.{}' refers to an outer query",
-            qualifier, name
+            "table or alias '{}' not in FROM scope",
+            qualifier
         )));
     }
-    Err(Error::SqlParse(format!(
-        "table or alias '{}' not in FROM scope",
-        qualifier
-    )))
+    let display = format!("{}.{}", qualifier, name);
+    let matches: Vec<&OuterColumn> = scope
+        .correlated_columns
+        .iter()
+        .filter(|c| c.qualifier == qualifier && c.name == name)
+        .collect();
+    if matches.is_empty() {
+        return Err(Error::SqlParse(format!(
+            "column '{}' not found in outer relation '{}'",
+            name, qualifier
+        )));
+    }
+    resolve_correlated_ref(scope, &matches, &display)
+}
+
+/// Turn a set of enclosing-scope candidate columns for one reference into an
+/// `OuterRef` (H4c) or a loud refusal. Exactly one LEVEL-1 candidate →
+/// `OuterRef` (recording its outer index); no level-1 but a level-≥2 candidate →
+/// the multi-level refusal; more than one level-1 → an ambiguous correlated
+/// reference; none at all → "column not found".
+fn resolve_correlated_ref(
+    scope: &Scope,
+    matches: &[&OuterColumn],
+    display: &str,
+) -> Result<Expression> {
+    let level1: Vec<&&OuterColumn> = matches.iter().filter(|c| c.level == 1).collect();
+    match level1.len() {
+        1 => {
+            let k = scope.record_outer_ref(level1[0].outer_index);
+            Ok(Expression::OuterRef(k))
+        }
+        0 => {
+            if matches.iter().any(|c| c.level >= 2) {
+                Err(Error::SqlParse(format!(
+                    "multi-level correlation not supported: '{}' refers to a query more than one \
+                     level out",
+                    display
+                )))
+            } else {
+                Err(Error::SqlParse(format!(
+                    "column '{}' not found in scope",
+                    display
+                )))
+            }
+        }
+        _ => Err(Error::SqlParse(format!(
+            "correlated column '{}' is ambiguous across outer relations — qualify it",
+            display
+        ))),
+    }
 }
 
 /// Bind SELECT items into `(projection, aggregates, select_list)`.
@@ -1707,7 +1867,9 @@ fn bind_having_predicate<E: StorageEngine>(
 
 /// One comparison operand inside HAVING: a literal, an uncorrelated scalar
 /// subquery (→ `SubqueryResult`, resolved by the session like a WHERE scalar),
-/// or anything `resolve_aggregate_output_column` accepts.
+/// or anything `resolve_aggregate_output_column` accepts. A CORRELATED scalar
+/// in HAVING is a loud refusal — it would reference the outer row from the
+/// aggregate-output coordinate space, which none of the target queries need.
 fn bind_having_operand<E: StorageEngine>(
     scope: &Scope,
     e: AstExpr,
@@ -1719,9 +1881,14 @@ fn bind_having_operand<E: StorageEngine>(
         AstExpr::Value(v) => Ok(Expression::Literal(ast_value_to_value_unconstrained(v)?)),
         AstExpr::Nested(inner) => bind_having_operand(scope, *inner, projection, aggregates, ctx),
         AstExpr::Subquery(q) => {
-            let plan = ctx.binder.bind_scalar_subquery(*q, scope, ctx.depth)?;
+            let bound = ctx.binder.bind_scalar_subquery(*q, scope, ctx.depth)?;
+            if !bound.outer_cols.is_empty() {
+                return Err(Error::SqlParse(
+                    "binder: correlated scalar subquery in HAVING is not supported".into(),
+                ));
+            }
             let slot = ctx.scalar_subqueries.len();
-            ctx.scalar_subqueries.push(plan);
+            ctx.scalar_subqueries.push(bound.plan);
             Ok(Expression::SubqueryResult(slot))
         }
         other => Ok(Expression::Column(resolve_aggregate_output_column(
@@ -2054,23 +2221,18 @@ fn bind_expression<E: StorageEngine>(
                 })
             }
         },
-        AstExpr::Identifier(ident) => {
-            let idx = column_index(scope, &ident.value)?;
-            Ok(Expression::Column(idx))
-        }
+        // Expression-position column refs resolve through `resolve_ref`, which
+        // binds an enclosing-scope reference to `OuterRef` (H4c) rather than
+        // erroring — the correlation flip. A top-level query has no enclosing
+        // columns, so this is exactly `Column` there.
+        AstExpr::Identifier(ident) => resolve_ref(scope, &ident.value),
         AstExpr::CompoundIdentifier(parts) => {
             // `qualifier.column` — qualifier is a table name or alias.
             // Two parts: standard SQL. Three+: schema-qualified (we don't
             // support a notion of SQL schemas yet — error).
             match parts.len() {
-                1 => {
-                    let idx = column_index(scope, &parts[0].value)?;
-                    Ok(Expression::Column(idx))
-                }
-                2 => {
-                    let idx = column_index_qualified(scope, &parts[0].value, &parts[1].value)?;
-                    Ok(Expression::Column(idx))
-                }
+                1 => resolve_ref(scope, &parts[0].value),
+                2 => resolve_ref_qualified(scope, &parts[0].value, &parts[1].value),
                 _ => Err(Error::SqlParse(format!(
                     "binder: compound identifier with {} parts not supported",
                     parts.len()
@@ -2618,19 +2780,33 @@ fn bind_predicate<E: StorageEngine>(
                 negated,
             })
         }
-        // `[NOT] EXISTS (subquery)` (H4b): no probe; the inner (capped at one
-        // row) drives a statement-constant true/false.
+        // `[NOT] EXISTS (subquery)`: the inner is capped at one row. If it made
+        // NO correlated reference it is a statement constant → the uncorrelated
+        // H4b `InSubquery` (materialized once). If it DID (H4c), route it to
+        // `CorrelatedExists` with the outer columns it referenced (Q4, Q21, Q22)
+        // — re-run per outer row.
         AstExpr::Exists { subquery, negated } => {
-            let plan = ctx
+            let bound = ctx
                 .binder
                 .bind_exists_subquery(*subquery, scope, ctx.depth)?;
-            let slot = ctx.in_subqueries.len();
-            ctx.in_subqueries.push(plan);
-            Ok(Predicate::InSubquery {
-                expr: None,
-                subquery: slot,
-                negated,
-            })
+            if bound.outer_cols.is_empty() {
+                let slot = ctx.in_subqueries.len();
+                ctx.in_subqueries.push(bound.plan);
+                Ok(Predicate::InSubquery {
+                    expr: None,
+                    subquery: slot,
+                    negated,
+                })
+            } else {
+                reject_nested_subqueries_in_correlated(&bound.plan)?;
+                let slot = ctx.correlated_subqueries.len();
+                ctx.correlated_subqueries.push(bound.plan);
+                Ok(Predicate::CorrelatedExists {
+                    subquery: slot,
+                    outer_cols: bound.outer_cols,
+                    negated,
+                })
+            }
         }
         // BETWEEN desugars to `expr >= low AND expr <= high`; NOT BETWEEN
         // wraps the whole thing in NOT. Kleene-correct: a NULL `expr` makes
@@ -2727,7 +2903,10 @@ fn reject_unsupported_subqueries<E: StorageEngine>(
     ctx: &SubqueryCtx<E>,
     position: &str,
 ) -> Result<()> {
-    if ctx.scalar_subqueries.is_empty() && ctx.in_subqueries.is_empty() {
+    if ctx.scalar_subqueries.is_empty()
+        && ctx.in_subqueries.is_empty()
+        && ctx.correlated_subqueries.is_empty()
+    {
         Ok(())
     } else {
         Err(Error::SqlParse(format!(
@@ -2735,6 +2914,40 @@ fn reject_unsupported_subqueries<E: StorageEngine>(
             position
         )))
     }
+}
+
+/// A CORRELATED subquery's inner template is re-planned + executed PER OUTER ROW
+/// by the session's correlated evaluator, which runs it with EMPTY subquery sets
+/// and correlated evaluators (`build_correlated_evaluators`): it does not
+/// materialize a nested IN/EXISTS set, splice a nested scalar, or build a nested
+/// per-row evaluator. So a correlated template that itself carries a scalar / IN
+/// / EXISTS / correlated subquery would silently mis-evaluate (its nested leaf
+/// captures an empty set) — reject it loudly instead. None of the target TPC-H
+/// queries nest a subquery inside a correlated one (Q20's nesting is the reverse:
+/// a correlated scalar inside an UNCORRELATED IN, which the session's
+/// `run_subquery` resolves recursively). Recorded lever: nested subqueries inside
+/// a correlated subquery. This enforces the invariant `substitute_outer_refs`
+/// relies on (a template's own subquery lists are empty).
+fn reject_nested_subqueries_in_correlated(plan: &LogicalPlan) -> Result<()> {
+    if let LogicalPlan::Select {
+        scalar_subqueries,
+        in_subqueries,
+        correlated_subqueries,
+        ..
+    } = plan
+    {
+        if !scalar_subqueries.is_empty()
+            || !in_subqueries.is_empty()
+            || !correlated_subqueries.is_empty()
+        {
+            return Err(Error::SqlParse(
+                "binder: a correlated subquery whose inner query itself contains a subquery is \
+                 not supported yet"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Bind a comparison `left <op> right` with O13 operand narrowing — the
@@ -2760,11 +2973,13 @@ fn bind_compare<E: StorageEngine>(
     })
 }
 
-/// One comparison operand: an uncorrelated scalar subquery collapses to an
-/// `Expression::SubqueryResult(slot)` (the session substitutes its value before
-/// planning); anything else binds as an ordinary expression. A subquery is
-/// supported only as a DIRECT operand here — one buried inside arithmetic
-/// (`x = (SELECT …) + 1`) falls through to `bind_expression`'s loud refusal.
+/// One comparison operand: a scalar subquery collapses to a placeholder — an
+/// `Expression::SubqueryResult(slot)` when uncorrelated (the session substitutes
+/// its value before planning), or an `Expression::CorrelatedScalar` when it
+/// referenced the enclosing scope (H4c — Q2/Q17/Q20; re-run per outer row).
+/// Anything else binds as an ordinary expression. A subquery is supported only
+/// as a DIRECT operand here — one buried inside arithmetic (`x = (SELECT …) + 1`)
+/// falls through to `bind_expression`'s loud refusal.
 fn bind_compare_operand<E: StorageEngine>(
     scope: &Scope,
     e: AstExpr,
@@ -2772,10 +2987,20 @@ fn bind_compare_operand<E: StorageEngine>(
 ) -> Result<Expression> {
     match e {
         AstExpr::Subquery(q) => {
-            let plan = ctx.binder.bind_scalar_subquery(*q, scope, ctx.depth)?;
-            let slot = ctx.scalar_subqueries.len();
-            ctx.scalar_subqueries.push(plan);
-            Ok(Expression::SubqueryResult(slot))
+            let bound = ctx.binder.bind_scalar_subquery(*q, scope, ctx.depth)?;
+            if bound.outer_cols.is_empty() {
+                let slot = ctx.scalar_subqueries.len();
+                ctx.scalar_subqueries.push(bound.plan);
+                Ok(Expression::SubqueryResult(slot))
+            } else {
+                reject_nested_subqueries_in_correlated(&bound.plan)?;
+                let slot = ctx.correlated_subqueries.len();
+                ctx.correlated_subqueries.push(bound.plan);
+                Ok(Expression::CorrelatedScalar {
+                    subquery: slot,
+                    outer_cols: bound.outer_cols,
+                })
+            }
         }
         AstExpr::Nested(inner) => bind_compare_operand(scope, *inner, ctx),
         other => bind_expression(scope, other, ctx.binder),
@@ -3217,6 +3442,7 @@ mod tests {
                 derived,
                 scalar_subqueries: _,
                 in_subqueries: _,
+                correlated_subqueries: _,
                 projection,
                 aggregates,
                 select_list,

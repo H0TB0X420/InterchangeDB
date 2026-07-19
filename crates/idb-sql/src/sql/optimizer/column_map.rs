@@ -120,10 +120,27 @@ impl ColumnRemap {
         match expr {
             Expression::Column(i) => Expression::Column(self.apply_index(i)),
             // No column reference to remap (both are resolved to a `Literal`
-            // before the plan is optimized).
-            Expression::Literal(_) | Expression::Parameter(_) | Expression::SubqueryResult(_) => {
-                expr
-            }
+            // before the plan is optimized). `OuterRef(k)` is a positional index
+            // into the outer form's `outer_cols` — the inner template it lives in
+            // is never walked by the outer remap (the indirection rule), so an
+            // `OuterRef` reaching here is left unchanged.
+            Expression::Literal(_)
+            | Expression::Parameter(_)
+            | Expression::SubqueryResult(_)
+            | Expression::OuterRef(_) => expr,
+            // Remap a correlated scalar's `outer_cols` (they index the join tuple
+            // the reorder permutes); the subquery slot + inner template are
+            // untouched — the template carries only positional `OuterRef`s.
+            Expression::CorrelatedScalar {
+                subquery,
+                outer_cols,
+            } => Expression::CorrelatedScalar {
+                subquery,
+                outer_cols: outer_cols
+                    .into_iter()
+                    .map(|c| self.apply_index(c))
+                    .collect(),
+            },
             Expression::BinaryOp { op, left, right } => Expression::BinaryOp {
                 op,
                 left: Box::new(self.apply_expression(*left)),
@@ -180,6 +197,20 @@ impl ColumnRemap {
             } => Predicate::InSubquery {
                 expr: expr.map(|e| self.apply_expression(e)),
                 subquery,
+                negated,
+            },
+            // Remap a correlated EXISTS's `outer_cols` (the join tuple the
+            // reorder permutes); the subquery slot + inner template are untouched.
+            Predicate::CorrelatedExists {
+                subquery,
+                outer_cols,
+                negated,
+            } => Predicate::CorrelatedExists {
+                subquery,
+                outer_cols: outer_cols
+                    .into_iter()
+                    .map(|c| self.apply_index(c))
+                    .collect(),
                 negated,
             },
         }

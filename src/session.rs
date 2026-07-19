@@ -42,7 +42,7 @@ use crate::sql::frontend::parse;
 use crate::sql::ir::logical::LogicalPlan;
 use crate::sql::planner::{PhysicalPlan, Planner};
 use crate::sql::workload_log::WorkloadLog;
-use crate::sql::InSubquerySet;
+use crate::sql::{CorrelatedEvaluator, InSubquerySet};
 use crate::storage::StorageEngine;
 use crate::txn::{TxnId, TxnMode};
 use crate::types::Value;
@@ -262,6 +262,11 @@ impl<E: StorageEngine + 'static> Session<E> {
             (logical, Vec::new())
         };
 
+        // Build the per-outer-row correlated evaluators BEFORE planning consumes
+        // the logical plan (the planner drops `correlated_subqueries` like the
+        // other subquery lists); each captures this same engine handle.
+        let correlated = self.build_correlated_evaluators(&logical, &engine_handle);
+
         let physical = match self.planner.plan(logical, &self.catalog) {
             Ok(p) => p,
             Err(e) => {
@@ -272,7 +277,13 @@ impl<E: StorageEngine + 'static> Session<E> {
             }
         };
 
-        let result = self.run_physical(physical, is_select_shape, &engine_handle, &in_sets);
+        let result = self.run_physical(
+            physical,
+            is_select_shape,
+            &engine_handle,
+            &in_sets,
+            &correlated,
+        );
 
         if implicit {
             match &result {
@@ -291,15 +302,20 @@ impl<E: StorageEngine + 'static> Session<E> {
         is_select_shape: bool,
         engine: &Arc<H>,
         subqueries: &[InSubquerySet],
+        correlated: &[CorrelatedEvaluator],
     ) -> Result<QueryResult>
     where
         H: StorageEngine + 'static,
     {
         match physical {
             PhysicalPlan::Query(physop) => {
-                let (schema, rows) =
-                    self.execution_model
-                        .execute(&physop, engine, &self.catalog, subqueries)?;
+                let (schema, rows) = self.execution_model.execute(
+                    &physop,
+                    engine,
+                    &self.catalog,
+                    subqueries,
+                    correlated,
+                )?;
                 if is_select_shape {
                     Ok(QueryResult::Rows { schema, rows })
                 } else {
@@ -373,19 +389,26 @@ impl<E: StorageEngine + 'static> Session<E> {
     }
 
     /// Plan and run one subquery's inner query through the same engine handle,
-    /// resolving ITS subqueries first (nesting is bounded by the binder's
-    /// depth limit). Returns the raw output rows.
+    /// resolving ITS uncorrelated subqueries and building ITS correlated
+    /// evaluators first (nesting is bounded by the binder's depth limit; Q20's
+    /// uncorrelated IN whose inner carries a correlated scalar composes here).
+    /// Returns the raw output rows.
     fn run_subquery<H>(&self, logical: LogicalPlan, engine: &Arc<H>) -> Result<Vec<Tuple>>
     where
         H: StorageEngine + 'static,
     {
         let (resolved, in_sets) = self.resolve_select_subqueries(logical, engine)?;
+        let correlated = self.build_correlated_evaluators(&resolved, engine);
         let physical = self.planner.plan(resolved, &self.catalog)?;
         match physical {
             PhysicalPlan::Query(physop) => {
-                let (_schema, rows) =
-                    self.execution_model
-                        .execute(&physop, engine, &self.catalog, &in_sets)?;
+                let (_schema, rows) = self.execution_model.execute(
+                    &physop,
+                    engine,
+                    &self.catalog,
+                    &in_sets,
+                    &correlated,
+                )?;
                 Ok(rows)
             }
             other => Err(Error::SqlParse(format!(
@@ -393,6 +416,59 @@ impl<E: StorageEngine + 'static> Session<E> {
                 kind_name(&other)
             ))),
         }
+    }
+
+    /// Build the per-outer-row evaluators for a SELECT's correlated subquery
+    /// templates (H4c), in slot order (empty for any plan without one). Each
+    /// evaluator OWNS a clone of the engine handle (same MVCC snapshot), the
+    /// catalog, and the execution model; per call it substitutes the template's
+    /// `OuterRef` placeholders with the supplied outer values, plans the now-
+    /// uncorrelated inner (rule-based — the inner plan shape is planner-invariant
+    /// and never reorders the outer, so this is faithful under every outer
+    /// planner), and runs it to rows. Plan-per-row is the recorded
+    /// correctness-first shape; caching the plan and decorrelation are the
+    /// recorded levers. The inner template carries no further subquery/correlated
+    /// layer (single-level, binder-guaranteed), so it needs no sets or nested
+    /// evaluators of its own.
+    fn build_correlated_evaluators<H>(
+        &self,
+        logical: &LogicalPlan,
+        engine: &Arc<H>,
+    ) -> Vec<CorrelatedEvaluator>
+    where
+        H: StorageEngine + 'static,
+    {
+        let templates = match logical {
+            LogicalPlan::Select {
+                correlated_subqueries,
+                ..
+            } => correlated_subqueries,
+            _ => return Vec::new(),
+        };
+        let mut evaluators: Vec<CorrelatedEvaluator> = Vec::with_capacity(templates.len());
+        for template in templates {
+            let template = template.clone();
+            let engine = engine.clone();
+            let catalog = self.catalog.clone();
+            let model = self.execution_model;
+            evaluators.push(Arc::new(
+                move |outer_values: &[Value]| -> Result<Vec<Tuple>> {
+                    let substituted = template.clone().substitute_outer_refs(outer_values)?;
+                    match crate::sql::planner::plan(substituted, catalog.as_ref())? {
+                        PhysicalPlan::Query(physop) => {
+                            let (_schema, rows) =
+                                model.execute(&physop, &engine, catalog.as_ref(), &[], &[])?;
+                            Ok(rows)
+                        }
+                        other => Err(Error::SqlParse(format!(
+                            "session: correlated subquery planned to a non-query {:?}",
+                            kind_name(&other)
+                        ))),
+                    }
+                },
+            ));
+        }
+        evaluators
     }
 
     // -----------------------------------------------------------------------

@@ -1,0 +1,39 @@
+# TPC-H Q17 — Small-Quantity-Order Revenue (H4c), VERBATIM on a micro-fixture.
+# Correlated AVG scaled by 0.2, compared to a local Int column; whole-table SUM
+# of the survivors / 7.0 (the correlated scalar × arithmetic shape).
+
+statement ok
+CREATE TABLE part (p_partkey INT PRIMARY KEY, p_brand VARCHAR(10), p_container VARCHAR(10))
+
+statement ok
+CREATE TABLE lineitem (l_orderkey INT, l_linenumber INT, l_partkey INT, l_quantity INT, l_extendedprice DECIMAL(12,2), PRIMARY KEY (l_orderkey, l_linenumber))
+
+statement ok
+INSERT INTO part VALUES
+  (1, 'Brand#23', 'MED BOX'),
+  (2, 'Brand#23', 'MED BOX'),
+  (3, 'Brand#99', 'MED BOX')
+
+statement ok
+INSERT INTO lineitem VALUES
+  (1, 1, 1, 3, 70.00),
+  (1, 2, 1, 24, 500.00),
+  (1, 3, 1, 33, 600.00),
+  (2, 1, 2, 1, 70.00),
+  (2, 2, 2, 19, 400.00),
+  (3, 1, 3, 1, 999.00)
+
+# part 1 avg qty = (3+24+33)/3 = 20 → threshold 0.2*20 = 4.00000; only the
+# qty-3 line (price 70.00) is below it. part 2 avg = (1+19)/2 = 10 → threshold
+# 2.00000; only the qty-1 line (price 70.00). SUM = 140.00; / 7.0 = 20.00.
+query R
+SELECT SUM(l_extendedprice) / 7.0
+FROM lineitem, part
+WHERE p_partkey = l_partkey
+  AND p_brand = 'Brand#23'
+  AND p_container = 'MED BOX'
+  AND l_quantity < (
+    SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey
+  )
+----
+20.00

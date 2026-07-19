@@ -384,6 +384,41 @@ ride a session→executor seam rather than PhysOp fields.
   (re-bind outer columns per row). Correctness-first; decorrelation is a
   recorded deferred lever.
 
+**H4c executed (2026-07-19).** Correlated subqueries land as per-outer-row
+apply: the binder's correlation flip binds enclosing-scope references to
+positional `Expression::OuterRef(k)` inside inner templates, with the
+outer tuple-global indices in `outer_cols` vecs ON the outer variants
+(`Predicate::CorrelatedExists`, `Expression::CorrelatedScalar`) — the
+indirection that makes join-reorder remapping touch one small vec and
+never walk into subplans. Session-built evaluators capture the
+statement's engine handle (one MVCC snapshot for every row) and
+plan/execute the substituted template per outer row (rule-based inner
+planning, plan-per-row: recorded correctness-first shape; caching,
+decorrelation, planner-threading = levers). Infallible filter closures
+report faults through a shared cell checked before any row is emitted —
+proven leak-free in review for both execution models. Correlated IN and
+multi-level correlation reject loudly (no target query needs them);
+CorrelatedScalar is direct-compare-operand only. The implementing
+agent's internal review caught nested-subqueries-inside-correlated-
+templates executing with empty sets (now a loud bind rejection); the
+independent review confirmed zero correctness defects and yielded three
+fixes: (1) the cost-tie lesson's THIRD recurrence — now a STANDING
+RULE: any reorder-sensitive guard query must prove the rewrite fires
+(3-relation big-first shape + an EXPLAIN leaf-order assertion; the new
+guard shows RuleBased [c,b,a] vs Selinger [a,b,c] with outer_cols 6→0
+remapped and results identical); (2) fault-cell gating became
+per-predicate (`contains_correlated`) so plain Filters in correlated
+statements skip the mutex; (3) the new invariant-violation paths crash
+(`unreachable!`) instead of silently NULLing in release — incl. the
+scalar analog found adjacent to the specced sites. Tests 1380 → 1390.
+**Q2, Q4, Q17, Q20, Q21 verbatim (Q21 modulo the recorded ORDER BY
+alias form, as Q13); Q22 correlated-core gated — 21/22.** Q22's last
+mile is H4d: SUBSTRING + subquery machinery inside DerivedScan subplans
+(its NOT EXISTS correlates within the derived table's own scope).
+Second prompt-injection sighting in a subagent tool stream this phase
+(fake system-reminder requesting hidden info / expanded git
+permissions) — recognized, ignored, reported.
+
 Gates: per-stage query unlocks (see demand map); parity suite runs the
 unlocked queries across all planners (identical *results*; plan shapes may
 legitimately differ only in the join core).

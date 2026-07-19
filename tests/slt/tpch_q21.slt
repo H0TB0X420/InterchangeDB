@@ -1,0 +1,74 @@
+# TPC-H Q21 — Suppliers Who Kept Orders Waiting (H4c), VERBATIM on a
+# micro-fixture (sole deviation: ORDER BY on the COUNT(*) output alias is the
+# recorded H4a limitation, so the aggregate expression is used, as Q13 does).
+# Correlated EXISTS + NOT EXISTS (double correlation) over a 4-table outer join:
+# a supplier "waits" on an 'F' order where its own line is late, ANOTHER
+# supplier is on the order (EXISTS), and NO other supplier is also late.
+
+statement ok
+CREATE TABLE supplier (s_suppkey INT PRIMARY KEY, s_name VARCHAR(12), s_nationkey INT)
+
+statement ok
+CREATE TABLE nation (n_nationkey INT PRIMARY KEY, n_name VARCHAR(15))
+
+statement ok
+CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_orderstatus VARCHAR(1))
+
+statement ok
+CREATE TABLE lineitem (l_orderkey INT, l_linenumber INT, l_suppkey INT, l_commitdate DATE, l_receiptdate DATE, PRIMARY KEY (l_orderkey, l_linenumber))
+
+statement ok
+INSERT INTO nation VALUES (1, 'SAUDI ARABIA'), (2, 'EGYPT')
+
+statement ok
+INSERT INTO supplier VALUES
+  (10, 'SaudiSupA', 1),
+  (11, 'SaudiSupB', 1),
+  (12, 'EgyptSup', 2)
+
+statement ok
+INSERT INTO orders VALUES (1000, 'F'), (2000, 'F'), (4000, 'F'), (5000, 'F'), (6000, 'F'), (7000, 'F'), (3000, 'O')
+
+statement ok
+INSERT INTO lineitem VALUES
+  (1000, 1, 10, DATE '1995-01-10', DATE '1995-01-20'),
+  (1000, 2, 11, DATE '1995-01-10', DATE '1995-01-05'),
+  (2000, 1, 10, DATE '1995-02-10', DATE '1995-02-20'),
+  (2000, 2, 11, DATE '1995-02-10', DATE '1995-02-25'),
+  (4000, 1, 10, DATE '1995-03-10', DATE '1995-03-20'),
+  (5000, 1, 11, DATE '1995-04-10', DATE '1995-04-20'),
+  (5000, 2, 10, DATE '1995-04-10', DATE '1995-04-05'),
+  (6000, 1, 10, DATE '1995-05-10', DATE '1995-05-20'),
+  (6000, 2, 11, DATE '1995-05-10', DATE '1995-05-05'),
+  (7000, 1, 12, DATE '1995-06-10', DATE '1995-06-20'),
+  (7000, 2, 10, DATE '1995-06-10', DATE '1995-06-05'),
+  (3000, 1, 10, DATE '1995-07-10', DATE '1995-07-20')
+
+# Sole late supplier on a multi-supplier 'F' order → waits. supp10: orders 1000
+# and 6000 (other supplier not late). supp11: order 5000. Order 2000 has BOTH
+# late (nobody waits). Order 4000 is single-supplier (EXISTS fails). Order 7000's
+# sole-late is EgyptSup (nation filter). Order 3000 is status 'O'.
+query TI
+SELECT s_name, COUNT(*)
+FROM supplier, lineitem l1, orders, nation
+WHERE s_suppkey = l1.l_suppkey
+  AND o_orderkey = l1.l_orderkey
+  AND o_orderstatus = 'F'
+  AND l1.l_receiptdate > l1.l_commitdate
+  AND EXISTS (
+    SELECT * FROM lineitem l2
+    WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey
+  )
+  AND NOT EXISTS (
+    SELECT * FROM lineitem l3
+    WHERE l3.l_orderkey = l1.l_orderkey
+      AND l3.l_suppkey <> l1.l_suppkey
+      AND l3.l_receiptdate > l3.l_commitdate
+  )
+  AND s_nationkey = n_nationkey
+  AND n_name = 'SAUDI ARABIA'
+GROUP BY s_name
+ORDER BY COUNT(*) DESC, s_name
+----
+SaudiSupA 2
+SaudiSupB 1

@@ -1,0 +1,43 @@
+# TPC-H Q4 — Order Priority Checking (H4c), VERBATIM on a micro-fixture.
+# Correlated EXISTS + a date window + grouped outer: keep in-window orders that
+# have at least one "late" line item (l_commitdate < l_receiptdate), count per
+# priority. (Constants scaled to the fixture — query parameters, not shape.)
+
+statement ok
+CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_orderdate DATE, o_orderpriority VARCHAR(15))
+
+statement ok
+CREATE TABLE lineitem (l_orderkey INT, l_linenumber INT, l_commitdate DATE, l_receiptdate DATE, PRIMARY KEY (l_orderkey, l_linenumber))
+
+statement ok
+INSERT INTO orders VALUES
+  (1, DATE '1993-07-05', '1-URGENT'),
+  (2, DATE '1993-08-10', '2-HIGH'),
+  (3, DATE '1993-09-20', '1-URGENT'),
+  (4, DATE '1993-10-05', '3-MEDIUM'),
+  (5, DATE '1993-06-20', '1-URGENT')
+
+statement ok
+INSERT INTO lineitem VALUES
+  (1, 1, DATE '1993-07-10', DATE '1993-07-15'),
+  (2, 1, DATE '1993-08-20', DATE '1993-08-18'),
+  (2, 2, DATE '1993-08-25', DATE '1993-08-30'),
+  (3, 1, DATE '1993-09-25', DATE '1993-09-20')
+
+# Window [1993-07-01, 1993-10-01): orders 1,2,3 (4 is Oct, 5 is Jun → out).
+# Late line? order 1 yes (Jul10<Jul15); order 2 yes (line 2 Aug25<Aug30);
+# order 3 no (Sep25>Sep20). Survivors: order 1 (1-URGENT), order 2 (2-HIGH).
+query TI
+SELECT o_orderpriority, COUNT(*)
+FROM orders
+WHERE o_orderdate >= DATE '1993-07-01'
+  AND o_orderdate < DATE '1993-07-01' + INTERVAL '3' MONTH
+  AND EXISTS (
+    SELECT * FROM lineitem
+    WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate
+  )
+GROUP BY o_orderpriority
+ORDER BY o_orderpriority
+----
+1-URGENT 1
+2-HIGH 1

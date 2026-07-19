@@ -2,8 +2,9 @@
 # (→ constant-set filter, NULL-aware 3VL), and EXISTS / NOT EXISTS (→ a
 # statement constant). The session runs each inner query through the same
 # engine handle BEFORE planning; scalars become literals, IN/EXISTS become
-# materialized sets the Filter closure captures. Correlated forms are a loud,
-# named refusal — this phase is uncorrelated only.
+# materialized sets the Filter closure captures. CORRELATED scalar / EXISTS
+# now bind + run per outer row (H4c — see correlated.slt); the residual
+# refusals here are correlated IN (rewrite as EXISTS) and multi-level.
 
 statement ok
 CREATE TABLE t (a INT PRIMARY KEY, b INT)
@@ -156,15 +157,20 @@ SELECT a FROM t WHERE a IN (SELECT x, y FROM s)
 statement error exactly one column
 SELECT a FROM t WHERE a = (SELECT x, y FROM s WHERE x = 2)
 
-# ---- correlated reference is a named refusal -----------------------------
+# ---- correlated IN is a named refusal (rewrite as EXISTS) -----------------
 # `b` is unknown in the inner scope (s) but resolvable in the outer (t) — a
-# correlated reference, unsupported this phase.
-statement error correlated subqueries not yet supported
+# correlated reference, which now binds to OuterRef. But a correlated IN has no
+# per-row set the InSubquery machinery can hold, so it is refused by name.
+statement error correlated IN subqueries are not supported
 SELECT a FROM t WHERE a IN (SELECT x FROM s WHERE b = 2)
 
-# Qualified correlated reference (`t.b`) — same refusal.
-statement error correlated subqueries not yet supported
+# A correlated SCALAR now binds + runs per outer row (H4c). For each t.b in
+# {10,20,30,40} the inner `SELECT y FROM s WHERE y = t.b` matches no s.y
+# ({100,200}) → 0 rows → NULL → `a = NULL` UNKNOWN → no rows. (Non-trivial
+# correlated results live in correlated.slt.)
+query I
 SELECT a FROM t WHERE a = (SELECT y FROM s WHERE y = t.b)
+----
 
 # A typo'd qualifier is a plain scope error, NOT a correlation misdiagnosis.
 # `zzz` matches no relation here or in any enclosing scope. The column name

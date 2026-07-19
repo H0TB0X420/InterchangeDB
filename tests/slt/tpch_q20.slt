@@ -1,0 +1,69 @@
+# TPC-H Q20 — Potential Part Promotion (H4c), VERBATIM on a micro-fixture.
+# NESTED composition: an UNCORRELATED IN (supplier ∈ …) whose inner query
+# itself carries an UNCORRELATED IN (part ∈ …) AND a CORRELATED scalar
+# (0.5 * SUM over a date-windowed, doubly-correlated lineitem). Proves a
+# correlated subquery composes inside an uncorrelated one, threaded on the same
+# snapshot by the session machinery.
+
+statement ok
+CREATE TABLE supplier (s_suppkey INT PRIMARY KEY, s_name VARCHAR(10), s_address VARCHAR(10), s_nationkey INT)
+
+statement ok
+CREATE TABLE nation (n_nationkey INT PRIMARY KEY, n_name VARCHAR(10))
+
+statement ok
+CREATE TABLE part (p_partkey INT PRIMARY KEY, p_name VARCHAR(20))
+
+statement ok
+CREATE TABLE partsupp (ps_partkey INT, ps_suppkey INT, ps_availqty INT, PRIMARY KEY (ps_partkey, ps_suppkey))
+
+statement ok
+CREATE TABLE lineitem (l_orderkey INT, l_linenumber INT, l_partkey INT, l_suppkey INT, l_quantity INT, l_shipdate DATE, PRIMARY KEY (l_orderkey, l_linenumber))
+
+statement ok
+INSERT INTO nation VALUES (1, 'CANADA'), (2, 'US')
+
+statement ok
+INSERT INTO supplier VALUES
+  (10, 'CanSupX', 'addrX', 1),
+  (11, 'CanSupY', 'addrY', 1),
+  (12, 'UsSup', 'addrZ', 2)
+
+statement ok
+INSERT INTO part VALUES (100, 'forest green'), (200, 'ocean blue')
+
+statement ok
+INSERT INTO partsupp VALUES
+  (100, 10, 50),
+  (100, 11, 5),
+  (200, 10, 100)
+
+statement ok
+INSERT INTO lineitem VALUES
+  (1, 1, 100, 10, 30, DATE '1994-03-01'),
+  (1, 2, 100, 10, 50, DATE '1994-06-01'),
+  (2, 1, 100, 11, 20, DATE '1994-04-01'),
+  (3, 1, 100, 10, 1000, DATE '1993-12-31')
+
+# Forest parts = {100}. For (part100, supp10): 1994 qty = 30+50 = 80 (the 1993
+# row is out of window), 0.5*80 = 40, availqty 50 > 40 → qualifies. For
+# (part100, supp11): 1994 qty = 20, 0.5*20 = 10, availqty 5 > 10 is false → out.
+# part 200 not forest. So the IN set is {10}; CANADA suppliers ∩ {10} = CanSupX.
+query TT
+SELECT s_name, s_address
+FROM supplier, nation
+WHERE s_suppkey IN (
+    SELECT ps_suppkey FROM partsupp
+    WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%')
+      AND ps_availqty > (
+        SELECT 0.5 * SUM(l_quantity) FROM lineitem
+        WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey
+          AND l_shipdate >= DATE '1994-01-01'
+          AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR
+      )
+  )
+  AND s_nationkey = n_nationkey
+  AND n_name = 'CANADA'
+ORDER BY s_name
+----
+CanSupX addrX

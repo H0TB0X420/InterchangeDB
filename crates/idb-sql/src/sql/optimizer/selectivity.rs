@@ -72,11 +72,12 @@ pub const LIKE_CONTAINS_SELECTIVITY: f64 = 0.25;
 pub const IS_NULL_FALLBACK: f64 = 0.1;
 
 /// Selectivity default for `expr [NOT] IN (subquery)` / `[NOT] EXISTS
-/// (subquery)`. The true selectivity depends on the inner result set, which
-/// is materialized independently (by the session) and not visible at plan
-/// time; `0.5` is a neutral placeholder that neither over- nor under-values a
-/// subquery filter when the planner orders joins around it. Estimating from
-/// the inner query's cardinality is a recorded lever.
+/// (subquery)`, uncorrelated OR correlated. The true selectivity depends on the
+/// inner result set — materialized independently (uncorrelated) or re-run per
+/// outer row (correlated) — and is not visible at plan time; `0.5` is a neutral
+/// placeholder that neither over- nor under-values a subquery filter when the
+/// planner orders joins around it. Estimating from the inner query's
+/// cardinality is a recorded lever.
 pub const IN_SUBQUERY_FALLBACK: f64 = 0.5;
 
 /// Estimate the selectivity of `pred` against rows of a single
@@ -124,6 +125,9 @@ pub fn estimate_predicate_selectivity(
         // moderate default keeps it from biasing join ordering either way;
         // estimating from the inner cardinality is a recorded lever.
         Predicate::InSubquery { .. } => IN_SUBQUERY_FALLBACK,
+        // A correlated EXISTS (H4c) shares the same unknown-inner-cardinality
+        // rationale — the neutral default keeps it from biasing join ordering.
+        Predicate::CorrelatedExists { .. } => IN_SUBQUERY_FALLBACK,
     };
     raw.clamp(MIN_SELECTIVITY, 1.0)
 }

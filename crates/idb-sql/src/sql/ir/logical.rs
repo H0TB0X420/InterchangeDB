@@ -118,6 +118,18 @@ pub enum LogicalPlan {
         /// `InSubquery` predicate closure captures. EMPTY for every query
         /// without one. Uncorrelated by construction — bound in a fresh scope.
         in_subqueries: Vec<LogicalPlan>,
+        /// Correlated subquery templates (H4c), indexed by the `subquery` field
+        /// of a `Predicate::CorrelatedExists` / `Expression::CorrelatedScalar`
+        /// in this SELECT's `filter`. Each is the already-bound inner query
+        /// carrying `Expression::OuterRef(k)` placeholders for the outer columns
+        /// it correlates on (the outer indices live in the correlating form's
+        /// `outer_cols`, never here — the indirection rule). The session
+        /// captures these before planning and turns each into a per-outer-row
+        /// evaluator (substitute `OuterRef` → plan → execute through the same
+        /// engine handle). EMPTY for every query without a correlated subquery;
+        /// the planner drops it (vestigial by plan time, like the two lists
+        /// above), EXPLAIN renders it via the `Explain` arm.
+        correlated_subqueries: Vec<LogicalPlan>,
         /// Column indices in the requested output order. Empty = `SELECT *`
         /// (when aggregates is also empty) or whole-table aggregation (when
         /// aggregates is non-empty). H1 meaning unchanged: bare column
@@ -368,6 +380,7 @@ impl LogicalPlan {
                 derived,
                 scalar_subqueries,
                 in_subqueries,
+                correlated_subqueries,
                 projection,
                 aggregates,
                 select_list,
@@ -421,9 +434,10 @@ impl LogicalPlan {
                     // Subquery inner plans are separate statements with their
                     // own parameter/slot spaces, resolved when the session
                     // executes each; the outer's user parameters do not reach
-                    // into them, so carry both lists through untouched.
+                    // into them, so carry all three lists through untouched.
                     scalar_subqueries,
                     in_subqueries,
+                    correlated_subqueries,
                     projection,
                     aggregates,
                     select_list,
@@ -495,6 +509,7 @@ impl LogicalPlan {
                 derived,
                 scalar_subqueries,
                 in_subqueries,
+                correlated_subqueries,
                 projection,
                 aggregates,
                 select_list,
@@ -549,9 +564,10 @@ impl LogicalPlan {
                     derived,
                     // The inner plans are separate statements with their own
                     // slot spaces, resolved when the session runs each; carry
-                    // both lists through untouched.
+                    // all three lists through untouched.
                     scalar_subqueries,
                     in_subqueries,
+                    correlated_subqueries,
                     projection,
                     aggregates,
                     select_list,
@@ -564,6 +580,109 @@ impl LogicalPlan {
             // No scalar subqueries reach substitution outside a SELECT.
             other => Ok(other),
         }
+    }
+
+    /// Substitute every `Expression::OuterRef(k)` with `Literal(values[k])`
+    /// (H4c) — the per-outer-row step the correlated evaluator runs on an inner
+    /// template before planning it into a plain, uncorrelated query. `OuterRef`
+    /// lives wherever the inner query's expressions do — its WHERE `filter`,
+    /// join `ON`s, `HAVING`, aggregate arguments, and `select_list`. A correlated
+    /// template's own subquery lists (`scalar_subqueries` / `in_subqueries` /
+    /// `correlated_subqueries`) and derived tables are EMPTY — the binder rejects
+    /// a subquery nested inside a correlated one
+    /// (`reject_nested_subqueries_in_correlated`), so there is nothing to recurse
+    /// into and the session's evaluator runs this template with empty sets;
+    /// `projection` / `order_by` are plain indices with no `OuterRef`. A
+    /// non-SELECT template is a binder bug — every correlated subquery binds to a
+    /// SELECT.
+    pub fn substitute_outer_refs(self, values: &[Value]) -> Result<LogicalPlan> {
+        match self {
+            LogicalPlan::Select {
+                table,
+                joins,
+                derived,
+                scalar_subqueries,
+                in_subqueries,
+                correlated_subqueries,
+                projection,
+                aggregates,
+                select_list,
+                filter,
+                order_by,
+                having,
+                limit,
+            } => {
+                let joins = joins
+                    .into_iter()
+                    .map(|j| {
+                        Ok::<JoinClause, Error>(JoinClause {
+                            right_table: j.right_table,
+                            right_alias: j.right_alias,
+                            on: match j.on {
+                                Some(p) => Some(p.substitute_outer_refs(values)?),
+                                None => None,
+                            },
+                            kind: j.kind,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let aggregates = aggregates
+                    .into_iter()
+                    .map(|a| a.substitute_outer_refs(values))
+                    .collect::<Result<Vec<_>>>()?;
+                let select_list = select_list
+                    .into_iter()
+                    .map(|e| e.substitute_outer_refs(values))
+                    .collect::<Result<Vec<_>>>()?;
+                let filter = match filter {
+                    Some(p) => Some(p.substitute_outer_refs(values)?),
+                    None => None,
+                };
+                let having = match having {
+                    Some(p) => Some(p.substitute_outer_refs(values)?),
+                    None => None,
+                };
+                Ok(LogicalPlan::Select {
+                    table,
+                    joins,
+                    // Templates never carry these (multi-level correlation and
+                    // subqueries-in-templates are binder-rejected); pass through.
+                    derived,
+                    scalar_subqueries,
+                    in_subqueries,
+                    correlated_subqueries,
+                    projection,
+                    aggregates,
+                    select_list,
+                    filter,
+                    order_by,
+                    having,
+                    limit,
+                })
+            }
+            other => Err(Error::Internal(format!(
+                "substitute_outer_refs: correlated template is not a SELECT: {:?}",
+                std::mem::discriminant(&other)
+            ))),
+        }
+    }
+}
+
+impl AggregateSpec {
+    /// Substitute `OuterRef` in this aggregate's argument (H4c). `COUNT(*)` has
+    /// no argument; every other variant carries one expression.
+    fn substitute_outer_refs(self, values: &[Value]) -> Result<AggregateSpec> {
+        Ok(match self {
+            AggregateSpec::CountStar => AggregateSpec::CountStar,
+            AggregateSpec::Count { arg, distinct } => AggregateSpec::Count {
+                arg: arg.substitute_outer_refs(values)?,
+                distinct,
+            },
+            AggregateSpec::Sum(e) => AggregateSpec::Sum(e.substitute_outer_refs(values)?),
+            AggregateSpec::Min(e) => AggregateSpec::Min(e.substitute_outer_refs(values)?),
+            AggregateSpec::Max(e) => AggregateSpec::Max(e.substitute_outer_refs(values)?),
+            AggregateSpec::Avg(e) => AggregateSpec::Avg(e.substitute_outer_refs(values)?),
+        })
     }
 }
 

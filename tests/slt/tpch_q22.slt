@@ -1,0 +1,33 @@
+# TPC-H Q22 (CORE) — Global Sales Opportunity (H4c), on a micro-fixture.
+#
+# NOTE (recorded deviation — Q22 is NOT verbatim this phase): verbatim Q22
+# additionally needs (1) SUBSTRING(c_phone FROM 1 FOR 2), (2) a FROM-subquery
+# that itself carries these subqueries, and (3) GROUP BY on that substring
+# EXPRESSION — three features OUTSIDE correlation, each a recorded lever
+# (subqueries-in-derived-tables, expression GROUP BY keys, SUBSTRING). This gate
+# exercises Q22's correlated CORE: customers with an above-average account
+# balance and NO orders — the correlated NOT EXISTS composed with the
+# uncorrelated scalar AVG that Q22 is built on.
+
+statement ok
+CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_acctbal DECIMAL(12,2))
+
+statement ok
+CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_custkey INT)
+
+statement ok
+INSERT INTO customer VALUES (1, 100.00), (2, 500.00), (3, 600.00), (4, -50.00)
+
+statement ok
+INSERT INTO orders VALUES (10, 2)
+
+# AVG over positive balances = (100+500+600)/3 = 400.00. Above-average and no
+# orders: cust 2 (500) has an order; cust 3 (600) qualifies; cust 1/4 below.
+query IR
+SELECT c_custkey, c_acctbal
+FROM customer
+WHERE c_acctbal > (SELECT AVG(c_acctbal) FROM customer WHERE c_acctbal > 0.00)
+  AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)
+ORDER BY c_custkey
+----
+3 600.00

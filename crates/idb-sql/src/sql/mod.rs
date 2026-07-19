@@ -22,7 +22,9 @@ pub mod workload_log;
 
 pub use binder::Binder;
 pub use frontend::parse;
-pub use ir::expr::{BinaryOp, CompareOp, Expression, InSubquerySet, Predicate};
+pub use ir::expr::{
+    BinaryOp, CompareOp, CorrelatedEvaluator, Expression, InSubquerySet, Predicate,
+};
 pub use ir::logical::LogicalPlan;
 pub use ir::physical::PhysOp;
 pub use optimizer::column_map::ColumnRemap;

@@ -28,8 +28,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::common::{Error, Result};
 use crate::types::Tuple;
 use crate::types::{ColumnType, Decimal, Value};
 
@@ -87,6 +89,32 @@ pub enum Expression {
     /// substitution passes from ever touching each other's slots. Appended LAST
     /// so bincode discriminants for the pre-existing variants stay stable.
     SubqueryResult(usize),
+    /// A reference to a column of an ENCLOSING query, inside a correlated
+    /// subquery's inner plan (H4c). `k` is a POSITIONAL index into the
+    /// correlating outer form's `outer_cols` list — NOT a tuple index. The
+    /// indirection is deliberate: the inner plan (a `correlated_subqueries`
+    /// template) carries only positional `OuterRef(k)`, while the OUTER
+    /// tuple-global indices live in `outer_cols` on the outer `CorrelatedScalar`
+    /// / `CorrelatedExists`, so outer join-reorder remapping rewrites only
+    /// `outer_cols` and never walks an inner plan. Per outer row the correlated
+    /// evaluator substitutes `OuterRef(k)` → `Literal(v[k])` via
+    /// `substitute_outer_refs` before planning the inner. Appended after
+    /// `SubqueryResult` for bincode discriminant stability.
+    OuterRef(usize),
+    /// A correlated scalar subquery used as a compare operand (H4c — Q2's
+    /// `MIN`, Q17's `AVG`, Q20's inner `SUM`). `subquery` indexes the enclosing
+    /// `Select`'s `correlated_subqueries` list (the inner template, carrying
+    /// `OuterRef` placeholders); `outer_cols` are the OUTER tuple-global column
+    /// indices this subquery correlates on, positionally aligned with the
+    /// template's `OuterRef(k)`. The build path turns the template into a
+    /// per-row evaluator; the compiled compare reduces its rows to a single
+    /// value (0 → NULL, 1 → the value, >1 → a loud runtime fault). Supported
+    /// only as a DIRECT compare operand (like the uncorrelated `SubqueryResult`
+    /// — see `bind_compare_operand`). Appended LAST for bincode stability.
+    CorrelatedScalar {
+        subquery: usize,
+        outer_cols: Vec<usize>,
+    },
 }
 
 /// Arithmetic operator for `Expression::BinaryOp`.
@@ -144,6 +172,19 @@ pub enum Predicate {
         subquery: usize,
         negated: bool,
     },
+    /// A correlated `[NOT] EXISTS (subquery)` (H4c — Q4, Q21, Q22). `subquery`
+    /// indexes the enclosing `Select`'s `correlated_subqueries` list (the inner
+    /// template, carrying `OuterRef` placeholders); `outer_cols` are the OUTER
+    /// tuple-global columns it correlates on, positionally aligned with the
+    /// template's `OuterRef(k)`. Unlike the uncorrelated `InSubquery` EXISTS — a
+    /// statement constant materialized once — this re-runs the inner per outer
+    /// row (the template is capped at `LIMIT 1`): true iff the inner yields a
+    /// row, `negated` flips it. Appended LAST for bincode discriminant stability.
+    CorrelatedExists {
+        subquery: usize,
+        outer_cols: Vec<usize>,
+        negated: bool,
+    },
 }
 
 /// The materialized result of one uncorrelated subquery referenced by a
@@ -187,6 +228,103 @@ type Predicate3VL = Box<dyn Fn(&Tuple) -> Option<bool> + Send>;
 /// (a CASE's per-branch results) don't spell the `dyn Fn` out inline.
 type ExpressionFn = Box<dyn Fn(&Tuple) -> Value + Send>;
 
+/// A correlated subquery, ready to run per outer row (H4c). Given the outer
+/// row's values at the correlating form's `outer_cols` (extracted by the
+/// compiled closure), it substitutes the inner template's `OuterRef`
+/// placeholders, plans, and executes through the SAME engine handle, returning
+/// the raw output rows. Built once per statement at build time — the session
+/// captures the engine handle, catalog, and execution model into it; `Arc` so
+/// it is shared across the plan tree and cheap to clone into each closure.
+/// `Send + Sync` so the `Send` executor tree can hold it.
+pub type CorrelatedEvaluator = Arc<dyn Fn(&[Value]) -> Result<Vec<Tuple>> + Send + Sync>;
+
+/// The error channel for correlated evaluation (H4c). The compiled predicate /
+/// expression closures are infallible (`-> bool` / `-> Value`), so a correlated
+/// evaluation that faults — an inner execution error, or a scalar subquery
+/// returning more than one row — records its error here and returns a sentinel
+/// (EXISTS → drop, scalar → NULL); the hosting `Filter` / `FilterSink` takes
+/// the cell after each predicate call and surfaces the error loudly. One shared
+/// cell per statement, cloned into every correlated closure and the operators
+/// that run them.
+pub type CorrelatedFault = Arc<Mutex<Option<Error>>>;
+
+/// A fresh, empty fault cell — for the non-correlated compile paths (which
+/// never fault) and as the shared cell the correlated build path threads.
+pub fn new_correlated_fault() -> CorrelatedFault {
+    Arc::new(Mutex::new(None))
+}
+
+/// Record the FIRST correlated fault (later rows may pile on; the first is the
+/// honest cause). The operator surfaces it and aborts.
+fn record_correlated_fault(fault: &CorrelatedFault, err: Error) {
+    let mut slot = fault.lock();
+    if slot.is_none() {
+        *slot = Some(err);
+    }
+}
+
+/// Reduce a correlated scalar subquery's rows to one `Value`: 0 rows → NULL,
+/// 1 row → its sole column value, >1 → a loud error (the binder guarantees
+/// exactly one output column). Mirrors the session's uncorrelated
+/// `scalar_value_of`.
+fn reduce_correlated_scalar(rows: Vec<Tuple>) -> Result<Value> {
+    match rows.len() {
+        0 => Ok(Value::Null),
+        1 => Ok(rows
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Null)),
+        n => Err(Error::SqlParse(format!(
+            "correlated scalar subquery returned {} rows (expected at most 1)",
+            n
+        ))),
+    }
+}
+
+/// Compile one comparison operand (H4c): a `CorrelatedScalar` becomes an
+/// evaluator-driven closure that, per outer row, extracts its `outer_cols`,
+/// runs the subquery, and reduces to a scalar (faults recorded, NULL returned);
+/// anything else compiles plainly. Correlated scalars are supported only as a
+/// DIRECT operand — one buried in arithmetic falls to `Expression::compile`'s
+/// loud `debug_assert` (the same direct-operand rule the uncorrelated
+/// `SubqueryResult` follows).
+fn compile_operand(
+    expr: Expression,
+    correlated: &[CorrelatedEvaluator],
+    fault: &CorrelatedFault,
+) -> ExpressionFn {
+    match expr {
+        Expression::CorrelatedScalar {
+            subquery,
+            outer_cols,
+        } => {
+            // Binder invariant: every CorrelatedScalar slot has an evaluator.
+            // A miss is a programmer error — crash at build time (the exact
+            // analog of CorrelatedExists' rule), never silently NULL rows.
+            let eval = correlated.get(subquery).cloned().unwrap_or_else(|| {
+                unreachable!("CorrelatedScalar slot {} has no evaluator", subquery)
+            });
+            let fault = fault.clone();
+            Box::new(move |t| {
+                // Extract the outer row's values at the correlated columns,
+                // positionally aligned with the template's `OuterRef(k)`.
+                let values: Vec<Value> = outer_cols.iter().map(|&c| t[c].clone()).collect();
+                match eval(&values).and_then(reduce_correlated_scalar) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        record_correlated_fault(&fault, e);
+                        Value::Null
+                    }
+                }
+            })
+        }
+        other => other.compile(),
+    }
+}
+
 // ===========================================================================
 // Compilation: IR → closures
 // ===========================================================================
@@ -219,6 +357,30 @@ impl Expression {
                 );
                 Box::new(move |_t| Value::Null)
             }
+            Expression::OuterRef(k) => {
+                // Binder-established invariant: the correlated evaluator's
+                // `substitute_outer_refs` replaces every `OuterRef(k)` with a
+                // `Literal` before an inner template is planned + compiled.
+                // Reaching plain compile means an `OuterRef` leaked into a
+                // non-correlated plan — corruption, not user input. Crash rather
+                // than silently NULL every row in release (CLAUDE.md: crash on
+                // corruption).
+                unreachable!(
+                    "unsubstituted OuterRef({k}) reached Expression::compile() — \
+                     substitute_outer_refs must run on every inner template before compilation"
+                )
+            }
+            Expression::CorrelatedScalar { subquery, .. } => {
+                // Binder-established invariant: a `CorrelatedScalar` is supported
+                // ONLY as a direct compare operand (`compile_operand` handles it
+                // with the per-row evaluator + fault cell). Reaching plain compile
+                // means the binder admitted one buried in arithmetic — corruption.
+                // Crash rather than silently NULL every row in release.
+                unreachable!(
+                    "CorrelatedScalar(subquery {subquery}) reached Expression::compile() — \
+                     a correlated scalar is only valid as a direct compare operand"
+                )
+            }
             Expression::BinaryOp { op, left, right } => {
                 let l = left.compile();
                 let r = right.compile();
@@ -244,10 +406,16 @@ impl Expression {
                 // per-row IR walking.
                 let compiled: Vec<(Predicate3VL, ExpressionFn)> = branches
                     .into_iter()
-                    // CASE-branch predicates never carry an `InSubquery` in
-                    // the H4b surface (the binder only emits one from a
-                    // top-level WHERE/HAVING IN/EXISTS), so no sets are needed.
-                    .map(|(pred, result)| (pred.compile_3vl(&[]), result.compile()))
+                    // CASE-branch predicates never carry an `InSubquery` or a
+                    // correlated form in this surface (the binder only emits
+                    // those from a top-level WHERE/HAVING IN/EXISTS/compare), so
+                    // no sets, evaluators, or fault cell are needed here.
+                    .map(|(pred, result)| {
+                        (
+                            pred.compile_3vl(&[], &[], &new_correlated_fault()),
+                            result.compile(),
+                        )
+                    })
                     .collect();
                 let else_f = else_expr.map(|e| e.compile());
                 Box::new(move |t| {
@@ -289,10 +457,14 @@ impl Expression {
             // A scalar-subquery slot is NOT a user parameter — leave it for
             // substitute_subquery_results. Keeping the two namespaces separate
             // is the whole point: user-parameter binding must not clobber a
-            // subquery slot (nor vice versa).
-            Expression::Literal(_) | Expression::Column(_) | Expression::SubqueryResult(_) => {
-                Ok(self)
-            }
+            // subquery slot (nor vice versa). `OuterRef` / `CorrelatedScalar`
+            // (H4c) are resolved per outer row by the correlated evaluator, not
+            // by user-parameter binding — pass through untouched.
+            Expression::Literal(_)
+            | Expression::Column(_)
+            | Expression::SubqueryResult(_)
+            | Expression::OuterRef(_)
+            | Expression::CorrelatedScalar { .. } => Ok(self),
             Expression::BinaryOp { op, left, right } => Ok(Expression::BinaryOp {
                 op,
                 left: Box::new(left.substitute_params(params)?),
@@ -351,7 +523,13 @@ impl Expression {
                         values.len()
                     ))
                 }),
-            Expression::Literal(_) | Expression::Column(_) | Expression::Parameter(_) => Ok(self),
+            // `OuterRef` / `CorrelatedScalar` (H4c) are resolved per outer row by
+            // the correlated evaluator, not by this scalar-splice pass.
+            Expression::Literal(_)
+            | Expression::Column(_)
+            | Expression::Parameter(_)
+            | Expression::OuterRef(_)
+            | Expression::CorrelatedScalar { .. } => Ok(self),
             Expression::BinaryOp { op, left, right } => Ok(Expression::BinaryOp {
                 op,
                 left: Box::new(left.substitute_subquery_results(values)?),
@@ -385,6 +563,69 @@ impl Expression {
         }
     }
 
+    /// Recursively substitute `OuterRef(k)` with `Literal(values[k])` (H4c) —
+    /// the per-outer-row step the correlated evaluator runs on an inner template
+    /// before planning it (the mirror of `substitute_subquery_results`, on the
+    /// `OuterRef` namespace). Every other leaf passes through. An out-of-range
+    /// `k` is an internal invariant break: the binder emits exactly
+    /// `outer_cols.len()` distinct `OuterRef` indices and the evaluator supplies
+    /// exactly that many values.
+    pub fn substitute_outer_refs(self, values: &[Value]) -> crate::common::Result<Expression> {
+        match self {
+            Expression::OuterRef(k) => {
+                values
+                    .get(k)
+                    .cloned()
+                    .map(Expression::Literal)
+                    .ok_or_else(|| {
+                        crate::common::Error::Internal(format!(
+                            "OuterRef slot {} has no value (only {} supplied)",
+                            k,
+                            values.len()
+                        ))
+                    })
+            }
+            // A nested `CorrelatedScalar` inside a correlated template would be a
+            // SECOND correlation level — the binder rejects multi-level, so this
+            // is unreachable; pass it through rather than mis-substituting.
+            Expression::Literal(_)
+            | Expression::Column(_)
+            | Expression::Parameter(_)
+            | Expression::SubqueryResult(_)
+            | Expression::CorrelatedScalar { .. } => Ok(self),
+            Expression::BinaryOp { op, left, right } => Ok(Expression::BinaryOp {
+                op,
+                left: Box::new(left.substitute_outer_refs(values)?),
+                right: Box::new(right.substitute_outer_refs(values)?),
+            }),
+            Expression::ExtractYear(arg) => Ok(Expression::ExtractYear(Box::new(
+                arg.substitute_outer_refs(values)?,
+            ))),
+            Expression::Case {
+                branches,
+                else_expr,
+            } => {
+                let branches = branches
+                    .into_iter()
+                    .map(|(pred, result)| {
+                        Ok((
+                            pred.substitute_outer_refs(values)?,
+                            result.substitute_outer_refs(values)?,
+                        ))
+                    })
+                    .collect::<crate::common::Result<Vec<_>>>()?;
+                let else_expr = match else_expr {
+                    Some(e) => Some(Box::new(e.substitute_outer_refs(values)?)),
+                    None => None,
+                };
+                Ok(Expression::Case {
+                    branches,
+                    else_expr,
+                })
+            }
+        }
+    }
+
     /// Static result type of this expression over a row of
     /// `column_types` — MUST mirror `eval_binary_op` exactly, or the
     /// aggregate accumulator (picked from this type) diverges from the
@@ -398,7 +639,13 @@ impl Expression {
             Expression::Column(i) => column_types.get(*i).copied(),
             // Neither is statically typed: both are resolved to a `Literal`
             // (user binding / subquery result) before the plan is typed.
-            Expression::Parameter(_) | Expression::SubqueryResult(_) => None,
+            // `OuterRef` (substituted to a literal per outer row before the inner
+            // is planned) and `CorrelatedScalar` (never a typed output — only a
+            // direct compare operand, where narrowing tolerates `None`) join them.
+            Expression::Parameter(_)
+            | Expression::SubqueryResult(_)
+            | Expression::OuterRef(_)
+            | Expression::CorrelatedScalar { .. } => None,
             Expression::BinaryOp { op, left, right } => {
                 // None propagates: a NULL-typed sub-expression makes the
                 // whole result NULL, exactly as `eval_binary_op` does.
@@ -573,6 +820,11 @@ impl std::fmt::Display for Expression {
             // A scalar-subquery result slot: `subq{i}`, distinct from `$N` so
             // an EXPLAIN can tell a user parameter from a subquery placeholder.
             Expression::SubqueryResult(i) => write!(f, "subq{}", i),
+            // A correlated outer-column reference (H4c): `outer{k}` (positional
+            // into the outer form's `outer_cols`); a correlated scalar subquery:
+            // `correlated{i}` (its `correlated_subqueries` slot).
+            Expression::OuterRef(k) => write!(f, "outer{}", k),
+            Expression::CorrelatedScalar { subquery, .. } => write!(f, "correlated{}", subquery),
             Expression::BinaryOp { op, left, right } => {
                 let symbol = match op {
                     BinaryOp::Add => '+',
@@ -638,6 +890,18 @@ impl Predicate {
                 subquery,
                 negated,
             }),
+            // A correlated EXISTS (H4c) carries no user-parameter operand — the
+            // subquery index, outer columns, and inner template are resolved per
+            // outer row by the correlated evaluator; carry it through untouched.
+            Predicate::CorrelatedExists {
+                subquery,
+                outer_cols,
+                negated,
+            } => Ok(Predicate::CorrelatedExists {
+                subquery,
+                outer_cols,
+                negated,
+            }),
         }
     }
 
@@ -682,6 +946,117 @@ impl Predicate {
                 subquery,
                 negated,
             }),
+            // Correlated EXISTS (H4c) carries no scalar-subquery slot; untouched.
+            Predicate::CorrelatedExists {
+                subquery,
+                outer_cols,
+                negated,
+            } => Ok(Predicate::CorrelatedExists {
+                subquery,
+                outer_cols,
+                negated,
+            }),
+        }
+    }
+
+    /// Recursively substitute `OuterRef(k)` with `Literal(values[k])` (H4c) in
+    /// nested expressions — the per-outer-row step the correlated evaluator runs
+    /// on an inner template's predicates before planning. A nested
+    /// `CorrelatedExists` would be a second correlation level (binder-rejected),
+    /// so it is carried through, not descended into.
+    pub fn substitute_outer_refs(self, values: &[Value]) -> crate::common::Result<Predicate> {
+        match self {
+            Predicate::Compare { op, left, right } => Ok(Predicate::Compare {
+                op,
+                left: left.substitute_outer_refs(values)?,
+                right: right.substitute_outer_refs(values)?,
+            }),
+            Predicate::And(a, b) => Ok(Predicate::And(
+                Box::new(a.substitute_outer_refs(values)?),
+                Box::new(b.substitute_outer_refs(values)?),
+            )),
+            Predicate::Or(a, b) => Ok(Predicate::Or(
+                Box::new(a.substitute_outer_refs(values)?),
+                Box::new(b.substitute_outer_refs(values)?),
+            )),
+            Predicate::Not(p) => Ok(Predicate::Not(Box::new(p.substitute_outer_refs(values)?))),
+            Predicate::Like { expr, pattern } => Ok(Predicate::Like {
+                expr: expr.substitute_outer_refs(values)?,
+                pattern,
+            }),
+            Predicate::IsNull(expr) => Ok(Predicate::IsNull(expr.substitute_outer_refs(values)?)),
+            Predicate::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => Ok(Predicate::InSubquery {
+                expr: match expr {
+                    Some(e) => Some(e.substitute_outer_refs(values)?),
+                    None => None,
+                },
+                subquery,
+                negated,
+            }),
+            Predicate::CorrelatedExists {
+                subquery,
+                outer_cols,
+                negated,
+            } => Ok(Predicate::CorrelatedExists {
+                subquery,
+                outer_cols,
+                negated,
+            }),
+        }
+    }
+}
+
+/// Does `predicate` carry a correlated form (H4c) — a `CorrelatedExists`, or a
+/// `CorrelatedScalar` operand nested anywhere within it (including inside a CASE
+/// arm of a compare operand)? Drives per-`Filter` compile routing in the
+/// executor builders: a plain predicate in a correlated statement compiles the
+/// faultless plain path instead of locking a never-written fault mutex per row.
+/// Full recursion over BOTH the predicate tree and its expression operands.
+pub(crate) fn contains_correlated(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::CorrelatedExists { .. } => true,
+        Predicate::Compare { left, right, .. } => {
+            expr_contains_correlated(left) || expr_contains_correlated(right)
+        }
+        Predicate::And(a, b) | Predicate::Or(a, b) => {
+            contains_correlated(a) || contains_correlated(b)
+        }
+        Predicate::Not(p) => contains_correlated(p),
+        Predicate::Like { expr, .. } => expr_contains_correlated(expr),
+        Predicate::IsNull(expr) => expr_contains_correlated(expr),
+        // An uncorrelated IN/EXISTS is not itself a correlated form; its probe
+        // expression could still hide a correlated scalar, so recurse into it.
+        Predicate::InSubquery { expr, .. } => expr.as_ref().is_some_and(expr_contains_correlated),
+    }
+}
+
+/// Does `expr` carry a `CorrelatedScalar` anywhere within it (H4c)? Recurses
+/// through arithmetic, EXTRACT, and BOTH the branch predicates and results of a
+/// CASE — the exhaustive walk `contains_correlated` needs on compare operands.
+fn expr_contains_correlated(expr: &Expression) -> bool {
+    match expr {
+        Expression::CorrelatedScalar { .. } => true,
+        Expression::Literal(_)
+        | Expression::Column(_)
+        | Expression::Parameter(_)
+        | Expression::SubqueryResult(_)
+        | Expression::OuterRef(_) => false,
+        Expression::BinaryOp { left, right, .. } => {
+            expr_contains_correlated(left) || expr_contains_correlated(right)
+        }
+        Expression::ExtractYear(arg) => expr_contains_correlated(arg),
+        Expression::Case {
+            branches,
+            else_expr,
+        } => {
+            branches
+                .iter()
+                .any(|(pred, result)| contains_correlated(pred) || expr_contains_correlated(result))
+                || else_expr.as_deref().is_some_and(expr_contains_correlated)
         }
     }
 }
@@ -698,12 +1073,30 @@ impl Predicate {
 
     /// Like `compile`, but with the statement's materialized subquery sets
     /// available so an `InSubquery` leaf can capture its set. The executor
-    /// builders (Volcano + Push) call this for every `Filter`.
+    /// builders (Volcano + Push) call this for every `Filter` whose statement
+    /// carries no correlated subquery. A fresh (unused) fault cell is threaded —
+    /// the non-correlated arms never touch it.
     pub fn compile_with_subqueries(
         self,
         subqueries: &[InSubquerySet],
     ) -> Box<dyn Fn(&Tuple) -> bool + Send> {
-        let f = self.compile_3vl(subqueries);
+        let fault = new_correlated_fault();
+        let f = self.compile_3vl(subqueries, &[], &fault);
+        Box::new(move |t| f(t) == Some(true))
+    }
+
+    /// Like `compile_with_subqueries`, but with the statement's correlated
+    /// evaluators and a shared fault cell threaded (H4c). The `Filter` build
+    /// site uses this whenever the statement carries correlated subqueries; the
+    /// same `fault` cell is handed to the operator, which surfaces any recorded
+    /// fault loudly after each predicate call.
+    pub fn compile_correlated(
+        self,
+        subqueries: &[InSubquerySet],
+        correlated: &[CorrelatedEvaluator],
+        fault: &CorrelatedFault,
+    ) -> Box<dyn Fn(&Tuple) -> bool + Send> {
+        let f = self.compile_3vl(subqueries, correlated, fault);
         Box::new(move |t| f(t) == Some(true))
     }
 
@@ -711,17 +1104,26 @@ impl Predicate {
     /// to two values happens once, at the `WHERE` boundary in `compile` —
     /// never inside the tree, where `NOT` would invert a premature
     /// collapse into a wrong answer. `subqueries` are the statement's
-    /// materialized `InSubquery` sets (empty when the caller has none).
-    fn compile_3vl(self, subqueries: &[InSubquerySet]) -> Predicate3VL {
+    /// materialized `InSubquery` sets; `correlated` its per-row correlated
+    /// evaluators; `fault` the shared cell a correlated evaluation records into
+    /// (all empty / unused for a plain predicate).
+    fn compile_3vl(
+        self,
+        subqueries: &[InSubquerySet],
+        correlated: &[CorrelatedEvaluator],
+        fault: &CorrelatedFault,
+    ) -> Predicate3VL {
         match self {
             Predicate::Compare { op, left, right } => {
-                let l = left.compile();
-                let r = right.compile();
+                // Operands may be `CorrelatedScalar` (H4c) — `compile_operand`
+                // handles that leaf, else compiles plainly.
+                let l = compile_operand(left, correlated, fault);
+                let r = compile_operand(right, correlated, fault);
                 Box::new(move |t| eval_compare(op, &l(t), &r(t)))
             }
             Predicate::And(a, b) => {
-                let a = a.compile_3vl(subqueries);
-                let b = b.compile_3vl(subqueries);
+                let a = a.compile_3vl(subqueries, correlated, fault);
+                let b = b.compile_3vl(subqueries, correlated, fault);
                 // Kleene AND: FALSE dominates (short-circuit), UNKNOWN
                 // contaminates everything except FALSE.
                 Box::new(move |t| {
@@ -737,8 +1139,8 @@ impl Predicate {
                 })
             }
             Predicate::Or(a, b) => {
-                let a = a.compile_3vl(subqueries);
-                let b = b.compile_3vl(subqueries);
+                let a = a.compile_3vl(subqueries, correlated, fault);
+                let b = b.compile_3vl(subqueries, correlated, fault);
                 // Kleene OR: TRUE dominates (short-circuit), UNKNOWN
                 // contaminates everything except TRUE.
                 Box::new(move |t| {
@@ -754,7 +1156,7 @@ impl Predicate {
                 })
             }
             Predicate::Not(p) => {
-                let p = p.compile_3vl(subqueries);
+                let p = p.compile_3vl(subqueries, correlated, fault);
                 // NOT UNKNOWN = UNKNOWN — the case that forces real 3VL.
                 Box::new(move |t| p(t).map(|b| !b))
             }
@@ -812,6 +1214,44 @@ impl Predicate {
                         Box::new(move |t| eval_in(&e(t), &set, negated))
                     }
                 }
+            }
+            Predicate::CorrelatedExists {
+                subquery,
+                outer_cols,
+                negated,
+            } => {
+                // Per outer row: extract the correlated columns, run the inner
+                // template (capped at LIMIT 1 by the binder), and test nonempty.
+                // Binder-established invariant: the statement's correlated
+                // evaluators are threaded whenever a `CorrelatedExists` is present,
+                // so `correlated[subquery]` MUST resolve. A missing evaluator is
+                // corruption (a stray `CorrelatedExists` reached a plain compile) —
+                // crash rather than silently drop every row in release.
+                let eval = correlated.get(subquery).cloned().unwrap_or_else(|| {
+                    unreachable!(
+                        "CorrelatedExists slot {subquery} has no evaluator — the correlated \
+                         evaluators must be threaded to compile a correlated predicate"
+                    )
+                });
+                let fault = fault.clone();
+                Box::new(move |t| {
+                    let values: Vec<Value> = outer_cols.iter().map(|&c| t[c].clone()).collect();
+                    match eval(&values) {
+                        // Nonempty == "a row exists"; `negated` flips it. Never
+                        // UNKNOWN — EXISTS is always determinate (mirrors the
+                        // uncorrelated `set.nonempty != negated`).
+                        Ok(rows) => {
+                            let nonempty = !rows.is_empty();
+                            Some(nonempty != negated)
+                        }
+                        // Fault recorded; the operator surfaces it. Drop the row
+                        // meanwhile (the sentinel never reaches output).
+                        Err(e) => {
+                            record_correlated_fault(&fault, e);
+                            None
+                        }
+                    }
+                })
             }
         }
     }
@@ -1934,5 +2374,55 @@ mod tests {
             None,
         );
         assert_eq!(no_else.to_string(), "CASE(1 branches)");
+    }
+
+    // ---- contains_correlated (per-Filter compile routing) ----
+
+    #[test]
+    fn contains_correlated_recurses_into_case_arms() {
+        // HOW: a `CorrelatedScalar` hidden in a CASE — first as a branch RESULT,
+        // then as a branch-PREDICATE operand — must be found, proving the walk
+        // descends expression operands and both CASE arms, not just the top-level
+        // predicate shape. This is what lets the executor builders route a Filter
+        // whose predicate hides a correlated form to the correlated compile path
+        // (fault cell) while every plain per-relation Filter stays on the
+        // faultless plain path.
+        let correlated_scalar = Expression::CorrelatedScalar {
+            subquery: 0,
+            outer_cols: vec![3],
+        };
+
+        // CorrelatedScalar as a CASE branch RESULT, itself a compare operand.
+        let case_result = Expression::Case {
+            branches: vec![(
+                compare(CompareOp::Gt, col(0), lit(Value::Int32(0))),
+                correlated_scalar.clone(),
+            )],
+            else_expr: Some(Box::new(lit(Value::Int32(0)))),
+        };
+        let pred_result = compare(CompareOp::Eq, case_result, lit(Value::Int32(1)));
+        assert!(contains_correlated(&pred_result));
+
+        // CorrelatedScalar inside a CASE branch PREDICATE is found too.
+        let case_branch_pred = Expression::Case {
+            branches: vec![(
+                compare(CompareOp::Eq, correlated_scalar, lit(Value::Int32(1))),
+                lit(Value::Int32(9)),
+            )],
+            else_expr: None,
+        };
+        let pred_branch = compare(CompareOp::Eq, case_branch_pred, lit(Value::Int32(9)));
+        assert!(contains_correlated(&pred_branch));
+
+        // A plain predicate (no correlated form anywhere) is NOT correlated — the
+        // gate routes it to the plain, mutex-free path.
+        let plain = Predicate::And(
+            Box::new(compare(CompareOp::Eq, col(0), lit(Value::Int32(1)))),
+            Box::new(Predicate::Like {
+                expr: col(1),
+                pattern: "a%".into(),
+            }),
+        );
+        assert!(!contains_correlated(&plain));
     }
 }

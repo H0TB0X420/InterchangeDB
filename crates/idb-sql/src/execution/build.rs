@@ -20,7 +20,9 @@ use crate::execution::{
     PkLookup, Projection, SeqScan, SetExpr, Sort, SortDir, Tuple, Update,
 };
 use crate::layout::RowLayout;
-use crate::sql::ir::expr::InSubquerySet;
+use crate::sql::ir::expr::{
+    contains_correlated, new_correlated_fault, CorrelatedEvaluator, InSubquerySet,
+};
 use crate::sql::ir::logical::{AggregateSpec, JoinKind, OrderDir};
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
@@ -30,9 +32,9 @@ use crate::table::{IndexHandle, Table};
 type ResolvedTable<E> = (Arc<Table<E, RowLayout>>, Vec<IndexHandle>);
 
 /// Compile a physical plan into a runnable pull-operator tree, with no
-/// materialized subquery sets — a test convenience for plans that carry no
-/// `InSubquery`. Production callers go through the model, which threads the
-/// statement's sets into `build_executor_with_subqueries`.
+/// materialized subquery sets or correlated evaluators — a test convenience for
+/// plans that carry no `InSubquery` / correlated form. Production callers go
+/// through the model, which threads both into `build_executor_with_subqueries`.
 #[cfg(test)]
 pub(crate) fn build_executor<E, CatE>(
     plan: &PhysOp,
@@ -43,27 +45,31 @@ where
     E: StorageEngine + 'static,
     CatE: StorageEngine,
 {
-    build_executor_with_subqueries(plan, engine, catalog, &[])
+    build_executor_with_subqueries(plan, engine, catalog, &[], &[])
 }
 
 /// Compile a physical plan into a runnable pull-operator tree. Recurses into
 /// child plans; resolves table/index names against `catalog`; re-compiles
 /// `Predicate`/`Expression` ASTs into the closures operators drive per tuple.
 /// `subqueries` are the statement's materialized `InSubquery` sets (empty
-/// unless the plan filters on an uncorrelated IN/EXISTS subquery), captured by
-/// each `Filter`'s compiled predicate closure.
+/// unless the plan filters on an uncorrelated IN/EXISTS subquery); `correlated`
+/// its per-outer-row correlated evaluators (H4c, empty unless the plan filters
+/// on a correlated EXISTS / scalar). A `Filter` carrying a correlated form
+/// compiles through `compile_correlated` with a shared fault cell it also holds,
+/// surfacing a correlated evaluation error loudly.
 pub(crate) fn build_executor_with_subqueries<E, CatE>(
     plan: &PhysOp,
     engine: &Arc<E>,
     catalog: &Catalog<CatE>,
     subqueries: &[InSubquerySet],
+    correlated: &[CorrelatedEvaluator],
 ) -> Result<Box<dyn Executor>>
 where
     E: StorageEngine + 'static,
     CatE: StorageEngine,
 {
     let build_executor = |plan: &PhysOp, engine: &Arc<E>, catalog: &Catalog<CatE>| {
-        build_executor_with_subqueries(plan, engine, catalog, subqueries)
+        build_executor_with_subqueries(plan, engine, catalog, subqueries, correlated)
     };
     match plan {
         PhysOp::SeqScan { table } => {
@@ -101,12 +107,29 @@ where
         }
         PhysOp::Filter { input, predicate } => {
             let child = build_executor(input, engine, catalog)?;
-            // The only operator that can carry an `InSubquery`: compile with
-            // the statement's materialized sets so the closure captures them.
-            Ok(Box::new(Filter::from_boxed(
-                child,
-                predicate.clone().compile_with_subqueries(subqueries),
-            )))
+            // The only operator that can carry an `InSubquery` or a correlated
+            // form. Route per-PREDICATE, not per-statement: a plain predicate
+            // (no correlated form) compiles the faultless plain path even inside
+            // a correlated statement, so it never locks the shared fault mutex
+            // per row (Q2's several plain per-relation Filters). Only a predicate
+            // that actually carries a `CorrelatedExists` / `CorrelatedScalar`
+            // compiles through `compile_correlated`, which captures a fresh shared
+            // fault cell the Filter also holds so a correlated evaluation error
+            // surfaces loudly.
+            if correlated.is_empty() || !contains_correlated(predicate) {
+                Ok(Box::new(Filter::from_boxed(
+                    child,
+                    predicate.clone().compile_with_subqueries(subqueries),
+                )))
+            } else {
+                let fault = new_correlated_fault();
+                let closure = predicate
+                    .clone()
+                    .compile_correlated(subqueries, correlated, &fault);
+                Ok(Box::new(Filter::from_boxed_correlated(
+                    child, closure, fault,
+                )))
+            }
         }
         PhysOp::Projection { input, cols } => {
             let child = build_executor(input, engine, catalog)?;

@@ -1,0 +1,170 @@
+# Correlated subqueries (H4c): a subquery that references its enclosing query
+# binds the outer column to `Expression::OuterRef(k)` (the correlation flip) and
+# is re-run PER OUTER ROW — the inner template's `OuterRef` placeholders are
+# substituted with the outer row's values, then planned + executed through the
+# same engine handle. Correlated EXISTS / NOT EXISTS and correlated scalar
+# compare operands are supported; correlated IN and multi-level correlation are
+# loud refusals.
+#
+# Data: three departments (one empty) and five employees (one with a NULL dept).
+#   dept 1 "eng":   emps 10(100), 11(200), 12(150)      SUM 450  MIN 100
+#   dept 2 "sales": emp  13(50)                          SUM  50  MIN  50
+#   dept 3 "empty": (no employees)                       SUM NULL MIN NULL
+#   emp 14: e_dept NULL, e_sal 999 (belongs to no dept)
+
+statement ok
+CREATE TABLE dept (d_id INT PRIMARY KEY, d_name VARCHAR(16))
+
+statement ok
+INSERT INTO dept VALUES (1, 'eng'), (2, 'sales'), (3, 'empty')
+
+statement ok
+CREATE TABLE emp (e_id INT PRIMARY KEY, e_dept INT, e_sal INT)
+
+statement ok
+INSERT INTO emp VALUES (10, 1, 100), (11, 1, 200), (12, 1, 150), (13, 2, 50), (14, NULL, 999)
+
+# ---- correlated EXISTS: departments that HAVE at least one employee --------
+# `e_dept = d_id` correlates on the outer d_id. dept 3 has none; the NULL-dept
+# emp 14 never matches (NULL = d_id is UNKNOWN).
+query I
+SELECT d_id FROM dept WHERE EXISTS (SELECT * FROM emp WHERE e_dept = d_id) ORDER BY d_id
+----
+1
+2
+
+# ---- correlated NOT EXISTS: departments with NO employee -------------------
+query I
+SELECT d_id FROM dept WHERE NOT EXISTS (SELECT * FROM emp WHERE e_dept = d_id) ORDER BY d_id
+----
+3
+
+# ---- empty inner for every outer row → EXISTS false for all ---------------
+# No employee earns over 10000, so the correlated inner is empty for every dept.
+query I
+SELECT d_id FROM dept WHERE EXISTS (SELECT * FROM emp WHERE e_dept = d_id AND e_sal > 10000)
+----
+
+# ---- inner non-empty for every outer row → EXISTS true for all ------------
+# `e_sal > 0` holds for some employee regardless of dept, so the (still
+# correlated — it names d_id) inner is non-empty for every dept.
+query I
+SELECT d_id FROM dept WHERE EXISTS (SELECT * FROM emp WHERE e_sal > 0 OR e_dept = d_id) ORDER BY d_id
+----
+1
+2
+3
+
+# ---- NULL correlation key is a non-match ----------------------------------
+# Outer = emp; inner tests the emp's dept exists. emp 14's e_dept is NULL, so
+# `d_id = e_dept` is UNKNOWN for every dept → inner empty → emp 14 excluded.
+query I
+SELECT e_id FROM emp WHERE EXISTS (SELECT * FROM dept WHERE d_id = e_dept) ORDER BY e_id
+----
+10
+11
+12
+13
+
+# ---- correlated EXISTS inside a larger conjunction (opaque conjunct) -------
+query I
+SELECT d_id FROM dept WHERE d_name = 'eng' AND EXISTS (SELECT * FROM emp WHERE e_dept = d_id)
+----
+1
+
+# ---- correlated scalar in a WHERE compare (Q2/Q17 shape) ------------------
+# dept's total payroll > 100: dept 1 = 450 (yes), dept 2 = 50 (no), dept 3 =
+# NULL over the empty aggregate (NULL > 100 is UNKNOWN → dropped).
+query I
+SELECT d_id FROM dept WHERE (SELECT SUM(e_sal) FROM emp WHERE e_dept = d_id) > 100 ORDER BY d_id
+----
+1
+
+# ---- self-correlated scalar: employees earning their dept's MINIMUM -------
+# Both scans alias `emp` (Q21's l1/l2 shape) so the correlation is unambiguous:
+# `e1.e_dept` names the OUTER row, `e2.e_dept` the inner. The unqualified
+# `e_sal` inside MIN resolves LOCALLY to e2 (shadowing e1). dept 1 MIN = 100
+# (emp 10), dept 2 MIN = 50 (emp 13); emp 14's dept is NULL so its inner MIN is
+# over an empty set → NULL → 999 = NULL is UNKNOWN → excluded.
+query I
+SELECT e1.e_id FROM emp e1 WHERE e1.e_sal = (SELECT MIN(e_sal) FROM emp e2 WHERE e2.e_dept = e1.e_dept) ORDER BY e1.e_id
+----
+10
+13
+
+# ---- 0-row scalar subquery is NULL ----------------------------------------
+# The non-aggregate inner returns NO row for any dept (nobody earns > 10000) →
+# NULL → `NULL = 999` is UNKNOWN → no rows.
+query I
+SELECT d_id FROM dept WHERE (SELECT e_sal FROM emp WHERE e_dept = d_id AND e_sal > 10000) = 999
+----
+
+# ---- >1-row scalar subquery is a loud runtime fault -----------------------
+# dept 1 has three employees, so the non-aggregate scalar inner yields 3 rows.
+statement error correlated scalar subquery returned
+SELECT d_id FROM dept WHERE (SELECT e_sal FROM emp WHERE e_dept = d_id) > 0
+
+# ---- correlation through a WHERE inside a GROUPED inner (EXISTS) -----------
+# The inner groups its correlated selection and filters with HAVING: keep a
+# dept whose employee count (within that dept) exceeds one. dept 1 has 3, dept
+# 2 has 1, dept 3 has 0.
+query I
+SELECT d_id FROM dept WHERE EXISTS (SELECT e_dept, COUNT(*) FROM emp WHERE e_dept = d_id GROUP BY e_dept HAVING COUNT(*) > 1) ORDER BY d_id
+----
+1
+
+# ---- inner-shadows-outer name resolution ----------------------------------
+# Both tables have an `id` column. Inside the inner, unqualified `id` resolves
+# LOCALLY to b_tbl.id (shadowing a_tbl.id); the correlation is the QUALIFIED
+# `a_tbl.id`. So the inner is `b_tbl.id = <outer a_tbl.id>`. b_tbl has id 1 and
+# 3; a_tbl has id 1 and 2 → only a_tbl.id=1 finds a match.
+statement ok
+CREATE TABLE a_tbl (id INT PRIMARY KEY, tag INT)
+
+statement ok
+INSERT INTO a_tbl VALUES (1, 100), (2, 200)
+
+statement ok
+CREATE TABLE b_tbl (id INT PRIMARY KEY, tag INT)
+
+statement ok
+INSERT INTO b_tbl VALUES (1, 999), (3, 300)
+
+query I
+SELECT tag FROM a_tbl WHERE EXISTS (SELECT * FROM b_tbl WHERE id = a_tbl.id) ORDER BY tag
+----
+100
+
+# ---- multi-level correlation is a loud refusal ----------------------------
+# The innermost subquery references `dept.d_id`, which is TWO scopes out (the
+# middle `emp` subquery is one level, dept is two) — rejected by name.
+statement error multi-level correlation not supported
+SELECT d_id FROM dept WHERE EXISTS (SELECT * FROM emp WHERE e_dept > 0 AND EXISTS (SELECT * FROM emp e3 WHERE dept.d_id = e3.e_dept))
+
+# ---- correlated IN is refused (rewrite as EXISTS) -------------------------
+statement error correlated IN subqueries are not supported
+SELECT d_id FROM dept WHERE d_id IN (SELECT e_dept FROM emp WHERE e_sal = d_id)
+
+# ---- a subquery nested INSIDE a correlated template is refused -------------
+# The correlated EXISTS template correlates on d_id (fine), but ALSO carries a
+# nested uncorrelated IN. The per-row evaluator runs the template with no
+# materialized sets, so that nested subquery has no home — reject it loudly
+# (recorded lever). (Q20's legal nesting is the reverse: a correlated scalar
+# inside an UNCORRELATED IN, which the session resolves recursively.)
+statement error correlated subquery whose inner query itself contains a subquery
+SELECT d_id FROM dept WHERE EXISTS (SELECT * FROM emp WHERE e_dept = d_id AND e_sal IN (SELECT e_sal FROM emp WHERE e_sal > 100))
+
+# ---- EXPLAIN renders the correlated template under a Subquery header -------
+# The outer Filter carries the CorrelatedExists (not printed in the Filter
+# label); the inner template — capped at LIMIT 1, its `OuterRef` shown as
+# `outer0` — renders under `Subquery[0]:`, never executed.
+query T
+EXPLAIN SELECT d_id FROM dept WHERE EXISTS (SELECT * FROM emp WHERE e_dept = d_id)
+----
+Projection([0])
+Filter
+SeqScan(dept)
+Subquery[0]:
+Limit(1)
+Filter
+SeqScan(emp)

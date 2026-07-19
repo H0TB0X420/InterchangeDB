@@ -250,6 +250,28 @@ const CORPUS: &[&str] = &[
     // the routing verdict the design calls for, asserted end to end.
     "SELECT a_val FROM a WHERE a_val > (SELECT MIN(a_val) FROM a)",
     "SELECT c_val FROM c JOIN b ON c_b = b_id WHERE c_b IN (SELECT b_id FROM b)",
+    // H4c correlated subqueries. The correlated conjunct is an opaque residual
+    // over the reorderable join core, referencing `a_id` — a column of the
+    // LATER-textual table `a`. These MUST be the 3-relation worst-textual-order
+    // shape (big table c first, like the proven reorder query at the top of this
+    // corpus), NOT a 2-relation join: a 2-relation hash join costs the same in
+    // either order, so the strictly-cheaper reorder gate ties, `ColumnRemap`
+    // stays an identity no-op, and the `CorrelatedExists`/`CorrelatedScalar`
+    // outer_cols remap arms guard nothing (the recurring cost-tie lesson, THIRD
+    // recurrence — see the H2a entries above for the first two). With three
+    // relations in big-first order Selinger/memo actually reorder to a-first, so
+    // `referenced_columns` reports `outer_cols = [a_id]` and the shared
+    // `ColumnRemap` rewrites it textual→physical (6 → 0, a real move) while the
+    // inner template's positional `OuterRef`s stay untouched (the indirection
+    // rule). The per-row evaluators are built by the session independent of the
+    // planner, so all three must agree on rows; `correlated_residual_rides_real_reorder`
+    // below proves the reorder actually fires (EXPLAIN leaf order differs).
+    // Correlated EXISTS and a correlated scalar (per-row COUNT), each riding the
+    // reorder. These two are the LAST corpus entries (that test slices them off).
+    "SELECT c_val FROM c JOIN b ON c_b = b_id JOIN a ON b_a = a_id \
+     WHERE EXISTS (SELECT * FROM jb WHERE jb_key = a_id AND jb_id > 2)",
+    "SELECT c_val FROM c JOIN b ON c_b = b_id JOIN a ON b_a = a_id \
+     WHERE c_val > (SELECT COUNT(*) FROM jb WHERE jb_key <= a_id)",
 ];
 
 fn rows(session: &mut Session<BTreeEngine>, sql: &str) -> Vec<Vec<Value>> {
@@ -318,4 +340,66 @@ fn volcano_memo_name_is_distinct() {
     let (mut session, _dir) = setup();
     session.set_planner(Planner::VolcanoMemo(VolcanoPlanner::default()));
     assert_eq!(session.planner_name(), "volcano-memo");
+}
+
+/// The ordered sequence of scanned table names in an EXPLAIN tree, top to
+/// bottom — the join's leaf order. A left-deep plan lists its base (deepest-
+/// left) leaf first, so a reorder shows up as a changed sequence. The
+/// correlated subquery's inner template is not part of the outer `PhysOp`
+/// tree, so it never appears here — only the reorderable join's leaves do.
+fn leaf_order(plan: &str) -> Vec<String> {
+    plan.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            for prefix in ["SeqScan(", "IndexScan(", "PkLookup("] {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    // "SeqScan(c)" → c; "IndexScan(jb, on jb_by_key)" → jb.
+                    return Some(rest.chars().take_while(|&c| c != ',' && c != ')').collect());
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// The recurring cost-tie lesson, THIRD recurrence: a 2-relation correlated
+/// residual never exercises the `outer_cols` remap arm because the equi-join
+/// costs the same in either order (the reorder gate ties → identity remap). The
+/// two correlated corpus entries are 3-relation, big-table-first shapes, so the
+/// cost-based planners DO reorder — proving the `CorrelatedExists` /
+/// `CorrelatedScalar` remap arm actually moves `outer_cols` under a real reorder.
+/// Mirrors `selinger_actually_reorders_the_plan`: the RuleBased leaf order
+/// (textual, c first) MUST differ from Selinger's (small-table-first, a first).
+#[test]
+fn correlated_residual_rides_real_reorder() {
+    let (mut session, _dir) = setup();
+    // The correlated entries are the last two of the corpus (see the comment
+    // beside them). Slicing keeps this in lockstep with the corpus, no copies.
+    for sql in &CORPUS[CORPUS.len() - 2..] {
+        session.set_planner(Planner::RuleBased(RuleBasedPlanner));
+        let rule = explain(&mut session, sql);
+        session.set_planner(Planner::Selinger(SelingerPlanner::default()));
+        let selinger = explain(&mut session, sql);
+
+        let rule_leaves = leaf_order(&rule);
+        let selinger_leaves = leaf_order(&selinger);
+        assert_ne!(
+            rule_leaves, selinger_leaves,
+            "reorder must fire (leaf order differs) so the outer_cols remap is non-identity;\n\
+             rule-based:\n{rule}\nselinger:\n{selinger}"
+        );
+        // RuleBased keeps textual order (c is the base scan); Selinger reorders
+        // small-table-first (a becomes the base) — the move that makes the
+        // outer_cols remap non-identity.
+        assert_eq!(
+            rule_leaves.first().map(String::as_str),
+            Some("c"),
+            "rule-based base should be c (textual), got:\n{rule}"
+        );
+        assert_eq!(
+            selinger_leaves.first().map(String::as_str),
+            Some("a"),
+            "selinger base should be a (small-first reorder), got:\n{selinger}"
+        );
+    }
 }

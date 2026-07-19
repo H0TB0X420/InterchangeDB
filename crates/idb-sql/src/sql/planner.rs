@@ -233,11 +233,13 @@ where
             joins,
             derived,
             // Subqueries are resolved by the session before planning (scalars
-            // substituted to literals, IN/EXISTS materialized into sets); the
-            // planner treats their leftovers as vestigial. EXPLAIN reads them
-            // via the `Explain` arm above, not here.
+            // substituted to literals, IN/EXISTS materialized into sets, and
+            // correlated templates turned into per-row evaluators threaded to
+            // build); the planner treats their leftovers as vestigial. EXPLAIN
+            // reads them via the `Explain` arm above, not here.
             scalar_subqueries: _,
             in_subqueries: _,
+            correlated_subqueries: _,
             projection,
             aggregates,
             select_list,
@@ -1063,6 +1065,11 @@ pub(crate) fn referenced_columns(pred: &Predicate, out: &mut Vec<usize>) {
                 columns_in_expr(e, out);
             }
         }
+        // A correlated EXISTS (H4c) references exactly its `outer_cols` in the
+        // outer tuple — reporting them is what routes the conjunct to where all
+        // those columns are available (a residual Filter for the 6 target
+        // queries). The inner template's own columns are a separate space.
+        Predicate::CorrelatedExists { outer_cols, .. } => out.extend_from_slice(outer_cols),
     }
 }
 
@@ -1071,8 +1078,16 @@ fn columns_in_expr(expr: &Expression, out: &mut Vec<usize>) {
     match expr {
         Expression::Column(i) => out.push(*i),
         // A `SubqueryResult` is resolved to a `Literal` before planning, just
-        // like `Parameter`; neither references an input column.
-        Expression::Literal(_) | Expression::Parameter(_) | Expression::SubqueryResult(_) => {}
+        // like `Parameter`; neither references an input column. `OuterRef` is a
+        // template placeholder (never in an outer expression being routed) — it
+        // names no outer-tuple column, so it contributes nothing.
+        Expression::Literal(_)
+        | Expression::Parameter(_)
+        | Expression::SubqueryResult(_)
+        | Expression::OuterRef(_) => {}
+        // A correlated scalar (H4c) references exactly its `outer_cols` in the
+        // outer tuple — report them so the conjunct routes correctly.
+        Expression::CorrelatedScalar { outer_cols, .. } => out.extend_from_slice(outer_cols),
         Expression::BinaryOp { left, right, .. } => {
             columns_in_expr(left, out);
             columns_in_expr(right, out);
@@ -1345,7 +1360,19 @@ fn shift_expr(expr: Expression, delta: isize) -> Expression {
         }
         lit_or_param @ (Expression::Literal(_)
         | Expression::Parameter(_)
-        | Expression::SubqueryResult(_)) => lit_or_param,
+        | Expression::SubqueryResult(_)
+        // `OuterRef(k)` is a positional index into the outer form's `outer_cols`,
+        // NOT a tuple index in this coordinate space — never shifted.
+        | Expression::OuterRef(_)) => lit_or_param,
+        // A correlated scalar's `outer_cols` ARE outer-tuple indices — shift them
+        // like `Column`s when the whole predicate is rebased.
+        Expression::CorrelatedScalar {
+            subquery,
+            outer_cols,
+        } => Expression::CorrelatedScalar {
+            subquery,
+            outer_cols: shift_indices(outer_cols, delta),
+        },
         Expression::BinaryOp { op, left, right } => Expression::BinaryOp {
             op,
             left: Box::new(shift_expr(*left, delta)),
@@ -1398,7 +1425,31 @@ pub(crate) fn shift_predicate(pred: Predicate, delta: isize) -> Predicate {
             subquery,
             negated,
         },
+        // A correlated EXISTS's `outer_cols` are outer-tuple indices — shift
+        // them; the subquery index and inner template are coordinate-independent.
+        Predicate::CorrelatedExists {
+            subquery,
+            outer_cols,
+            negated,
+        } => Predicate::CorrelatedExists {
+            subquery,
+            outer_cols: shift_indices(outer_cols, delta),
+            negated,
+        },
     }
+}
+
+/// Shift a list of tuple-global column indices by `delta` (see `shift_expr`).
+/// Underflow is a coordinate-space bug and crashes.
+fn shift_indices(indices: Vec<usize>, delta: isize) -> Vec<usize> {
+    indices
+        .into_iter()
+        .map(|i| {
+            let shifted = i as isize + delta;
+            assert!(shifted >= 0, "column {i} shifted below zero by {delta}");
+            shifted as usize
+        })
+        .collect()
 }
 
 /// Build a join's right (inner) leaf from the predicates that reference only
@@ -1580,17 +1631,21 @@ where
 /// it emits a one-line summary.
 /// `pub(crate)`: the memo planner renders its own EXPLAIN arm (T17-A.6).
 /// The inner plans of every subquery a `SELECT` carries (scalar first, then
-/// IN/EXISTS), in slot order — the plans EXPLAIN renders under `Subquery[i]:`
-/// headers. Empty for any non-`SELECT` or a `SELECT` with no subqueries.
+/// IN/EXISTS, then correlated), in slot order — the plans EXPLAIN renders under
+/// `Subquery[i]:` headers. Empty for any non-`SELECT` or a `SELECT` with no
+/// subqueries. A correlated template still carries its `OuterRef` placeholders
+/// (rendered as `outer{k}`), so EXPLAIN shows the correlation shape unresolved.
 fn subquery_plans_of(logical: &LogicalPlan) -> Vec<LogicalPlan> {
     match logical {
         LogicalPlan::Select {
             scalar_subqueries,
             in_subqueries,
+            correlated_subqueries,
             ..
         } => scalar_subqueries
             .iter()
             .chain(in_subqueries.iter())
+            .chain(correlated_subqueries.iter())
             .cloned()
             .collect(),
         _ => Vec::new(),
@@ -1939,6 +1994,7 @@ Limit(3)
             derived: vec![],
             scalar_subqueries: vec![],
             in_subqueries: vec![],
+            correlated_subqueries: vec![],
             projection: vec![],
             aggregates: vec![],
             select_list: vec![],

@@ -247,6 +247,29 @@ fn subquery_filters_are_equivalent() {
 }
 
 #[test]
+fn correlated_filters_are_equivalent() {
+    let (mut s, _dir) = setup();
+    // A correlated filter (H4c) re-runs its inner per outer row through the
+    // SAME build path both models share: Volcano's `Filter` and Push's
+    // `FilterSink` capture the same compiled closure (with the same correlated
+    // evaluators + fault cell), and the inner runs under whichever model is
+    // active — so the two must agree row for row. Correlated EXISTS / NOT
+    // EXISTS (nonempty test) and a correlated scalar (per-row aggregate).
+    assert_equivalent(
+        &mut s,
+        "SELECT i_id FROM item WHERE EXISTS (SELECT * FROM stock WHERE s_id = i_id)",
+    );
+    assert_equivalent(
+        &mut s,
+        "SELECT i_id FROM item WHERE NOT EXISTS (SELECT * FROM stock WHERE s_id = i_id)",
+    );
+    assert_equivalent(
+        &mut s,
+        "SELECT i_id FROM item WHERE i_price > (SELECT MAX(s_qty) FROM stock WHERE s_id = i_id)",
+    );
+}
+
+#[test]
 fn dml_round_trips_through_push() {
     // DML delegates to the shared operator builder, so running it under Push
     // mutates exactly as under Volcano. Apply an UPDATE in Push mode, then

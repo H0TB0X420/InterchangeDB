@@ -57,7 +57,10 @@ use crate::execution::operators::hash_aggregate::{
 };
 use crate::execution::{AggregateFn, Executor, Tuple};
 use crate::layout::{DataLayout, LayoutCtx, RowLayout};
-use crate::sql::ir::expr::{Expression, InSubquerySet};
+use crate::sql::ir::expr::{
+    contains_correlated, new_correlated_fault, CorrelatedEvaluator, CorrelatedFault, Expression,
+    InSubquerySet,
+};
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 use crate::types::Value;
@@ -97,15 +100,25 @@ impl Sink for Collector {
     }
 }
 
-/// Keeps only tuples for which `predicate` holds.
+/// Keeps only tuples for which `predicate` holds. Model-shared compile with the
+/// Volcano `Filter`: `fault` is the correlated error channel (H4c), `Some` only
+/// when the predicate carries a correlated form — checked after each call so an
+/// inner-execution / >1-row-scalar fault surfaces loudly.
 struct FilterSink {
     predicate: Box<dyn Fn(&Tuple) -> bool + Send>,
+    fault: Option<CorrelatedFault>,
     out: Box<dyn Sink>,
 }
 
 impl Sink for FilterSink {
     fn push(&mut self, tuple: Tuple) -> Result<Flow> {
-        if (self.predicate)(&tuple) {
+        let keep = (self.predicate)(&tuple);
+        if let Some(fault) = &self.fault {
+            if let Some(err) = fault.lock().take() {
+                return Err(err);
+            }
+        }
+        if keep {
             self.out.push(tuple)
         } else {
             Ok(Flow::Continue)
@@ -311,16 +324,17 @@ fn build_push<E, CatE>(
     engine: &Arc<E>,
     catalog: &Catalog<CatE>,
     subqueries: &[InSubquerySet],
+    correlated: &[CorrelatedEvaluator],
 ) -> Result<(Box<dyn Source>, Schema)>
 where
     E: StorageEngine + 'static,
     CatE: StorageEngine,
 {
-    // Adapter so the recursive calls below thread the statement's subquery
-    // sets unchanged (mirrors the Volcano builder's closure).
+    // Adapter so the recursive calls below thread the statement's subquery sets
+    // and correlated evaluators unchanged (mirrors the Volcano builder's closure).
     let build_push =
         |plan: &PhysOp, out: Box<dyn Sink>, engine: &Arc<E>, catalog: &Catalog<CatE>| {
-            build_push(plan, out, engine, catalog, subqueries)
+            build_push(plan, out, engine, catalog, subqueries, correlated)
         };
     match plan {
         PhysOp::SeqScan { table } => {
@@ -336,10 +350,28 @@ where
         // Filter and Limit pass tuples through unchanged — output schema is the
         // input's, so just return the recursive result.
         PhysOp::Filter { input, predicate } => {
-            let sink = Box::new(FilterSink {
-                predicate: predicate.clone().compile_with_subqueries(subqueries),
-                out,
-            });
+            // Model-shared with Volcano's `Filter`: route per-PREDICATE — a plain
+            // predicate compiles the faultless plain path even inside a correlated
+            // statement (no per-row lock of a never-written fault mutex); only a
+            // predicate carrying a correlated form takes `compile_correlated` with
+            // a fresh shared fault cell the sink also holds.
+            let sink: Box<dyn Sink> = if correlated.is_empty() || !contains_correlated(predicate) {
+                Box::new(FilterSink {
+                    predicate: predicate.clone().compile_with_subqueries(subqueries),
+                    fault: None,
+                    out,
+                })
+            } else {
+                let fault = new_correlated_fault();
+                let closure = predicate
+                    .clone()
+                    .compile_correlated(subqueries, correlated, &fault);
+                Box::new(FilterSink {
+                    predicate: closure,
+                    fault: Some(fault),
+                    out,
+                })
+            };
             build_push(input, sink, engine, catalog)
         }
         PhysOp::Limit { input, max_rows } => {
@@ -423,7 +455,8 @@ where
         // operators default to this safe path until given a push sink of
         // their own.
         _ => {
-            let exec = build_executor_with_subqueries(plan, engine, catalog, subqueries)?;
+            let exec =
+                build_executor_with_subqueries(plan, engine, catalog, subqueries, correlated)?;
             let out_schema = exec.schema().clone();
             Ok((Box::new(ExecutorSource { exec, out }), out_schema))
         }
@@ -452,6 +485,7 @@ impl ExecutionModel for Push {
         engine: &Arc<E>,
         catalog: &Catalog<CatE>,
         subqueries: &[InSubquerySet],
+        correlated: &[CorrelatedEvaluator],
     ) -> Result<(Schema, Vec<Tuple>)>
     where
         E: StorageEngine + 'static,
@@ -459,7 +493,8 @@ impl ExecutionModel for Push {
     {
         let rows = Rc::new(RefCell::new(Vec::new()));
         let collector = Box::new(Collector { rows: rows.clone() });
-        let (mut source, schema) = build_push(plan, collector, engine, catalog, subqueries)?;
+        let (mut source, schema) =
+            build_push(plan, collector, engine, catalog, subqueries, correlated)?;
         source.run()?;
         let collected = rows.borrow().clone();
         Ok((schema, collected))
@@ -553,7 +588,7 @@ mod tests {
             cols: vec![0],
             input: Box::new(n_ge_2(scan("nums"))),
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[], &[]).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -573,7 +608,7 @@ mod tests {
             max_rows: 3,
             input: Box::new(scan("nums")),
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[], &[]).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], Value::Int32(0));
         assert_eq!(rows[2][0], Value::Int32(2));
@@ -587,7 +622,7 @@ mod tests {
             max_rows: 0,
             input: Box::new(scan("nums")),
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[], &[]).unwrap();
         assert!(rows.is_empty());
     }
 
@@ -602,7 +637,7 @@ mod tests {
             group_by: vec![],
             aggregates: vec![AggregateSpec::CountStar],
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[], &[]).unwrap();
         assert_eq!(rows, vec![vec![Value::Int64(5)]]);
     }
 
@@ -620,7 +655,7 @@ mod tests {
                 keys: vec![(0, OrderDir::Desc)],
             }),
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[], &[]).unwrap();
         // desc → 3, 2, 1, 0; limit 2 → first two.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Int32(3));

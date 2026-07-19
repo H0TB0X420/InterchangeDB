@@ -17,7 +17,7 @@ use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
 use crate::execution::build::build_executor_with_subqueries;
 use crate::execution::Tuple;
-use crate::sql::ir::expr::InSubquerySet;
+use crate::sql::ir::expr::{CorrelatedEvaluator, InSubquerySet};
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 
@@ -28,14 +28,16 @@ pub trait ExecutionModel {
     /// Build `plan` into a runnable form and drive it to completion. Returns
     /// the output schema (for framing `SELECT` results) alongside the rows.
     /// `subqueries` are the statement's materialized uncorrelated `InSubquery`
-    /// sets (empty for a plan with no IN/EXISTS subquery filter). `Err(_)` if
-    /// building or any operator faults.
+    /// sets (empty for a plan with no IN/EXISTS subquery filter); `correlated`
+    /// its per-outer-row correlated evaluators (empty for a plan with no
+    /// correlated EXISTS / scalar). `Err(_)` if building or any operator faults.
     fn execute<E, CatE>(
         &self,
         plan: &PhysOp,
         engine: &Arc<E>,
         catalog: &Catalog<CatE>,
         subqueries: &[InSubquerySet],
+        correlated: &[CorrelatedEvaluator],
     ) -> Result<(Schema, Vec<Tuple>)>
     where
         E: StorageEngine + 'static,
@@ -56,12 +58,14 @@ impl ExecutionModel for Volcano {
         engine: &Arc<E>,
         catalog: &Catalog<CatE>,
         subqueries: &[InSubquerySet],
+        correlated: &[CorrelatedEvaluator],
     ) -> Result<(Schema, Vec<Tuple>)>
     where
         E: StorageEngine + 'static,
         CatE: StorageEngine,
     {
-        let mut root = build_executor_with_subqueries(plan, engine, catalog, subqueries)?;
+        let mut root =
+            build_executor_with_subqueries(plan, engine, catalog, subqueries, correlated)?;
         let schema = root.schema().clone();
         // Pull discipline: ask the root for its next tuple until end-of-stream.
         // Each `?` propagates a fatal operator error.
@@ -83,7 +87,9 @@ impl ExecutionModel for Volcano {
 /// because `execute` is generic over the storage engine — so the trait isn't
 /// object-safe — and the model set is closed (`Volcano`, `Push`). The session
 /// swaps this to change evaluation strategy at runtime.
-#[derive(Default)]
+/// `Copy` so the session can capture the active model by value into a
+/// correlated evaluator's `'static` closure (H4c).
+#[derive(Default, Clone, Copy)]
 pub enum ExecModel {
     #[default]
     Volcano,
@@ -93,22 +99,24 @@ pub enum ExecModel {
 impl ExecModel {
     /// Execute `plan` with the selected model, returning its output schema and
     /// rows. `subqueries` are the statement's materialized uncorrelated
-    /// `InSubquery` sets (empty when the plan has no IN/EXISTS filter).
+    /// `InSubquery` sets (empty when the plan has no IN/EXISTS filter);
+    /// `correlated` its per-outer-row correlated evaluators (empty when none).
     pub fn execute<E, CatE>(
         &self,
         plan: &PhysOp,
         engine: &Arc<E>,
         catalog: &Catalog<CatE>,
         subqueries: &[InSubquerySet],
+        correlated: &[CorrelatedEvaluator],
     ) -> Result<(Schema, Vec<Tuple>)>
     where
         E: StorageEngine + 'static,
         CatE: StorageEngine,
     {
         match self {
-            ExecModel::Volcano => Volcano.execute(plan, engine, catalog, subqueries),
+            ExecModel::Volcano => Volcano.execute(plan, engine, catalog, subqueries, correlated),
             ExecModel::Push => {
-                crate::execution::push::Push.execute(plan, engine, catalog, subqueries)
+                crate::execution::push::Push.execute(plan, engine, catalog, subqueries, correlated)
             }
         }
     }

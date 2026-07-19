@@ -146,7 +146,7 @@ fn plan_with(env: &Env, planner: &impl PlannerStrategy) -> interchangedb::sql::P
 
 fn run(env: &Env, op: &interchangedb::sql::PhysOp) -> Vec<Vec<Value>> {
     let (_schema, rows) = ExecModel::Volcano
-        .execute(op, &env.engine, &env.catalog, &[])
+        .execute(op, &env.engine, &env.catalog, &[], &[])
         .unwrap();
     rows
 }

@@ -1,0 +1,73 @@
+# TPC-H Q2 — Minimum Cost Supplier (H4c), VERBATIM on a micro-fixture.
+# Correlated MIN across a 4-table inner join, a 5-table outer join, and
+# multi-key ORDER BY: keep the supplier(s) whose supplycost equals the part's
+# minimum over EUROPE suppliers.
+
+statement ok
+CREATE TABLE part (p_partkey INT PRIMARY KEY, p_mfgr VARCHAR(10), p_size INT, p_type VARCHAR(20))
+
+statement ok
+CREATE TABLE supplier (s_suppkey INT PRIMARY KEY, s_name VARCHAR(10), s_address VARCHAR(10), s_nationkey INT, s_phone VARCHAR(10), s_acctbal DECIMAL(12,2), s_comment VARCHAR(20))
+
+statement ok
+CREATE TABLE partsupp (ps_partkey INT, ps_suppkey INT, ps_supplycost DECIMAL(12,2), PRIMARY KEY (ps_partkey, ps_suppkey))
+
+statement ok
+CREATE TABLE nation (n_nationkey INT PRIMARY KEY, n_name VARCHAR(10), n_regionkey INT)
+
+statement ok
+CREATE TABLE region (r_regionkey INT PRIMARY KEY, r_name VARCHAR(10))
+
+statement ok
+INSERT INTO region VALUES (1, 'EUROPE'), (2, 'ASIA')
+
+statement ok
+INSERT INTO nation VALUES (10, 'FRANCE', 1), (11, 'GERMANY', 1), (12, 'CHINA', 2)
+
+statement ok
+INSERT INTO supplier VALUES
+  (100, 'SupA', 'addrA', 10, 'phoneA', 500.00, 'commentA'),
+  (101, 'SupB', 'addrB', 11, 'phoneB', 700.00, 'commentB'),
+  (102, 'SupC', 'addrC', 12, 'phoneC', 900.00, 'commentC')
+
+statement ok
+INSERT INTO part VALUES
+  (1000, 'Mfgr#1', 15, 'SMALL BRASS'),
+  (1500, 'Mfgr#1', 15, 'MED BRASS'),
+  (2000, 'Mfgr#2', 15, 'LARGE STEEL')
+
+statement ok
+INSERT INTO partsupp VALUES
+  (1000, 100, 50.00),
+  (1000, 101, 30.00),
+  (1000, 102, 10.00),
+  (1500, 100, 20.00),
+  (1500, 101, 40.00),
+  (2000, 100, 5.00)
+
+# part 1000 EUROPE costs: SupA 50, SupB 30 (SupC is ASIA, excluded) → MIN 30 →
+# SupB. part 1500 EUROPE costs: SupA 20, SupB 40 → MIN 20 → SupA. part 2000 is
+# LARGE STEEL (not '%BRASS') → excluded. Order by acctbal desc: 700 then 500.
+query RTTITTTT
+SELECT s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment
+FROM part, supplier, partsupp, nation, region
+WHERE p_partkey = ps_partkey
+  AND s_suppkey = ps_suppkey
+  AND p_size = 15
+  AND p_type LIKE '%BRASS'
+  AND s_nationkey = n_nationkey
+  AND n_regionkey = r_regionkey
+  AND r_name = 'EUROPE'
+  AND ps_supplycost = (
+    SELECT MIN(ps_supplycost)
+    FROM partsupp, supplier, nation, region
+    WHERE p_partkey = ps_partkey
+      AND s_suppkey = ps_suppkey
+      AND s_nationkey = n_nationkey
+      AND n_regionkey = r_regionkey
+      AND r_name = 'EUROPE'
+  )
+ORDER BY s_acctbal DESC, n_name, s_name, p_partkey
+----
+700.00 SupB GERMANY 1000 Mfgr#1 addrB phoneB commentB
+500.00 SupA FRANCE 1500 Mfgr#1 addrA phoneA commentA

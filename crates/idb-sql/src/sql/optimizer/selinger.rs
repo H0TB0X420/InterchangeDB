@@ -198,6 +198,7 @@ fn maybe_reorder<CatE: StorageEngine>(
             derived,
             scalar_subqueries,
             in_subqueries,
+            correlated_subqueries,
             projection,
             aggregates,
             select_list,
@@ -225,6 +226,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                     derived,
                     scalar_subqueries,
                     in_subqueries,
+                    correlated_subqueries,
                     projection,
                     aggregates,
                     select_list,
@@ -257,6 +259,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                     derived,
                     scalar_subqueries,
                     in_subqueries,
+                    correlated_subqueries,
                     projection,
                     aggregates,
                     select_list,
@@ -271,6 +274,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                 &best.order,
                 scalar_subqueries,
                 in_subqueries,
+                correlated_subqueries,
                 projection,
                 aggregates,
                 select_list,
@@ -485,6 +489,7 @@ fn rewrite_select(
     order: &JoinOrder,
     scalar_subqueries: Vec<LogicalPlan>,
     in_subqueries: Vec<LogicalPlan>,
+    correlated_subqueries: Vec<LogicalPlan>,
     projection: Vec<usize>,
     aggregates: Vec<AggregateSpec>,
     select_list: Vec<Expression>,
@@ -543,10 +548,14 @@ fn rewrite_select(
         derived: Vec::new(),
         // Uncorrelated subqueries are statement constants — join reordering
         // neither reorders nor remaps them (the `InSubquery` probe columns are
-        // remapped through `filter` below); carry both lists through so EXPLAIN
-        // still renders them after a reorder.
+        // remapped through `filter` below); carry the lists through so EXPLAIN
+        // still renders them after a reorder. A correlated template carries only
+        // positional `OuterRef`s (never remapped — the indirection rule); its
+        // `CorrelatedExists`/`CorrelatedScalar` `outer_cols` ARE remapped, but
+        // through `filter` below, not here.
         scalar_subqueries,
         in_subqueries,
+        correlated_subqueries,
         projection: projection
             .into_iter()
             .map(|c| remap.apply_index(c))

@@ -6,11 +6,17 @@
 use crate::catalog::Schema;
 use crate::common::Result;
 use crate::execution::{Executor, Tuple};
+use crate::sql::ir::expr::CorrelatedFault;
 
 /// Volcano pipeline operator: row-wise selection.
 pub struct Filter {
     child: Box<dyn Executor>,
     predicate: Box<dyn Fn(&Tuple) -> bool + Send>,
+    /// Shared error channel for a correlated predicate (H4c): the compiled
+    /// closure records a correlated evaluation fault here, and `next` surfaces
+    /// it after each predicate call. `None` for a plain predicate (the common
+    /// case) — no per-row check, exactly the pre-H4c behavior.
+    fault: Option<CorrelatedFault>,
 }
 
 impl Filter {
@@ -23,6 +29,7 @@ impl Filter {
         Self {
             child,
             predicate: Box::new(predicate),
+            fault: None,
         }
     }
 
@@ -33,7 +40,25 @@ impl Filter {
         child: Box<dyn Executor>,
         predicate: Box<dyn Fn(&Tuple) -> bool + Send>,
     ) -> Self {
-        Self { child, predicate }
+        Self {
+            child,
+            predicate,
+            fault: None,
+        }
+    }
+
+    /// Construct from a boxed correlated predicate (H4c) and the shared `fault`
+    /// cell its closure records into — checked after each predicate call.
+    pub fn from_boxed_correlated(
+        child: Box<dyn Executor>,
+        predicate: Box<dyn Fn(&Tuple) -> bool + Send>,
+        fault: CorrelatedFault,
+    ) -> Self {
+        Self {
+            child,
+            predicate,
+            fault: Some(fault),
+        }
     }
 }
 
@@ -41,8 +66,20 @@ impl Executor for Filter {
     fn next(&mut self) -> Result<Option<Tuple>> {
         loop {
             match self.child.next()? {
-                Some(tuple) if (self.predicate)(&tuple) => return Ok(Some(tuple)),
-                Some(_) => continue,
+                Some(tuple) => {
+                    let keep = (self.predicate)(&tuple);
+                    // A correlated predicate may have recorded a fault (an inner
+                    // execution error, or a scalar subquery yielding >1 rows) —
+                    // surface it loudly before emitting, regardless of `keep`.
+                    if let Some(fault) = &self.fault {
+                        if let Some(err) = fault.lock().take() {
+                            return Err(err);
+                        }
+                    }
+                    if keep {
+                        return Ok(Some(tuple));
+                    }
+                }
                 None => return Ok(None),
             }
         }
