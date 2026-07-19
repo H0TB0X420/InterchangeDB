@@ -139,6 +139,7 @@ pub(crate) fn normalize<CatE: StorageEngine>(
     let LogicalPlan::Select {
         table,
         joins,
+        derived,
         projection,
         aggregates,
         select_list,
@@ -150,6 +151,15 @@ pub(crate) fn normalize<CatE: StorageEngine>(
     else {
         return Ok(None);
     };
+
+    // A derived table (H4a) breaks the "leaf = catalog table" assumption the
+    // memo's join core is built on, and cross-boundary optimization is a
+    // recorded lever — so ANY derived table D8-bails the whole query to the
+    // shared `plan_inner` lowering (which handles derived leaves). Explicit,
+    // matching the outer-join bail below.
+    if !derived.is_empty() {
+        return Ok(None);
+    }
 
     // No-reorder rule (H3b): the memo only searches Inner join cores. An
     // outer join is not commutative or associative with its neighbours —

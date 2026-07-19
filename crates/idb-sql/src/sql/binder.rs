@@ -20,12 +20,31 @@ use sqlparser::ast::{
     UnaryOperator, Value as AstValue, Values,
 };
 
-use crate::catalog::{Catalog, ColumnDef, IndexBackend, Schema};
+use crate::catalog::{Catalog, ColumnDef, IndexBackend, Schema, TableId};
 use crate::common::{Error, Result};
 use crate::sql::ir::expr::{BinaryOp, CompareOp, Expression, Predicate};
-use crate::sql::ir::logical::{AggregateSpec, JoinKind, LogicalPlan, OrderDir};
+use crate::sql::ir::logical::{
+    select_output_schema, AggregateSpec, DerivedTable, JoinKind, LogicalPlan, OrderDir,
+};
 use crate::storage::StorageEngine;
 use crate::types::{ColumnType, Decimal, Value};
+
+/// Maximum nesting depth for derived tables / FROM-subqueries (H4a),
+/// enforced at bind time. A bounded limit on bind recursion — a query
+/// nesting derived tables deeper than this is rejected loudly rather than
+/// risking a stack-deep bind. Four levels covers the TPC-H shapes we target
+/// (Q13/Q7/Q8/Q9 nest one level; Q22's inner shells two).
+const MAX_DERIVED_DEPTH: usize = 4;
+
+/// Bound SELECT items: `(projection, aggregates, select_list, output_aliases)`.
+/// The per-item output `AS` aliases (H4a step 1) ride alongside the three
+/// coordinate vectors so a derived table can name its output schema.
+type BoundSelectItems = (
+    Vec<usize>,
+    Vec<AggregateSpec>,
+    Vec<Expression>,
+    Vec<Option<String>>,
+);
 
 /// Bind one SQL statement against the catalog.
 pub struct Binder<E: StorageEngine> {
@@ -45,13 +64,56 @@ struct Scope {
 
 struct ScopedTable {
     /// Original catalog table name (used for qualified refs like `t.col`
-    /// when no alias is given).
+    /// when no alias is given). For a derived table this is its alias — the
+    /// alias IS the relation's name (there is no catalog name).
     table_name: String,
     /// FROM-clause alias, if any. Qualified refs prefer alias over name.
     alias: Option<String>,
     schema: Arc<Schema>,
     /// Start index of this table's columns in the joined tuple.
     column_offset: usize,
+}
+
+/// The result of binding a SELECT body: the plan plus the ingredients to
+/// type its output as a derived table's schema. Top-level queries use only
+/// `plan`; a derived table computes its output columns from `input` +
+/// `output_aliases` (so the schema-typing pass — which can error on
+/// uninferable aggregate/computed types — runs ONLY for FROM-subqueries,
+/// leaving top-level typing where it was: at executor build time).
+struct BoundSelect {
+    plan: LogicalPlan,
+    /// The join-tuple input schema (the FROM relations concatenated) — the
+    /// coordinate space `select_output_schema` types the output against.
+    input: Schema,
+    /// Per-output-column `AS` alias, positionally aligned with the output
+    /// columns (`Some` overrides the derived-schema default name; `None`
+    /// keeps it). Empty for `SELECT *` (no items to name).
+    output_aliases: Vec<Option<String>>,
+}
+
+impl BoundSelect {
+    /// The output columns this SELECT presents as a derived table: types
+    /// from `select_output_schema`, names overridden by any explicit per-item
+    /// `AS` alias. The column-list alias (`AS d (a, b)`), when present, is a
+    /// further positional override applied by the caller.
+    fn derived_columns(&self) -> Result<Vec<ColumnDef>> {
+        let LogicalPlan::Select {
+            projection,
+            aggregates,
+            select_list,
+            ..
+        } = &self.plan
+        else {
+            unreachable!("bind_select_query always yields LogicalPlan::Select");
+        };
+        let mut columns = select_output_schema(&self.input, projection, aggregates, select_list)?;
+        for (column, alias) in columns.iter_mut().zip(&self.output_aliases) {
+            if let Some(name) = alias {
+                column.name = name.clone();
+            }
+        }
+        Ok(columns)
+    }
 }
 
 impl Scope {
@@ -69,7 +131,39 @@ impl Scope {
 
     /// Append another table to the scope. The new table's
     /// `column_offset` is the sum of all prior tables' column counts.
-    fn push(&mut self, table_name: String, alias: Option<String>, schema: Arc<Schema>) {
+    ///
+    /// Rejects a relation whose *exposed* name (its alias if aliased, else its
+    /// name) duplicates one already in this statement's scope. Two relations
+    /// sharing an exposed name make every qualified ref resolve to whichever
+    /// the resolver hits first — silent wrong results: `SELECT x, y FROM
+    /// (SELECT 1 AS x) d, (SELECT 2 AS y) d` returned the second subquery's row
+    /// for both columns. SQL requires each FROM item be uniquely named; this is
+    /// the one point every relation (catalog table, aliased table, or derived
+    /// alias) enters the scope, so enforce it here. Catalog-SHADOWING by a
+    /// single derived alias stays legal — that is one relation named `t`, not
+    /// two — because it is only ever one push into an otherwise-clear scope.
+    ///
+    /// NOTE: this also closes a pre-H4a latent bug. Before derived tables, a
+    /// duplicate catalog-table alias (`FROM t AS a, u AS a`) was likewise never
+    /// rejected — `column_index_qualified` returns the first match, so `a.col`
+    /// silently resolved to `t`. The exposed-name check catches that case too;
+    /// it was not introduced by H4a but is fixed by the same guard.
+    fn push(
+        &mut self,
+        table_name: String,
+        alias: Option<String>,
+        schema: Arc<Schema>,
+    ) -> Result<()> {
+        let exposed = alias.as_deref().unwrap_or(&table_name);
+        for existing in &self.tables {
+            let existing_exposed = existing.alias.as_deref().unwrap_or(&existing.table_name);
+            if existing_exposed == exposed {
+                return Err(Error::SqlParse(format!(
+                    "binder: relation name '{}' specified more than once in FROM",
+                    exposed
+                )));
+            }
+        }
         let column_offset: usize = self.tables.iter().map(|t| t.schema.columns.len()).sum();
         self.tables.push(ScopedTable {
             table_name,
@@ -77,6 +171,7 @@ impl Scope {
             schema,
             column_offset,
         });
+        Ok(())
     }
 }
 
@@ -316,6 +411,18 @@ impl<E: StorageEngine> Binder<E> {
     // -----------------------------------------------------------------------
 
     fn bind_query(&self, q: Query) -> Result<LogicalPlan> {
+        // Top-level: bind at depth 0 and keep only the plan. The derived-table
+        // schema ingredients (`input` / `output_aliases`) are discarded, so a
+        // top-level query never runs the output-typing pass — its type errors
+        // stay at executor build time, exactly as before.
+        Ok(self.bind_select_query(q, 0)?.plan)
+    }
+
+    /// Bind a SELECT body, returning the plan plus what a derived table needs
+    /// to type its output schema. `depth` is the FROM-subquery nesting level
+    /// (0 = top level); each derived table recurses at `depth + 1`, bounded by
+    /// `MAX_DERIVED_DEPTH`.
+    fn bind_select_query(&self, q: Query, depth: usize) -> Result<BoundSelect> {
         let limit = match q.limit {
             Some(AstExpr::Value(AstValue::Number(n, _))) => {
                 Some(n.parse::<usize>().map_err(|e| {
@@ -365,26 +472,29 @@ impl<E: StorageEngine> Binder<E> {
         let mut scope = Scope { tables: Vec::new() };
         let mut joined_tables: Vec<(String, Option<String>, Option<AstExpr>, JoinKind)> =
             Vec::new();
+        // FROM-subqueries collected as we resolve the FROM factors (H4a).
+        let mut derived: Vec<DerivedTable> = Vec::new();
 
         for (twj_idx, twj) in select.from.into_iter().enumerate() {
-            // The "head" relation of this TableWithJoins.
-            let (head_name, head_alias) = extract_table_and_alias(&twj.relation)?;
-            let head_schema = self.catalog.get_table(&head_name)?;
+            // The "head" relation of this TableWithJoins — a catalog table or a
+            // derived table (FROM-subquery).
+            let (head_name, head_alias, head_schema) =
+                self.resolve_from_factor(twj.relation, depth, &mut derived)?;
             if twj_idx == 0 {
-                scope.push(head_name.clone(), head_alias.clone(), head_schema);
+                scope.push(head_name.clone(), head_alias.clone(), head_schema)?;
             } else {
                 // Implicit cross join with the running scope.
-                scope.push(head_name.clone(), head_alias.clone(), head_schema);
+                scope.push(head_name.clone(), head_alias.clone(), head_schema)?;
                 joined_tables.push((head_name, head_alias, None, JoinKind::Inner));
             }
 
             // Explicit joins attached to this entry.
             for j in twj.joins {
-                let (right_name, right_alias) = extract_table_and_alias(&j.relation)?;
-                let right_schema = self.catalog.get_table(&right_name)?;
+                let (right_name, right_alias, right_schema) =
+                    self.resolve_from_factor(j.relation, depth, &mut derived)?;
                 // The ON predicate (when present) must bind against a scope
                 // that already includes the right side, so push first.
-                scope.push(right_name.clone(), right_alias.clone(), right_schema);
+                scope.push(right_name.clone(), right_alias.clone(), right_schema)?;
 
                 // R1 (H3b): a LEFT OUTER join's ON filters the *match*, so it
                 // must carry an ON — an outer join without one can never leave
@@ -471,10 +581,13 @@ impl<E: StorageEngine> Binder<E> {
             }
         };
 
-        // Projection + aggregates + display list. Empty projection/aggregates
-        // = SELECT *; empty select_list = identity display (the zero-churn
-        // invariant — see LogicalPlan::Select).
-        let (projection, aggregates, select_list) =
+        // Projection + aggregates + display list + captured output-column
+        // aliases. Empty projection/aggregates = SELECT *; empty select_list =
+        // identity display (the zero-churn invariant — see LogicalPlan::Select).
+        // `output_aliases` (H4a step 1) names the derived-table schema when
+        // this SELECT is a FROM-subquery; it is positionally aligned with the
+        // output columns and ignored for top-level queries.
+        let (projection, aggregates, select_list, output_aliases) =
             bind_select_items(&scope, &select.projection, &group_cols)?;
 
         // Grouping rules. The IR carries group keys IN `projection`
@@ -563,9 +676,48 @@ impl<E: StorageEngine> Binder<E> {
             None => Vec::new(),
         };
 
-        Ok(LogicalPlan::Select {
+        // The join-tuple input schema: every scoped relation's columns
+        // concatenated in tuple-global order. This is the coordinate space the
+        // output columns are typed against when this SELECT is a derived table.
+        //
+        // Join-kind-aware nullability: a LEFT OUTER join pads its right side
+        // with NULLs for outer rows that found no match, so those columns are
+        // nullable in the joined tuple regardless of their base declaration.
+        // This mirrors the executor's `concat_schemas`, which ORs a
+        // `right_nullable` flag into each right column of an outer join; the
+        // derived schema must agree, or an outer-join-padded column would be
+        // reported `nullable: false` through the derived table while the
+        // runtime can hand back NULLs there. `scope.tables[0]` is the left
+        // relation (never padded); each later `scope.tables[i]` pairs with
+        // `joins[i - 1]` in textual order (every push past the first appended
+        // exactly one join clause above).
+        debug_assert_eq!(
+            joins.len(),
+            scope.tables.len() - 1,
+            "each scoped relation past the first must pair with one join clause"
+        );
+        let mut input_columns: Vec<ColumnDef> =
+            Vec::with_capacity(scope.tables.iter().map(|t| t.schema.columns.len()).sum());
+        for (i, scoped) in scope.tables.iter().enumerate() {
+            let right_nullable = i > 0 && joins[i - 1].kind == JoinKind::LeftOuter;
+            for col in &scoped.schema.columns {
+                input_columns.push(ColumnDef {
+                    nullable: col.nullable || right_nullable,
+                    ..col.clone()
+                });
+            }
+        }
+        let input = Schema {
+            name: "derived-input".into(),
+            table_id: TableId(0),
+            columns: input_columns,
+            primary_key: vec![],
+        };
+
+        let plan = LogicalPlan::Select {
             table: table_name,
             joins,
+            derived,
             projection,
             aggregates,
             select_list,
@@ -573,7 +725,107 @@ impl<E: StorageEngine> Binder<E> {
             order_by,
             having,
             limit,
+        };
+        Ok(BoundSelect {
+            plan,
+            input,
+            output_aliases,
         })
+    }
+
+    /// Resolve one FROM `TableFactor` into a scope entry
+    /// `(scope_name, scope_alias, schema)`. A catalog table resolves against
+    /// the catalog. A derived table (FROM-subquery, H4a) is bound recursively
+    /// here in a FRESH scope (uncorrelated), its output schema computed, and
+    /// its `(alias, plan, schema)` recorded in `derived`; the ALIAS becomes the
+    /// scope name (there is no catalog name), so the outer query refers to it
+    /// by that alias and it shadows any catalog table of the same name.
+    fn resolve_from_factor(
+        &self,
+        factor: TableFactor,
+        depth: usize,
+        derived: &mut Vec<DerivedTable>,
+    ) -> Result<(String, Option<String>, Arc<Schema>)> {
+        match factor {
+            TableFactor::Table { name, alias, .. } => {
+                let table_name = object_name_to_string(&name);
+                let alias = alias.as_ref().map(|a| a.name.value.clone());
+                let schema = self.catalog.get_table(&table_name)?;
+                Ok((table_name, alias, schema))
+            }
+            TableFactor::Derived {
+                lateral,
+                subquery,
+                alias,
+            } => {
+                // LATERAL is correlated (the subquery may reference columns of
+                // earlier FROM items) — out of scope for uncorrelated H4a.
+                if lateral {
+                    return Err(Error::SqlParse(
+                        "binder: LATERAL derived tables not supported".into(),
+                    ));
+                }
+                // A derived table with no alias has no name to reference its
+                // columns by — required, rejected loudly.
+                let alias = alias.ok_or_else(|| {
+                    Error::SqlParse(
+                        "binder: derived table (FROM-subquery) requires an alias".into(),
+                    )
+                })?;
+                // Depth bound: the inner query sits one level deeper. Reject
+                // before recursing so nesting can't blow the bind stack.
+                if depth + 1 > MAX_DERIVED_DEPTH {
+                    return Err(Error::SqlParse(format!(
+                        "binder: derived tables nested deeper than {} levels not supported",
+                        MAX_DERIVED_DEPTH
+                    )));
+                }
+
+                // Bind the inner query in a fresh scope (uncorrelated) and
+                // compute its output columns (types + per-item `AS` names).
+                let bound = self.bind_select_query(*subquery, depth + 1)?;
+                let mut columns = bound.derived_columns()?;
+
+                // Column-list alias `AS d (c1, c2, …)` (Q13 verbatim): a
+                // positional rename of EVERY output column — the count must
+                // match exactly, or it is a loud error, never a silent partial.
+                if !alias.columns.is_empty() {
+                    if alias.columns.len() != columns.len() {
+                        return Err(Error::SqlParse(format!(
+                            "binder: derived table '{}' column list has {} names but the \
+                             subquery produces {} columns",
+                            alias.name.value,
+                            alias.columns.len(),
+                            columns.len()
+                        )));
+                    }
+                    for (column, ident) in columns.iter_mut().zip(&alias.columns) {
+                        column.name = ident.value.clone();
+                    }
+                }
+
+                let alias_name = alias.name.value.clone();
+                let schema = Arc::new(Schema {
+                    name: alias_name.clone(),
+                    table_id: TableId(0),
+                    columns: columns.clone(),
+                    primary_key: vec![],
+                });
+                derived.push(DerivedTable {
+                    alias: alias_name.clone(),
+                    plan: Box::new(bound.plan),
+                    schema: columns,
+                });
+                // A derived table's alias IS its relation name (no catalog
+                // name), so `scope_alias` is None — qualified refs match on the
+                // scope name.
+                Ok((alias_name, None, schema))
+            }
+            other => Err(Error::SqlParse(format!(
+                "binder: FROM/JOIN must be a named table or derived table, got {:?}",
+                other
+            ))),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -773,23 +1025,6 @@ fn object_name_to_string(n: &ObjectName) -> String {
         .join(".")
 }
 
-/// Extract the table name and optional alias from a `TableFactor`. Used
-/// when walking a `TableWithJoins`. Errors on derived tables, subqueries,
-/// table functions — those land in later phases.
-fn extract_table_and_alias(tf: &TableFactor) -> Result<(String, Option<String>)> {
-    match tf {
-        TableFactor::Table { name, alias, .. } => {
-            let table_name = object_name_to_string(name);
-            let alias = alias.as_ref().map(|a| a.name.value.clone());
-            Ok((table_name, alias))
-        }
-        other => Err(Error::SqlParse(format!(
-            "binder: FROM/JOIN must be a named table, got {:?}",
-            other
-        ))),
-    }
-}
-
 /// Resolve an unqualified column name to a tuple-global index. Errors
 /// on "not found" and "ambiguous" (column present in multiple scoped
 /// tables — caller must use the qualified `t.col` form to disambiguate).
@@ -861,22 +1096,37 @@ fn column_index_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<
 /// contains an aggregate call. The two regimes bind separately: the
 /// aggregated path resolves items into aggregate-output coordinates; the
 /// unaggregated path binds items straight against the input scope.
+///
+/// The fourth return value (H4a step 1) captures each item's explicit `AS`
+/// alias — `Some(name)` overrides the derived-table schema's default column
+/// name for that item, `None` keeps it. It is positionally aligned with the
+/// output columns (one per item, in item order) in every non-wildcard case;
+/// empty for `SELECT *`. Top-level queries ignore it (their output naming is
+/// unchanged); only derived tables consume it.
 fn bind_select_items(
     scope: &Scope,
     items: &[ast::SelectItem],
     group_cols: &[usize],
-) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<Expression>)> {
-    // Single Wildcard → SELECT *.
+) -> Result<BoundSelectItems> {
+    // Single Wildcard → SELECT * (columns keep their catalog names, so no
+    // aliases to capture).
     if items.len() == 1 && matches!(items[0], ast::SelectItem::Wildcard(_)) {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     }
 
-    // Unwrap each item to its expression (an alias is display-only here).
+    // Unwrap each item to its expression, capturing its `AS` alias alongside.
     let mut exprs: Vec<&AstExpr> = Vec::with_capacity(items.len());
+    let mut aliases: Vec<Option<String>> = Vec::with_capacity(items.len());
     for it in items {
         match it {
-            ast::SelectItem::UnnamedExpr(e) => exprs.push(e),
-            ast::SelectItem::ExprWithAlias { expr, .. } => exprs.push(expr),
+            ast::SelectItem::UnnamedExpr(e) => {
+                exprs.push(e);
+                aliases.push(None);
+            }
+            ast::SelectItem::ExprWithAlias { expr, alias } => {
+                exprs.push(expr);
+                aliases.push(Some(alias.value.clone()));
+            }
             other => {
                 return Err(Error::SqlParse(format!(
                     "binder: projection item shape unsupported: {:?}",
@@ -887,11 +1137,12 @@ fn bind_select_items(
     }
 
     let aggregated = !group_cols.is_empty() || exprs.iter().any(|e| expr_contains_aggregate(e));
-    if aggregated {
-        bind_select_items_grouped(scope, &exprs)
+    let (projection, aggregates, select_list) = if aggregated {
+        bind_select_items_grouped(scope, &exprs)?
     } else {
-        bind_select_items_ungrouped(scope, &exprs)
-    }
+        bind_select_items_ungrouped(scope, &exprs)?
+    };
+    Ok((projection, aggregates, select_list, aliases))
 }
 
 /// Unaggregated display: bind each item against the input scope. A list of
@@ -2582,6 +2833,7 @@ mod tests {
             LogicalPlan::Select {
                 table,
                 joins,
+                derived,
                 projection,
                 aggregates,
                 select_list,
@@ -2592,6 +2844,7 @@ mod tests {
             } => {
                 assert_eq!(table, "warehouse");
                 assert!(joins.is_empty());
+                assert!(derived.is_empty());
                 assert!(aggregates.is_empty());
                 assert!(order_by.is_empty());
                 assert!(projection.is_empty(), "SELECT * → empty projection");

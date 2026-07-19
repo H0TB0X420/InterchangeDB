@@ -53,6 +53,20 @@ pub enum PhysOp {
     /// coerced to the PK column types.
     PkLookup { table: String, pk: Vec<Value> },
 
+    /// Materialized FROM-subquery (H4a). A leaf of the outer plan: the inner
+    /// `subplan` runs, its rows are buffered, and the outer plan reads them as
+    /// though scanning a table of `schema`. `alias` is the name the outer
+    /// query used (rendered by EXPLAIN). The schema travels in the IR, so the
+    /// executor builds this leaf without any catalog lookup. No predicate
+    /// pushdown into `subplan` and no index paths (recorded lever): a WHERE on
+    /// a derived column becomes a `Filter` ABOVE this leaf, never below the
+    /// materialization boundary.
+    DerivedScan {
+        alias: String,
+        subplan: Box<PhysOp>,
+        schema: Vec<crate::catalog::ColumnDef>,
+    },
+
     /// Row-wise selection: keep rows where `predicate` holds.
     Filter {
         input: Box<PhysOp>,
@@ -181,6 +195,11 @@ impl PhysOp {
                 format!("{pad}IndexScan({table}, on {index})\n")
             }
             PhysOp::PkLookup { table, .. } => format!("{pad}PkLookup({table})\n"),
+            PhysOp::DerivedScan { alias, subplan, .. } => {
+                // `DerivedScan(alias)` header, then the inner subplan indented
+                // one level — the materialized subquery reads as a subtree.
+                format!("{pad}DerivedScan({alias})\n{}", subplan.explain(indent + 1))
+            }
             PhysOp::Filter { input, .. } => {
                 format!("{pad}Filter\n{}", input.explain(indent + 1))
             }

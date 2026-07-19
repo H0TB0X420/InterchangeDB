@@ -188,3 +188,8 @@ fn slt_date() {
 fn slt_scalar() {
     run_slt("scalar.slt");
 }
+
+#[test]
+fn slt_derived() {
+    run_slt("derived.slt");
+}

@@ -87,6 +87,11 @@ fn select_shapes_are_equivalent() {
         // (a bare column mixed with an arithmetic item) — prove it against
         // Volcano's Compute operator.
         "SELECT i_id, i_price * 2 FROM item WHERE i_id > 1",
+        // H4a: a derived table (FROM-subquery). Push bridges the DerivedScan
+        // leaf through `ExecutorSource` (no native push sink), so its output
+        // must match Volcano's materialized DerivedScan row-for-row — including
+        // the outer WHERE filtering the derived output.
+        "SELECT id2, p2 FROM (SELECT i_id, i_price FROM item) AS d (id2, p2) WHERE p2 > 200",
     ];
     for q in queries {
         assert_equivalent(&mut s, q);

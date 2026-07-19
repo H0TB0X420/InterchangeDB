@@ -34,6 +34,7 @@ mod cross_engine_differential;
 mod database_test;
 mod deadlock_test;
 mod decode_fuzz_test;
+mod derived_table_test;
 mod deterministic_test;
 mod disk_manager_conformance;
 mod dst_recovery_test;

@@ -1,0 +1,138 @@
+# Derived tables (FROM-subqueries, uncorrelated) — H4a.
+#
+# A derived table binds its inner query in a fresh scope, computes its output
+# schema (types + captured `AS` names / a column-list alias), and materializes
+# it as a `DerivedScan` leaf. The outer WHERE / GROUP BY / aggregates then
+# resolve over the derived columns exactly like a catalog table's — that
+# uniformity is the whole point (Q7's `l_year` is a plain column OF the derived
+# table, not an expression the outer query re-derives).
+
+statement ok
+CREATE TABLE emp (e_id INT PRIMARY KEY, dept INT, salary INT, hired DATE)
+
+statement ok
+CREATE TABLE dept (d_id INT PRIMARY KEY, d_name VARCHAR(10))
+
+statement ok
+INSERT INTO emp VALUES
+  (1, 10, 100, DATE '1995-01-01'),
+  (2, 10, 200, DATE '1995-06-01'),
+  (3, 20, 300, DATE '1996-01-01'),
+  (4, 20, 400, DATE '1996-06-01'),
+  (5, 30, 500, DATE '1997-01-01')
+
+statement ok
+INSERT INTO dept VALUES (10, 'eng'), (20, 'sales'), (30, 'ops')
+
+# ---- basic derived scan: a subquery in FROM behaves like the table ----------
+query II
+SELECT e_id, salary FROM (SELECT e_id, salary FROM emp) AS d ORDER BY e_id
+----
+1 100
+2 200
+3 300
+4 400
+5 500
+
+# ---- plan shape: a derived leaf lowers to DerivedScan(alias) + subplan ------
+# The header names the alias; the inner query renders indented one level. No
+# predicate pushdown into the subplan, no index paths (recorded lever).
+query T
+EXPLAIN SELECT e_id, salary FROM (SELECT e_id, salary FROM emp) AS d ORDER BY e_id
+----
+Projection([0, 1])
+Sort[0 ASC]
+DerivedScan(d)
+Projection([0, 2])
+SeqScan(emp)
+
+# ---- aliased expression column, grouped on it in the OUTER query ------------
+# `EXTRACT(YEAR FROM hired) AS yr` is a computed column of the derived table;
+# the outer query groups by `yr` as a plain column (Q7's l_year shape).
+query II
+SELECT yr, COUNT(*) FROM (SELECT EXTRACT(YEAR FROM hired) AS yr FROM emp) AS d
+  GROUP BY yr ORDER BY yr
+----
+1995 2
+1996 2
+1997 1
+
+# ---- column-list alias `AS d (g, s)` — positional rename of every column ----
+query II
+SELECT g, s FROM (SELECT dept, SUM(salary) FROM emp GROUP BY dept) AS d (g, s)
+  ORDER BY g
+----
+10 300
+20 700
+30 500
+
+# ---- outer WHERE + GROUP BY + aggregates over derived columns ---------------
+# The WHERE (`s >= 200`) filters the derived output ABOVE the DerivedScan; the
+# outer GROUP BY / COUNT / SUM run over the derived columns g and s.
+query III
+SELECT g, COUNT(*), SUM(s) FROM (SELECT dept, salary AS s FROM emp) AS d (g, s)
+  WHERE s >= 200 GROUP BY g ORDER BY g
+----
+10 1 200
+20 2 700
+30 1 500
+
+# ---- a derived table CONTAINING a join --------------------------------------
+# The inner query joins emp and dept and aggregates; the outer reads the
+# result. The join lives entirely inside the DerivedScan's subplan.
+query TI
+SELECT dname, total FROM (
+  SELECT d_name, SUM(salary) FROM emp JOIN dept ON dept = d_id GROUP BY d_name
+) AS d (dname, total) ORDER BY dname
+----
+eng 300
+ops 500
+sales 700
+
+# ---- error contracts --------------------------------------------------------
+# LATERAL is correlated — out of scope for uncorrelated H4a.
+statement error LATERAL derived tables not supported
+SELECT * FROM emp, LATERAL (SELECT e_id FROM emp) AS d
+
+# A derived table needs an alias to name its columns by.
+statement error requires an alias
+SELECT * FROM (SELECT e_id FROM emp)
+
+# A column list must name every output column — a count mismatch is loud.
+statement error column list has 1 names but the subquery produces 2 columns
+SELECT * FROM (SELECT e_id, salary FROM emp) AS d (only_one)
+
+# Derived tables nested deeper than MAX_DERIVED_DEPTH (4) are rejected.
+statement error nested deeper than 4 levels
+SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (
+  SELECT e_id FROM emp) AS d5) AS d4) AS d3) AS d2) AS d1
+
+# ---- duplicate FROM relation names (silent wrong results) -------------------
+# Two derived tables sharing an alias: the binder resolves per first-match
+# schema while the planner's leaf map is last-insert-wins, so every ref to `d`
+# reads the SECOND subquery — both output columns came from it. Reject the
+# duplicate exposed name loudly.
+statement error specified more than once in FROM
+SELECT * FROM (SELECT e_id FROM emp) AS d, (SELECT salary FROM emp) AS d
+
+# A derived alias colliding with a table's alias is the same error — a derived
+# table is just another exposed relation name in the FROM scope.
+statement error specified more than once in FROM
+SELECT * FROM emp AS d, (SELECT e_id FROM emp) AS d
+
+# Two catalog tables sharing an alias — rejected too. Pre-H4a this was silently
+# accepted and a qualified `d.col` resolved to the first table (first match).
+statement error specified more than once in FROM
+SELECT * FROM emp AS d, dept AS d
+
+# Single-alias catalog shadowing STAYS legal: a derived table may take a
+# catalog table's name (`emp`) when it is the only relation so named — that is
+# one relation called `emp`, not two.
+query II
+SELECT e_id, salary FROM (SELECT e_id, salary FROM emp) AS emp ORDER BY e_id
+----
+1 100
+2 200
+3 300
+4 400
+5 500

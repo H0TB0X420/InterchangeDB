@@ -101,10 +101,27 @@ impl<C: CostModel> PlannerStrategy for SelingerPlanner<C> {
 /// snapshot and return empty.
 fn collect_select_tables(logical: &LogicalPlan) -> Vec<String> {
     match logical {
-        LogicalPlan::Select { table, joins, .. } => {
-            let mut names = vec![table.clone()];
+        LogicalPlan::Select {
+            table,
+            joins,
+            derived,
+            ..
+        } => {
+            // A derived alias is NOT a catalog table (no stats to snapshot),
+            // but the catalog tables INSIDE each derived subquery still need
+            // stats — the subplan lowers cost-based off the same snapshot.
+            let is_derived = |name: &str| derived.iter().any(|d| d.alias == name);
+            let mut names = Vec::new();
+            if !is_derived(table) {
+                names.push(table.clone());
+            }
             for j in joins {
-                names.push(j.right_table.clone());
+                if !is_derived(&j.right_table) {
+                    names.push(j.right_table.clone());
+                }
+            }
+            for d in derived {
+                names.extend(collect_select_tables(&d.plan));
             }
             names
         }
@@ -125,6 +142,11 @@ pub(crate) fn gather_query_stats<CatE: StorageEngine>(
     let mut requests_owned: Vec<(TableId, Vec<u32>)> = Vec::new();
     for name in collect_select_tables(logical) {
         let schema = catalog.get_table(&name)?;
+        // The same catalog table can surface both in the outer query and
+        // inside a derived subquery — request its stats only once.
+        if requests_owned.iter().any(|(t, _)| *t == schema.table_id) {
+            continue;
+        }
         let column_count = schema.columns.len() as u32;
         requests_owned.push((schema.table_id, (0..column_count).collect()));
     }
@@ -173,6 +195,7 @@ fn maybe_reorder<CatE: StorageEngine>(
         LogicalPlan::Select {
             table,
             joins,
+            derived,
             projection,
             aggregates,
             select_list,
@@ -181,9 +204,14 @@ fn maybe_reorder<CatE: StorageEngine>(
             having,
             limit,
         } => {
-            // No joins, or an `ON` we can't model as a clean equi-join
-            // graph → leave textual order for P14.13a to lower.
-            let graph = if joins.is_empty() {
+            // A derived table (H4a) breaks the "leaf = catalog table"
+            // assumption the join-graph reorder is built on, and cross-boundary
+            // reordering is a recorded lever — so ANY derived table bails the
+            // whole SELECT to textual lowering (the shared `plan_inner`, which
+            // handles derived leaves). Explicit, matching the outer-join bail.
+            // No joins, or an `ON` we can't model as a clean equi-join graph →
+            // also leave textual order for P14.13a to lower.
+            let graph = if !derived.is_empty() || joins.is_empty() {
                 None
             } else {
                 build_join_graph(&table, &joins, filter.as_ref(), catalog, stats)?
@@ -192,6 +220,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                 return Ok(LogicalPlan::Select {
                     table,
                     joins,
+                    derived,
                     projection,
                     aggregates,
                     select_list,
@@ -219,6 +248,9 @@ fn maybe_reorder<CatE: StorageEngine>(
                 return Ok(LogicalPlan::Select {
                     table,
                     joins,
+                    // Empty here: a non-empty `derived` bailed to textual above
+                    // (graph is None), so this reorder path never carries one.
+                    derived,
                     projection,
                     aggregates,
                     select_list,
@@ -494,6 +526,10 @@ fn rewrite_select(
     LogicalPlan::Select {
         table: graph.names[first_rel].clone(),
         joins: new_joins,
+        // The reorder path only runs on derived-free SELECTs (maybe_reorder
+        // bails to textual for any derived table), so the rewritten plan
+        // carries none.
+        derived: Vec::new(),
         projection: projection
             .into_iter()
             .map(|c| remap.apply_index(c))

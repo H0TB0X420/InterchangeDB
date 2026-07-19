@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use crate::catalog::{ColumnDef, Schema};
-use crate::common::{Error, Result};
+use crate::catalog::Schema;
+use crate::common::Result;
 use crate::execution::{Executor, Tuple};
 use crate::sql::ir::expr::Expression;
 use crate::types::Value;
@@ -81,28 +81,11 @@ impl Executor for Compute {
 /// computed column is nullable because arithmetic (NULL propagation,
 /// div-by-zero) can produce NULL even from non-nullable inputs.
 pub(crate) fn build_compute_schema(input: &Schema, exprs: &[Expression]) -> Result<Schema> {
-    let types = input.column_types();
-    let mut columns = Vec::with_capacity(exprs.len());
-    for expr in exprs {
-        let ty = expr.column_type(&types).ok_or_else(|| {
-            Error::SqlParse(format!(
-                "compute: cannot infer type of expression `{}`",
-                expr
-            ))
-        })?;
-        let (name, nullable) = match expr {
-            // Passthrough: keep the input column's label and nullability.
-            Expression::Column(i) => (input.columns[*i].name.clone(), input.columns[*i].nullable),
-            // Computed: named "expr", nullable (arithmetic can produce NULL).
-            _ => ("expr".to_string(), true),
-        };
-        columns.push(ColumnDef {
-            name,
-            ty,
-            nullable,
-            default: None,
-        });
-    }
+    // Column names/types/nullability come from the IR-level
+    // `compute_output_columns` (single source, shared with the binder's
+    // `select_output_schema`); here we only wrap them in a `Schema`,
+    // preserving the input's name/table_id and dropping the PK.
+    let columns = crate::sql::ir::logical::compute_output_columns(input, exprs)?;
     Ok(Schema {
         name: input.name.clone(),
         table_id: input.table_id,
@@ -114,7 +97,8 @@ pub(crate) fn build_compute_schema(input: &Schema, exprs: &[Expression]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::TableId;
+    use crate::catalog::{ColumnDef, TableId};
+    use crate::common::Error;
     use crate::execution::test_util::VecExecutor;
     use crate::sql::ir::expr::BinaryOp;
     use crate::types::ColumnType;

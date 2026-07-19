@@ -15,9 +15,9 @@ use std::sync::Arc;
 use crate::catalog::Catalog;
 use crate::common::{Error, Result};
 use crate::execution::{
-    AggregateFn, Compute, Delete, Executor, Filter, HashAggregate, HashJoin, IndexNestedLoopJoin,
-    IndexScan, Insert, JoinPredicate, Limit, MergeJoin, NestedLoopJoin, PkLookup, Projection,
-    SeqScan, SetExpr, Sort, SortDir, Tuple, Update,
+    AggregateFn, Compute, Delete, DerivedScan, Executor, Filter, HashAggregate, HashJoin,
+    IndexNestedLoopJoin, IndexScan, Insert, JoinPredicate, Limit, MergeJoin, NestedLoopJoin,
+    PkLookup, Projection, SeqScan, SetExpr, Sort, SortDir, Tuple, Update,
 };
 use crate::layout::RowLayout;
 use crate::sql::ir::logical::{AggregateSpec, JoinKind, OrderDir};
@@ -57,6 +57,22 @@ where
         PhysOp::PkLookup { table, pk } => {
             let (tbl, _indexes) = resolve_table(table, engine, catalog)?;
             Ok(Box::new(PkLookup::new(&*tbl, pk)?))
+        }
+        PhysOp::DerivedScan {
+            alias,
+            subplan,
+            schema,
+        } => {
+            // A derived table (H4a): build the subplan's executor and wrap it
+            // in a DerivedScan carrying the alias-named output schema. No
+            // catalog lookup — the schema travels in the IR (a derived table
+            // has no catalog entry).
+            let child = build_executor(subplan, engine, catalog)?;
+            Ok(Box::new(DerivedScan::new(
+                alias.clone(),
+                child,
+                schema.clone(),
+            )))
         }
         PhysOp::Filter { input, predicate } => {
             let child = build_executor(input, engine, catalog)?;

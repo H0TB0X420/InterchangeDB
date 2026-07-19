@@ -4,6 +4,7 @@
 
 pub mod compute;
 pub mod delete;
+pub mod derived_scan;
 pub mod filter;
 pub mod hash_aggregate;
 pub mod index_scan;

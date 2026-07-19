@@ -19,10 +19,13 @@
 //! `[ … ]` brackets indicate optional wrappers — emitted only when the
 //! corresponding clause is present in the logical plan.
 
-use crate::catalog::{Catalog, ColumnDef, Schema};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::catalog::{Catalog, ColumnDef, Schema, TableId};
 use crate::common::Result;
 use crate::sql::ir::expr::{Expression, Predicate};
-use crate::sql::ir::logical::{JoinKind, LogicalPlan};
+use crate::sql::ir::logical::{DerivedTable, JoinKind, LogicalPlan};
 use crate::sql::ir::physical::PhysOp;
 use crate::sql::optimizer::cost::{CostModel, DefaultCostModel};
 use crate::sql::optimizer::join_order::JoinAlgorithm;
@@ -218,6 +221,7 @@ where
         LogicalPlan::Select {
             table,
             joins,
+            derived,
             projection,
             aggregates,
             select_list,
@@ -229,6 +233,7 @@ where
             let physop = plan_select(
                 table,
                 joins,
+                derived,
                 projection,
                 aggregates,
                 select_list,
@@ -267,6 +272,7 @@ where
 fn plan_select<CatE>(
     table_name: String,
     joins: Vec<crate::sql::ir::logical::JoinClause>,
+    derived: Vec<DerivedTable>,
     projection: Vec<usize>,
     aggregates: Vec<crate::sql::ir::logical::AggregateSpec>,
     select_list: Vec<Expression>,
@@ -280,13 +286,21 @@ fn plan_select<CatE>(
 where
     CatE: StorageEngine,
 {
-    let left_schema = catalog.get_table(&table_name)?;
+    // Pre-plan every derived table's subquery ONCE into a `DerivedScan` leaf,
+    // keyed by alias (H4a). Rule-based lowering: a derived leaf materializes
+    // its subplan; no predicate pushdown across the boundary and no index
+    // paths (recorded lever — cross-boundary optimization is future work). The
+    // leaf builders below clone the matching `DerivedScan` for a derived alias
+    // instead of emitting a table scan.
+    let derived_leaves = plan_derived_leaves(&derived, catalog, selection)?;
+
+    let left_schema = resolve_relation_schema(&table_name, &derived, catalog)?;
     let left_table_id = left_schema.table_id;
-    let left_indexes = catalog.indexes_for_table(left_schema.table_id, &left_schema)?;
+    let left_indexes = relation_indexes(&table_name, &derived, &left_schema, catalog)?;
 
     // Per-table column ranges (left = index 0, then each join's right table) —
     // used to route each WHERE conjunct to the table it constrains.
-    let ranges = table_ranges(&left_schema, &joins, catalog)?;
+    let ranges = table_ranges(&left_schema, &joins, &derived, catalog)?;
 
     // Build the left leaf and collect the conjuncts we can't place on it into
     // `residual`. With no joins the whole WHERE scopes to the one table. With
@@ -297,7 +311,12 @@ where
     let mut current: PhysOp;
     let mut residual: Vec<Predicate> = Vec::new();
     if joins.is_empty() {
-        if let Some(pred) = filter {
+        if let Some(scan) = derived_leaves.get(&table_name) {
+            // Derived head, no joins: the DerivedScan leaf with the whole WHERE
+            // as a Filter ABOVE it (no pushdown into the subplan, no index).
+            current = scan.clone();
+            residual.extend(filter.map(flatten_conjuncts).unwrap_or_default());
+        } else if let Some(pred) = filter {
             if let Some(pk) = try_lower_pk_lookup(&pred, &left_schema) {
                 current = PhysOp::PkLookup {
                     table: table_name.clone(),
@@ -343,7 +362,13 @@ where
                 _ => residual.push(conjunct),
             }
         }
-        current = build_left_leaf(left_preds, &left_schema, &table_name, &left_indexes);
+        current = build_left_leaf(
+            left_preds,
+            &left_schema,
+            &table_name,
+            &left_indexes,
+            &derived_leaves,
+        );
     }
 
     // P13.1 + Phase C: chain joins onto the left side. For each join we first
@@ -363,8 +388,12 @@ where
     };
     for (i, join) in joins.into_iter().enumerate() {
         let right_range = &ranges[i + 1];
-        let right_schema = catalog.get_table(&join.right_table)?;
-        let right_indexes = catalog.indexes_for_table(right_schema.table_id, &right_schema)?;
+        // A join's right side may be a derived table (H4a): resolve its schema
+        // from the pre-planned derived schema (indexes empty — no index paths),
+        // otherwise from the catalog. The leaf builders emit a DerivedScan for a
+        // derived alias and a table scan otherwise.
+        let right_schema = resolve_relation_schema(&join.right_table, &derived, catalog)?;
+        let right_indexes = relation_indexes(&join.right_table, &derived, &right_schema, catalog)?;
         let right_cols = right_schema.columns.len();
         let right_table = join.right_table.clone();
         let join_kind = join.kind;
@@ -463,6 +492,7 @@ where
                     &right_table,
                     &right_indexes,
                     right_range.start,
+                    &derived_leaves,
                 );
                 if use_hash {
                     let ((outer_col, inner_col), residual_on) =
@@ -513,6 +543,7 @@ where
                                 &right_table,
                                 &right_indexes,
                                 right_range.start,
+                                &derived_leaves,
                             )),
                             outer_key_col: outer_col,
                             inner_key_col: inner_col,
@@ -528,6 +559,7 @@ where
                                 &right_table,
                                 &right_indexes,
                                 right_range.start,
+                                &derived_leaves,
                             )),
                             on,
                             kind: JoinKind::Inner,
@@ -588,6 +620,7 @@ where
                                     &right_table,
                                     &right_indexes,
                                     right_range.start,
+                                    &derived_leaves,
                                 )),
                                 outer_key_col: outer_col,
                                 inner_key_col: inner_col,
@@ -603,6 +636,7 @@ where
                                 &right_table,
                                 &right_indexes,
                                 right_range.start,
+                                &derived_leaves,
                             )),
                             on,
                             kind: JoinKind::Inner,
@@ -1040,11 +1074,106 @@ struct TableRange {
     end: usize,
 }
 
+/// Pre-plan every derived table's inner query into a `DerivedScan` leaf,
+/// keyed by alias. Recurses through `plan_inner` (so a nested derived table
+/// lowers too), carrying the same `JoinSelection` — but NO cross-boundary
+/// optimization: the subplan is lowered independently, and the leaf is used
+/// as an opaque source (recorded lever). The subquery's schema travels in the
+/// `DerivedScan`, so the executor builds it without a catalog lookup.
+///
+/// Scope limit (honest, exceeds the documented "no cross-boundary
+/// optimization"): we call `plan_inner` directly, NOT the active `Planner`.
+/// `plan_inner` is the rule-based join *lowering* — it honors the carried
+/// `JoinSelection` (so a subplan's own joins still get cost-based algorithm
+/// choice under Selinger/memo) but keeps joins in textual order. Join
+/// *reordering* lives in `SelingerPlanner`/`VolcanoPlanner::plan`, which we do
+/// not re-enter here, so a derived subplan's joins are never reordered even
+/// when the outer query is. Threading the active `Planner` through this call
+/// (to reorder inside the boundary) is a recorded lever — see docs/plan-tpch.md
+/// H4 ("optimization across the boundary recorded as a lever").
+fn plan_derived_leaves<CatE>(
+    derived: &[DerivedTable],
+    catalog: &Catalog<CatE>,
+    selection: &JoinSelection,
+) -> Result<HashMap<String, PhysOp>>
+where
+    CatE: StorageEngine,
+{
+    let mut leaves = HashMap::with_capacity(derived.len());
+    for d in derived {
+        let subplan = match plan_inner((*d.plan).clone(), catalog, selection)? {
+            PhysicalPlan::Query(op) => op,
+            // A derived table's inner query is always a SELECT, which lowers to
+            // a `Query`; anything else is a binder bug.
+            _ => {
+                return Err(crate::common::Error::Internal(
+                    "derived table subquery did not lower to a query".into(),
+                ))
+            }
+        };
+        leaves.insert(
+            d.alias.clone(),
+            PhysOp::DerivedScan {
+                alias: d.alias.clone(),
+                subplan: Box::new(subplan),
+                schema: d.schema.clone(),
+            },
+        );
+    }
+    Ok(leaves)
+}
+
+/// Resolve a FROM relation name to its schema. A derived alias (H4a) resolves
+/// to a synthetic schema over its output columns and shadows any catalog
+/// table of the same name; every other name is a catalog table.
+fn resolve_relation_schema<CatE>(
+    name: &str,
+    derived: &[DerivedTable],
+    catalog: &Catalog<CatE>,
+) -> Result<Arc<Schema>>
+where
+    CatE: StorageEngine,
+{
+    match derived.iter().find(|d| d.alias == name) {
+        Some(d) => Ok(Arc::new(Schema {
+            name: d.alias.clone(),
+            // Synthetic — not a catalog table; TableId(0) has no stats, so the
+            // cost-based planners read the un-ANALYZEd default row count.
+            table_id: TableId(0),
+            columns: d.schema.clone(),
+            primary_key: vec![],
+        })),
+        None => catalog.get_table(name),
+    }
+}
+
+/// The index handles usable for a relation's access paths — empty for a
+/// derived table (no index paths across the materialization boundary; a
+/// recorded lever), the catalog's indexes for a real table.
+fn relation_indexes<CatE>(
+    name: &str,
+    derived: &[DerivedTable],
+    schema: &Schema,
+    catalog: &Catalog<CatE>,
+) -> Result<Vec<crate::table::IndexHandle>>
+where
+    CatE: StorageEngine,
+{
+    if derived.iter().any(|d| d.alias == name) {
+        Ok(Vec::new())
+    } else {
+        catalog.indexes_for_table(schema.table_id, schema)
+    }
+}
+
 /// Column ranges for the left table (index 0) then each joined right table, in
-/// textual order — mirroring how `plan_select` grows `outer_offset`.
+/// textual order — mirroring how `plan_select` grows `outer_offset`. Widths
+/// come through `resolve_relation_schema`, so a derived alias contributes its
+/// derived-schema width like any table.
 fn table_ranges<CatE>(
     left: &Schema,
     joins: &[crate::sql::ir::logical::JoinClause],
+    derived: &[DerivedTable],
     catalog: &Catalog<CatE>,
 ) -> Result<Vec<TableRange>>
 where
@@ -1054,7 +1183,7 @@ where
     let mut end = left.columns.len();
     ranges.push(TableRange { start: 0, end });
     for join in joins {
-        let right = catalog.get_table(&join.right_table)?;
+        let right = resolve_relation_schema(&join.right_table, derived, catalog)?;
         let start = end;
         end = start + right.columns.len();
         ranges.push(TableRange { start, end });
@@ -1103,12 +1232,27 @@ pub(crate) fn and_all(preds: Vec<Predicate>) -> Option<Predicate> {
 /// table: lower one to a `PkLookup`/`IndexScan` access path when possible, and
 /// drop the rest onto a leaf `Filter`. Left columns sit at offset 0, so the
 /// global column indices are already local — no rebasing needed.
+///
+/// A derived alias (H4a) resolves to its pre-planned `DerivedScan` instead:
+/// local predicates become a `Filter` ABOVE the leaf (no pushdown into the
+/// subplan, no index / PK access path — recorded lever).
 fn build_left_leaf(
     left_preds: Vec<Predicate>,
     schema: &Schema,
     table_name: &str,
     indexes: &[crate::table::IndexHandle],
+    derived_leaves: &HashMap<String, PhysOp>,
 ) -> PhysOp {
+    if let Some(scan) = derived_leaves.get(table_name) {
+        let mut leaf = scan.clone();
+        if let Some(pred) = and_all(left_preds) {
+            leaf = PhysOp::Filter {
+                input: Box::new(leaf),
+                predicate: pred,
+            };
+        }
+        return leaf;
+    }
     let mut access: Option<PhysOp> = None;
     let mut leftover: Vec<Predicate> = Vec::new();
     for pred in left_preds {
@@ -1228,12 +1372,13 @@ fn build_right_leaf(
     table_name: &str,
     indexes: &[crate::table::IndexHandle],
     offset: usize,
+    derived_leaves: &HashMap<String, PhysOp>,
 ) -> PhysOp {
     let local_preds = global_preds
         .into_iter()
         .map(|p| shift_predicate(p, -(offset as isize)))
         .collect();
-    build_left_leaf(local_preds, schema, table_name, indexes)
+    build_left_leaf(local_preds, schema, table_name, indexes, derived_leaves)
 }
 
 fn plan_insert<CatE>(
@@ -1733,6 +1878,7 @@ Limit(3)
         let logical = LogicalPlan::Select {
             table: "nonexistent".to_string(),
             joins: vec![],
+            derived: vec![],
             projection: vec![],
             aggregates: vec![],
             select_list: vec![],

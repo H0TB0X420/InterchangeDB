@@ -324,6 +324,29 @@ landing shape is plan-inner-query → materialize → anonymous table
 source at the executor layer with D8-style planner fallbacks first,
 optimization across the boundary recorded as a lever.
 
+**H4a executed (2026-07-19).** Derived tables land per the recorded
+shape: step-0 pre-req relocated aggregate output-type/name promotion to
+the IR (`AggregateSpec::{output_type, output_name}` +
+`select_output_schema`; executor delegates — single source; gated alone
+at 1362/0 before feature work); alias capture incl. Q13's column-list
+form (`AS c_orders (c_custkey, c_count)`); `DerivedTable` on Select +
+`PhysOp::DerivedScan` leaf materializing once per statement
+(`MAX_DERIVED_ROWS 2^20`, `MAX_DERIVED_DEPTH 4`); derived aliases
+shadow catalog names; Selinger/memo bail explicitly; no pushdown into
+subplans and no index paths (levers); same-snapshot execution verified
+(one engine handle threads the whole statement). **Q13 runs FULL
+VERBATIM** (sole note: ORDER BY output-alias unsupported —
+`ORDER BY COUNT(*)` equivalent used; recorded). Review: HIGH finding
+fixed pre-commit — duplicate relation names in one FROM were never
+rejected anywhere (binder first-match vs planner last-insert-wins →
+`[2,2]` for `[1,2]`); the guard at the `Scope::push` choke point also
+fixed the PRE-EXISTING `FROM t AS a, u AS a` silent misresolution.
+Derived schemas are now outer-join-nullability-aware (mirrors the
+executor's rule); the subplan-joins-never-reorder scope limit is
+documented as a lever. Tests 1362 → 1369. Q7/Q8/Q9/Q13 unlocked —
+12/22 verbatim-capable. Draws: derived cardinality is the un-ANALYZEd
+default; ORDER BY aliases; subplan reordering lever.
+
 ### H4 — subqueries, staged
 
 - H4a-scalar: uncorrelated scalar subquery — plan and run the inner query

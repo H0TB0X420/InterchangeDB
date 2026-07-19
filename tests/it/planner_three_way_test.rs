@@ -233,6 +233,15 @@ const CORPUS: &[&str] = &[
     // results. Both assert results-only parity across all three planners.
     "SELECT c_val FROM c WHERE c_val IN (1, 3, 5)",
     "SELECT st_id FROM st WHERE st_name LIKE 'ap%'",
+    // H4a derived table (FROM-subquery). A derived table makes ALL three
+    // planners bail to the shared textual lowering (selinger's reorder and the
+    // memo's normalize both bail on any derived table — cross-boundary
+    // optimization is a recorded lever), so they must return the SAME rows over
+    // the identical rule-based-shaped plan. The inner query aggregates `c`; the
+    // outer WHERE + GROUP BY run over the derived columns via the column-list
+    // alias `(g, s)`.
+    "SELECT g, COUNT(*) FROM (SELECT c_b, SUM(c_val) FROM c GROUP BY c_b) AS t (g, s) \
+     WHERE s > 5 GROUP BY g",
 ];
 
 fn rows(session: &mut Session<BTreeEngine>, sql: &str) -> Vec<Vec<Value>> {

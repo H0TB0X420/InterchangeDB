@@ -32,10 +32,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::catalog::{ColumnDef, Schema, TableId};
+use crate::catalog::{Schema, TableId};
 use crate::common::{Error, Result};
 use crate::execution::{Executor, Tuple};
 use crate::sql::ir::expr::Expression;
+use crate::sql::ir::logical::AggregateSpec;
 use crate::types::{ColumnType, Decimal, Value};
 
 /// A per-row argument evaluator, compiled once from an aggregate's
@@ -107,55 +108,25 @@ fn infer_arg_type(agg: &AggregateFn, input_schema: &Schema) -> Result<Option<Col
     }
 }
 
-/// Column name for the synthetic schema entry this aggregate emits. A
-/// bare-column argument keeps the pre-H2a "{fn}_{column}" naming (schema
-/// stability); any richer expression is "{fn}_expr".
-fn output_name(agg: &AggregateFn, input_schema: &Schema) -> String {
-    let prefix = match agg {
-        AggregateFn::CountStar => return "count_star".to_string(),
-        AggregateFn::Count(_) => "count",
-        AggregateFn::CountDistinct(_) => "count_distinct",
-        AggregateFn::Sum(_) => "sum",
-        AggregateFn::Min(_) => "min",
-        AggregateFn::Max(_) => "max",
-        AggregateFn::Avg(_) => "avg",
-    };
-    match agg.arg() {
-        Some(Expression::Column(i)) => format!("{}_{}", prefix, input_schema.columns[*i].name),
-        _ => format!("{}_expr", prefix),
-    }
-}
-
-/// Output column type from the argument's inferred type (`arg_type` is
-/// `None` only for `COUNT(*)`). `COUNT`→`Int64`; `SUM(Int32)` promotes to
-/// `Int64` to avoid overflow, `SUM(Int64/Decimal)` keeps its type;
-/// `MIN`/`MAX` preserve the argument type; `AVG` is `Decimal{18,4}` for
-/// integer inputs (a fractional result) and the input's scale for Decimal.
-fn output_type(agg: &AggregateFn, arg_type: Option<ColumnType>) -> Result<ColumnType> {
+/// The `AggregateSpec` (IR) equivalent of this executor aggregate — the
+/// inverse of `translate_aggregate_spec`. Lets the schema builder delegate
+/// output typing/naming to the single-source IR rules
+/// (`AggregateSpec::output_type` / `output_name`).
+fn spec_of(agg: &AggregateFn) -> AggregateSpec {
     match agg {
-        AggregateFn::CountStar | AggregateFn::Count(_) | AggregateFn::CountDistinct(_) => {
-            Ok(ColumnType::Int64)
-        }
-        AggregateFn::Sum(_) => match arg_type.expect("Sum has an argument") {
-            ColumnType::Int32 | ColumnType::Int64 => Ok(ColumnType::Int64),
-            ty @ ColumnType::Decimal { .. } => Ok(ty),
-            other => Err(Error::SqlParse(format!(
-                "SUM of non-numeric type {:?} not supported",
-                other
-            ))),
+        AggregateFn::CountStar => AggregateSpec::CountStar,
+        AggregateFn::Count(e) => AggregateSpec::Count {
+            arg: e.clone(),
+            distinct: false,
         },
-        AggregateFn::Min(_) | AggregateFn::Max(_) => Ok(arg_type.expect("Min/Max has an argument")),
-        AggregateFn::Avg(_) => match arg_type.expect("Avg has an argument") {
-            ColumnType::Int32 | ColumnType::Int64 => Ok(ColumnType::Decimal {
-                precision: 18,
-                scale: 4,
-            }),
-            ty @ ColumnType::Decimal { .. } => Ok(ty),
-            other => Err(Error::SqlParse(format!(
-                "AVG of non-numeric type {:?} not supported",
-                other
-            ))),
+        AggregateFn::CountDistinct(e) => AggregateSpec::Count {
+            arg: e.clone(),
+            distinct: true,
         },
+        AggregateFn::Sum(e) => AggregateSpec::Sum(e.clone()),
+        AggregateFn::Min(e) => AggregateSpec::Min(e.clone()),
+        AggregateFn::Max(e) => AggregateSpec::Max(e.clone()),
+        AggregateFn::Avg(e) => AggregateSpec::Avg(e.clone()),
     }
 }
 
@@ -387,7 +358,8 @@ impl Executor for HashAggregate {
 
 /// Output schema: group-key columns (cloned from the input schema, in
 /// `group_by` order) followed by one synthetic column per aggregate. The
-/// argument type is inferred once per aggregate here; a type that can't be
+/// column names and types come from the IR-level `aggregate_output_columns`
+/// (single source for the type-promotion rules); a type that can't be
 /// inferred or that the aggregate rejects (non-numeric SUM/AVG) errors
 /// loudly rather than reaching the accumulator.
 pub(crate) fn build_aggregate_schema(
@@ -395,19 +367,8 @@ pub(crate) fn build_aggregate_schema(
     group_by: &[usize],
     aggregates: &[AggregateFn],
 ) -> Result<Schema> {
-    let mut columns: Vec<ColumnDef> = group_by.iter().map(|&c| input.columns[c].clone()).collect();
-    for agg in aggregates {
-        let arg_type = infer_arg_type(agg, input)?;
-        columns.push(ColumnDef {
-            name: output_name(agg, input),
-            ty: output_type(agg, arg_type)?,
-            // Aggregates can return NULL (empty input → SUM/AVG/MIN/MAX).
-            // COUNT returns 0, never NULL, but unifying as nullable keeps
-            // the schema simple and matches PostgreSQL.
-            nullable: true,
-            default: None,
-        });
-    }
+    let specs: Vec<AggregateSpec> = aggregates.iter().map(spec_of).collect();
+    let columns = crate::sql::ir::logical::aggregate_output_columns(input, group_by, &specs)?;
     Ok(Schema {
         name: "aggregate".into(),
         // Synthetic — not a real table.
