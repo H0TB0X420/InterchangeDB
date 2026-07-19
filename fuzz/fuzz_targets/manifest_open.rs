@@ -5,7 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use interchangedb::index::lsm::manifest::Manifest;
+use interchangedb::engines::lsm::manifest::Manifest;
 
 fuzz_target!(|data: &[u8]| {
     let dir = tempfile::tempdir().expect("create temp dir");

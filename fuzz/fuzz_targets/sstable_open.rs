@@ -8,7 +8,7 @@ use std::io::Write;
 
 use libfuzzer_sys::fuzz_target;
 
-use interchangedb::index::lsm::sstable::SSTableReader;
+use interchangedb::engines::lsm::sstable::SSTableReader;
 
 fuzz_target!(|data: &[u8]| {
     let mut file = tempfile::NamedTempFile::new().expect("create temp sst file");
