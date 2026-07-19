@@ -177,6 +177,32 @@ pending the division-semantics fix noted under H3.
 
 ### H3 — scalar and predicate surface
 
+**H3.1 executed (2026-07-18).** Change, generic: Decimal division became
+true rounded division at result scale `max(s1, s2)` (round half away
+from zero, everything checked, error → NULL), replacing the
+equal-scale-only rule — `div_keeping_scale` deleted (single caller).
+Inference mirrors; `align_target` dropped its Div special case (proven
+value-preserving for any operand scale in review); the four temporary
+error contracts flipped positive — including TPC-H Q14's verbatim
+left-associative `100.00 * sum(..) / sum(..)` → 45.0000, hand-computed
+and independently recomputed. `AvgDecimal`'s finalize was derived (not
+assumed) identical to routing SUM/COUNT through `Decimal::div`. New
+parity property test: an op×type grid asserts `eval_binary_op` result
+types equal `column_type` inference — the H2a divergence class is now
+regression-guarded as a class. Review findings fixed before commit:
+(1) CONFIRMED pre-existing member of that same class — inference's Mul
+arm had no `MAX_SCALE` guard, so `DECIMAL(18,10) × DECIMAL(18,10)`
+inferred scale 20 while the runtime NULLed every row; guarded, and the
+grid gained a scale-10 entry because its old scale-≤4 values made the
+failing region structurally unreachable. (2) The rescale-overflow test
+was exercising a different overflow branch than its name claimed —
+renamed honestly; `rescale_mantissa`'s check documented as
+defense-in-depth (unreachable from valid Decimals; serde doesn't
+re-validate). (3) `docs/optimizer-review.md` O4 status corrected to
+FIXED. Gains: tests 1328 → 1331; Q14 runs verbatim. Draws: none new;
+Decimal Mul at extreme scale pairs now errs loudly at bind/build instead
+of silently NULLing at runtime.
+
 - DATE: **decided 2026-07-18** — new `Value::Date(i32 days)` with its own
   `ColumnType`, order-preserving key encoding, and display. TPC-H compares
   dates to dates; a distinct type keeps encoding and rendering honest

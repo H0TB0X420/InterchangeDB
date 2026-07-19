@@ -990,11 +990,10 @@ fn bind_output_expr(
             let l = bind_output_expr(scope, left, projection, aggregates)?;
             let r = bind_output_expr(scope, right, projection, aggregates)?;
             // NO literal alignment in output space (H2b): aggregate outputs
-            // carry their own scales, and Div still requires equal scales,
-            // so the left-associative `100.00 * SUM(x) / SUM(y)` is
-            // uninferable and errs loudly at build — a recorded limitation
-            // (Q14 writes the working form `100.00 * (SUM(x) / SUM(y))`),
-            // not silenced here.
+            // carry their own scales. Div is now native max-scale
+            // (`Decimal::div`), so the left-associative `100.00 * SUM(x) /
+            // SUM(y)` — TPC-H Q14's verbatim shape, a scale-4 ÷ scale-2
+            // division — infers a scale-4 result and runs without alignment.
             Ok(Expression::BinaryOp {
                 op: arith_op,
                 left: Box::new(l),
@@ -1554,20 +1553,19 @@ fn align_numeric_literal(
 
 /// The type an integer literal should coerce toward, given the other
 /// operand's inferred type and the operator: Int32 for any op; Decimal for
-/// Add/Sub/Div but NOT Mul. The split follows the runtime decimal algebra:
-/// Mul *promotes* (result scale = sum of operand scales), so an Int literal
-/// already promotes to a scale-0 Decimal in `eval_binary_op` and coercing
-/// it to the column's scale would change the result scale. Add/Sub/Div all
-/// *require equal scales* at runtime (`div_keeping_scale` rejects a
-/// mismatch exactly like `add`/`sub`), so coercing the literal to the
-/// Decimal side's scale is what turns `price / 2` into a legal scale-2
-/// division instead of an every-row NULL.
+/// Add/Sub but NOT Mul or Div. The split follows the runtime decimal algebra:
+/// - Mul *promotes* (result scale = sum of operand scales), so an Int literal
+///   already promotes to a scale-0 Decimal in `eval_binary_op` and coercing it
+///   to the column's scale would change the result scale.
+/// - Add/Sub *require equal scales* at runtime, so coercing the literal to the
+///   Decimal side's scale is what makes the operation legal instead of NULL.
+/// - Div is native max-scale (`Decimal::div`): `price / 2` promotes `2` to a
+///   scale-0 Decimal and takes scale = max(price_scale, 0) = price_scale with
+///   the identical value, so it needs NO alignment.
 fn align_target(op: BinaryOp, other: Option<ColumnType>) -> Option<ColumnType> {
     match other {
         Some(ty @ ColumnType::Int32) => Some(ty),
-        Some(ty @ ColumnType::Decimal { .. })
-            if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Div) =>
-        {
+        Some(ty @ ColumnType::Decimal { .. }) if matches!(op, BinaryOp::Add | BinaryOp::Sub) => {
             Some(ty)
         }
         _ => None,

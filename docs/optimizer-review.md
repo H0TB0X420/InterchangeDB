@@ -93,7 +93,9 @@ changed; findings are for the user to triage later.
 
 ### O4 — Decimal division is integer-truncating, not SQL decimal division
 - **Where:** `sql/expr.rs:258` (`div_keeping_scale`).
-- **Priority:** P3 · **Confidence:** high · **Status:** open (documented deviation)
+- **Priority:** P3 · **Confidence:** high · **Status:** FIXED (2026-07-18, TPC-H H3.1) —
+  `Decimal::div` now performs true rounded division (round half away from zero) at result
+  scale `max(s1, s2)` (`10.00 / 4.00 = 2.50`); the truncating `div_keeping_scale` is gone.
 - **Detail:** `Decimal / Decimal` divides raw mantissas with integer truncation and keeps the
   dividend's scale → `10.00 / 4.00 = 0.02`, not `2.50`. A test NOTE flags this. Latent
   (TPC-C doesn't divide decimals) but a real semantic gap; AVG-style division needs true

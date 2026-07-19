@@ -174,7 +174,7 @@ impl Expression {
 
 /// The mirror of `eval_binary_op`'s type resolution: the static result
 /// type of `l op r`, or `None` for any operand pair `eval_binary_op`
-/// resolves to `Value::Null` (scale-mismatched Decimal Add/Sub/Div, or an
+/// resolves to `Value::Null` (scale-mismatched Decimal Add/Sub, or an
 /// unsupported type combination).
 fn infer_binary_op_type(op: BinaryOp, l: ColumnType, r: ColumnType) -> Option<ColumnType> {
     use ColumnType::*;
@@ -198,19 +198,36 @@ fn infer_binary_op_type(op: BinaryOp, l: ColumnType, r: ColumnType) -> Option<Co
 }
 
 /// Decimal-op scale algebra (`s1` = left scale, `s2` = right scale,
-/// `precision` from the left operand): Add/Sub/Div require equal scales
-/// (else `None`, mirroring the runtime NULL — `div_keeping_scale` rejects a
-/// scale mismatch exactly like `add`/`sub`), keeping the shared scale; Mul
-/// alone promotes, summing the operand scales.
+/// `precision` from the left operand), an exact mirror of the runtime
+/// `Decimal` methods:
+/// - Add/Sub require equal scales (else `None`, mirroring the runtime NULL —
+///   `add`/`sub` reject a scale mismatch), keeping the shared scale.
+/// - Mul promotes, summing the operand scales.
+/// - Div is native max-scale: result scale = `max(s1, s2)`, no equal-scale
+///   requirement (mirrors `Decimal::div`), so a scale-4 ÷ scale-2 division
+///   (TPC-H Q14) infers a scale-4 result instead of bailing to `None`.
 fn decimal_op_type(op: BinaryOp, precision: u8, s1: u8, s2: u8) -> Option<ColumnType> {
     let scale = match op {
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Div => {
+        BinaryOp::Add | BinaryOp::Sub => {
             if s1 != s2 {
                 return None;
             }
             s1
         }
-        BinaryOp::Mul => s1 + s2,
+        BinaryOp::Mul => {
+            // Scales are individually catalog-bounded ≤ MAX_SCALE, so their
+            // sum can't overflow the u8 — but (unlike Div's max()) the sum CAN
+            // exceed MAX_SCALE, and `Decimal::mul` errors (→ NULL) in that case.
+            // Inference must mirror that early-out or it predicts a Decimal type
+            // the runtime resolves to NULL (the silent-NULL divergence class
+            // this file's doc comment forbids).
+            let sum = s1 + s2;
+            if sum > Decimal::MAX_SCALE {
+                return None;
+            }
+            sum
+        }
+        BinaryOp::Div => s1.max(s2),
     };
     Some(ColumnType::Decimal { precision, scale })
 }
@@ -387,7 +404,7 @@ fn apply_decimal_op(op: BinaryOp, a: &Decimal, b: &Decimal) -> Value {
         BinaryOp::Add => a.add(b),
         BinaryOp::Sub => a.sub(b),
         BinaryOp::Mul => a.mul(b),
-        BinaryOp::Div => a.div_keeping_scale(b),
+        BinaryOp::Div => a.div(b),
     };
     match result {
         Ok(d) => Value::Decimal(d),
@@ -574,13 +591,16 @@ mod tests {
                 scale: 6
             })
         );
-        // Div requires equal scales at runtime (`div_keeping_scale` NULLs
-        // on mismatch, exactly like Add/Sub), so scale 2 / scale 4 → None.
+        // Div is native max-scale (no equal-scale requirement): mismatched
+        // scale 2 / scale 4 → max(2,4) = scale 4 (mirrors `Decimal::div`).
         assert_eq!(
             binop(BinaryOp::Div, col(0), col(1)).column_type(&types),
-            None
+            Some(ColumnType::Decimal {
+                precision: 12,
+                scale: 4
+            })
         );
-        // Equal-scale division keeps that scale: scale 2 / scale 2 → scale 2.
+        // Equal-scale division keeps that scale: max(2,2) = scale 2.
         assert_eq!(
             binop(BinaryOp::Div, col(0), col(0)).column_type(&types),
             Some(ColumnType::Decimal {
@@ -612,6 +632,62 @@ mod tests {
             binop(BinaryOp::Sub, lit(Value::Int64(1)), col(0)).column_type(&types),
             None
         );
+    }
+
+    #[test]
+    fn runtime_inference_parity_grid() {
+        // PARITY PROPERTY: for every (op, left-type, right-type) in a
+        // representative grid, the runtime `eval_binary_op` value's `type_of`
+        // MUST equal the static `infer_binary_op_type` — Some vs Some agree on
+        // type, and inference `None` ⇔ runtime `Value::Null`. This kills the
+        // whole inference-divergence class the H2a review caught: the
+        // aggregate accumulator is picked from `infer_binary_op_type`, so any
+        // op/type pair where the closure produces a value the inference didn't
+        // predict (or vice versa) silently corrupts aggregation.
+        //
+        // The representative values all share magnitude 6, so no op divides by
+        // zero or overflows i64. Decimal `precision` is MAX_PRECISION because
+        // `Value::type_of` reports exactly that (a bare value can't recover its
+        // column's declared precision); the inference arms carry the left
+        // operand's precision, so both sides read MAX_PRECISION and match.
+        let dec_ty = |scale: u8| ColumnType::Decimal {
+            precision: Decimal::MAX_PRECISION,
+            scale,
+        };
+        // The scale-10 entry (still value 6.0, mantissa 6·10^10) exists so Mul
+        // can reach its overflow region: scale10 × scale10 sums to scale 20 >
+        // MAX_SCALE (18), where `Decimal::mul` errors → runtime Null and
+        // inference now returns None — a both-None ⇒ runtime-Null case that
+        // regression-guards the Mul overflow early-out. The scales stopping at 4
+        // left that region structurally unreachable. All entries remain value 6
+        // (6·10^scale fits i64 comfortably), so no op divides by zero or
+        // overflows the numerator.
+        let grid: [(ColumnType, Value); 6] = [
+            (ColumnType::Int32, Value::Int32(6)),
+            (ColumnType::Int64, Value::Int64(6)),
+            (dec_ty(0), dec(6, 0)),
+            (dec_ty(2), dec(600, 2)),
+            (dec_ty(4), dec(60000, 4)),
+            (dec_ty(10), dec(60_000_000_000, 10)),
+        ];
+        for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div] {
+            for (left_type, left_value) in &grid {
+                for (right_type, right_value) in &grid {
+                    let inferred = infer_binary_op_type(op, *left_type, *right_type);
+                    let runtime = eval_binary_op(op, left_value.clone(), right_value.clone());
+                    assert_eq!(
+                        runtime.type_of(),
+                        inferred,
+                        "parity mismatch for {:?} {:?} {:?}: runtime {:?} vs inferred {:?}",
+                        left_type,
+                        op,
+                        right_type,
+                        runtime,
+                        inferred
+                    );
+                }
+            }
+        }
     }
 
     // ---- Display ----
@@ -709,9 +785,8 @@ mod tests {
 
     #[test]
     fn decimal_div_is_true_decimal_division() {
-        // O4 fixed: `Decimal::div_keeping_scale` now performs real decimal
-        // division rounded to the dividend's scale — 10.00 / 4.00 = 2.50.
-        // (The old mantissa-division semantic returned 0.02.)
+        // `Decimal::div` performs real decimal division at scale max(s1,s2),
+        // rounded half away from zero — 10.00 / 4.00 = 2.50 (max(2,2)=2).
         let f = Expression::BinaryOp {
             op: BinaryOp::Div,
             left: Box::new(lit(dec(1000, 2))),
@@ -719,6 +794,16 @@ mod tests {
         }
         .compile();
         assert_eq!(f(&vec![]), dec(250, 2));
+        // Mixed scale: scale4 ÷ scale2 → scale4 (Q14's shape). 9000.0000 /
+        // 200.00 = 45.0000 — the left-associative `100.00 * SUM(x) / SUM(y)`
+        // core, now legal instead of NULL.
+        let g = Expression::BinaryOp {
+            op: BinaryOp::Div,
+            left: Box::new(lit(dec(90000000, 4))),
+            right: Box::new(lit(dec(20000, 2))),
+        }
+        .compile();
+        assert_eq!(g(&vec![]), dec(450000, 4));
     }
 
     #[test]

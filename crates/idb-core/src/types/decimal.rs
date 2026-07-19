@@ -11,13 +11,16 @@
 //!
 //! # Arithmetic semantics
 //!
-//! - `add` / `sub` / `div_keeping_scale` require operands to have the same scale.
-//!   Cross-scale operations return `Error::DecimalArithmetic`. SQL-level scale
-//!   alignment is the planner's job (Phase 11).
+//! - `add` / `sub` require operands to have the same scale. Cross-scale
+//!   operations return `Error::DecimalArithmetic`. SQL-level scale alignment
+//!   is the planner's job (Phase 11).
 //! - `mul` produces a result whose scale is the sum of operand scales (ANSI SQL
 //!   convention). Intermediate computation uses `i128` to detect overflow.
-//! - `div_keeping_scale` truncates toward zero (matches SQL `INT/INT` semantic)
-//!   and preserves the dividend's scale. Division by zero is an explicit error.
+//! - `div` produces a result at scale `max(s1, s2)` — NO equal-scale
+//!   requirement: it rescales both operands to that common scale and divides,
+//!   rounding half away from zero. This makes TPC-H Q14's verbatim
+//!   `100.00 * sum(..) / sum(..)` (scale 4 ÷ scale 2) legal. Division by zero
+//!   and mantissa overflow are explicit errors.
 
 use serde::{Deserialize, Serialize};
 
@@ -143,40 +146,78 @@ impl Decimal {
         })
     }
 
-    /// Divide two same-scale decimals; result keeps `self`'s scale.
+    /// Divide two decimals; result scale is `max(self.scale, other.scale)` —
+    /// there is NO equal-scale requirement (unlike `add`/`sub`), so TPC-H
+    /// Q14's verbatim left-associative `100.00 * sum(..) / sum(..)` (a
+    /// scale-4 ÷ scale-2 division) is legal and yields a scale-4 result.
     ///
-    /// TRUE decimal division (O4): the result is `self / other` rounded to
-    /// this scale, half away from zero — `10.00 / 4.00 = 2.50`. (The prior
-    /// implementation divided raw mantissas with truncation, yielding
-    /// `0.02` for that input — an INT/INT semantic that was wrong for any
-    /// scale > 0.) Errors on scale mismatch, division by zero, or a result
-    /// mantissa exceeding i64.
-    pub fn div_keeping_scale(&self, other: &Decimal) -> Result<Decimal> {
-        if self.scale != other.scale {
-            return Err(Error::DecimalArithmetic(format!(
-                "div: scale mismatch: {} vs {}",
-                self.scale, other.scale
-            )));
-        }
+    /// TRUE decimal division: rescale both operands' mantissas to the common
+    /// scale `s = max(s1, s2)`, then the result mantissa is
+    /// `round_half_away_from_zero(a_scaled · 10^s / b_scaled)`. Rounding is
+    /// HALF AWAY FROM ZERO (SQL rounding): a tie rounds up in magnitude,
+    /// symmetric across sign (`5/2 → 3`, `-5/2 → -3`). The scaled numerator
+    /// lives in `i128`; every widening multiply is checked and the final
+    /// narrow to `i64` is checked, so any overflow is an error, never a wrong
+    /// value. Division by zero is an explicit error.
+    pub fn div(&self, other: &Decimal) -> Result<Decimal> {
         if other.mantissa == 0 {
             return Err(Error::DecimalArithmetic("div: division by zero".into()));
         }
-        // value = m_a / m_b (scales cancel); mantissa at scale s is
-        // round(m_a·10^s / m_b). i128 headroom: |m_a| < 2^63 and
-        // 10^s ≤ 10^MAX_SCALE = 1e18, so the product < 1e37 << i128::MAX.
-        let numerator = self.mantissa as i128 * 10i128.pow(self.scale as u32);
-        let mantissa = div_i128_round_half_away(numerator, other.mantissa as i128);
+        let result_scale = self.scale.max(other.scale);
+        // Rescale each operand to the common scale (only the lower-scale one
+        // actually gains digits). A single rescale is safe in i128 —
+        // |m|·10^s ≤ 1e18·1e18 = 1e36 < i128::MAX — but stays checked per the
+        // division contract.
+        let a_scaled = rescale_mantissa(self.mantissa, self.scale, result_scale)?;
+        let b_scaled = rescale_mantissa(other.mantissa, other.scale, result_scale)?;
+        // Mantissa at scale s is round(a_scaled·10^s / b_scaled). The ·10^s is
+        // checked: a near-i64 dividend at a high scale can push the numerator
+        // past i128.
+        let numerator = a_scaled
+            .checked_mul(10i128.pow(result_scale as u32))
+            .ok_or_else(|| {
+                Error::DecimalArithmetic(format!(
+                    "div: numerator overflow: {} / {} at scale {}",
+                    self.mantissa, other.mantissa, result_scale
+                ))
+            })?;
+        let mantissa = div_i128_round_half_away(numerator, b_scaled);
         let mantissa = i64::try_from(mantissa).map_err(|_| {
             Error::DecimalArithmetic(format!(
                 "div: result mantissa overflows i64: {} / {} at scale {}",
-                self.mantissa, other.mantissa, self.scale
+                self.mantissa, other.mantissa, result_scale
             ))
         })?;
         Ok(Decimal {
             mantissa,
-            scale: self.scale,
+            scale: result_scale,
         })
     }
+}
+
+/// Widen `mantissa` (interpreted at `from_scale`) to `to_scale`, in `i128`.
+/// `to_scale >= from_scale` is guaranteed by the sole caller (`div` picks the
+/// max of the two operand scales).
+///
+/// The `checked_mul` Err path is UNREACHABLE from a validly-constructed
+/// `Decimal`: the mantissa is an `i64` (|m| ≤ ~9.2e18) and both scales are
+/// bounded by `MAX_SCALE` (18), so the widening factor is at most `10^18` and
+/// the product is at most ~9.2e18·10^18 ≈ 9.2e36 < `i128::MAX` (~1.7e38) — it
+/// cannot overflow. The check is kept as defense-in-depth: the derived serde
+/// `Deserialize` does NOT re-validate the `scale ≤ MAX_SCALE` invariant that
+/// `from_i64_with_scale` asserts, so a corrupt/hand-forged blob could carry an
+/// out-of-range scale; a checked Err is the correct crash-on-corruption
+/// response, never a wrapped value.
+fn rescale_mantissa(mantissa: i64, from_scale: u8, to_scale: u8) -> Result<i128> {
+    debug_assert!(to_scale >= from_scale, "rescale_mantissa: narrowing");
+    (mantissa as i128)
+        .checked_mul(10i128.pow((to_scale - from_scale) as u32))
+        .ok_or_else(|| {
+            Error::DecimalArithmetic(format!(
+                "div: rescale overflow: {} from scale {} to {}",
+                mantissa, from_scale, to_scale
+            ))
+        })
 }
 
 /// Integer division rounding half away from zero (SQL rounding), instead of
@@ -311,36 +352,72 @@ mod tests {
 
     #[test]
     fn div_is_true_decimal_division_rounded() {
-        // O4: 10.00 / 4.00 = 2.50 (the old mantissa-division gave 0.02).
+        // Equal-scale: 10.00 / 4.00 = 2.50, result scale = max(2,2) = 2.
         let a = Decimal::from_i64_with_scale(1000, 2);
         let b = Decimal::from_i64_with_scale(400, 2);
-        let r = a.div_keeping_scale(&b).unwrap();
+        let r = a.div(&b).unwrap();
         assert_eq!(r.mantissa(), 250);
         assert_eq!(r.scale(), 2);
         // 7 / 3 at scale 0: 2.33… rounds to 2; -7 / 3 → -2 (symmetric).
         let a = Decimal::from_i64_with_scale(7, 0);
         let b = Decimal::from_i64_with_scale(3, 0);
-        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), 2);
+        assert_eq!(a.div(&b).unwrap().mantissa(), 2);
         let a = Decimal::from_i64_with_scale(-7, 0);
-        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), -2);
-        // Half cases round away from zero: 5/2 → 3, -5/2 → -3.
+        assert_eq!(a.div(&b).unwrap().mantissa(), -2);
+        // Half cases round AWAY FROM ZERO: 5/2 → 3, -5/2 → -3 (both signs).
         let a = Decimal::from_i64_with_scale(5, 0);
         let b = Decimal::from_i64_with_scale(2, 0);
-        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), 3);
+        assert_eq!(a.div(&b).unwrap().mantissa(), 3);
         let a = Decimal::from_i64_with_scale(-5, 0);
-        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), -3);
-        // 2/3 at scale 0: 0.67 rounds to 1 (old truncation gave 0).
+        assert_eq!(a.div(&b).unwrap().mantissa(), -3);
+        // 2/3 at scale 0: 0.67 rounds to 1 (truncation would give 0).
         let a = Decimal::from_i64_with_scale(2, 0);
         let b = Decimal::from_i64_with_scale(3, 0);
-        assert_eq!(a.div_keeping_scale(&b).unwrap().mantissa(), 1);
+        assert_eq!(a.div(&b).unwrap().mantissa(), 1);
+    }
+
+    #[test]
+    fn div_mixed_scale_takes_max_scale() {
+        // scale4 ÷ scale2 → scale max(4,2)=4. 7.0000 / 2.00 = 3.5000.
+        //   a_scaled = 70000·10^(4-4) = 70000 ; b_scaled = 200·10^(4-2) = 20000
+        //   round(70000·10^4 / 20000) = round(700000000/20000) = 35000
+        let a = Decimal::from_i64_with_scale(70000, 4);
+        let b = Decimal::from_i64_with_scale(200, 2);
+        let r = a.div(&b).unwrap();
+        assert_eq!(r.mantissa(), 35000);
+        assert_eq!(r.scale(), 4);
+        // Reverse operand order → same max scale 4. -2.00 / 4.0000 = -0.5000.
+        //   a_scaled = -200·10^2 = -20000 ; b_scaled = 40000
+        //   round(-20000·10^4 / 40000) = round(-200000000/40000) = -5000
+        let a = Decimal::from_i64_with_scale(-200, 2);
+        let b = Decimal::from_i64_with_scale(40000, 4);
+        let r = a.div(&b).unwrap();
+        assert_eq!(r.mantissa(), -5000);
+        assert_eq!(r.scale(), 4);
     }
 
     #[test]
     fn div_by_zero_errors() {
+        // Zero divisor at any scale is an explicit error, not a NaN/panic.
         let a = Decimal::from_i64_with_scale(5, 0);
-        let b = Decimal::from_i64_with_scale(0, 0);
-        let err = a.div_keeping_scale(&b).unwrap_err();
+        let b = Decimal::from_i64_with_scale(0, 4);
+        let err = a.div(&b).unwrap_err();
         assert!(matches!(err, Error::DecimalArithmetic(ref m) if m.contains("division by zero")));
+    }
+
+    #[test]
+    fn div_numerator_overflow_errors() {
+        // i64::MAX (scale 0) ÷ 1e-18 (scale 18): result_scale = max(0,18) = 18.
+        // Rescaling i64::MAX up to scale 18 is i64::MAX·10^18 ≈ 9.2e36, which is
+        // < i128::MAX (~1.7e38) — so the rescale SUCCEEDS. It is the subsequent
+        // numerator ·10^18 (≈ 9.2e54) that overflows i128. So this exercises
+        // div()'s own numerator `checked_mul` Err path, NOT `rescale_mantissa`'s
+        // (that one is unreachable from validly-constructed Decimals — see its
+        // doc comment).
+        let a = Decimal::from_i64_with_scale(i64::MAX, 0);
+        let b = Decimal::from_i64_with_scale(1, 18);
+        let err = a.div(&b).unwrap_err();
+        assert!(matches!(err, Error::DecimalArithmetic(ref m) if m.contains("numerator overflow")));
     }
 
     #[test]

@@ -626,6 +626,11 @@ pub(crate) fn finalize_state(agg: &AggregateFn, state: AggState) -> Result<Value
             } else {
                 // Decimal AVG: round(sum / count), half away from zero,
                 // preserving the input scale (E14 — was truncating).
+                // This rounding MUST match `Decimal::div`'s (both use the
+                // shared `div_i128_round_half_away`): a user may write either
+                // `AVG(x)` or the explicit `SUM(x) / COUNT(x)` — the latter now
+                // routes through `Decimal::div` — and the two spellings must
+                // yield the same value.
                 // NOTE (plan deviation): reference engines also WIDEN the
                 // result scale; we keep the column's scale — the rounding
                 // fix lands now, scale-widening waits for a typed-AVG

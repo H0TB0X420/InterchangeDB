@@ -139,9 +139,10 @@ fn grouped_aggregate_is_equivalent() {
 
     // H2b: TPC-H Q14's post-aggregate arithmetic over a grouped push
     // aggregate — the native grouped sink feeds the native ComputeSink, so
-    // this proves BOTH push kernels against Volcano on the Q14 shape.
-    // `100.00 * (SUM(x) / SUM(y))` parenthesizes the division first (H2a's
-    // equal-scale Div rule; the left-associative form is uninferable).
+    // this proves BOTH push kernels against Volcano on the Q14 shape. Both the
+    // parenthesized and the VERBATIM left-associative forms are checked; H3.1
+    // made Div native max-scale, so `100.00 * SUM(x) / SUM(y)` — scale4 ÷
+    // scale2 → scale4 — now runs and equals the parenthesized form.
     s.execute(
         "CREATE TABLE q14 (q_id INT PRIMARY KEY, grp VARCHAR(8), x DECIMAL(12,2), y DECIMAL(12,2))",
     )
@@ -161,6 +162,10 @@ fn grouped_aggregate_is_equivalent() {
     assert_equivalent(
         &mut s,
         "SELECT grp, 100.00 * (SUM(x) / SUM(y)) FROM q14 GROUP BY grp",
+    );
+    assert_equivalent(
+        &mut s,
+        "SELECT grp, 100.00 * SUM(x) / SUM(y) FROM q14 GROUP BY grp",
     );
 }
 

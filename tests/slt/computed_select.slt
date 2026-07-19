@@ -6,7 +6,7 @@
 #
 # Decimal scales are load-bearing and asserted at exact stored scale:
 #   x, y, 100.00           scale 2
-#   SUM(x) / SUM(y)         scale 2   (equal-scale Div keeps the scale)
+#   SUM(x) / SUM(y)         scale 2   (max-scale Div; max(2,2) = 2)
 #   100.00 * (…)            scale 4   (Mul sums scales: 2 + 2)
 
 # ---- ungrouped row-level arithmetic --------------------------------------
@@ -115,13 +115,17 @@ SELECT typ, 100.00 * (SUM(x) / SUM(y)) FROM parts GROUP BY typ ORDER BY typ
 A 40.0000
 B 50.0000
 
-# The LEFT-ASSOCIATIVE form parses as (100.00 * SUM(x)) / SUM(y): 100.00 *
-# SUM(x) is scale2 * scale2 = scale4, then scale4 / scale2 breaks the
-# equal-scale Div rule (H2a) → uninferable → loud error. A faithfully
-# recorded H2b limitation (division scale semantics are NOT fixed here);
-# the working form above parenthesizes the division first.
-statement error cannot infer
+# TPC-H Q14's VERBATIM left-associative form parses as (100.00 * SUM(x)) /
+# SUM(y): 100.00 * SUM(x) is scale2 * scale2 = scale4, then scale4 / scale2 is
+# a native max-scale Div → max(4,2) = scale4. No parentheses needed (H3.1
+# fixed division scale semantics). Ungrouped, same data as above:
+#   SUM(x)=90.00, 100.00 * 90.00 = 9000.0000 (scale 4)
+#   SUM(y)=200.00 ; 9000.0000 / 200.00 = 45.0000 (scale 4) — identical to the
+#   parenthesized working form.
+query R
 SELECT 100.00 * SUM(x) / SUM(y) FROM parts
+----
+45.0000
 
 # ---- error contracts -----------------------------------------------------
 

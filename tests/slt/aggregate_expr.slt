@@ -62,11 +62,10 @@ SELECT MIN(price * (1 - disc)), MAX(price * (1 - disc)) FROM li WHERE sd <= 100
 ----
 40.0000 180.0000
 
-# Division inside a grouped SUM. The literal `2` is coerced to Decimal(_,2)
-# at bind time, so `price / 2` is an equal-scale division (`div_keeping_scale`
-# keeps the dividend's scale 2) — NOT an every-row NULL. Regression guard for
-# the Div-scale bug where the type was inferred scale-2 but the runtime NULLed
-# on the scale mismatch. Hand-computed per group over rows 1-4:
+# Division inside a grouped SUM. Div is native max-scale, so the literal `2`
+# needs NO bind-time alignment: it promotes to a scale-0 Decimal and
+# `price / 2` takes scale max(2,0) = 2 with the same value — NOT an every-row
+# NULL. Hand-computed per group over rows 1-4:
 #   ('A','F'): 100.00/2 = 50.00, 200.00/2 = 100.00 → SUM = 150.00
 #   ('N','O'):  50.00/2 = 25.00,  40.00/2 =  20.00 → SUM =  45.00
 query TTR
@@ -75,19 +74,21 @@ SELECT rf, ls, SUM(price / 2) FROM li WHERE sd <= 100 GROUP BY rf, ls ORDER BY r
 A F 150.00
 N O 45.00
 
-# A genuinely uninferable division: a scale-2 column over a scale-4 column,
-# with no integer literal to coerce, has no equal-scale alignment — so
-# `div_keeping_scale` would NULL every row. The schema builder refuses to
-# type an accumulator it can't infer and errors loudly (build_aggregate_schema
-# → infer_arg_type) rather than silently summing NULL.
+# Mismatched-scale division is now native: a scale-2 column over a scale-4
+# column infers scale max(2,4) = 4 and runs. Hand-computed over the one row
+# (a2=7.00, a4=2.0000):
+#   a2/a4 = 7.00 / 2.0000 → scale 4 → 3.5000  (rescale 7.00→7.0000, 70000·10^4
+#           / 20000 = 35000); SUM over one row = 3.5000.
 statement ok
 CREATE TABLE ld (pk INT PRIMARY KEY, a2 DECIMAL(12,2), a4 DECIMAL(12,4))
 
 statement ok
-INSERT INTO ld VALUES (1, 1.00, 1.0000)
+INSERT INTO ld VALUES (1, 7.00, 2.0000)
 
-statement error cannot infer argument type
+query R
 SELECT SUM(a2 / a4) FROM ld
+----
+3.5000
 
 # A second table with nullable numerics, for NULL-skipping COUNT over an
 # expression and COUNT(DISTINCT). v+w is NULL whenever either operand is
