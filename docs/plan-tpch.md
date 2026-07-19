@@ -349,6 +349,33 @@ default; ORDER BY aliases; subplan reordering lever.
 
 ### H4 — subqueries, staged
 
+**H4b executed (2026-07-19).** Uncorrelated subqueries: scalar (bind to
+a dedicated slot, session pre-executes through the statement's engine
+handle — 0 rows → NULL, >1 → loud — then splices; planners see
+literals) and IN/NOT IN/EXISTS (`Predicate::InSubquery` — the constant
+set materializes once per statement into a null-aware hash set; no new
+join operators, no reorder implications; EXISTS keys on nonempty with a
+bind-time LIMIT 1 early-exit). Q18's prerequisite landed: HAVING/ORDER
+BY-only aggregates compute-then-project-out (H1's projected-only
+restriction lifted; position math append-stable). Correlated references
+reject loudly naming the column. Review found and fixes closed three
+substantive defects pre-commit: (1) CONFIRMED — scalar slots shared
+`Expression::Parameter`'s namespace with user `$n`, so a prepared
+statement mixing both silently substituted the user's value into the
+subquery slot (traced repro); fixed with a dedicated
+`Expression::SubqueryResult` namespace + its own substitution walker.
+(2) CONFIRMED — `eval_in` returned UNKNOWN for a NULL probe against an
+EMPTY set where SQL's quantified-comparison semantics say vacuous
+FALSE/TRUE (the unit test had pinned the wrong behavior; Postgres
+cross-checked); fixed nonempty-first. (3) The in-subquery row cap was a
+release-crashing assert on user-triggerable volume — now a returned
+error per the MAX_IN_LIST_ITEMS policy. Also: qualified-typo errors no
+longer misreport as "correlated". Tests 1369 → 1380. **Q11, Q16, Q18
+verbatim; Q15 as-derived (CREATE VIEW recorded gap). 16/22.** Draws:
+subqueries inside derived tables reject loudly (lever); IN-subquery
+selectivity is a documented constant; statement-global subquery indices
+ride a session→executor seam rather than PhysOp fields.
+
 - H4a-scalar: uncorrelated scalar subquery — plan and run the inner query
   first, splice its result as a literal into the outer plan. All planners
   see a literal; identical everywhere.

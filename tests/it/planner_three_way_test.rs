@@ -242,6 +242,14 @@ const CORPUS: &[&str] = &[
     // alias `(g, s)`.
     "SELECT g, COUNT(*) FROM (SELECT c_b, SUM(c_val) FROM c GROUP BY c_b) AS t (g, s) \
      WHERE s > 5 GROUP BY g",
+    // H4b uncorrelated subqueries. The session resolves each subquery BEFORE
+    // planning (scalar → spliced literal, IN → materialized set), so the
+    // resolution is planner-independent and all three must agree on rows. The
+    // scalar case is invisible (a literal); the IN case rides one relation as
+    // an opaque residual/local conjunct through a join the planners reorder —
+    // the routing verdict the design calls for, asserted end to end.
+    "SELECT a_val FROM a WHERE a_val > (SELECT MIN(a_val) FROM a)",
+    "SELECT c_val FROM c JOIN b ON c_b = b_id WHERE c_b IN (SELECT b_id FROM b)",
 ];
 
 fn rows(session: &mut Session<BTreeEngine>, sql: &str) -> Vec<Vec<Value>> {

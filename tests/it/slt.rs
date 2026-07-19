@@ -193,3 +193,23 @@ fn slt_scalar() {
 fn slt_derived() {
     run_slt("derived.slt");
 }
+
+#[test]
+fn slt_subquery() {
+    run_slt("subquery.slt");
+}
+
+#[test]
+fn slt_tpch_subquery() {
+    run_slt("tpch_subquery.slt");
+}
+
+#[test]
+fn slt_tpch_q11() {
+    run_slt("tpch_q11.slt");
+}
+
+#[test]
+fn slt_tpch_q15() {
+    run_slt("tpch_q15.slt");
+}

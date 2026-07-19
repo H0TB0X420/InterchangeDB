@@ -147,5 +147,13 @@ SELECT total FROM orders HAVING total > 1
 statement error column 'total' in ORDER BY/HAVING must be a group key
 SELECT region, COUNT(*) FROM orders GROUP BY region ORDER BY total
 
-statement error aggregate in ORDER BY/HAVING must also appear in the SELECT list
+# A HAVING aggregate absent from the SELECT list is legal: it is COMPUTED for
+# the filter and PROJECTED OUT of the display (Q18's grouped-HAVING subquery
+# shape). Here SUM(total) filters but only [region, COUNT(*)] is shown; every
+# region's SUM(total) exceeds 1, so all three groups survive.
+query TI
 SELECT region, COUNT(*) FROM orders GROUP BY region HAVING SUM(total) > 1
+----
+NULL 2
+east 3
+west 2

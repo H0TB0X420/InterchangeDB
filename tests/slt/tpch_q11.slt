@@ -1,0 +1,51 @@
+# TPC-H Q11 — Important Stock Identification. VERBATIM (sole deviation: the
+# ORDER BY on the `value` output alias is unsupported — the recorded H4a limit
+# — so the equivalent aggregate expression is used, as Q13 does). A grouped,
+# 3-way-join outer query whose HAVING compares each group's total against a
+# SCALAR SUBQUERY that is itself a 3-way-join aggregate. The fraction (0.0001
+# in the spec) is scaled to the micro-fixture.
+
+statement ok
+CREATE TABLE nation (n_nationkey INT PRIMARY KEY, n_name VARCHAR(25))
+
+statement ok
+CREATE TABLE supplier (s_suppkey INT PRIMARY KEY, s_nationkey INT)
+
+statement ok
+CREATE TABLE partsupp (ps_partkey INT, ps_suppkey INT, ps_availqty INT, ps_supplycost INT, PRIMARY KEY (ps_partkey, ps_suppkey))
+
+statement ok
+INSERT INTO nation VALUES (1, 'GERMANY'), (2, 'FRANCE')
+
+statement ok
+INSERT INTO supplier VALUES (10, 1), (20, 2), (30, 1)
+
+statement ok
+INSERT INTO partsupp VALUES
+  (100, 10, 100, 5),
+  (100, 30, 100, 3),
+  (200, 10, 50, 2),
+  (200, 20, 1000, 10),
+  (300, 30, 10, 1)
+
+# German-supplier stock value per part: part 100 = 500 + 300 = 800, part 200 =
+# 100 (the France row for part 200 is excluded), part 300 = 10. The total is
+# 910; the HAVING threshold is 910 * 0.1 = 91, so parts 100 and 200 survive.
+query II
+SELECT ps_partkey, SUM(ps_supplycost * ps_availqty)
+FROM partsupp, supplier, nation
+WHERE ps_suppkey = s_suppkey
+  AND s_nationkey = n_nationkey
+  AND n_name = 'GERMANY'
+GROUP BY ps_partkey
+HAVING SUM(ps_supplycost * ps_availqty) > (
+    SELECT SUM(ps_supplycost * ps_availqty) * 0.1
+    FROM partsupp, supplier, nation
+    WHERE ps_suppkey = s_suppkey
+      AND s_nationkey = n_nationkey
+      AND n_name = 'GERMANY'
+  )
+ORDER BY SUM(ps_supplycost * ps_availqty) DESC
+----
+100 800
+200 100

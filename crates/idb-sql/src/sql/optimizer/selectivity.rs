@@ -71,6 +71,14 @@ pub const LIKE_CONTAINS_SELECTIVITY: f64 = 0.25;
 /// true null fraction is a recorded lever.
 pub const IS_NULL_FALLBACK: f64 = 0.1;
 
+/// Selectivity default for `expr [NOT] IN (subquery)` / `[NOT] EXISTS
+/// (subquery)`. The true selectivity depends on the inner result set, which
+/// is materialized independently (by the session) and not visible at plan
+/// time; `0.5` is a neutral placeholder that neither over- nor under-values a
+/// subquery filter when the planner orders joins around it. Estimating from
+/// the inner query's cardinality is a recorded lever.
+pub const IN_SUBQUERY_FALLBACK: f64 = 0.5;
+
 /// Estimate the selectivity of `pred` against rows of a single
 /// (possibly joined) schema. `column_stats[i]` is the stats row for
 /// the column at tuple-global index `i`, or `None` if unanalyzed.
@@ -110,6 +118,12 @@ pub fn estimate_predicate_selectivity(
         // WHY a constant: see `IS_NULL_FALLBACK` — the row count needed to
         // turn `null_count` into a fraction isn't in scope here.
         Predicate::IsNull(_) => IS_NULL_FALLBACK,
+        // WHY a constant: an uncorrelated `IN`/`EXISTS` subquery's selectivity
+        // depends on the (unmaterialized-at-plan-time) inner result set, which
+        // isn't in scope here — the subquery is executed independently. A
+        // moderate default keeps it from biasing join ordering either way;
+        // estimating from the inner cardinality is a recorded lever.
+        Predicate::InSubquery { .. } => IN_SUBQUERY_FALLBACK,
     };
     raw.clamp(MIN_SELECTIVITY, 1.0)
 }

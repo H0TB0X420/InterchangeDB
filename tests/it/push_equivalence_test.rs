@@ -221,6 +221,32 @@ fn join_is_equivalent() {
 }
 
 #[test]
+fn subquery_filters_are_equivalent() {
+    let (mut s, _dir) = setup();
+    // The session resolves subqueries before planning (model-independent), so
+    // both models see the same spliced literal / materialized set. The scalar
+    // form is invisible (a literal); the IN / NOT IN / EXISTS forms compile an
+    // `InSubquery` closure that Push's native `FilterSink` and Volcano's
+    // `Filter` both capture from the same set — they must agree row for row.
+    assert_equivalent(
+        &mut s,
+        "SELECT i_id FROM item WHERE i_price > (SELECT MIN(i_price) FROM item)",
+    );
+    assert_equivalent(
+        &mut s,
+        "SELECT i_id FROM item WHERE i_id IN (SELECT s_id FROM stock)",
+    );
+    assert_equivalent(
+        &mut s,
+        "SELECT i_id FROM item WHERE i_id NOT IN (SELECT s_id FROM stock)",
+    );
+    assert_equivalent(
+        &mut s,
+        "SELECT i_id FROM item WHERE EXISTS (SELECT s_id FROM stock WHERE s_qty > 100)",
+    );
+}
+
+#[test]
 fn dml_round_trips_through_push() {
     // DML delegates to the shared operator builder, so running it under Push
     // mutates exactly as under Volcano. Apply an UPDATE in Push mode, then

@@ -30,6 +30,7 @@
 //! anonymous `?` form requires occurrence-order tracking in the binder
 //! and is deferred — Phase 14 territory.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::catalog::{Catalog, ColumnDef, Schema};
@@ -41,9 +42,18 @@ use crate::sql::frontend::parse;
 use crate::sql::ir::logical::LogicalPlan;
 use crate::sql::planner::{PhysicalPlan, Planner};
 use crate::sql::workload_log::WorkloadLog;
+use crate::sql::InSubquerySet;
 use crate::storage::StorageEngine;
 use crate::txn::{TxnId, TxnMode};
 use crate::types::Value;
+
+/// Upper bound on rows an uncorrelated `IN` subquery may materialize into a
+/// set. These rows are already in memory (the inner query ran to completion),
+/// so this is a guard against a pathologically large set. The row count is
+/// user-triggerable (any subquery can return arbitrarily many rows), so
+/// exceeding it is a returned error, NOT a panic — per the max-bound rule
+/// (see `materialize_in_set`).
+const MAX_IN_SUBQUERY_ROWS: usize = 1 << 20;
 
 /// A parsed + bound SQL statement, ready for repeated execution with
 /// different parameter bindings. Returned by `Session::prepare`.
@@ -232,6 +242,26 @@ impl<E: StorageEngine + 'static> Session<E> {
             }
         };
 
+        // Resolve uncorrelated subqueries against THIS engine handle (same
+        // snapshot) BEFORE planning: run each scalar subquery and splice its
+        // value as a literal, and materialize each IN/EXISTS subquery into a
+        // set the executor build captures. SELECT-shaped only — EXPLAIN renders
+        // subqueries in the planner (never executing them) and DML has none, so
+        // both pass through with empty sets.
+        let (logical, in_sets) = if is_select_shape {
+            match self.resolve_select_subqueries(logical, &engine_handle) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    if implicit {
+                        let _ = self.database.txn_abort(txn_id);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            (logical, Vec::new())
+        };
+
         let physical = match self.planner.plan(logical, &self.catalog) {
             Ok(p) => p,
             Err(e) => {
@@ -242,7 +272,7 @@ impl<E: StorageEngine + 'static> Session<E> {
             }
         };
 
-        let result = self.run_physical(physical, is_select_shape, &engine_handle);
+        let result = self.run_physical(physical, is_select_shape, &engine_handle, &in_sets);
 
         if implicit {
             match &result {
@@ -260,6 +290,7 @@ impl<E: StorageEngine + 'static> Session<E> {
         physical: PhysicalPlan,
         is_select_shape: bool,
         engine: &Arc<H>,
+        subqueries: &[InSubquerySet],
     ) -> Result<QueryResult>
     where
         H: StorageEngine + 'static,
@@ -268,7 +299,7 @@ impl<E: StorageEngine + 'static> Session<E> {
             PhysicalPlan::Query(physop) => {
                 let (schema, rows) =
                     self.execution_model
-                        .execute(&physop, engine, &self.catalog)?;
+                        .execute(&physop, engine, &self.catalog, subqueries)?;
                 if is_select_shape {
                     Ok(QueryResult::Rows { schema, rows })
                 } else {
@@ -282,6 +313,83 @@ impl<E: StorageEngine + 'static> Session<E> {
             // is even called — they shouldn't reach here.
             other => Err(Error::SqlParse(format!(
                 "session: unexpected physical plan in run_physical: {:?}",
+                kind_name(&other)
+            ))),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Uncorrelated subquery resolution (H4b)
+    // -----------------------------------------------------------------------
+
+    /// Resolve a SELECT's uncorrelated subqueries against `engine` (the same
+    /// snapshot the outer query reads): run each scalar subquery and substitute
+    /// its single value as a literal, and materialize each IN/EXISTS subquery
+    /// into an `InSubquerySet`. Returns the substituted plan (planners then see
+    /// literals) and the slot-indexed IN/EXISTS sets. Recurses: an inner query
+    /// resolves its OWN subqueries through `run_subquery` before it runs.
+    /// A non-SELECT plan, or a SELECT with no subqueries, is returned unchanged
+    /// with empty sets.
+    fn resolve_select_subqueries<H>(
+        &self,
+        logical: LogicalPlan,
+        engine: &Arc<H>,
+    ) -> Result<(LogicalPlan, Vec<InSubquerySet>)>
+    where
+        H: StorageEngine + 'static,
+    {
+        let (scalar_plans, in_plans) = match &logical {
+            LogicalPlan::Select {
+                scalar_subqueries,
+                in_subqueries,
+                ..
+            } if !scalar_subqueries.is_empty() || !in_subqueries.is_empty() => {
+                (scalar_subqueries.clone(), in_subqueries.clone())
+            }
+            // No subqueries (or not a SELECT): nothing to resolve.
+            _ => return Ok((logical, Vec::new())),
+        };
+
+        // Scalar subqueries first: run each, reduce to a value, then substitute
+        // every `SubqueryResult(slot)` with `Literal(values[slot])`. A SEPARATE
+        // namespace from user `$N` parameters (substituted earlier in
+        // `execute_prepared`), so this pass cannot clobber — nor be clobbered
+        // by — a prepared statement's bound parameters.
+        let mut scalar_values = Vec::with_capacity(scalar_plans.len());
+        for plan in scalar_plans {
+            let rows = self.run_subquery(plan, engine)?;
+            scalar_values.push(scalar_value_of(rows)?);
+        }
+        let logical = logical.substitute_subquery_results(&scalar_values)?;
+
+        // IN/EXISTS subqueries: materialize each into a set, slot-indexed to
+        // match `Predicate::InSubquery.subquery`.
+        let mut in_sets = Vec::with_capacity(in_plans.len());
+        for plan in in_plans {
+            let rows = self.run_subquery(plan, engine)?;
+            in_sets.push(materialize_in_set(rows)?);
+        }
+        Ok((logical, in_sets))
+    }
+
+    /// Plan and run one subquery's inner query through the same engine handle,
+    /// resolving ITS subqueries first (nesting is bounded by the binder's
+    /// depth limit). Returns the raw output rows.
+    fn run_subquery<H>(&self, logical: LogicalPlan, engine: &Arc<H>) -> Result<Vec<Tuple>>
+    where
+        H: StorageEngine + 'static,
+    {
+        let (resolved, in_sets) = self.resolve_select_subqueries(logical, engine)?;
+        let physical = self.planner.plan(resolved, &self.catalog)?;
+        match physical {
+            PhysicalPlan::Query(physop) => {
+                let (_schema, rows) =
+                    self.execution_model
+                        .execute(&physop, engine, &self.catalog, &in_sets)?;
+                Ok(rows)
+            }
+            other => Err(Error::SqlParse(format!(
+                "session: subquery planned to a non-query {:?}",
                 kind_name(&other)
             ))),
         }
@@ -436,6 +544,63 @@ fn is_write(plan: &LogicalPlan) -> bool {
         LogicalPlan::Explain(_) => false,
         _ => false,
     }
+}
+
+/// Reduce a scalar subquery's output to a single `Value`: 0 rows → NULL
+/// (SQL scalar-subquery semantics), 1 row → its (sole) column value, more
+/// than 1 → a loud runtime error. The binder guarantees exactly one output
+/// column, so the row's first element is the value.
+fn scalar_value_of(rows: Vec<Tuple>) -> Result<Value> {
+    match rows.len() {
+        0 => Ok(Value::Null),
+        1 => Ok(rows
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Null)),
+        n => Err(Error::SqlParse(format!(
+            "scalar subquery returned {} rows (expected at most 1)",
+            n
+        ))),
+    }
+}
+
+/// Materialize an IN/EXISTS subquery's rows into an `InSubquerySet`. The value
+/// set holds each first-column value `join_key_normalized` (so `IN` matches
+/// exactly as `=` does); NULLs are excluded from the set and recorded in
+/// `has_null` (the 3VL in `eval_in` needs "a NULL was present" distinct from
+/// "absent"). `nonempty` drives `EXISTS`.
+fn materialize_in_set(rows: Vec<Tuple>) -> Result<InSubquerySet> {
+    // A subquery's row count is user-triggerable, so an over-limit set must not
+    // panic — refuse loudly instead, naming the count and limit (the
+    // MAX_IN_LIST_ITEMS pattern).
+    if rows.len() > MAX_IN_SUBQUERY_ROWS {
+        return Err(Error::SqlParse(format!(
+            "IN subquery produced {} rows, exceeding MAX_IN_SUBQUERY_ROWS ({})",
+            rows.len(),
+            MAX_IN_SUBQUERY_ROWS
+        )));
+    }
+    let nonempty = !rows.is_empty();
+    let mut has_null = false;
+    let mut values = HashSet::with_capacity(rows.len());
+    for row in rows {
+        // Exactly one column for IN (binder-enforced); EXISTS ignores the value
+        // but a row always has at least one column.
+        let value = row.into_iter().next().unwrap_or(Value::Null);
+        if matches!(value, Value::Null) {
+            has_null = true;
+        } else {
+            values.insert(value.join_key_normalized());
+        }
+    }
+    Ok(InSubquerySet {
+        values: Arc::new(values),
+        has_null,
+        nonempty,
+    })
 }
 
 fn extract_count(rows: Vec<Tuple>) -> Result<u64> {

@@ -1,0 +1,192 @@
+# Uncorrelated subqueries (H4b): scalar (→ spliced literal), IN / NOT IN
+# (→ constant-set filter, NULL-aware 3VL), and EXISTS / NOT EXISTS (→ a
+# statement constant). The session runs each inner query through the same
+# engine handle BEFORE planning; scalars become literals, IN/EXISTS become
+# materialized sets the Filter closure captures. Correlated forms are a loud,
+# named refusal — this phase is uncorrelated only.
+
+statement ok
+CREATE TABLE t (a INT PRIMARY KEY, b INT)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+statement ok
+CREATE TABLE s (x INT PRIMARY KEY, y INT)
+
+statement ok
+INSERT INTO s VALUES (2, 100), (3, 200)
+
+# `nn.v` carries a NULL — the null-aware IN / NOT IN pins depend on it.
+statement ok
+CREATE TABLE nn (k INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO nn VALUES (1, 2), (2, NULL)
+
+# ---- scalar subquery in WHERE (compare operands) -------------------------
+# COUNT(*) of s is 2, spliced as a literal → a = 2.
+query I
+SELECT a FROM t WHERE a = (SELECT COUNT(*) FROM s)
+----
+2
+
+# MIN(a) of t is 1 → a > 1.
+query I
+SELECT a FROM t WHERE a > (SELECT MIN(a) FROM t) ORDER BY a
+----
+2
+3
+4
+
+# ---- scalar subquery in HAVING (Q11 shape) -------------------------------
+# Each b is its own group (SUM(a) = a); keep groups with SUM(a) > 2.
+query II
+SELECT b, SUM(a) FROM t GROUP BY b HAVING SUM(a) > (SELECT COUNT(*) FROM s) ORDER BY b
+----
+30 3
+40 4
+
+# ---- 0-row scalar subquery is NULL ---------------------------------------
+# Inner returns no row → NULL; `a = NULL` is UNKNOWN → zero rows.
+query I
+SELECT a FROM t WHERE a = (SELECT a FROM t WHERE a = 999)
+----
+
+# ---- >1-row scalar subquery is a loud runtime error ----------------------
+statement error scalar subquery returned
+SELECT a FROM t WHERE a = (SELECT a FROM t)
+
+# ---- IN / NOT IN (no NULL in the set) ------------------------------------
+# s.x = {2, 3}.
+query I
+SELECT a FROM t WHERE a IN (SELECT x FROM s) ORDER BY a
+----
+2
+3
+
+query I
+SELECT a FROM t WHERE a NOT IN (SELECT x FROM s) ORDER BY a
+----
+1
+4
+
+# ---- IN over a set containing NULL ---------------------------------------
+# nn.v = {2, NULL}: a=2 is contained (TRUE); every other a is absent but the
+# NULL makes it UNKNOWN, not FALSE — so only a=2 survives.
+query I
+SELECT a FROM t WHERE a IN (SELECT v FROM nn) ORDER BY a
+----
+2
+
+# ---- NOT IN over a set containing NULL is the classic zero-rows trap ------
+# a NOT IN (2, NULL) is UNKNOWN for EVERY a (contained → FALSE; absent →
+# has_null → UNKNOWN), so nothing survives.
+query I
+SELECT a FROM t WHERE a NOT IN (SELECT v FROM nn)
+----
+
+# ---- empty-set, both directions ------------------------------------------
+# NOT IN over the empty set → all rows; IN over the empty set → none.
+query I
+SELECT a FROM t WHERE a NOT IN (SELECT x FROM s WHERE x = 999) ORDER BY a
+----
+1
+2
+3
+4
+
+query I
+SELECT a FROM t WHERE a IN (SELECT x FROM s WHERE x = 999)
+----
+
+# A NULL probe survives NOT IN over the EMPTY set too: `IN (empty)` is
+# vacuously FALSE (nothing to equal), so `NOT IN (empty)` is TRUE even for a
+# NULL probe (SQL vacuous truth; Postgres agrees). `nn.v` carries a NULL at
+# k=2 — BOTH rows survive (the NULL row is not dropped).
+query I
+SELECT k FROM nn WHERE v NOT IN (SELECT x FROM s WHERE x = 999) ORDER BY k
+----
+1
+2
+
+# IN over the EMPTY set is FALSE for every probe, a NULL probe included → none.
+query I
+SELECT k FROM nn WHERE v IN (SELECT x FROM s WHERE x = 999)
+----
+
+# ---- EXISTS / NOT EXISTS -------------------------------------------------
+# s is non-empty → EXISTS true (all rows), NOT EXISTS false (none).
+query I
+SELECT a FROM t WHERE EXISTS (SELECT x FROM s) ORDER BY a
+----
+1
+2
+3
+4
+
+query I
+SELECT a FROM t WHERE NOT EXISTS (SELECT x FROM s)
+----
+
+# Empty inner → EXISTS false (none), NOT EXISTS true (all rows).
+query I
+SELECT a FROM t WHERE EXISTS (SELECT x FROM s WHERE x = 999)
+----
+
+query I
+SELECT a FROM t WHERE NOT EXISTS (SELECT x FROM s WHERE x = 999) ORDER BY a
+----
+1
+2
+3
+4
+
+# IN inside a larger conjunction (routes as one opaque conjunct).
+query I
+SELECT a FROM t WHERE b > 15 AND a IN (SELECT x FROM s) ORDER BY a
+----
+2
+3
+
+# ---- one-column contracts ------------------------------------------------
+statement error exactly one column
+SELECT a FROM t WHERE a IN (SELECT x, y FROM s)
+
+statement error exactly one column
+SELECT a FROM t WHERE a = (SELECT x, y FROM s WHERE x = 2)
+
+# ---- correlated reference is a named refusal -----------------------------
+# `b` is unknown in the inner scope (s) but resolvable in the outer (t) — a
+# correlated reference, unsupported this phase.
+statement error correlated subqueries not yet supported
+SELECT a FROM t WHERE a IN (SELECT x FROM s WHERE b = 2)
+
+# Qualified correlated reference (`t.b`) — same refusal.
+statement error correlated subqueries not yet supported
+SELECT a FROM t WHERE a = (SELECT y FROM s WHERE y = t.b)
+
+# A typo'd qualifier is a plain scope error, NOT a correlation misdiagnosis.
+# `zzz` matches no relation here or in any enclosing scope. The column name
+# `b` DOES exist in the outer table `t`, but an unknown qualifier is always
+# "not in FROM scope" — the diagnosis keys on the QUALIFIER, not the column
+# name (the prior check keyed on the name and misread this typo as correlated).
+statement error not in FROM scope
+SELECT a FROM t WHERE a IN (SELECT x FROM s WHERE zzz.b = 2)
+
+# ---- depth bound (MAX_DERIVED_DEPTH shared) ------------------------------
+# Five nested scalar subqueries exceed the bound; the fifth is rejected.
+statement error nested deeper
+SELECT a FROM t WHERE a = (SELECT a FROM t WHERE a = (SELECT a FROM t WHERE a = (SELECT a FROM t WHERE a = (SELECT a FROM t WHERE a = (SELECT MIN(a) FROM t)))))
+
+# ---- EXPLAIN renders each subquery under a Subquery[i]: header ------------
+# The outer plan keeps the Filter (the InSubquery predicate is not printed);
+# the subquery plan follows, never executed.
+query T
+EXPLAIN SELECT * FROM t WHERE a IN (SELECT x FROM s)
+----
+Filter
+SeqScan(t)
+Subquery[0]:
+Projection([0])
+SeqScan(s)

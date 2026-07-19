@@ -215,13 +215,29 @@ where
         LogicalPlan::CommitTxn => Ok(PhysicalPlan::CommitTxn),
         LogicalPlan::AbortTxn => Ok(PhysicalPlan::AbortTxn),
         LogicalPlan::Explain(inner) => {
+            // Capture the subquery inner plans BEFORE planning consumes
+            // `inner` (the reordering planners may drop the lists during
+            // reconstruction). Rendered under `Subquery[i]:` headers after
+            // the outer plan; NEVER executed (EXPLAIN plans only).
+            let subplans = subquery_plans_of(&inner);
             let inner_phys = plan_inner(*inner, catalog, selection)?;
-            Ok(PhysicalPlan::Explain(render_explain(&inner_phys)))
+            let mut text = render_explain(&inner_phys);
+            for (i, sub) in subplans.into_iter().enumerate() {
+                let sub_phys = plan_inner(sub, catalog, selection)?;
+                text.push_str(&format!("Subquery[{}]:\n{}", i, render_explain(&sub_phys)));
+            }
+            Ok(PhysicalPlan::Explain(text))
         }
         LogicalPlan::Select {
             table,
             joins,
             derived,
+            // Subqueries are resolved by the session before planning (scalars
+            // substituted to literals, IN/EXISTS materialized into sets); the
+            // planner treats their leftovers as vestigial. EXPLAIN reads them
+            // via the `Explain` arm above, not here.
+            scalar_subqueries: _,
+            in_subqueries: _,
             projection,
             aggregates,
             select_list,
@@ -1038,6 +1054,15 @@ pub(crate) fn referenced_columns(pred: &Predicate, out: &mut Vec<usize>) {
         Predicate::Not(p) => referenced_columns(p, out),
         Predicate::Like { expr, .. } => columns_in_expr(expr, out),
         Predicate::IsNull(expr) => columns_in_expr(expr, out),
+        // Only the probe expression touches the OUTER tuple; the subquery's
+        // own columns live in a separate coordinate space (and it is
+        // uncorrelated). `EXISTS` (expr = None) references no outer column —
+        // it stays a residual constant, matching `Bucket::NoColumns` routing.
+        Predicate::InSubquery { expr, .. } => {
+            if let Some(e) = expr {
+                columns_in_expr(e, out);
+            }
+        }
     }
 }
 
@@ -1045,7 +1070,9 @@ pub(crate) fn referenced_columns(pred: &Predicate, out: &mut Vec<usize>) {
 fn columns_in_expr(expr: &Expression, out: &mut Vec<usize>) {
     match expr {
         Expression::Column(i) => out.push(*i),
-        Expression::Literal(_) | Expression::Parameter(_) => {}
+        // A `SubqueryResult` is resolved to a `Literal` before planning, just
+        // like `Parameter`; neither references an input column.
+        Expression::Literal(_) | Expression::Parameter(_) | Expression::SubqueryResult(_) => {}
         Expression::BinaryOp { left, right, .. } => {
             columns_in_expr(left, out);
             columns_in_expr(right, out);
@@ -1316,7 +1343,9 @@ fn shift_expr(expr: Expression, delta: isize) -> Expression {
             assert!(shifted >= 0, "column {i} shifted below zero by {delta}");
             Expression::Column(shifted as usize)
         }
-        lit_or_param @ (Expression::Literal(_) | Expression::Parameter(_)) => lit_or_param,
+        lit_or_param @ (Expression::Literal(_)
+        | Expression::Parameter(_)
+        | Expression::SubqueryResult(_)) => lit_or_param,
         Expression::BinaryOp { op, left, right } => Expression::BinaryOp {
             op,
             left: Box::new(shift_expr(*left, delta)),
@@ -1358,6 +1387,17 @@ pub(crate) fn shift_predicate(pred: Predicate, delta: isize) -> Predicate {
             pattern,
         },
         Predicate::IsNull(expr) => Predicate::IsNull(shift_expr(expr, delta)),
+        // Only the probe lives in the (shiftable) outer tuple; the subquery
+        // index and inner plan are coordinate-independent.
+        Predicate::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Predicate::InSubquery {
+            expr: expr.map(|e| shift_expr(e, delta)),
+            subquery,
+            negated,
+        },
     }
 }
 
@@ -1539,6 +1579,24 @@ where
 /// the `PhysOp` IR directly (engine-free — no build, no scan); for descriptors
 /// it emits a one-line summary.
 /// `pub(crate)`: the memo planner renders its own EXPLAIN arm (T17-A.6).
+/// The inner plans of every subquery a `SELECT` carries (scalar first, then
+/// IN/EXISTS), in slot order — the plans EXPLAIN renders under `Subquery[i]:`
+/// headers. Empty for any non-`SELECT` or a `SELECT` with no subqueries.
+fn subquery_plans_of(logical: &LogicalPlan) -> Vec<LogicalPlan> {
+    match logical {
+        LogicalPlan::Select {
+            scalar_subqueries,
+            in_subqueries,
+            ..
+        } => scalar_subqueries
+            .iter()
+            .chain(in_subqueries.iter())
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn render_explain(plan: &PhysicalPlan) -> String {
     match plan {
         PhysicalPlan::Query(physop) => physop.explain(0),
@@ -1879,6 +1937,8 @@ Limit(3)
             table: "nonexistent".to_string(),
             joins: vec![],
             derived: vec![],
+            scalar_subqueries: vec![],
+            in_subqueries: vec![],
             projection: vec![],
             aggregates: vec![],
             select_list: vec![],

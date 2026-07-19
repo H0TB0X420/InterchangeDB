@@ -60,6 +60,45 @@ pub struct Binder<E: StorageEngine> {
 /// match the schema's column order directly (`column_offset == 0`).
 struct Scope {
     tables: Vec<ScopedTable>,
+    /// Column names resolvable in ENCLOSING scopes (H4b correlation
+    /// detection). A subquery is bound in a FRESH scope; if it references a
+    /// column absent from its own `tables` but present here, it is a
+    /// correlated reference — unsupported this phase, rejected with the column
+    /// named. Never used for RESOLUTION (uncorrelated by construction), only to
+    /// turn a "column not found" into the precise "correlated" diagnosis.
+    /// Empty for every top-level statement (no enclosing scope).
+    correlated_names: Vec<String>,
+    /// Table/alias QUALIFIERS exposed by ENCLOSING scopes. A qualified ref
+    /// `q.col` whose `q` matches one of these is a correlated reference
+    /// (unsupported); a `q` matching NOTHING — this scope or any enclosing —
+    /// is a typo, always the plain "not in FROM scope" error. Keyed on the
+    /// QUALIFIER (not the column name), so `outer_col`-shaped typos aren't
+    /// misdiagnosed as correlation. Empty for every top-level statement.
+    correlated_qualifiers: Vec<String>,
+}
+
+/// Statement-level accumulator threaded through predicate/comparison binding
+/// so an uncorrelated subquery (scalar, IN, or EXISTS) in a WHERE / HAVING /
+/// ON position collects its already-bound inner plan into the right list and
+/// yields the matching IR leaf (`SubqueryResult` for scalar, `InSubquery` for
+/// IN/EXISTS). `binder` recurses into the inner query; `depth` bounds that
+/// recursion alongside `MAX_DERIVED_DEPTH`.
+struct SubqueryCtx<'a, E: StorageEngine> {
+    binder: &'a Binder<E>,
+    depth: usize,
+    scalar_subqueries: Vec<LogicalPlan>,
+    in_subqueries: Vec<LogicalPlan>,
+}
+
+impl<'a, E: StorageEngine> SubqueryCtx<'a, E> {
+    fn new(binder: &'a Binder<E>, depth: usize) -> Self {
+        Self {
+            binder,
+            depth,
+            scalar_subqueries: Vec::new(),
+            in_subqueries: Vec::new(),
+        }
+    }
 }
 
 struct ScopedTable {
@@ -126,7 +165,38 @@ impl Scope {
                 schema,
                 column_offset: 0,
             }],
+            correlated_names: Vec::new(),
+            correlated_qualifiers: Vec::new(),
         }
+    }
+
+    /// Every column name this scope can RESOLVE (its own tables' columns),
+    /// plus the names it inherited from enclosing scopes — the set a nested
+    /// subquery consults to distinguish a genuine unknown column from a
+    /// correlated outer reference.
+    fn resolvable_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tables
+            .iter()
+            .flat_map(|t| t.schema.columns.iter().map(|c| c.name.clone()))
+            .collect();
+        names.extend(self.correlated_names.iter().cloned());
+        names
+    }
+
+    /// Every table/alias QUALIFIER a nested subquery could see in enclosing
+    /// scopes: this scope's own exposed relation names (its alias if aliased,
+    /// else its table name) plus the qualifiers it inherited. A subquery
+    /// consults this to tell a correlated `outer_tbl.col` reference
+    /// (unsupported) from a simple typo'd qualifier ("not in FROM scope").
+    fn resolvable_qualifiers(&self) -> Vec<String> {
+        let mut quals: Vec<String> = self
+            .tables
+            .iter()
+            .map(|t| t.alias.clone().unwrap_or_else(|| t.table_name.clone()))
+            .collect();
+        quals.extend(self.correlated_qualifiers.iter().cloned());
+        quals
     }
 
     /// Append another table to the scope. The new table's
@@ -415,14 +485,24 @@ impl<E: StorageEngine> Binder<E> {
         // schema ingredients (`input` / `output_aliases`) are discarded, so a
         // top-level query never runs the output-typing pass — its type errors
         // stay at executor build time, exactly as before.
-        Ok(self.bind_select_query(q, 0)?.plan)
+        Ok(self.bind_select_query(q, 0, Vec::new(), Vec::new())?.plan)
     }
 
     /// Bind a SELECT body, returning the plan plus what a derived table needs
-    /// to type its output schema. `depth` is the FROM-subquery nesting level
-    /// (0 = top level); each derived table recurses at `depth + 1`, bounded by
-    /// `MAX_DERIVED_DEPTH`.
-    fn bind_select_query(&self, q: Query, depth: usize) -> Result<BoundSelect> {
+    /// to type its output schema. `depth` is the FROM-subquery / subquery
+    /// nesting level (0 = top level); each derived table or subquery recurses
+    /// at `depth + 1`, bounded by `MAX_DERIVED_DEPTH`. `correlated_names` /
+    /// `correlated_qualifiers` are the column names / table-alias qualifiers
+    /// resolvable in ENCLOSING scopes — non-empty only when this is a subquery,
+    /// and used purely to diagnose a correlated reference (this phase binds
+    /// uncorrelated subqueries only).
+    fn bind_select_query(
+        &self,
+        q: Query,
+        depth: usize,
+        correlated_names: Vec<String>,
+        correlated_qualifiers: Vec<String>,
+    ) -> Result<BoundSelect> {
         let limit = match q.limit {
             Some(AstExpr::Value(AstValue::Number(n, _))) => {
                 Some(n.parse::<usize>().map_err(|e| {
@@ -469,9 +549,15 @@ impl<E: StorageEngine> Binder<E> {
         // Build a scope incrementally + a parallel `JoinClause` list. The
         // first table becomes `LogicalPlan::Select::table`; the rest become
         // entries in `joins`.
-        let mut scope = Scope { tables: Vec::new() };
+        let mut scope = Scope {
+            tables: Vec::new(),
+            correlated_names,
+            correlated_qualifiers,
+        };
         let mut joined_tables: Vec<(String, Option<String>, Option<AstExpr>, JoinKind)> =
             Vec::new();
+        // Subquery accumulator for this SELECT's WHERE / HAVING / ON positions.
+        let mut ctx = SubqueryCtx::new(self, depth);
         // FROM-subqueries collected as we resolve the FROM factors (H4a).
         let mut derived: Vec<DerivedTable> = Vec::new();
 
@@ -548,7 +634,7 @@ impl<E: StorageEngine> Binder<E> {
             Vec::with_capacity(joined_tables.len());
         for (right_table, right_alias, on_expr, kind) in joined_tables {
             let on = match on_expr {
-                Some(e) => Some(bind_predicate(&scope, e)?),
+                Some(e) => Some(bind_predicate(&scope, e, &mut ctx)?),
                 None => None,
             };
             joins.push(crate::sql::ir::logical::JoinClause {
@@ -587,13 +673,25 @@ impl<E: StorageEngine> Binder<E> {
         // `output_aliases` (H4a step 1) names the derived-table schema when
         // this SELECT is a FROM-subquery; it is positionally aligned with the
         // output columns and ignored for top-level queries.
-        let (projection, aggregates, select_list, output_aliases) =
-            bind_select_items(&scope, &select.projection, &group_cols)?;
+        let (projection, mut aggregates, mut select_list, output_aliases) =
+            bind_select_items(&scope, &select.projection, &group_cols, self)?;
+
+        // A query is aggregated iff it groups OR the SELECT list already
+        // contains an aggregate. HAVING / ORDER BY may reference an aggregate
+        // that is NOT in the SELECT list (Q18's `HAVING SUM(l_quantity) > n`
+        // over a subquery projecting only `l_orderkey`); those aggregates are
+        // COMPUTED (appended below) and PROJECTED OUT of the display. Remember
+        // how many aggregates are display aggregates so the trailing
+        // computed-only ones can be dropped.
+        let is_aggregated = !group_cols.is_empty() || !aggregates.is_empty();
+        let display_agg_count = aggregates.len();
 
         // Grouping rules. The IR carries group keys IN `projection`
         // (LogicalPlan::Select's contract), so the GROUP BY clause and the
         // projected plain columns must name the same set — each direction
-        // violated gets its own blame.
+        // violated gets its own blame. The "GROUP BY needs an aggregate"
+        // check is deferred until after HAVING/ORDER BY (either may supply the
+        // sole aggregate).
         if group_cols.is_empty() {
             if !projection.is_empty() && !aggregates.is_empty() {
                 return Err(Error::SqlParse(
@@ -601,12 +699,6 @@ impl<E: StorageEngine> Binder<E> {
                 ));
             }
         } else {
-            if aggregates.is_empty() {
-                return Err(Error::SqlParse(
-                    "binder: GROUP BY without aggregates not supported (did you mean DISTINCT?)"
-                        .into(),
-                ));
-            }
             for &p in &projection {
                 if !group_cols.contains(&p) {
                     return Err(Error::SqlParse(format!(
@@ -627,20 +719,28 @@ impl<E: StorageEngine> Binder<E> {
 
         // WHERE clause.
         let filter = match select.selection {
-            Some(e) => Some(bind_predicate(&scope, e)?),
+            Some(e) => Some(bind_predicate(&scope, e, &mut ctx)?),
             None => None,
         };
 
-        // HAVING filters the aggregate output row — legal with GROUP BY
-        // and with whole-table aggregates, meaningless without either.
+        // HAVING filters the aggregate output row — legal only for an
+        // aggregated query (GROUP BY or a whole-table aggregate). A HAVING
+        // aggregate absent from the SELECT list is appended to `aggregates`
+        // (computed, then projected out).
         let having = match select.having {
             Some(e) => {
-                if aggregates.is_empty() {
+                if !is_aggregated {
                     return Err(Error::SqlParse(
                         "binder: HAVING requires an aggregate in the SELECT list".into(),
                     ));
                 }
-                Some(bind_having_predicate(&scope, e, &projection, &aggregates)?)
+                Some(bind_having_predicate(
+                    &scope,
+                    e,
+                    &projection,
+                    &mut aggregates,
+                    &mut ctx,
+                )?)
             }
             None => None,
         };
@@ -655,14 +755,15 @@ impl<E: StorageEngine> Binder<E> {
             Some(ob) => {
                 let mut keys: Vec<(usize, OrderDir)> = Vec::with_capacity(ob.exprs.len());
                 for obe in ob.exprs {
-                    let col = if aggregates.is_empty() {
+                    let col = if !is_aggregated {
                         resolve_column_expr(&scope, &obe.expr)?
                     } else {
                         resolve_aggregate_output_column(
                             &scope,
                             &obe.expr,
                             &projection,
-                            &aggregates,
+                            &mut aggregates,
+                            self,
                         )?
                     };
                     let dir = match obe.asc {
@@ -675,6 +776,24 @@ impl<E: StorageEngine> Binder<E> {
             }
             None => Vec::new(),
         };
+
+        // Deferred grouping check: a GROUP BY that has produced no aggregate
+        // anywhere (SELECT list, HAVING, or ORDER BY) is meaningless.
+        if !group_cols.is_empty() && aggregates.is_empty() {
+            return Err(Error::SqlParse(
+                "binder: GROUP BY without aggregates not supported (did you mean DISTINCT?)".into(),
+            ));
+        }
+
+        // If HAVING / ORDER BY appended aggregates the SELECT list does not
+        // display, make the display explicit so those trailing aggregates are
+        // projected out. An already-explicit `select_list` references only
+        // display positions (which are unchanged), so leave it alone.
+        if is_aggregated && aggregates.len() > display_agg_count && select_list.is_empty() {
+            select_list = (0..projection.len() + display_agg_count)
+                .map(Expression::Column)
+                .collect();
+        }
 
         // The join-tuple input schema: every scoped relation's columns
         // concatenated in tuple-global order. This is the coordinate space the
@@ -718,6 +837,8 @@ impl<E: StorageEngine> Binder<E> {
             table: table_name,
             joins,
             derived,
+            scalar_subqueries: ctx.scalar_subqueries,
+            in_subqueries: ctx.in_subqueries,
             projection,
             aggregates,
             select_list,
@@ -731,6 +852,91 @@ impl<E: StorageEngine> Binder<E> {
             input,
             output_aliases,
         })
+    }
+
+    /// Bind an uncorrelated subquery's inner query in a FRESH scope, depth-
+    /// bounded. `outer.resolvable_names()` travels into the inner scope for
+    /// correlation DETECTION only (a reference to one becomes the loud
+    /// "correlated subqueries not yet supported" error). Shared by the scalar,
+    /// IN, and EXISTS binders below.
+    fn bind_subquery_inner(
+        &self,
+        subquery: Query,
+        outer: &Scope,
+        depth: usize,
+    ) -> Result<BoundSelect> {
+        if depth + 1 > MAX_DERIVED_DEPTH {
+            return Err(Error::SqlParse(format!(
+                "binder: subqueries nested deeper than {} levels not supported",
+                MAX_DERIVED_DEPTH
+            )));
+        }
+        self.bind_select_query(
+            subquery,
+            depth + 1,
+            outer.resolvable_names(),
+            outer.resolvable_qualifiers(),
+        )
+    }
+
+    /// Uncorrelated scalar subquery (a compare or HAVING operand). Asserts
+    /// exactly one output column; the caller allocates a slot and emits
+    /// `Expression::SubqueryResult(slot)`.
+    fn bind_scalar_subquery(
+        &self,
+        subquery: Query,
+        outer: &Scope,
+        depth: usize,
+    ) -> Result<LogicalPlan> {
+        let bound = self.bind_subquery_inner(subquery, outer, depth)?;
+        let column_count = bound.derived_columns()?.len();
+        if column_count != 1 {
+            return Err(Error::SqlParse(format!(
+                "binder: scalar subquery must return exactly one column, got {}",
+                column_count
+            )));
+        }
+        Ok(bound.plan)
+    }
+
+    /// Uncorrelated `IN` subquery. Asserts exactly one output column (the
+    /// value set the probe matches against); the caller emits
+    /// `Predicate::InSubquery`.
+    fn bind_in_subquery(
+        &self,
+        subquery: Query,
+        outer: &Scope,
+        depth: usize,
+    ) -> Result<LogicalPlan> {
+        let bound = self.bind_subquery_inner(subquery, outer, depth)?;
+        let column_count = bound.derived_columns()?.len();
+        if column_count != 1 {
+            return Err(Error::SqlParse(format!(
+                "binder: IN subquery must return exactly one column, got {}",
+                column_count
+            )));
+        }
+        Ok(bound.plan)
+    }
+
+    /// Uncorrelated `EXISTS` subquery. No output-arity constraint — EXISTS
+    /// only observes whether ANY row survives — so cap the inner plan at one
+    /// row, letting materialization early-exit at the first row.
+    fn bind_exists_subquery(
+        &self,
+        subquery: Query,
+        outer: &Scope,
+        depth: usize,
+    ) -> Result<LogicalPlan> {
+        let bound = self.bind_subquery_inner(subquery, outer, depth)?;
+        let mut plan = bound.plan;
+        if let LogicalPlan::Select { limit, .. } = &mut plan {
+            *limit = Some(match *limit {
+                Some(existing) => existing.min(1),
+                None => 1,
+            });
+        }
+        Ok(plan)
     }
 
     /// Resolve one FROM `TableFactor` into a scope entry
@@ -781,9 +987,30 @@ impl<E: StorageEngine> Binder<E> {
                     )));
                 }
 
-                // Bind the inner query in a fresh scope (uncorrelated) and
-                // compute its output columns (types + per-item `AS` names).
-                let bound = self.bind_select_query(*subquery, depth + 1)?;
+                // Bind the inner query in a fresh scope (uncorrelated, no
+                // enclosing names) and compute its output columns (types +
+                // per-item `AS` names).
+                let bound = self.bind_select_query(*subquery, depth + 1, Vec::new(), Vec::new())?;
+                // A derived table's inner query is materialized at executor
+                // build time (a `DerivedScan` leaf), NOT through the session's
+                // subquery-resolution pass — so a scalar/IN/EXISTS subquery
+                // INSIDE it would never have its parameter/set resolved. Reject
+                // loudly rather than silently mis-evaluate (recorded lever:
+                // subqueries inside a derived table).
+                if let LogicalPlan::Select {
+                    scalar_subqueries,
+                    in_subqueries,
+                    ..
+                } = &bound.plan
+                {
+                    if !scalar_subqueries.is_empty() || !in_subqueries.is_empty() {
+                        return Err(Error::SqlParse(
+                            "binder: subqueries inside a derived table (FROM-subquery) are not \
+                             supported yet"
+                                .into(),
+                        ));
+                    }
+                }
                 let mut columns = bound.derived_columns()?;
 
                 // Column-list alias `AS d (c1, c2, …)` (Q13 verbatim): a
@@ -948,7 +1175,7 @@ impl<E: StorageEngine> Binder<E> {
             let idx = column_index(&scope, &col_name)?;
             // Single-table scope in UPDATE — table[0] is the target.
             let target_ty = scope.tables[0].schema.columns[idx].ty;
-            let expr = bind_expression(&scope, a.value)?;
+            let expr = bind_expression(&scope, a.value, self)?;
             // The SET result must match the target column's type — Table's
             // update_columns rejects type mismatch outright. Narrow Int64
             // literals (the unconstrained-default for whole numbers) down
@@ -958,10 +1185,15 @@ impl<E: StorageEngine> Binder<E> {
             set_clauses.push((idx, expr));
         }
 
+        // UPDATE has no place to carry subquery plans (its LogicalPlan has no
+        // subquery lists) and no session resolution path, so a WHERE subquery
+        // is rejected via `reject_dml_subqueries` after binding.
+        let mut ctx = SubqueryCtx::new(self, 0);
         let filter = match selection {
-            Some(e) => Some(bind_predicate(&scope, e)?),
+            Some(e) => Some(bind_predicate(&scope, e, &mut ctx)?),
             None => None,
         };
+        reject_unsupported_subqueries(&ctx, "an UPDATE WHERE clause")?;
 
         Ok(LogicalPlan::Update {
             table: table_name,
@@ -1002,10 +1234,12 @@ impl<E: StorageEngine> Binder<E> {
         let schema = self.catalog.get_table(&table_name)?;
         let scope = Scope::single(table_name.clone(), schema);
 
+        let mut ctx = SubqueryCtx::new(self, 0);
         let filter = match del.selection {
-            Some(e) => Some(bind_predicate(&scope, e)?),
+            Some(e) => Some(bind_predicate(&scope, e, &mut ctx)?),
             None => None,
         };
+        reject_unsupported_subqueries(&ctx, "a DELETE WHERE clause")?;
 
         Ok(LogicalPlan::Delete {
             table: table_name,
@@ -1037,6 +1271,15 @@ fn column_index(scope: &Scope, name: &str) -> Result<usize> {
     }
     match hits.len() {
         0 => {
+            // A miss that the ENCLOSING scope could resolve is a correlated
+            // reference — unsupported this phase. Name the column so the
+            // limitation is actionable (H4b handles uncorrelated forms only).
+            if scope.correlated_names.iter().any(|n| n == name) {
+                return Err(Error::SqlParse(format!(
+                    "correlated subqueries not yet supported: column '{}' refers to an outer query",
+                    name
+                )));
+            }
             let names: Vec<String> = scope.tables.iter().map(|t| t.table_name.clone()).collect();
             Err(Error::SqlParse(format!(
                 "column '{}' not found in scope (tables: {:?})",
@@ -1072,6 +1315,18 @@ fn column_index_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<
             return Ok(t.column_offset + local);
         }
     }
+    // A qualified reference is correlated only when its QUALIFIER resolves to
+    // an enclosing scope's table/alias (e.g. `WHERE o.x = (SELECT … WHERE
+    // t.y = o.z)` — `o` is the outer relation). Keying on the qualifier, not
+    // the column name, is the fix: a typo'd qualifier whose column name happens
+    // to match an outer column (`zzz.b` where `b` exists outside) is a plain
+    // scope error, never a correlation misdiagnosis.
+    if scope.correlated_qualifiers.iter().any(|q| q == qualifier) {
+        return Err(Error::SqlParse(format!(
+            "correlated subqueries not yet supported: column '{}.{}' refers to an outer query",
+            qualifier, name
+        )));
+    }
     Err(Error::SqlParse(format!(
         "table or alias '{}' not in FROM scope",
         qualifier
@@ -1103,10 +1358,11 @@ fn column_index_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<
 /// output columns (one per item, in item order) in every non-wildcard case;
 /// empty for `SELECT *`. Top-level queries ignore it (their output naming is
 /// unchanged); only derived tables consume it.
-fn bind_select_items(
+fn bind_select_items<E: StorageEngine>(
     scope: &Scope,
     items: &[ast::SelectItem],
     group_cols: &[usize],
+    binder: &Binder<E>,
 ) -> Result<BoundSelectItems> {
     // Single Wildcard → SELECT * (columns keep their catalog names, so no
     // aliases to capture).
@@ -1138,9 +1394,9 @@ fn bind_select_items(
 
     let aggregated = !group_cols.is_empty() || exprs.iter().any(|e| expr_contains_aggregate(e));
     let (projection, aggregates, select_list) = if aggregated {
-        bind_select_items_grouped(scope, &exprs)?
+        bind_select_items_grouped(scope, &exprs, binder)?
     } else {
-        bind_select_items_ungrouped(scope, &exprs)?
+        bind_select_items_ungrouped(scope, &exprs, binder)?
     };
     Ok((projection, aggregates, select_list, aliases))
 }
@@ -1151,13 +1407,14 @@ fn bind_select_items(
 /// reorderings like `SELECT b, a`). Any computed item switches to the
 /// `Compute` path: `projection` empty, `select_list` carries every item in
 /// input coordinates.
-fn bind_select_items_ungrouped(
+fn bind_select_items_ungrouped<E: StorageEngine>(
     scope: &Scope,
     exprs: &[&AstExpr],
+    binder: &Binder<E>,
 ) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<Expression>)> {
     let bound: Vec<Expression> = exprs
         .iter()
-        .map(|e| bind_expression(scope, (*e).clone()))
+        .map(|e| bind_expression(scope, (*e).clone(), binder))
         .collect::<Result<Vec<_>>>()?;
     if bound.iter().all(|e| matches!(e, Expression::Column(_))) {
         let projection = bound
@@ -1184,9 +1441,10 @@ fn bind_select_items_ungrouped(
 /// elides to an empty `select_list`. Two passes so pass 2's key lookups see
 /// the complete key set regardless of display order (`SELECT COUNT(*),
 /// region`).
-fn bind_select_items_grouped(
+fn bind_select_items_grouped<E: StorageEngine>(
     scope: &Scope,
     exprs: &[&AstExpr],
+    binder: &Binder<E>,
 ) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<Expression>)> {
     // Pass 1: group keys = the top-level bare-column items, deduped.
     let mut projection: Vec<usize> = Vec::new();
@@ -1201,7 +1459,13 @@ fn bind_select_items_grouped(
     let mut aggregates: Vec<AggregateSpec> = Vec::new();
     let mut select_list: Vec<Expression> = Vec::with_capacity(exprs.len());
     for e in exprs {
-        select_list.push(bind_output_expr(scope, e, &projection, &mut aggregates)?);
+        select_list.push(bind_output_expr(
+            scope,
+            e,
+            &projection,
+            &mut aggregates,
+            binder,
+        )?);
     }
     if is_identity_select_list(&select_list) {
         select_list.clear();
@@ -1233,15 +1497,16 @@ fn as_bare_column(scope: &Scope, e: &AstExpr) -> Result<Option<usize>> {
 /// are extracted into `aggregates` (deduped by `PartialEq`) and referenced
 /// by their output slot (`projection.len()` + position); bare columns
 /// resolve to their group-key position; arithmetic recurses.
-fn bind_output_expr(
+fn bind_output_expr<E: StorageEngine>(
     scope: &Scope,
     e: &AstExpr,
     projection: &[usize],
     aggregates: &mut Vec<AggregateSpec>,
+    binder: &Binder<E>,
 ) -> Result<Expression> {
     match e {
         AstExpr::Function(func) => {
-            let spec = bind_aggregate_function(scope, func)?;
+            let spec = bind_aggregate_function(scope, func, binder)?;
             let pos = match aggregates.iter().position(|a| *a == spec) {
                 Some(pos) => pos,
                 None => {
@@ -1265,8 +1530,8 @@ fn bind_output_expr(
         }
         AstExpr::BinaryOp { left, op, right } => {
             let arith_op = map_arith_op(op)?;
-            let l = bind_output_expr(scope, left, projection, aggregates)?;
-            let r = bind_output_expr(scope, right, projection, aggregates)?;
+            let l = bind_output_expr(scope, left, projection, aggregates, binder)?;
+            let r = bind_output_expr(scope, right, projection, aggregates, binder)?;
             // NO literal alignment in output space (H2b): aggregate outputs
             // carry their own scales. Div is now native max-scale
             // (`Decimal::div`), so the left-associative `100.00 * SUM(x) /
@@ -1286,7 +1551,7 @@ fn bind_output_expr(
                 ast_value_to_value_unconstrained(AstValue::Number(format!("-{}", n), false))?,
             )),
             other => {
-                let inner = bind_output_expr(scope, other, projection, aggregates)?;
+                let inner = bind_output_expr(scope, other, projection, aggregates, binder)?;
                 Ok(Expression::BinaryOp {
                     op: BinaryOp::Sub,
                     left: Box::new(Expression::Literal(Value::Int64(0))),
@@ -1297,7 +1562,7 @@ fn bind_output_expr(
         AstExpr::Value(v) => Ok(Expression::Literal(ast_value_to_value_unconstrained(
             v.clone(),
         )?)),
-        AstExpr::Nested(inner) => bind_output_expr(scope, inner, projection, aggregates),
+        AstExpr::Nested(inner) => bind_output_expr(scope, inner, projection, aggregates, binder),
         other => Err(Error::SqlParse(format!(
             "binder: SELECT item shape unsupported: {:?}",
             other
@@ -1355,22 +1620,28 @@ fn column_name_at(scope: &Scope, idx: usize) -> String {
 /// (keys ++ aggregates): a plain column must be a group key (→ its
 /// position in `projection`); an aggregate call must match a SELECT-list
 /// spec (→ `projection.len()` + its position).
-fn resolve_aggregate_output_column(
+fn resolve_aggregate_output_column<E: StorageEngine>(
     scope: &Scope,
     e: &AstExpr,
     projection: &[usize],
-    aggregates: &[AggregateSpec],
+    aggregates: &mut Vec<AggregateSpec>,
+    binder: &Binder<E>,
 ) -> Result<usize> {
     match e {
         AstExpr::Function(func) => {
-            let spec = bind_aggregate_function(scope, func)?;
-            match aggregates.iter().position(|a| *a == spec) {
-                Some(pos) => Ok(projection.len() + pos),
-                None => Err(Error::SqlParse(
-                    "binder: aggregate in ORDER BY/HAVING must also appear in the SELECT list"
-                        .into(),
-                )),
-            }
+            let spec = bind_aggregate_function(scope, func, binder)?;
+            // An aggregate the SELECT list does not display is still legal in
+            // HAVING / ORDER BY: compute it (append to the aggregate row) and
+            // reference its slot; the caller projects trailing computed-only
+            // aggregates back out.
+            let pos = match aggregates.iter().position(|a| *a == spec) {
+                Some(pos) => pos,
+                None => {
+                    aggregates.push(spec);
+                    aggregates.len() - 1
+                }
+            };
+            Ok(projection.len() + pos)
         }
         other => {
             let input_col = resolve_column_expr(scope, other)?;
@@ -1389,28 +1660,29 @@ fn resolve_aggregate_output_column(
 /// `bind_predicate`'s shape (And/Or/Not over comparisons) but resolves
 /// operands through `resolve_aggregate_output_column` — the input scope
 /// no longer exists above the aggregate.
-fn bind_having_predicate(
+fn bind_having_predicate<E: StorageEngine>(
     scope: &Scope,
     e: AstExpr,
     projection: &[usize],
-    aggregates: &[AggregateSpec],
+    aggregates: &mut Vec<AggregateSpec>,
+    ctx: &mut SubqueryCtx<E>,
 ) -> Result<Predicate> {
     match e {
         AstExpr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
-                let l = bind_having_predicate(scope, *left, projection, aggregates)?;
-                let r = bind_having_predicate(scope, *right, projection, aggregates)?;
+                let l = bind_having_predicate(scope, *left, projection, aggregates, ctx)?;
+                let r = bind_having_predicate(scope, *right, projection, aggregates, ctx)?;
                 Ok(Predicate::And(Box::new(l), Box::new(r)))
             }
             BinaryOperator::Or => {
-                let l = bind_having_predicate(scope, *left, projection, aggregates)?;
-                let r = bind_having_predicate(scope, *right, projection, aggregates)?;
+                let l = bind_having_predicate(scope, *left, projection, aggregates, ctx)?;
+                let r = bind_having_predicate(scope, *right, projection, aggregates, ctx)?;
                 Ok(Predicate::Or(Box::new(l), Box::new(r)))
             }
             cmp => {
                 let cmp_op = map_compare_op(&cmp)?;
-                let l = bind_having_operand(scope, *left, projection, aggregates)?;
-                let r = bind_having_operand(scope, *right, projection, aggregates)?;
+                let l = bind_having_operand(scope, *left, projection, aggregates, ctx)?;
+                let r = bind_having_operand(scope, *right, projection, aggregates, ctx)?;
                 Ok(Predicate::Compare {
                     op: cmp_op,
                     left: l,
@@ -1422,10 +1694,10 @@ fn bind_having_predicate(
             op: UnaryOperator::Not,
             expr,
         } => {
-            let inner = bind_having_predicate(scope, *expr, projection, aggregates)?;
+            let inner = bind_having_predicate(scope, *expr, projection, aggregates, ctx)?;
             Ok(Predicate::Not(Box::new(inner)))
         }
-        AstExpr::Nested(inner) => bind_having_predicate(scope, *inner, projection, aggregates),
+        AstExpr::Nested(inner) => bind_having_predicate(scope, *inner, projection, aggregates, ctx),
         other => Err(Error::SqlParse(format!(
             "binder: HAVING shape unsupported: {:?}",
             other
@@ -1433,19 +1705,27 @@ fn bind_having_predicate(
     }
 }
 
-/// One comparison operand inside HAVING: a literal, or anything
-/// `resolve_aggregate_output_column` accepts.
-fn bind_having_operand(
+/// One comparison operand inside HAVING: a literal, an uncorrelated scalar
+/// subquery (→ `SubqueryResult`, resolved by the session like a WHERE scalar),
+/// or anything `resolve_aggregate_output_column` accepts.
+fn bind_having_operand<E: StorageEngine>(
     scope: &Scope,
     e: AstExpr,
     projection: &[usize],
-    aggregates: &[AggregateSpec],
+    aggregates: &mut Vec<AggregateSpec>,
+    ctx: &mut SubqueryCtx<E>,
 ) -> Result<Expression> {
     match e {
         AstExpr::Value(v) => Ok(Expression::Literal(ast_value_to_value_unconstrained(v)?)),
-        AstExpr::Nested(inner) => bind_having_operand(scope, *inner, projection, aggregates),
+        AstExpr::Nested(inner) => bind_having_operand(scope, *inner, projection, aggregates, ctx),
+        AstExpr::Subquery(q) => {
+            let plan = ctx.binder.bind_scalar_subquery(*q, scope, ctx.depth)?;
+            let slot = ctx.scalar_subqueries.len();
+            ctx.scalar_subqueries.push(plan);
+            Ok(Expression::SubqueryResult(slot))
+        }
         other => Ok(Expression::Column(resolve_aggregate_output_column(
-            scope, &other, projection, aggregates,
+            scope, &other, projection, aggregates, ctx.binder,
         )?)),
     }
 }
@@ -1455,7 +1735,11 @@ fn bind_having_operand(
 /// `SUM(col)`, `MIN(col)`, `MAX(col)`, `AVG(col)`. Anything else is a
 /// non-aggregate function call — we error rather than silently treating
 /// it as a row-level expression (no scalar-function support yet).
-fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<AggregateSpec> {
+fn bind_aggregate_function<E: StorageEngine>(
+    scope: &Scope,
+    func: &ast::Function,
+    binder: &Binder<E>,
+) -> Result<AggregateSpec> {
     let name = object_name_to_string(&func.name).to_uppercase();
     let (args, distinct) = match &func.args {
         ast::FunctionArguments::List(list) => {
@@ -1508,7 +1792,7 @@ fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<Aggreg
                     Ok(AggregateSpec::CountStar)
                 }
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                    let arg = bind_expression(scope, e.clone())?;
+                    let arg = bind_expression(scope, e.clone(), binder)?;
                     Ok(AggregateSpec::Count { arg, distinct })
                 }
                 other => Err(Error::SqlParse(format!(
@@ -1532,7 +1816,7 @@ fn bind_aggregate_function(scope: &Scope, func: &ast::Function) -> Result<Aggreg
             }
             let arg = match &args[0] {
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                    bind_expression(scope, e.clone())?
+                    bind_expression(scope, e.clone(), binder)?
                 }
                 other => {
                     return Err(Error::SqlParse(format!(
@@ -1693,7 +1977,11 @@ fn decimal_from_str(s: &str, scale: u8) -> Result<Decimal> {
 
 // -------- expression binding (in-WHERE / RHS-of-SET) -----------------------
 
-fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
+fn bind_expression<E: StorageEngine>(
+    scope: &Scope,
+    e: AstExpr,
+    binder: &Binder<E>,
+) -> Result<Expression> {
     // DATE literals and `date_literal ± INTERVAL 'n' DAY|MONTH|YEAR` fold to a
     // plain `Value::Date` here, at bind time — planners and executors then see
     // an ordinary literal, with zero date-arithmetic machinery downstream.
@@ -1758,7 +2046,7 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
                 )?))
             }
             other => {
-                let inner = bind_expression(scope, other)?;
+                let inner = bind_expression(scope, other, binder)?;
                 Ok(Expression::BinaryOp {
                     op: BinaryOp::Sub,
                     left: Box::new(Expression::Literal(Value::Int64(0))),
@@ -1791,8 +2079,8 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
         }
         AstExpr::BinaryOp { left, op, right } => {
             let arith_op = map_arith_op(&op)?;
-            let l = bind_expression(scope, *left)?;
-            let r = bind_expression(scope, *right)?;
+            let l = bind_expression(scope, *left, binder)?;
+            let r = bind_expression(scope, *right, binder)?;
             // Align an integer literal to the other operand's numeric type
             // so the arithmetic is well-typed under eval_binary_op (which
             // otherwise resolves the mismatch to NULL).
@@ -1810,7 +2098,7 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
                     "binder: EXTRACT({field}) not supported (only YEAR)"
                 )));
             }
-            let arg = bind_expression(scope, *expr)?;
+            let arg = bind_expression(scope, *expr, binder)?;
             // Bind-time typing: EXTRACT(YEAR FROM …) is defined only over a
             // DATE argument. Refuse anything else here rather than let the
             // runtime silently return NULL.
@@ -1831,8 +2119,8 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
             conditions,
             results,
             else_result,
-        } => bind_case(scope, operand, conditions, results, else_result),
-        AstExpr::Nested(inner) => bind_expression(scope, *inner),
+        } => bind_case(scope, operand, conditions, results, else_result, binder),
+        AstExpr::Nested(inner) => bind_expression(scope, *inner, binder),
         other => Err(Error::SqlParse(format!(
             "binder: expression shape unsupported: {:?}",
             other
@@ -1904,12 +2192,13 @@ fn align_target(op: BinaryOp, other: Option<ColumnType>) -> Option<ColumnType> {
 /// `scope` (so a CASE inside `SUM(…)` resolves the same columns the
 /// aggregate sees). Bare integer-literal branches are then coerced toward
 /// the non-literal branches' type (see `coerce_case_literal_branches`).
-fn bind_case(
+fn bind_case<E: StorageEngine>(
     scope: &Scope,
     operand: Option<Box<AstExpr>>,
     conditions: Vec<AstExpr>,
     results: Vec<AstExpr>,
     else_result: Option<Box<AstExpr>>,
+    binder: &Binder<E>,
 ) -> Result<Expression> {
     if operand.is_some() {
         return Err(Error::SqlParse(
@@ -1921,12 +2210,18 @@ fn bind_case(
     // sqlparser pairs conditions[i] with results[i] for a searched CASE.
     let mut branches: Vec<(Predicate, Expression)> = Vec::with_capacity(conditions.len());
     for (cond, result) in conditions.into_iter().zip(results.into_iter()) {
-        let pred = bind_predicate(scope, cond)?;
-        let expr = bind_expression(scope, result)?;
+        // A CASE branch predicate cannot carry a subquery (the compiled CASE
+        // closure has no set to capture) — bind through a local ctx that
+        // rejects one loudly rather than dropping it into an unmaterialized
+        // slot.
+        let mut cond_ctx = SubqueryCtx::new(binder, 0);
+        let pred = bind_predicate(scope, cond, &mut cond_ctx)?;
+        reject_unsupported_subqueries(&cond_ctx, "a CASE branch condition")?;
+        let expr = bind_expression(scope, result, binder)?;
         branches.push((pred, expr));
     }
     let mut else_expr = match else_result {
-        Some(e) => Some(Box::new(bind_expression(scope, *e)?)),
+        Some(e) => Some(Box::new(bind_expression(scope, *e, binder)?)),
         None => None,
     };
     coerce_case_literal_branches(scope, &mut branches, &mut else_expr);
@@ -2275,30 +2570,67 @@ fn interval_overflow() -> Error {
 
 // -------- predicate binding -------------------------------------------------
 
-fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
+fn bind_predicate<E: StorageEngine>(
+    scope: &Scope,
+    e: AstExpr,
+    ctx: &mut SubqueryCtx<E>,
+) -> Result<Predicate> {
     match e {
         AstExpr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
-                let l = bind_predicate(scope, *left)?;
-                let r = bind_predicate(scope, *right)?;
+                let l = bind_predicate(scope, *left, ctx)?;
+                let r = bind_predicate(scope, *right, ctx)?;
                 Ok(Predicate::And(Box::new(l), Box::new(r)))
             }
             BinaryOperator::Or => {
-                let l = bind_predicate(scope, *left)?;
-                let r = bind_predicate(scope, *right)?;
+                let l = bind_predicate(scope, *left, ctx)?;
+                let r = bind_predicate(scope, *right, ctx)?;
                 Ok(Predicate::Or(Box::new(l), Box::new(r)))
             }
             cmp => {
                 let cmp_op = map_compare_op(&cmp)?;
-                bind_compare(scope, cmp_op, *left, *right)
+                bind_compare(scope, cmp_op, *left, *right, ctx)
             }
         },
         AstExpr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
         } => {
-            let inner = bind_predicate(scope, *expr)?;
+            let inner = bind_predicate(scope, *expr, ctx)?;
             Ok(Predicate::Not(Box::new(inner)))
+        }
+        // `[NOT] IN (subquery)` (H4b): bind the probe against the current
+        // scope, bind the (uncorrelated) inner query into `in_subqueries`, and
+        // emit an `InSubquery` leaf indexing its slot. The set is materialized
+        // by the session; NULL-aware 3VL lives in `eval_in`.
+        AstExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let probe = bind_expression(scope, *expr, ctx.binder)?;
+            let plan = ctx.binder.bind_in_subquery(*subquery, scope, ctx.depth)?;
+            let slot = ctx.in_subqueries.len();
+            ctx.in_subqueries.push(plan);
+            Ok(Predicate::InSubquery {
+                expr: Some(probe),
+                subquery: slot,
+                negated,
+            })
+        }
+        // `[NOT] EXISTS (subquery)` (H4b): no probe; the inner (capped at one
+        // row) drives a statement-constant true/false.
+        AstExpr::Exists { subquery, negated } => {
+            let plan = ctx
+                .binder
+                .bind_exists_subquery(*subquery, scope, ctx.depth)?;
+            let slot = ctx.in_subqueries.len();
+            ctx.in_subqueries.push(plan);
+            Ok(Predicate::InSubquery {
+                expr: None,
+                subquery: slot,
+                negated,
+            })
         }
         // BETWEEN desugars to `expr >= low AND expr <= high`; NOT BETWEEN
         // wraps the whole thing in NOT. Kleene-correct: a NULL `expr` makes
@@ -2311,8 +2643,8 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
             low,
             high,
         } => {
-            let lower = bind_compare(scope, CompareOp::Gte, (*expr).clone(), *low)?;
-            let upper = bind_compare(scope, CompareOp::Lte, *expr, *high)?;
+            let lower = bind_compare(scope, CompareOp::Gte, (*expr).clone(), *low, ctx)?;
+            let upper = bind_compare(scope, CompareOp::Lte, *expr, *high, ctx)?;
             let between = Predicate::And(Box::new(lower), Box::new(upper));
             Ok(maybe_negate(between, negated))
         }
@@ -2351,7 +2683,7 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
             }
             let mut chain: Option<Predicate> = None;
             for item in list {
-                let eq = bind_compare(scope, CompareOp::Eq, (*expr).clone(), item)?;
+                let eq = bind_compare(scope, CompareOp::Eq, (*expr).clone(), item, ctx)?;
                 chain = Some(match chain {
                     None => eq,
                     Some(acc) => Predicate::Or(Box::new(acc), Box::new(eq)),
@@ -2365,7 +2697,7 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
             expr,
             pattern,
             escape_char,
-        } => bind_like(scope, negated, *expr, *pattern, escape_char),
+        } => bind_like(scope, negated, *expr, *pattern, escape_char, ctx.binder),
         // ILIKE (case-insensitive) has different matching semantics we don't
         // implement — a loud, named refusal rather than a silent LIKE.
         AstExpr::ILike { .. } => Err(Error::SqlParse(
@@ -2373,15 +2705,35 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
         )),
         // IS NULL / IS NOT NULL over any expression. The predicate is total
         // (never UNKNOWN), so IS NOT NULL is a plain NOT wrap.
-        AstExpr::IsNull(inner) => Ok(Predicate::IsNull(bind_expression(scope, *inner)?)),
+        AstExpr::IsNull(inner) => Ok(Predicate::IsNull(bind_expression(
+            scope, *inner, ctx.binder,
+        )?)),
         AstExpr::IsNotNull(inner) => Ok(Predicate::Not(Box::new(Predicate::IsNull(
-            bind_expression(scope, *inner)?,
+            bind_expression(scope, *inner, ctx.binder)?,
         )))),
-        AstExpr::Nested(inner) => bind_predicate(scope, *inner),
+        AstExpr::Nested(inner) => bind_predicate(scope, *inner, ctx),
         other => Err(Error::SqlParse(format!(
             "binder: predicate shape unsupported: {:?}",
             other
         ))),
+    }
+}
+
+/// Reject any subquery collected in a position whose bound IR has no place to
+/// carry the inner plan and no session resolution path (a DML `WHERE`, a
+/// `CASE` branch): a subquery there is a loud, named refusal rather than a
+/// silently dropped filter or an unmaterialized set.
+fn reject_unsupported_subqueries<E: StorageEngine>(
+    ctx: &SubqueryCtx<E>,
+    position: &str,
+) -> Result<()> {
+    if ctx.scalar_subqueries.is_empty() && ctx.in_subqueries.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::SqlParse(format!(
+            "binder: subqueries in {} are not supported yet",
+            position
+        )))
     }
 }
 
@@ -2391,15 +2743,43 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
 /// (where the type is known here): runtime comparison is already exact
 /// across numeric representations, but PkLookup/IndexScan lowering
 /// key-encodes the literal against the column type strictly.
-fn bind_compare(scope: &Scope, op: CompareOp, left: AstExpr, right: AstExpr) -> Result<Predicate> {
-    let l = bind_expression(scope, left)?;
-    let r = bind_expression(scope, right)?;
+fn bind_compare<E: StorageEngine>(
+    scope: &Scope,
+    op: CompareOp,
+    left: AstExpr,
+    right: AstExpr,
+    ctx: &mut SubqueryCtx<E>,
+) -> Result<Predicate> {
+    let l = bind_compare_operand(scope, left, ctx)?;
+    let r = bind_compare_operand(scope, right, ctx)?;
     let (l, r) = narrow_compare_operands(scope, l, r);
     Ok(Predicate::Compare {
         op,
         left: l,
         right: r,
     })
+}
+
+/// One comparison operand: an uncorrelated scalar subquery collapses to an
+/// `Expression::SubqueryResult(slot)` (the session substitutes its value before
+/// planning); anything else binds as an ordinary expression. A subquery is
+/// supported only as a DIRECT operand here — one buried inside arithmetic
+/// (`x = (SELECT …) + 1`) falls through to `bind_expression`'s loud refusal.
+fn bind_compare_operand<E: StorageEngine>(
+    scope: &Scope,
+    e: AstExpr,
+    ctx: &mut SubqueryCtx<E>,
+) -> Result<Expression> {
+    match e {
+        AstExpr::Subquery(q) => {
+            let plan = ctx.binder.bind_scalar_subquery(*q, scope, ctx.depth)?;
+            let slot = ctx.scalar_subqueries.len();
+            ctx.scalar_subqueries.push(plan);
+            Ok(Expression::SubqueryResult(slot))
+        }
+        AstExpr::Nested(inner) => bind_compare_operand(scope, *inner, ctx),
+        other => bind_expression(scope, other, ctx.binder),
+    }
 }
 
 /// Wrap `pred` in `Not` when `negated` — the shared tail of BETWEEN, IN,
@@ -2415,12 +2795,13 @@ fn maybe_negate(pred: Predicate, negated: bool) -> Predicate {
 /// Bind `expr LIKE pattern` into `Predicate::Like` (NOT LIKE → `Not`).
 /// The pattern must be a string literal and `expr` must infer Varchar/Char;
 /// ESCAPE is refused. All three refusals are loud and named.
-fn bind_like(
+fn bind_like<E: StorageEngine>(
     scope: &Scope,
     negated: bool,
     expr: AstExpr,
     pattern: AstExpr,
     escape_char: Option<String>,
+    binder: &Binder<E>,
 ) -> Result<Predicate> {
     if escape_char.is_some() {
         return Err(Error::SqlParse(
@@ -2435,7 +2816,7 @@ fn bind_like(
             )))
         }
     };
-    let operand = bind_expression(scope, expr)?;
+    let operand = bind_expression(scope, expr, binder)?;
     // The operand must be a string; refuse anything else at bind time rather
     // than let a non-string silently evaluate to UNKNOWN every row.
     match operand.column_type(&scope_column_types(scope)) {
@@ -2834,6 +3215,8 @@ mod tests {
                 table,
                 joins,
                 derived,
+                scalar_subqueries: _,
+                in_subqueries: _,
                 projection,
                 aggregates,
                 select_list,

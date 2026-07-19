@@ -99,6 +99,25 @@ pub enum LogicalPlan {
         /// so WHERE / GROUP BY / aggregates over its columns resolve like any
         /// catalog table's.
         derived: Vec<DerivedTable>,
+        /// Uncorrelated scalar subqueries (H4b), slot-indexed. Each entry is
+        /// the already-bound inner query for one `Expression::SubqueryResult(slot)`
+        /// the binder emitted in a scalar position (a compare operand, a
+        /// HAVING operand). The session runs each through the SAME engine
+        /// handle BEFORE planning, reduces it to a single `Value` (0 rows →
+        /// NULL, 1 row → the value, >1 → loud error), and substitutes the
+        /// literal via `substitute_subquery_results` — so every planner sees a
+        /// literal and this list is vestigial by plan time. EMPTY for every
+        /// query without a scalar subquery. The planner ignores it; EXPLAIN
+        /// renders each entry's plan.
+        scalar_subqueries: Vec<LogicalPlan>,
+        /// Uncorrelated `IN` / `EXISTS` subqueries (H4b), indexed by
+        /// `Predicate::InSubquery.subquery`. Each entry is the already-bound
+        /// inner query; the session materializes each into an `InSubquerySet`
+        /// (a value set + `has_null`/`nonempty` flags) ONCE per statement and
+        /// hands the slice to the executor builder, which the compiled
+        /// `InSubquery` predicate closure captures. EMPTY for every query
+        /// without one. Uncorrelated by construction — bound in a fresh scope.
+        in_subqueries: Vec<LogicalPlan>,
         /// Column indices in the requested output order. Empty = `SELECT *`
         /// (when aggregates is also empty) or whole-table aggregation (when
         /// aggregates is non-empty). H1 meaning unchanged: bare column
@@ -347,6 +366,8 @@ impl LogicalPlan {
                 table,
                 joins,
                 derived,
+                scalar_subqueries,
+                in_subqueries,
                 projection,
                 aggregates,
                 select_list,
@@ -397,6 +418,12 @@ impl LogicalPlan {
                     table,
                     joins,
                     derived,
+                    // Subquery inner plans are separate statements with their
+                    // own parameter/slot spaces, resolved when the session
+                    // executes each; the outer's user parameters do not reach
+                    // into them, so carry both lists through untouched.
+                    scalar_subqueries,
+                    in_subqueries,
                     projection,
                     aggregates,
                     select_list,
@@ -446,6 +473,95 @@ impl LogicalPlan {
                 Ok(LogicalPlan::Delete { table, filter })
             }
             // No parameters in DDL or TC.
+            other => Ok(other),
+        }
+    }
+
+    /// Walk the plan tree and substitute every `Expression::SubqueryResult(i)`
+    /// with `Expression::Literal(values[i])`. The session calls this AFTER it
+    /// has run each uncorrelated scalar subquery, splicing each result in as a
+    /// literal — a SEPARATE pass from `substitute_params` (user parameters), on
+    /// a SEPARATE `Expression` namespace, so a prepared statement's `$N` values
+    /// and its scalar-subquery slots never collide. Only SELECT carries scalar
+    /// subqueries; every other shape passes through unchanged.
+    pub fn substitute_subquery_results(
+        self,
+        values: &[Value],
+    ) -> crate::common::Result<LogicalPlan> {
+        match self {
+            LogicalPlan::Select {
+                table,
+                joins,
+                derived,
+                scalar_subqueries,
+                in_subqueries,
+                projection,
+                aggregates,
+                select_list,
+                filter,
+                order_by,
+                having,
+                limit,
+            } => {
+                // The binder forbids a subquery inside a derived table's inner
+                // query, so a derived subplan carries no `SubqueryResult` — the
+                // recursion is a no-op there, kept only for structural parity
+                // with `substitute_params`.
+                let derived = derived
+                    .into_iter()
+                    .map(|d| {
+                        Ok::<DerivedTable, crate::common::Error>(DerivedTable {
+                            alias: d.alias,
+                            plan: Box::new(d.plan.substitute_subquery_results(values)?),
+                            schema: d.schema,
+                        })
+                    })
+                    .collect::<crate::common::Result<Vec<_>>>()?;
+                let joins = joins
+                    .into_iter()
+                    .map(|j| {
+                        Ok::<JoinClause, crate::common::Error>(JoinClause {
+                            right_table: j.right_table,
+                            right_alias: j.right_alias,
+                            on: match j.on {
+                                Some(p) => Some(p.substitute_subquery_results(values)?),
+                                None => None,
+                            },
+                            kind: j.kind,
+                        })
+                    })
+                    .collect::<crate::common::Result<Vec<_>>>()?;
+                let filter = match filter {
+                    Some(p) => Some(p.substitute_subquery_results(values)?),
+                    None => None,
+                };
+                let having = match having {
+                    Some(p) => Some(p.substitute_subquery_results(values)?),
+                    None => None,
+                };
+                let select_list = select_list
+                    .into_iter()
+                    .map(|e| e.substitute_subquery_results(values))
+                    .collect::<crate::common::Result<Vec<_>>>()?;
+                Ok(LogicalPlan::Select {
+                    table,
+                    joins,
+                    derived,
+                    // The inner plans are separate statements with their own
+                    // slot spaces, resolved when the session runs each; carry
+                    // both lists through untouched.
+                    scalar_subqueries,
+                    in_subqueries,
+                    projection,
+                    aggregates,
+                    select_list,
+                    filter,
+                    order_by,
+                    having,
+                    limit,
+                })
+            }
+            // No scalar subqueries reach substitution outside a SELECT.
             other => Ok(other),
         }
     }

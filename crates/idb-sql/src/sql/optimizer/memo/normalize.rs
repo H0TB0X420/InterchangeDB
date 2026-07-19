@@ -140,6 +140,19 @@ pub(crate) fn normalize<CatE: StorageEngine>(
         table,
         joins,
         derived,
+        // The memo splits the query into a join core + fixed spine (D3); it
+        // does not reconstruct a `Select`, and the session materializes each
+        // subquery's set independently of the planner, so the lists are not
+        // needed here. An `InSubquery` conjunct routes like any other WHERE
+        // conjunct (the routing loop below keys on the columns its probe
+        // references): `EXISTS` references zero columns and rides the
+        // `residual` (spine Filter) like a constant; a single-relation `IN`
+        // probe pushes to that relation's `local_preds`, rebased to local
+        // columns — a valid rewrite, since the materialized set is a statement
+        // constant, so the filter is genuinely table-local; only a
+        // cross-relation or constant-probe `InSubquery` lands in the `residual`.
+        scalar_subqueries: _,
+        in_subqueries: _,
         projection,
         aggregates,
         select_list,

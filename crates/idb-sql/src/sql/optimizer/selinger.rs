@@ -196,6 +196,8 @@ fn maybe_reorder<CatE: StorageEngine>(
             table,
             joins,
             derived,
+            scalar_subqueries,
+            in_subqueries,
             projection,
             aggregates,
             select_list,
@@ -221,6 +223,8 @@ fn maybe_reorder<CatE: StorageEngine>(
                     table,
                     joins,
                     derived,
+                    scalar_subqueries,
+                    in_subqueries,
                     projection,
                     aggregates,
                     select_list,
@@ -251,6 +255,8 @@ fn maybe_reorder<CatE: StorageEngine>(
                     // Empty here: a non-empty `derived` bailed to textual above
                     // (graph is None), so this reorder path never carries one.
                     derived,
+                    scalar_subqueries,
+                    in_subqueries,
                     projection,
                     aggregates,
                     select_list,
@@ -263,6 +269,8 @@ fn maybe_reorder<CatE: StorageEngine>(
             Ok(rewrite_select(
                 &graph,
                 &best.order,
+                scalar_subqueries,
+                in_subqueries,
                 projection,
                 aggregates,
                 select_list,
@@ -471,9 +479,12 @@ fn flatten_join_order(order: &JoinOrder) -> (RelId, Vec<(RelId, Vec<usize>)>) {
 /// `Projection` selects columns in the original SELECT order, so output
 /// column order is preserved.
 #[allow(clippy::too_many_arguments)] // mirrors the Select fields, same as plan_select.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_select(
     graph: &JoinGraph,
     order: &JoinOrder,
+    scalar_subqueries: Vec<LogicalPlan>,
+    in_subqueries: Vec<LogicalPlan>,
     projection: Vec<usize>,
     aggregates: Vec<AggregateSpec>,
     select_list: Vec<Expression>,
@@ -530,6 +541,12 @@ fn rewrite_select(
         // bails to textual for any derived table), so the rewritten plan
         // carries none.
         derived: Vec::new(),
+        // Uncorrelated subqueries are statement constants — join reordering
+        // neither reorders nor remaps them (the `InSubquery` probe columns are
+        // remapped through `filter` below); carry both lists through so EXPLAIN
+        // still renders them after a reorder.
+        scalar_subqueries,
+        in_subqueries,
         projection: projection
             .into_iter()
             .map(|c| remap.apply_index(c))

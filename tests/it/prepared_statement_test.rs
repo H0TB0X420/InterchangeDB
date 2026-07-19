@@ -140,3 +140,51 @@ fn prepare_multiple_parameters_with_compound_predicate() {
     );
     assert_eq!(r.len(), 2);
 }
+
+#[test]
+fn prepared_parameter_and_scalar_subquery_do_not_collide() {
+    // REGRESSION: a prepared `$1` and a scalar subquery once shared
+    // `Expression::Parameter`'s 0-based slot space, so `execute_prepared`
+    // substituted the user value into BOTH and silently discarded the subquery
+    // result. The separate `SubqueryResult` namespace keeps them independent.
+    //
+    // t = {(1, 5), (2, 1)}; `MIN(a) = 1`. Prepared with `$1 = 2` means
+    // `WHERE a = 2 AND b = (MIN(a) = 1)` → only row (2, 1) qualifies → [2].
+    // Under the old collision the subquery slot took the user value 2, giving
+    // `WHERE a = 2 AND b = 2` → zero rows — so [2] is exactly what proves the
+    // subquery result survived alongside the bound parameter.
+    let (mut s, _d) = setup();
+    s.execute("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+        .unwrap();
+    s.execute("INSERT INTO t VALUES (1, 5), (2, 1)").unwrap();
+
+    let ps = s
+        .prepare("SELECT a FROM t WHERE a = $1 AND b = (SELECT MIN(a) FROM t)")
+        .unwrap();
+    let r = rows(s.execute_prepared(&ps, &[Value::Int32(2)]).unwrap());
+    assert_eq!(
+        r.len(),
+        1,
+        "the bound param and the subquery must both apply"
+    );
+    assert_eq!(r[0][0], Value::Int32(2));
+}
+
+#[test]
+fn plain_execute_mixes_literal_predicate_and_scalar_subquery() {
+    // The non-prepared path: a literal predicate AND a scalar subquery in the
+    // same WHERE both resolve correctly — the subquery-result namespace is
+    // independent of any parameter binding, so a plain `execute` is unaffected.
+    // t = {(1, 5), (2, 1)}; `MIN(a) = 1` → `WHERE a >= 1 AND b = 1` → [2].
+    let (mut s, _d) = setup();
+    s.execute("CREATE TABLE t (a INT PRIMARY KEY, b INT)")
+        .unwrap();
+    s.execute("INSERT INTO t VALUES (1, 5), (2, 1)").unwrap();
+
+    let r = rows(
+        s.execute("SELECT a FROM t WHERE a >= 1 AND b = (SELECT MIN(a) FROM t)")
+            .unwrap(),
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Int32(2));
+}

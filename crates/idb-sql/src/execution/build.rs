@@ -20,6 +20,7 @@ use crate::execution::{
     PkLookup, Projection, SeqScan, SetExpr, Sort, SortDir, Tuple, Update,
 };
 use crate::layout::RowLayout;
+use crate::sql::ir::expr::InSubquerySet;
 use crate::sql::ir::logical::{AggregateSpec, JoinKind, OrderDir};
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
@@ -28,9 +29,11 @@ use crate::table::{IndexHandle, Table};
 /// A resolved `RowLayout` table handle paired with its index handles.
 type ResolvedTable<E> = (Arc<Table<E, RowLayout>>, Vec<IndexHandle>);
 
-/// Compile a physical plan into a runnable pull-operator tree. Recurses into
-/// child plans; resolves table/index names against `catalog`; re-compiles
-/// `Predicate`/`Expression` ASTs into the closures operators drive per tuple.
+/// Compile a physical plan into a runnable pull-operator tree, with no
+/// materialized subquery sets — a test convenience for plans that carry no
+/// `InSubquery`. Production callers go through the model, which threads the
+/// statement's sets into `build_executor_with_subqueries`.
+#[cfg(test)]
 pub(crate) fn build_executor<E, CatE>(
     plan: &PhysOp,
     engine: &Arc<E>,
@@ -40,6 +43,28 @@ where
     E: StorageEngine + 'static,
     CatE: StorageEngine,
 {
+    build_executor_with_subqueries(plan, engine, catalog, &[])
+}
+
+/// Compile a physical plan into a runnable pull-operator tree. Recurses into
+/// child plans; resolves table/index names against `catalog`; re-compiles
+/// `Predicate`/`Expression` ASTs into the closures operators drive per tuple.
+/// `subqueries` are the statement's materialized `InSubquery` sets (empty
+/// unless the plan filters on an uncorrelated IN/EXISTS subquery), captured by
+/// each `Filter`'s compiled predicate closure.
+pub(crate) fn build_executor_with_subqueries<E, CatE>(
+    plan: &PhysOp,
+    engine: &Arc<E>,
+    catalog: &Catalog<CatE>,
+    subqueries: &[InSubquerySet],
+) -> Result<Box<dyn Executor>>
+where
+    E: StorageEngine + 'static,
+    CatE: StorageEngine,
+{
+    let build_executor = |plan: &PhysOp, engine: &Arc<E>, catalog: &Catalog<CatE>| {
+        build_executor_with_subqueries(plan, engine, catalog, subqueries)
+    };
     match plan {
         PhysOp::SeqScan { table } => {
             let (tbl, _indexes) = resolve_table(table, engine, catalog)?;
@@ -76,9 +101,11 @@ where
         }
         PhysOp::Filter { input, predicate } => {
             let child = build_executor(input, engine, catalog)?;
+            // The only operator that can carry an `InSubquery`: compile with
+            // the statement's materialized sets so the closure captures them.
             Ok(Box::new(Filter::from_boxed(
                 child,
-                predicate.clone().compile(),
+                predicate.clone().compile_with_subqueries(subqueries),
             )))
         }
         PhysOp::Projection { input, cols } => {

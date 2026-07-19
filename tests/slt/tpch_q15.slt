@@ -1,0 +1,50 @@
+# TPC-H Q15 — Top Supplier. The spec defines a VIEW `revenue0`; we have no
+# CREATE VIEW yet (recorded gap), so the view is inlined as a DERIVED TABLE at
+# each of its two uses — the FROM relation and the `MAX(total_revenue)` scalar
+# subquery. This exercises a scalar subquery OVER a derived table, plus the
+# `SUM(l_extendedprice * (1 - l_discount))` decimal revenue shape. Otherwise
+# VERBATIM (the date window uses the spec's `+ INTERVAL '3' MONTH`).
+
+statement ok
+CREATE TABLE supplier (s_suppkey INT PRIMARY KEY, s_name VARCHAR(25), s_address VARCHAR(40), s_phone VARCHAR(15))
+
+statement ok
+CREATE TABLE lineitem (l_orderkey INT, l_linenumber INT, l_suppkey INT, l_extendedprice INT, l_discount DECIMAL(3,2), l_shipdate DATE, PRIMARY KEY (l_orderkey, l_linenumber))
+
+statement ok
+INSERT INTO supplier VALUES
+  (1, 'Supplier#1', 'addr-one', 'phone-one'),
+  (2, 'Supplier#2', 'addr-two', 'phone-two')
+
+statement ok
+INSERT INTO lineitem VALUES
+  (1, 1, 1, 1000, 0.10, DATE '1996-02-01'),
+  (2, 1, 1, 500, 0.00, DATE '1996-03-01'),
+  (3, 1, 2, 2000, 0.20, DATE '1996-02-15'),
+  (4, 1, 1, 9999, 0.00, DATE '1995-12-01')
+
+# In-window revenue per supplier: supplier 1 = 1000*0.90 + 500*1.00 = 1400.00;
+# supplier 2 = 2000*0.80 = 1600.00 (the 1995 row is out of the window). The
+# top revenue is 1600.00, so only supplier 2 is reported.
+query ITTTR
+SELECT s_suppkey, s_name, s_address, s_phone, total_revenue
+FROM supplier,
+     (SELECT l_suppkey AS supplier_no,
+             SUM(l_extendedprice * (1 - l_discount)) AS total_revenue
+      FROM lineitem
+      WHERE l_shipdate >= DATE '1996-01-01'
+        AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH
+      GROUP BY l_suppkey) revenue0
+WHERE s_suppkey = supplier_no
+  AND total_revenue = (
+      SELECT MAX(total_revenue)
+      FROM (SELECT l_suppkey AS supplier_no,
+                   SUM(l_extendedprice * (1 - l_discount)) AS total_revenue
+            FROM lineitem
+            WHERE l_shipdate >= DATE '1996-01-01'
+              AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH
+            GROUP BY l_suppkey) revenue1
+    )
+ORDER BY s_suppkey
+----
+2 Supplier#2 addr-two phone-two 1600.00

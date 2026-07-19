@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
-use crate::execution::build::{build_executor, translate_aggregate_spec};
+use crate::execution::build::{build_executor_with_subqueries, translate_aggregate_spec};
 use crate::execution::model::ExecutionModel;
 use crate::execution::operators::compute::{build_compute_schema, ColumnEvaluator};
 use crate::execution::operators::hash_aggregate::{
@@ -57,7 +57,7 @@ use crate::execution::operators::hash_aggregate::{
 };
 use crate::execution::{AggregateFn, Executor, Tuple};
 use crate::layout::{DataLayout, LayoutCtx, RowLayout};
-use crate::sql::ir::expr::Expression;
+use crate::sql::ir::expr::{Expression, InSubquerySet};
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 use crate::types::Value;
@@ -310,11 +310,18 @@ fn build_push<E, CatE>(
     out: Box<dyn Sink>,
     engine: &Arc<E>,
     catalog: &Catalog<CatE>,
+    subqueries: &[InSubquerySet],
 ) -> Result<(Box<dyn Source>, Schema)>
 where
     E: StorageEngine + 'static,
     CatE: StorageEngine,
 {
+    // Adapter so the recursive calls below thread the statement's subquery
+    // sets unchanged (mirrors the Volcano builder's closure).
+    let build_push =
+        |plan: &PhysOp, out: Box<dyn Sink>, engine: &Arc<E>, catalog: &Catalog<CatE>| {
+            build_push(plan, out, engine, catalog, subqueries)
+        };
     match plan {
         PhysOp::SeqScan { table } => {
             let schema = catalog.get_table(table)?;
@@ -330,7 +337,7 @@ where
         // input's, so just return the recursive result.
         PhysOp::Filter { input, predicate } => {
             let sink = Box::new(FilterSink {
-                predicate: predicate.clone().compile(),
+                predicate: predicate.clone().compile_with_subqueries(subqueries),
                 out,
             });
             build_push(input, sink, engine, catalog)
@@ -416,7 +423,7 @@ where
         // operators default to this safe path until given a push sink of
         // their own.
         _ => {
-            let exec = build_executor(plan, engine, catalog)?;
+            let exec = build_executor_with_subqueries(plan, engine, catalog, subqueries)?;
             let out_schema = exec.schema().clone();
             Ok((Box::new(ExecutorSource { exec, out }), out_schema))
         }
@@ -444,6 +451,7 @@ impl ExecutionModel for Push {
         plan: &PhysOp,
         engine: &Arc<E>,
         catalog: &Catalog<CatE>,
+        subqueries: &[InSubquerySet],
     ) -> Result<(Schema, Vec<Tuple>)>
     where
         E: StorageEngine + 'static,
@@ -451,7 +459,7 @@ impl ExecutionModel for Push {
     {
         let rows = Rc::new(RefCell::new(Vec::new()));
         let collector = Box::new(Collector { rows: rows.clone() });
-        let (mut source, schema) = build_push(plan, collector, engine, catalog)?;
+        let (mut source, schema) = build_push(plan, collector, engine, catalog, subqueries)?;
         source.run()?;
         let collected = rows.borrow().clone();
         Ok((schema, collected))
@@ -545,7 +553,7 @@ mod tests {
             cols: vec![0],
             input: Box::new(n_ge_2(scan("nums"))),
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -565,7 +573,7 @@ mod tests {
             max_rows: 3,
             input: Box::new(scan("nums")),
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], Value::Int32(0));
         assert_eq!(rows[2][0], Value::Int32(2));
@@ -579,7 +587,7 @@ mod tests {
             max_rows: 0,
             input: Box::new(scan("nums")),
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
         assert!(rows.is_empty());
     }
 
@@ -594,7 +602,7 @@ mod tests {
             group_by: vec![],
             aggregates: vec![AggregateSpec::CountStar],
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
         assert_eq!(rows, vec![vec![Value::Int64(5)]]);
     }
 
@@ -612,7 +620,7 @@ mod tests {
                 keys: vec![(0, OrderDir::Desc)],
             }),
         };
-        let (_schema, rows) = Push.execute(&plan, &engine, &catalog).unwrap();
+        let (_schema, rows) = Push.execute(&plan, &engine, &catalog, &[]).unwrap();
         // desc → 3, 2, 1, 0; limit 2 → first two.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Int32(3));

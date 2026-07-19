@@ -168,7 +168,7 @@ fn sorted_seq(table: &str, key_col: usize) -> Box<PhysOp> {
 }
 
 fn run_sorted(env: &Env, model: &ExecModel, plan: &PhysOp) -> Vec<Vec<Value>> {
-    let (_schema, mut rows) = model.execute(plan, &env.engine, &env.catalog).unwrap();
+    let (_schema, mut rows) = model.execute(plan, &env.engine, &env.catalog, &[]).unwrap();
     // Values carry no Ord; Debug text is a stable total order for a test.
     rows.sort_by_key(|r| format!("{:?}", r));
     rows

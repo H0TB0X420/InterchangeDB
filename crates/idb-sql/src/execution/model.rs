@@ -15,8 +15,9 @@ use std::sync::Arc;
 
 use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
-use crate::execution::build::build_executor;
+use crate::execution::build::build_executor_with_subqueries;
 use crate::execution::Tuple;
+use crate::sql::ir::expr::InSubquerySet;
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 
@@ -26,12 +27,15 @@ use crate::storage::StorageEngine;
 pub trait ExecutionModel {
     /// Build `plan` into a runnable form and drive it to completion. Returns
     /// the output schema (for framing `SELECT` results) alongside the rows.
-    /// `Err(_)` if building or any operator faults.
+    /// `subqueries` are the statement's materialized uncorrelated `InSubquery`
+    /// sets (empty for a plan with no IN/EXISTS subquery filter). `Err(_)` if
+    /// building or any operator faults.
     fn execute<E, CatE>(
         &self,
         plan: &PhysOp,
         engine: &Arc<E>,
         catalog: &Catalog<CatE>,
+        subqueries: &[InSubquerySet],
     ) -> Result<(Schema, Vec<Tuple>)>
     where
         E: StorageEngine + 'static,
@@ -51,12 +55,13 @@ impl ExecutionModel for Volcano {
         plan: &PhysOp,
         engine: &Arc<E>,
         catalog: &Catalog<CatE>,
+        subqueries: &[InSubquerySet],
     ) -> Result<(Schema, Vec<Tuple>)>
     where
         E: StorageEngine + 'static,
         CatE: StorageEngine,
     {
-        let mut root = build_executor(plan, engine, catalog)?;
+        let mut root = build_executor_with_subqueries(plan, engine, catalog, subqueries)?;
         let schema = root.schema().clone();
         // Pull discipline: ask the root for its next tuple until end-of-stream.
         // Each `?` propagates a fatal operator error.
@@ -87,20 +92,24 @@ pub enum ExecModel {
 
 impl ExecModel {
     /// Execute `plan` with the selected model, returning its output schema and
-    /// rows.
+    /// rows. `subqueries` are the statement's materialized uncorrelated
+    /// `InSubquery` sets (empty when the plan has no IN/EXISTS filter).
     pub fn execute<E, CatE>(
         &self,
         plan: &PhysOp,
         engine: &Arc<E>,
         catalog: &Catalog<CatE>,
+        subqueries: &[InSubquerySet],
     ) -> Result<(Schema, Vec<Tuple>)>
     where
         E: StorageEngine + 'static,
         CatE: StorageEngine,
     {
         match self {
-            ExecModel::Volcano => Volcano.execute(plan, engine, catalog),
-            ExecModel::Push => crate::execution::push::Push.execute(plan, engine, catalog),
+            ExecModel::Volcano => Volcano.execute(plan, engine, catalog, subqueries),
+            ExecModel::Push => {
+                crate::execution::push::Push.execute(plan, engine, catalog, subqueries)
+            }
         }
     }
 

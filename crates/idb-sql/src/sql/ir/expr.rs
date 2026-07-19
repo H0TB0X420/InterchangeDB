@@ -25,6 +25,9 @@
 //! - Type mismatch → `Value::Null` for arithmetic, UNKNOWN for compare.
 //! - Division by zero → `Value::Null`.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::Tuple;
@@ -63,12 +66,27 @@ pub enum Expression {
     /// `Expression` now contains `Predicate` (the branch conditions) — the
     /// two IR types were already mutually recursive through `Box`, so this
     /// closes the cycle without introducing any new indirection. Appended
-    /// LAST so bincode's discriminants for the pre-existing variants stay
-    /// stable (plans round-trip through the workload log).
+    /// after the original variants for bincode discriminant stability; the
+    /// append-only invariant now lives on `SubqueryResult`, the true last
+    /// variant (plans round-trip through the workload log).
     Case {
         branches: Vec<(Predicate, Expression)>,
         else_expr: Option<Box<Expression>>,
     },
+    /// A scalar-subquery result slot. The `usize` indexes the statement's
+    /// `scalar_subqueries` list; the session runs each uncorrelated inner
+    /// query ONCE and splices `Literal(value)` here via
+    /// `substitute_subquery_results` BEFORE `compile()`.
+    ///
+    /// A SEPARATE namespace from `Parameter`, and that separation is the point:
+    /// a prepared statement's user `$N` values and its scalar-subquery slots
+    /// both once shared `Parameter`'s 0-based space, so `execute_prepared`'s
+    /// user-parameter substitution clobbered a colliding subquery slot (`WHERE
+    /// a = $1 AND b = (SELECT …)` substituted the user value into BOTH, then
+    /// silently discarded the subquery result). Distinct variants keep the two
+    /// substitution passes from ever touching each other's slots. Appended LAST
+    /// so bincode discriminants for the pre-existing variants stay stable.
+    SubqueryResult(usize),
 }
 
 /// Arithmetic operator for `Expression::BinaryOp`.
@@ -104,12 +122,50 @@ pub enum Predicate {
     /// characters (including empty), `_` matches exactly one. `NOT LIKE`
     /// binds as `Not(Like)`. The pattern is a bind-time string literal,
     /// compiled once into a matcher. A NULL input evaluates to UNKNOWN.
-    /// Appended (with `IsNull`) LAST for bincode discriminant stability.
+    /// Appended (with `IsNull`) after the original variants for bincode
+    /// discriminant stability; the append-only invariant now lives on
+    /// `InSubquery`, the true last variant.
     Like { expr: Expression, pattern: String },
     /// `<expr> IS NULL` — always evaluates to `Some(bool)`, never UNKNOWN
     /// (that totality is the point of the predicate). `IS NOT NULL` binds
     /// as `Not(IsNull)`.
     IsNull(Expression),
+    /// An uncorrelated subquery filter (H4b): `<expr> [NOT] IN (subquery)`
+    /// (`expr` = `Some`) or `[NOT] EXISTS (subquery)` (`expr` = `None`).
+    /// `subquery` indexes the statement's subquery list — the session
+    /// materializes each referenced subquery ONCE into an `InSubquerySet`
+    /// (a value set + `has_null` + `nonempty` flags) and hands the slice to
+    /// `compile_with_subqueries`, so the compiled closure captures the set.
+    /// Because the subquery is uncorrelated its result is a statement
+    /// constant — no new join operator is introduced. Appended LAST so
+    /// bincode discriminants for the pre-existing variants stay stable.
+    InSubquery {
+        expr: Option<Expression>,
+        subquery: usize,
+        negated: bool,
+    },
+}
+
+/// The materialized result of one uncorrelated subquery referenced by a
+/// `Predicate::InSubquery`. Built once per statement at executor-build time
+/// (the session runs the inner query through the SAME engine handle), then
+/// captured by the compiled predicate closure.
+///
+/// - `values`: the subquery's first-column values, each `join_key_normalized`
+///   so `IN` matching agrees exactly with `=` (5 matches 5.00). NULLs are
+///   excluded from the set and recorded in `has_null` instead — 3VL needs to
+///   distinguish "absent" from "a NULL was present".
+/// - `has_null`: whether any probed row's first column was NULL.
+/// - `nonempty`: whether the subquery produced at least one row (drives
+///   `EXISTS`; the inner plan carries a `LIMIT 1` so this early-exits).
+///
+/// `Arc` around the set keeps the closure capture cheap (the set is shared,
+/// never cloned per row).
+#[derive(Clone, Default)]
+pub struct InSubquerySet {
+    pub values: Arc<HashSet<Value>>,
+    pub has_null: bool,
+    pub nonempty: bool,
 }
 
 /// Comparison operator for `Predicate::Compare`.
@@ -151,6 +207,18 @@ impl Expression {
                 debug_assert!(false, "unsubstituted Parameter({}) reached compile()", i);
                 Box::new(move |_t| Value::Null)
             }
+            Expression::SubqueryResult(i) => {
+                // Should have been substituted by the session's
+                // substitute_subquery_results (after running the scalar
+                // subquery) before reaching compile — same total-closure
+                // contract as the Parameter arm above.
+                debug_assert!(
+                    false,
+                    "unsubstituted SubqueryResult({}) reached compile()",
+                    i
+                );
+                Box::new(move |_t| Value::Null)
+            }
             Expression::BinaryOp { op, left, right } => {
                 let l = left.compile();
                 let r = right.compile();
@@ -176,7 +244,10 @@ impl Expression {
                 // per-row IR walking.
                 let compiled: Vec<(Predicate3VL, ExpressionFn)> = branches
                     .into_iter()
-                    .map(|(pred, result)| (pred.compile_3vl(), result.compile()))
+                    // CASE-branch predicates never carry an `InSubquery` in
+                    // the H4b surface (the binder only emits one from a
+                    // top-level WHERE/HAVING IN/EXISTS), so no sets are needed.
+                    .map(|(pred, result)| (pred.compile_3vl(&[]), result.compile()))
                     .collect();
                 let else_f = else_expr.map(|e| e.compile());
                 Box::new(move |t| {
@@ -215,7 +286,13 @@ impl Expression {
                         ))
                     })
             }
-            Expression::Literal(_) | Expression::Column(_) => Ok(self),
+            // A scalar-subquery slot is NOT a user parameter — leave it for
+            // substitute_subquery_results. Keeping the two namespaces separate
+            // is the whole point: user-parameter binding must not clobber a
+            // subquery slot (nor vice versa).
+            Expression::Literal(_) | Expression::Column(_) | Expression::SubqueryResult(_) => {
+                Ok(self)
+            }
             Expression::BinaryOp { op, left, right } => Ok(Expression::BinaryOp {
                 op,
                 left: Box::new(left.substitute_params(params)?),
@@ -250,6 +327,64 @@ impl Expression {
         }
     }
 
+    /// Recursively substitute `SubqueryResult(i)` with `Literal(values[i])`.
+    /// Used by the session AFTER it has run each uncorrelated scalar subquery,
+    /// to splice the subquery's single value in. The mirror of
+    /// `substitute_params`, but on the SEPARATE subquery-result namespace:
+    /// `Parameter` slots pass through untouched (the session bound them first),
+    /// so the two passes never interfere. An out-of-range slot is an internal
+    /// invariant break — the binder emits exactly `scalar_subqueries.len()`
+    /// slots and the session resolves exactly that many.
+    pub fn substitute_subquery_results(
+        self,
+        values: &[Value],
+    ) -> crate::common::Result<Expression> {
+        match self {
+            Expression::SubqueryResult(i) => values
+                .get(i)
+                .cloned()
+                .map(Expression::Literal)
+                .ok_or_else(|| {
+                    crate::common::Error::Internal(format!(
+                        "scalar-subquery slot {} has no resolved value (only {} resolved)",
+                        i,
+                        values.len()
+                    ))
+                }),
+            Expression::Literal(_) | Expression::Column(_) | Expression::Parameter(_) => Ok(self),
+            Expression::BinaryOp { op, left, right } => Ok(Expression::BinaryOp {
+                op,
+                left: Box::new(left.substitute_subquery_results(values)?),
+                right: Box::new(right.substitute_subquery_results(values)?),
+            }),
+            Expression::ExtractYear(arg) => Ok(Expression::ExtractYear(Box::new(
+                arg.substitute_subquery_results(values)?,
+            ))),
+            Expression::Case {
+                branches,
+                else_expr,
+            } => {
+                let branches = branches
+                    .into_iter()
+                    .map(|(pred, result)| {
+                        Ok((
+                            pred.substitute_subquery_results(values)?,
+                            result.substitute_subquery_results(values)?,
+                        ))
+                    })
+                    .collect::<crate::common::Result<Vec<_>>>()?;
+                let else_expr = match else_expr {
+                    Some(e) => Some(Box::new(e.substitute_subquery_results(values)?)),
+                    None => None,
+                };
+                Ok(Expression::Case {
+                    branches,
+                    else_expr,
+                })
+            }
+        }
+    }
+
     /// Static result type of this expression over a row of
     /// `column_types` — MUST mirror `eval_binary_op` exactly, or the
     /// aggregate accumulator (picked from this type) diverges from the
@@ -261,7 +396,9 @@ impl Expression {
             // `Null` literal → None (it has no intrinsic type).
             Expression::Literal(v) => v.type_of(),
             Expression::Column(i) => column_types.get(*i).copied(),
-            Expression::Parameter(_) => None,
+            // Neither is statically typed: both are resolved to a `Literal`
+            // (user binding / subquery result) before the plan is typed.
+            Expression::Parameter(_) | Expression::SubqueryResult(_) => None,
             Expression::BinaryOp { op, left, right } => {
                 // None propagates: a NULL-typed sub-expression makes the
                 // whole result NULL, exactly as `eval_binary_op` does.
@@ -433,6 +570,9 @@ impl std::fmt::Display for Expression {
             Expression::Literal(v) => write!(f, "{:?}", v),
             // 1-based to match SQL's `$1` placeholder syntax.
             Expression::Parameter(i) => write!(f, "${}", i + 1),
+            // A scalar-subquery result slot: `subq{i}`, distinct from `$N` so
+            // an EXPLAIN can tell a user parameter from a subquery placeholder.
+            Expression::SubqueryResult(i) => write!(f, "subq{}", i),
             Expression::BinaryOp { op, left, right } => {
                 let symbol = match op {
                     BinaryOp::Add => '+',
@@ -481,6 +621,67 @@ impl Predicate {
                 pattern,
             }),
             Predicate::IsNull(expr) => Ok(Predicate::IsNull(expr.substitute_params(params)?)),
+            // The probe expression may carry parameters (an uncorrelated
+            // subquery is a statement constant, but its LHS can be `$1 IN
+            // (…)`); the `subquery` index and the inner plan are untouched —
+            // the inner query is a separate statement, substituted when it
+            // is itself executed.
+            Predicate::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => Ok(Predicate::InSubquery {
+                expr: match expr {
+                    Some(e) => Some(e.substitute_params(params)?),
+                    None => None,
+                },
+                subquery,
+                negated,
+            }),
+        }
+    }
+
+    /// Recursively substitute scalar-subquery result slots in nested
+    /// expressions (see `Expression::substitute_subquery_results`). The probe
+    /// of an `InSubquery` may itself carry a `SubqueryResult`; the subquery
+    /// index and inner plan are untouched.
+    pub fn substitute_subquery_results(self, values: &[Value]) -> crate::common::Result<Predicate> {
+        match self {
+            Predicate::Compare { op, left, right } => Ok(Predicate::Compare {
+                op,
+                left: left.substitute_subquery_results(values)?,
+                right: right.substitute_subquery_results(values)?,
+            }),
+            Predicate::And(a, b) => Ok(Predicate::And(
+                Box::new(a.substitute_subquery_results(values)?),
+                Box::new(b.substitute_subquery_results(values)?),
+            )),
+            Predicate::Or(a, b) => Ok(Predicate::Or(
+                Box::new(a.substitute_subquery_results(values)?),
+                Box::new(b.substitute_subquery_results(values)?),
+            )),
+            Predicate::Not(p) => Ok(Predicate::Not(Box::new(
+                p.substitute_subquery_results(values)?,
+            ))),
+            Predicate::Like { expr, pattern } => Ok(Predicate::Like {
+                expr: expr.substitute_subquery_results(values)?,
+                pattern,
+            }),
+            Predicate::IsNull(expr) => {
+                Ok(Predicate::IsNull(expr.substitute_subquery_results(values)?))
+            }
+            Predicate::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => Ok(Predicate::InSubquery {
+                expr: match expr {
+                    Some(e) => Some(e.substitute_subquery_results(values)?),
+                    None => None,
+                },
+                subquery,
+                negated,
+            }),
         }
     }
 }
@@ -488,16 +689,30 @@ impl Predicate {
 impl Predicate {
     /// Compile to a `WHERE`-semantics closure: the row passes only when
     /// the predicate evaluates to TRUE — UNKNOWN and FALSE both drop it.
+    /// No subquery sets — used by the many call sites (and tests) whose
+    /// predicates carry no `InSubquery`. A predicate that DOES carry one
+    /// must go through `compile_with_subqueries`.
     pub fn compile(self) -> Box<dyn Fn(&Tuple) -> bool + Send> {
-        let f = self.compile_3vl();
+        self.compile_with_subqueries(&[])
+    }
+
+    /// Like `compile`, but with the statement's materialized subquery sets
+    /// available so an `InSubquery` leaf can capture its set. The executor
+    /// builders (Volcano + Push) call this for every `Filter`.
+    pub fn compile_with_subqueries(
+        self,
+        subqueries: &[InSubquerySet],
+    ) -> Box<dyn Fn(&Tuple) -> bool + Send> {
+        let f = self.compile_3vl(subqueries);
         Box::new(move |t| f(t) == Some(true))
     }
 
     /// Kleene three-valued compilation: `None` is UNKNOWN. The collapse
     /// to two values happens once, at the `WHERE` boundary in `compile` —
     /// never inside the tree, where `NOT` would invert a premature
-    /// collapse into a wrong answer.
-    fn compile_3vl(self) -> Predicate3VL {
+    /// collapse into a wrong answer. `subqueries` are the statement's
+    /// materialized `InSubquery` sets (empty when the caller has none).
+    fn compile_3vl(self, subqueries: &[InSubquerySet]) -> Predicate3VL {
         match self {
             Predicate::Compare { op, left, right } => {
                 let l = left.compile();
@@ -505,8 +720,8 @@ impl Predicate {
                 Box::new(move |t| eval_compare(op, &l(t), &r(t)))
             }
             Predicate::And(a, b) => {
-                let a = a.compile_3vl();
-                let b = b.compile_3vl();
+                let a = a.compile_3vl(subqueries);
+                let b = b.compile_3vl(subqueries);
                 // Kleene AND: FALSE dominates (short-circuit), UNKNOWN
                 // contaminates everything except FALSE.
                 Box::new(move |t| {
@@ -522,8 +737,8 @@ impl Predicate {
                 })
             }
             Predicate::Or(a, b) => {
-                let a = a.compile_3vl();
-                let b = b.compile_3vl();
+                let a = a.compile_3vl(subqueries);
+                let b = b.compile_3vl(subqueries);
                 // Kleene OR: TRUE dominates (short-circuit), UNKNOWN
                 // contaminates everything except TRUE.
                 Box::new(move |t| {
@@ -539,7 +754,7 @@ impl Predicate {
                 })
             }
             Predicate::Not(p) => {
-                let p = p.compile_3vl();
+                let p = p.compile_3vl(subqueries);
                 // NOT UNKNOWN = UNKNOWN — the case that forces real 3VL.
                 Box::new(move |t| p(t).map(|b| !b))
             }
@@ -566,7 +781,78 @@ impl Predicate {
                 // NULL into a definite truth value instead of UNKNOWN.
                 Box::new(move |t| Some(matches!(e(t), Value::Null)))
             }
+            Predicate::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                // Capture this leaf's materialized set. A missing slot means
+                // the sets weren't threaded (e.g. a stray `InSubquery` reached
+                // the zero-arg `compile`); stay total by treating it as an
+                // empty set — flagged in debug like the `Parameter` arm.
+                let set = subqueries.get(subquery).cloned().unwrap_or_else(|| {
+                    debug_assert!(
+                        false,
+                        "InSubquery slot {} has no materialized set",
+                        subquery
+                    );
+                    InSubquerySet::default()
+                });
+                match expr {
+                    // `[NOT] EXISTS`: a statement constant — true iff the
+                    // subquery produced a row. `negated` flips it; never
+                    // UNKNOWN.
+                    None => {
+                        let result = Some(set.nonempty != negated);
+                        Box::new(move |_t| result)
+                    }
+                    // `[NOT] IN`: NULL-aware 3VL per row (see `eval_in`).
+                    Some(e) => {
+                        let e = e.compile();
+                        Box::new(move |t| eval_in(&e(t), &set, negated))
+                    }
+                }
+            }
         }
+    }
+}
+
+/// NULL-aware `IN` / `NOT IN` under Kleene 3VL. Let `p = probe`:
+/// - set is EMPTY (no rows at all) → FALSE, vacuously, for EVERY `p` —
+///   a NULL `p` included. There is nothing `p` could equal, so membership is
+///   a determinate FALSE (and `NOT IN` a determinate TRUE), never UNKNOWN.
+///   This arm MUST precede the NULL-probe check: SQL makes `x IN (empty)`
+///   FALSE and `x NOT IN (empty)` TRUE even when `x` is NULL (vacuous truth;
+///   Postgres agrees). Falling into the NULL-probe arm first would wrongly
+///   report UNKNOWN and drop a NULL row from a `NOT IN (empty)`.
+/// - `p` is NULL → UNKNOWN (a NULL never equals or not-equals anything).
+/// - `p` ∈ set → TRUE.
+/// - `p` ∉ set → UNKNOWN when the set held a NULL (`p` MIGHT equal that
+///   unknown value), else FALSE.
+///
+/// `NOT IN` is the Kleene negation of that (`Some(b)` → `Some(!b)`, UNKNOWN
+/// stays UNKNOWN). Two pinned consequences fall straight out: `x NOT IN
+/// (subquery yielding a NULL)` is UNKNOWN for every `x` → zero rows, and
+/// `NOT IN` over an EMPTY set is TRUE for every `x` (NULL included) → all rows.
+fn eval_in(probe: &Value, set: &InSubquerySet, negated: bool) -> Option<bool> {
+    let raw = if !set.nonempty {
+        // Vacuous truth: empty-set membership is a determinate FALSE for every
+        // probe (see the doc comment) — checked before the NULL-probe arm on
+        // purpose, so a NULL probe over an empty set is FALSE, not UNKNOWN.
+        Some(false)
+    } else if matches!(probe, Value::Null) {
+        None
+    } else if set.values.contains(&probe.join_key_normalized()) {
+        Some(true)
+    } else if set.has_null {
+        None
+    } else {
+        Some(false)
+    };
+    if negated {
+        raw.map(|b| !b)
+    } else {
+        raw
     }
 }
 
@@ -1419,6 +1705,97 @@ mod tests {
         let g = Predicate::Not(Box::new(Predicate::IsNull(col(0)))).compile();
         assert!(!g(&vec![Value::Null]));
         assert!(g(&vec![Value::Int32(0)]));
+    }
+
+    // ---- IN / EXISTS subquery (NULL-aware 3VL) ----
+
+    /// A materialized set of `vals` (normalized), with the `has_null` flag.
+    fn in_set(vals: &[Value], has_null: bool) -> InSubquerySet {
+        InSubquerySet {
+            values: Arc::new(vals.iter().map(|v| v.join_key_normalized()).collect()),
+            has_null,
+            nonempty: !vals.is_empty() || has_null,
+        }
+    }
+
+    fn in_pred(negated: bool) -> Predicate {
+        Predicate::InSubquery {
+            expr: Some(col(0)),
+            subquery: 0,
+            negated,
+        }
+    }
+
+    #[test]
+    fn in_subquery_3vl_contained_absent_and_null_probe() {
+        // x IN (2, 3): contained → TRUE, absent (no NULL in set) → FALSE,
+        // probe NULL → UNKNOWN → dropped by WHERE.
+        let f = in_pred(false)
+            .compile_with_subqueries(&[in_set(&[Value::Int64(2), Value::Int64(3)], false)]);
+        assert!(f(&vec![Value::Int64(2)]));
+        assert!(!f(&vec![Value::Int64(5)]));
+        assert!(!f(&vec![Value::Null]));
+        // Cross-representation match: 2 IN (2.00) is TRUE (join_key_normalized,
+        // so IN agrees exactly with `=`).
+        let g = in_pred(false).compile_with_subqueries(&[in_set(&[dec(200, 2)], false)]);
+        assert!(g(&vec![Value::Int64(2)]));
+    }
+
+    #[test]
+    fn not_in_over_a_null_yields_zero_rows() {
+        // x NOT IN (subquery yielding a NULL): UNKNOWN for EVERY x (contained →
+        // NOT TRUE = FALSE dropped; absent → has_null → UNKNOWN dropped), so no
+        // row ever survives — the classic SQL trap (Q16 relies on it NOT
+        // firing, i.e. the subquery must exclude NULLs).
+        let f = in_pred(true).compile_with_subqueries(&[in_set(&[Value::Int64(2)], true)]);
+        assert!(!f(&vec![Value::Int64(2)])); // contained → FALSE
+        assert!(!f(&vec![Value::Int64(5)])); // absent + has_null → UNKNOWN
+        assert!(!f(&vec![Value::Null])); // probe NULL → UNKNOWN
+    }
+
+    #[test]
+    fn not_in_over_empty_set_keeps_all_rows_including_null() {
+        // NOT IN over an EMPTY set is TRUE for EVERY probe — a NULL probe
+        // included. `IN (empty)` is vacuously FALSE (nothing to equal), so
+        // `NOT IN (empty)` is TRUE regardless of the probe's nullness (SQL
+        // vacuous truth; Postgres agrees). This pins the empty-set arm running
+        // BEFORE the NULL-probe arm in `eval_in`.
+        let f = in_pred(true).compile_with_subqueries(&[in_set(&[], false)]);
+        assert!(f(&vec![Value::Int64(1)]));
+        assert!(f(&vec![Value::Int64(2)]));
+        assert!(f(&vec![Value::Null])); // vacuous truth — NULL row survives too
+                                        // IN over the empty set is FALSE for every row (matches nothing),
+                                        // a NULL probe included.
+        let g = in_pred(false).compile_with_subqueries(&[in_set(&[], false)]);
+        assert!(!g(&vec![Value::Int64(1)]));
+        assert!(!g(&vec![Value::Null]));
+    }
+
+    #[test]
+    fn exists_is_a_statement_constant() {
+        let nonempty = InSubquerySet {
+            values: Arc::new(HashSet::new()),
+            has_null: false,
+            nonempty: true,
+        };
+        let empty = InSubquerySet::default(); // nonempty = false
+        let exists = Predicate::InSubquery {
+            expr: None,
+            subquery: 0,
+            negated: false,
+        };
+        let not_exists = Predicate::InSubquery {
+            expr: None,
+            subquery: 0,
+            negated: true,
+        };
+        let row = vec![Value::Int64(0)];
+        let nonempty = std::slice::from_ref(&nonempty);
+        let empty = std::slice::from_ref(&empty);
+        assert!(exists.clone().compile_with_subqueries(nonempty)(&row));
+        assert!(!exists.compile_with_subqueries(empty)(&row));
+        assert!(!not_exists.clone().compile_with_subqueries(nonempty)(&row));
+        assert!(not_exists.compile_with_subqueries(empty)(&row));
     }
 
     // ---- searched CASE ----

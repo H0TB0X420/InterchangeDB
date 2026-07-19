@@ -119,7 +119,11 @@ impl ColumnRemap {
     pub fn apply_expression(&self, expr: Expression) -> Expression {
         match expr {
             Expression::Column(i) => Expression::Column(self.apply_index(i)),
-            Expression::Literal(_) | Expression::Parameter(_) => expr,
+            // No column reference to remap (both are resolved to a `Literal`
+            // before the plan is optimized).
+            Expression::Literal(_) | Expression::Parameter(_) | Expression::SubqueryResult(_) => {
+                expr
+            }
             Expression::BinaryOp { op, left, right } => Expression::BinaryOp {
                 op,
                 left: Box::new(self.apply_expression(*left)),
@@ -167,6 +171,17 @@ impl ColumnRemap {
                 pattern,
             },
             Predicate::IsNull(expr) => Predicate::IsNull(self.apply_expression(expr)),
+            // Remap the probe's columns (they index the join tuple the reorder
+            // permutes); the subquery index and inner plan are untouched.
+            Predicate::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => Predicate::InSubquery {
+                expr: expr.map(|e| self.apply_expression(e)),
+                subquery,
+                negated,
+            },
         }
     }
 }
