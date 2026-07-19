@@ -23,7 +23,7 @@ use sqlparser::ast::{
 use crate::catalog::{Catalog, ColumnDef, IndexBackend, Schema};
 use crate::common::{Error, Result};
 use crate::sql::ir::expr::{BinaryOp, CompareOp, Expression, Predicate};
-use crate::sql::ir::logical::{AggregateSpec, LogicalPlan, OrderDir};
+use crate::sql::ir::logical::{AggregateSpec, JoinKind, LogicalPlan, OrderDir};
 use crate::storage::StorageEngine;
 use crate::types::{ColumnType, Decimal, Value};
 
@@ -363,7 +363,8 @@ impl<E: StorageEngine> Binder<E> {
         // first table becomes `LogicalPlan::Select::table`; the rest become
         // entries in `joins`.
         let mut scope = Scope { tables: Vec::new() };
-        let mut joined_tables: Vec<(String, Option<String>, Option<AstExpr>)> = Vec::new();
+        let mut joined_tables: Vec<(String, Option<String>, Option<AstExpr>, JoinKind)> =
+            Vec::new();
 
         for (twj_idx, twj) in select.from.into_iter().enumerate() {
             // The "head" relation of this TableWithJoins.
@@ -374,7 +375,7 @@ impl<E: StorageEngine> Binder<E> {
             } else {
                 // Implicit cross join with the running scope.
                 scope.push(head_name.clone(), head_alias.clone(), head_schema);
-                joined_tables.push((head_name, head_alias, None));
+                joined_tables.push((head_name, head_alias, None, JoinKind::Inner));
             }
 
             // Explicit joins attached to this entry.
@@ -385,18 +386,43 @@ impl<E: StorageEngine> Binder<E> {
                 // that already includes the right side, so push first.
                 scope.push(right_name.clone(), right_alias.clone(), right_schema);
 
-                let on_expr = match j.join_operator {
-                    ast::JoinOperator::Inner(ast::JoinConstraint::On(e)) => Some(e),
-                    ast::JoinOperator::Inner(ast::JoinConstraint::None) => None,
-                    ast::JoinOperator::CrossJoin => None,
+                // R1 (H3b): a LEFT OUTER join's ON filters the *match*, so it
+                // must carry an ON — an outer join without one can never leave
+                // a row unmatched and is meaningless; reject it loudly. RIGHT
+                // and FULL OUTER are named rejections (unsupported, not silent
+                // mis-plans).
+                let (kind, on_expr) = match j.join_operator {
+                    ast::JoinOperator::Inner(ast::JoinConstraint::On(e)) => {
+                        (JoinKind::Inner, Some(e))
+                    }
+                    ast::JoinOperator::Inner(ast::JoinConstraint::None) => (JoinKind::Inner, None),
+                    ast::JoinOperator::CrossJoin => (JoinKind::Inner, None),
+                    ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(e)) => {
+                        (JoinKind::LeftOuter, Some(e))
+                    }
+                    ast::JoinOperator::LeftOuter(_) => {
+                        return Err(Error::SqlParse(
+                            "binder: LEFT OUTER JOIN requires an ON clause".into(),
+                        ))
+                    }
+                    ast::JoinOperator::RightOuter(_) => {
+                        return Err(Error::SqlParse(
+                            "binder: RIGHT OUTER JOIN not supported".into(),
+                        ))
+                    }
+                    ast::JoinOperator::FullOuter(_) => {
+                        return Err(Error::SqlParse(
+                            "binder: FULL OUTER JOIN not supported".into(),
+                        ))
+                    }
                     other => {
                         return Err(Error::SqlParse(format!(
-                            "binder: only INNER JOIN and CROSS JOIN supported, got {:?}",
+                            "binder: only INNER, CROSS, and LEFT OUTER JOIN supported, got {:?}",
                             other
                         )))
                     }
                 };
-                joined_tables.push((right_name, right_alias, on_expr));
+                joined_tables.push((right_name, right_alias, on_expr, kind));
             }
         }
 
@@ -410,7 +436,7 @@ impl<E: StorageEngine> Binder<E> {
         // reference (unusual, the binder rejects via column-not-found).
         let mut joins: Vec<crate::sql::ir::logical::JoinClause> =
             Vec::with_capacity(joined_tables.len());
-        for (right_table, right_alias, on_expr) in joined_tables {
+        for (right_table, right_alias, on_expr, kind) in joined_tables {
             let on = match on_expr {
                 Some(e) => Some(bind_predicate(&scope, e)?),
                 None => None,
@@ -419,6 +445,7 @@ impl<E: StorageEngine> Binder<E> {
                 right_table,
                 right_alias,
                 on,
+                kind,
             });
         }
 

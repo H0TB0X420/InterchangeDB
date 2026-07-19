@@ -24,7 +24,7 @@ use interchangedb::engines::btree::BTreeEngine;
 use interchangedb::execution::ExecModel;
 use interchangedb::layout::RowLayout;
 use interchangedb::sql::ir::expr::{CompareOp, Expression, Predicate};
-use interchangedb::sql::ir::logical::OrderDir;
+use interchangedb::sql::ir::logical::{JoinKind, OrderDir};
 use interchangedb::sql::ir::physical::PhysOp;
 use interchangedb::storage::MemoryDiskManager;
 use interchangedb::table::Table;
@@ -194,6 +194,7 @@ fn all_strategies_and_models_return_identical_rows_on_mixed_int_keys() {
                     left: Expression::Column(1),
                     right: Expression::Column(3),
                 }),
+                kind: JoinKind::Inner,
             },
         ),
         (
@@ -203,6 +204,8 @@ fn all_strategies_and_models_return_identical_rows_on_mixed_int_keys() {
                 inner: seq("b"),
                 outer_key_col: 1,
                 inner_key_col: 1,
+                kind: JoinKind::Inner,
+                residual: None,
             },
         ),
         (
@@ -240,6 +243,71 @@ fn all_strategies_and_models_return_identical_rows_on_mixed_int_keys() {
                 name,
                 model.name()
             );
+        }
+    }
+}
+
+// H3b — the two outer-capable algorithms must agree on the SAME LEFT OUTER
+// join with a COMPOUND ON. The equi conjunct `a_key = b_key` drives the
+// hash key; the residual `b_key = 1` is the extra conjunct — NLJ-outer runs
+// the whole ON per pair, hash-outer runs the equi via the hash table and the
+// residual per candidate. Both must null-pad identically. This one query
+// exercises every outer path at once:
+//   a1 (key 1): two b rows with b_key 1 pass the residual → fan-out (2 rows)
+//   a2 (key 2): its candidate (b_key 2) FAILS the residual → padded
+//   a3 (NULL) : NULL key matches nothing → padded
+//   a4 (5e9)  : out-of-i32-range, no candidate → padded
+//   a5 (9)    : no candidate → padded
+// Forcing the two algorithms directly (not via the planner) is the mechanism
+// the spec allows: the heuristic would pick hash-outer for this equi ON, so
+// direct construction is the only way to pin NLJ-outer against it.
+#[test]
+fn outer_nlj_and_hash_agree_on_compound_on() {
+    let env = setup();
+
+    // Global columns of `a || b`: a_id 0, a_key 1, b_id 2, b_key 3.
+    let equi = || Predicate::Compare {
+        op: CompareOp::Eq,
+        left: Expression::Column(1),
+        right: Expression::Column(3),
+    };
+    let residual = || Predicate::Compare {
+        op: CompareOp::Eq,
+        left: Expression::Column(3),
+        right: Expression::Literal(Value::Int32(1)),
+    };
+
+    // NLJ-outer: the FULL ON (`a_key = b_key AND b_key = 1`) per pair (R1).
+    let nlj_outer = PhysOp::NestedLoopJoin {
+        outer: seq("a"),
+        inner: seq("b"),
+        on: Some(Predicate::And(Box::new(equi()), Box::new(residual()))),
+        kind: JoinKind::LeftOuter,
+    };
+    // Hash-outer: equi via the hash key, `b_key = 1` as the residual ON.
+    let hash_outer = PhysOp::HashJoin {
+        outer: seq("a"),
+        inner: seq("b"),
+        outer_key_col: 1,
+        inner_key_col: 1,
+        kind: JoinKind::LeftOuter,
+        residual: Some(residual()),
+    };
+
+    // Ground truth: one fan-out group of 2 (a1) + four padded lefts = 6 rows.
+    let truth = run_sorted(&env, &ExecModel::Volcano, &nlj_outer);
+    assert_eq!(truth.len(), 6, "outer ground truth:\n{:?}", truth);
+    // Exactly four rows are padded (b side all NULL): a2, a3, a4, a5.
+    let padded = truth
+        .iter()
+        .filter(|r| r[2] == Value::Null && r[3] == Value::Null)
+        .count();
+    assert_eq!(padded, 4, "four unmatched lefts must pad:\n{:?}", truth);
+
+    for model in &[ExecModel::Volcano, ExecModel::Push] {
+        for (name, plan) in [("nlj-outer", &nlj_outer), ("hash-outer", &hash_outer)] {
+            let rows = run_sorted(&env, model, plan);
+            assert_eq!(rows, truth, "{}/{} diverges", name, model.name());
         }
     }
 }

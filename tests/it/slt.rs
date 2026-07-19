@@ -150,6 +150,11 @@ fn slt_join() {
 }
 
 #[test]
+fn slt_outer_join() {
+    run_slt("outer_join.slt");
+}
+
+#[test]
 fn slt_unique() {
     run_slt("unique.slt");
 }

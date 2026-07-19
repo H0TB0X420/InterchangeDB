@@ -154,16 +154,32 @@ pub enum LogicalPlan {
     Explain(Box<LogicalPlan>),
 }
 
+/// Whether a join preserves unmatched rows of its left input (H3b). `Inner`
+/// keeps only matched pairs; `LeftOuter` additionally pads every left row
+/// that matched nothing with a right side of NULLs. Derives mirror
+/// `OrderDir` (a small copy enum carried in the serde-clean physical IR) so
+/// the same value threads the logical `JoinClause` and `PhysOp` alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinKind {
+    Inner,
+    LeftOuter,
+}
+
 /// One JOIN clause attached to a SELECT. The right side is always a
 /// single table at this stage (3+-way joins compose by repeating). The
 /// `on` predicate is `None` for implicit `FROM a, b` (cross product) and
 /// `Some(p)` for explicit `JOIN b ON p`. WHERE filters are kept separate
 /// — Phase 14's cost-based planner will revisit predicate pushdown.
+///
+/// `kind` distinguishes an inner join from a `LEFT OUTER JOIN` (H3b). For
+/// `LeftOuter` the binder guarantees `on` is `Some` (an outer join without
+/// an ON is meaningless — a cross product can never leave a row unmatched).
 #[derive(Debug, Clone)]
 pub struct JoinClause {
     pub right_table: String,
     pub right_alias: Option<String>,
     pub on: Option<Predicate>,
+    pub kind: JoinKind,
 }
 
 /// SQL-level aggregate function spec. The planner translates each
@@ -220,6 +236,7 @@ impl LogicalPlan {
                                 Some(p) => Some(p.substitute_params(params)?),
                                 None => None,
                             },
+                            kind: j.kind,
                         })
                     })
                     .collect::<crate::common::Result<Vec<_>>>()?;

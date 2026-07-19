@@ -31,7 +31,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::sql::ir::expr::{Expression, Predicate};
-use crate::sql::ir::logical::{AggregateSpec, OrderDir};
+use crate::sql::ir::logical::{AggregateSpec, JoinKind, OrderDir};
 use crate::types::Value;
 
 /// One node of a physical plan. Children are owned `Box<PhysOp>`, so a plan
@@ -78,11 +78,15 @@ pub enum PhysOp {
 
     /// Block nested-loop join. `inner` is the materialized side (today always
     /// a `SeqScan` of the right table). `on` is the ON predicate over the
-    /// concatenated `outer || inner` tuple; `None` is a cross join.
+    /// concatenated `outer || inner` tuple; `None` is a cross join. `kind`
+    /// selects inner vs `LEFT OUTER` (H3b): under `LeftOuter`, the full `on`
+    /// runs per pair (R1) and any left row that matches nothing emits padded
+    /// with a right side of NULLs.
     NestedLoopJoin {
         outer: Box<PhysOp>,
         inner: Box<PhysOp>,
         on: Option<Predicate>,
+        kind: JoinKind,
     },
 
     /// Index nested-loop join: probe `inner_index` on `inner_table` once per
@@ -96,11 +100,19 @@ pub enum PhysOp {
 
     /// Hash equi-join: build a hash table on `inner` keyed by `inner_key_col`,
     /// probe with `outer_key_col`. NULL keys never match (SQL equi-join).
+    /// `kind` selects inner vs `LEFT OUTER` (H3b). `residual` is the rest of
+    /// a compound ON after the hashed equi conjunct is removed (Q13's
+    /// `o_comment NOT LIKE …`) — evaluated per candidate pair over the
+    /// concatenated `outer || inner` tuple; a `LeftOuter` probe that finds no
+    /// surviving pair emits the left row padded with NULLs. `None` for a bare
+    /// equi join (inner, or a single-conjunct outer ON).
     HashJoin {
         outer: Box<PhysOp>,
         inner: Box<PhysOp>,
         outer_key_col: usize,
         inner_key_col: usize,
+        kind: JoinKind,
+        residual: Option<Predicate>,
     },
 
     /// Merge equi-join (17-B): both inputs must arrive sorted ascending on
@@ -154,11 +166,12 @@ impl PhysOp {
     /// terminated by `\n`. Engine-free — reads only the IR — so EXPLAIN and
     /// plan-shape tests never have to build or scan.
     ///
-    /// Line formats mirror the operators' own `Executor::explain` so existing
-    /// goldens are unchanged, with two exceptions: `NestedLoopJoin` and
-    /// `HashJoin` operators print a *runtime* count of their materialized inner
-    /// (`<materialized inner: N rows>`) that the IR cannot know — here they
-    /// render the inner subtree instead, which is strictly more informative.
+    /// This IR renderer is the source of truth for SQL `EXPLAIN` output; its
+    /// line formats may differ from the runtime operators' own
+    /// `Executor::explain` debug rendering. An operator's explain can print
+    /// runtime-only facts the IR cannot know — e.g. `HashJoin` prints its
+    /// `build_size` (and a materialized-inner row/key-group count), whereas the
+    /// IR prints `inner_key` and renders the inner subtree instead.
     pub fn explain(&self, indent: usize) -> String {
         let pad = "  ".repeat(indent);
         let inner_pad = "  ".repeat(indent + 1);
@@ -184,11 +197,21 @@ impl PhysOp {
                     input.explain(indent + 1)
                 )
             }
-            PhysOp::NestedLoopJoin { outer, inner, .. } => format!(
-                "{pad}NestedLoopJoin\n{}{}",
-                outer.explain(indent + 1),
-                inner.explain(indent + 1)
-            ),
+            PhysOp::NestedLoopJoin {
+                outer, inner, kind, ..
+            } => {
+                // Inner rendering byte-unchanged (golden stability); outer
+                // gets a marker.
+                let marker = match kind {
+                    JoinKind::Inner => "",
+                    JoinKind::LeftOuter => "(outer)",
+                };
+                format!(
+                    "{pad}NestedLoopJoin{marker}\n{}{}",
+                    outer.explain(indent + 1),
+                    inner.explain(indent + 1)
+                )
+            }
             PhysOp::IndexNestedLoopJoin {
                 outer, inner_index, ..
             } => format!(
@@ -200,11 +223,21 @@ impl PhysOp {
                 inner,
                 outer_key_col,
                 inner_key_col,
-            } => format!(
-                "{pad}HashJoin(outer_key={outer_key_col}, inner_key={inner_key_col})\n{}{}",
-                outer.explain(indent + 1),
-                inner.explain(indent + 1)
-            ),
+                kind,
+                ..
+            } => {
+                // Inner rendering byte-unchanged (golden stability); outer
+                // prepends a `left_outer` marker before the keys.
+                let marker = match kind {
+                    JoinKind::Inner => "",
+                    JoinKind::LeftOuter => "left_outer, ",
+                };
+                format!(
+                    "{pad}HashJoin({marker}outer_key={outer_key_col}, inner_key={inner_key_col})\n{}{}",
+                    outer.explain(indent + 1),
+                    inner.explain(indent + 1)
+                )
+            }
             PhysOp::MergeJoin {
                 left,
                 right,

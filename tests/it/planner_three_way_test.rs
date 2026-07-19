@@ -175,6 +175,19 @@ const CORPUS: &[&str] = &[
     // Mixed-type equi-join (Int64 vs indexed Int32): NULL never matches,
     // 5e9 exceeds i32, 9 and 7 are unpartnered.
     "SELECT ja_id, jb_id FROM ja JOIN jb ON ja_key = jb_key",
+    // H3b LEFT OUTER JOIN: the cost-based planners (selinger, memo) BAIL on
+    // any outer join (no reordering across it) and lower it textually, so all
+    // three must return the SAME rows — including the padded lefts (ja_key
+    // NULL / 5e9 / 9 have no jb partner and emit jb_id NULL).
+    "SELECT ja_id, jb_id FROM ja LEFT OUTER JOIN jb ON ja_key = jb_key",
+    // Mixed chain: one INNER then one LEFT OUTER join in a single statement.
+    // `c JOIN a` is inner (keeps only c rows whose c_b hits a_id 1/2), then
+    // LEFT OUTER JOIN b pads the c rows with no b partner (c_id 5, 6 → b_id
+    // NULL). The presence of ANY outer join makes the cost-based planners bail
+    // to textual for the WHOLE statement (they do not reorder across it), so
+    // all three must return the SAME rows — matched AND padded — under the
+    // fixed left-to-right shape.
+    "SELECT c_id, b_id FROM c JOIN a ON c_b = a_id LEFT OUTER JOIN b ON c_id = b_id",
     // Non-equi ON → the memo's D8 fallback path, end to end.
     "SELECT a_val, b_val FROM a JOIN b ON b_a < a_id",
     // H1 grouped aggregation. The joined query is the load-bearing one:

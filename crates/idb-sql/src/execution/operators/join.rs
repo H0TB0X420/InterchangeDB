@@ -14,8 +14,10 @@
 //! returns true. Output schema is the concatenation of outer + inner
 //! schemas.
 //!
-//! Inner-only (no LEFT/RIGHT/FULL outer) for P12.7. The plan documents
-//! the trait shape evolution if outer joins are needed before Phase 22.
+//! Inner and LEFT OUTER (H3b): `new` is inner; `new_left_outer` pads every
+//! outer row that matches nothing with a right side of NULLs. RIGHT and FULL
+//! outer are not implemented (the binder rejects them). `HashJoin` mirrors
+//! this with `new` / `new_left_outer` (the latter carrying a residual ON).
 //!
 //! ## Cost shape
 //!
@@ -30,6 +32,8 @@ use std::sync::Arc;
 use crate::catalog::{ColumnDef, Schema, TableId};
 use crate::common::Result;
 use crate::execution::{Executor, Tuple};
+use crate::sql::ir::logical::JoinKind;
+use crate::types::Value;
 
 /// Marker trait for join-algorithm operators. Every implementor also
 /// implements `Executor`; this exists so the planner / cost model can
@@ -46,18 +50,27 @@ pub trait JoinStrategy: Executor {
 /// joined row.
 pub type JoinPredicate = Box<dyn Fn(&Tuple, &Tuple) -> bool + Send>;
 
-/// Inner nested-loop join. Eager-materializes the inner side once, then
-/// iterates the outer side lazily, scanning the buffered inner on each
-/// outer row.
+/// Nested-loop join. Eager-materializes the inner side once, then iterates
+/// the outer side lazily, scanning the buffered inner on each outer row.
+/// `kind` selects inner vs LEFT OUTER (H3b): under `LeftOuter`, an outer
+/// row that matches no inner row emits `outer ++ NULLs` (R1) instead of
+/// dropping.
 pub struct NestedLoopJoin {
     schema: Arc<Schema>,
     outer: Box<dyn Executor>,
     inner_rows: Vec<Tuple>,
     predicate: JoinPredicate,
+    kind: JoinKind,
+    /// Right-side column count — the width of the NULL pad a `LeftOuter`
+    /// emits for an unmatched outer row.
+    right_width: usize,
 
     /// Cached current outer row; we walk through all inner rows for each.
     current_outer: Option<Tuple>,
     inner_cursor: usize,
+    /// Whether the current outer row matched any inner row — drives the
+    /// LEFT OUTER pad (emit `outer ++ NULLs` iff this stayed false).
+    matched_current: bool,
 
     /// Debug-only bound: rows emitted for the current outer row. Exceeds
     /// `inner_rows.len()` only if the scan cursor regressed and re-matched
@@ -68,7 +81,7 @@ pub struct NestedLoopJoin {
 }
 
 impl NestedLoopJoin {
-    /// Construct from two children + a join predicate.
+    /// Inner join from two children + a join predicate.
     ///
     /// `outer` is the driving side (iterated once); `inner` is buffered
     /// up-front by draining it via `next()` and stored in a `Vec`. The
@@ -77,22 +90,52 @@ impl NestedLoopJoin {
     /// (Phase 14's cost model automates this choice.)
     pub fn new(
         outer: Box<dyn Executor>,
-        mut inner: Box<dyn Executor>,
+        inner: Box<dyn Executor>,
         predicate: JoinPredicate,
     ) -> Result<Self> {
+        Self::build(outer, inner, predicate, JoinKind::Inner)
+    }
+
+    /// LEFT OUTER join (H3b): identical materialization, but an outer row
+    /// that matches no inner row emits padded with `right_width` NULLs, and
+    /// the output's right columns are nullable. `predicate` is the FULL ON
+    /// (R1 — the whole ON gates the match; no conjunct is hoisted).
+    pub fn new_left_outer(
+        outer: Box<dyn Executor>,
+        inner: Box<dyn Executor>,
+        predicate: JoinPredicate,
+    ) -> Result<Self> {
+        Self::build(outer, inner, predicate, JoinKind::LeftOuter)
+    }
+
+    fn build(
+        outer: Box<dyn Executor>,
+        mut inner: Box<dyn Executor>,
+        predicate: JoinPredicate,
+        kind: JoinKind,
+    ) -> Result<Self> {
+        let right_width = inner.schema().columns.len();
         // Pre-materialize the inner side.
         let mut inner_rows = Vec::new();
         while let Some(t) = inner.next()? {
             inner_rows.push(t);
         }
-        let schema = Arc::new(concat_schemas(outer.schema(), inner.schema()));
+        let right_nullable = matches!(kind, JoinKind::LeftOuter);
+        let schema = Arc::new(concat_schemas(
+            outer.schema(),
+            inner.schema(),
+            right_nullable,
+        ));
         Ok(Self {
             schema,
             outer,
             inner_rows,
             predicate,
+            kind,
+            right_width,
             current_outer: None,
             inner_cursor: 0,
+            matched_current: false,
             #[cfg(debug_assertions)]
             emitted_for_outer: 0,
         })
@@ -106,6 +149,7 @@ impl Executor for NestedLoopJoin {
             if self.current_outer.is_none() {
                 self.current_outer = self.outer.next()?;
                 self.inner_cursor = 0;
+                self.matched_current = false;
                 #[cfg(debug_assertions)]
                 {
                     self.emitted_for_outer = 0;
@@ -127,6 +171,7 @@ impl Executor for NestedLoopJoin {
                 self.inner_cursor = idx + 1;
                 let inner_row = &self.inner_rows[idx];
                 if (self.predicate)(outer_row, inner_row) {
+                    self.matched_current = true;
                     #[cfg(debug_assertions)]
                     {
                         self.emitted_for_outer += 1;
@@ -141,7 +186,18 @@ impl Executor for NestedLoopJoin {
                 }
             }
 
-            // Inner exhausted for this outer row → advance outer.
+            // Inner exhausted for this outer row. LEFT OUTER (H3b): if
+            // nothing matched, emit the outer row once padded with a
+            // right-width run of NULLs, then advance. `take()` clears
+            // `current_outer` so the next call pulls a fresh outer and this
+            // pad fires at most once.
+            if matches!(self.kind, JoinKind::LeftOuter) && !self.matched_current {
+                let mut joined = self.current_outer.take().unwrap();
+                joined.extend(std::iter::repeat_n(Value::Null, self.right_width));
+                return Ok(Some(joined));
+            }
+
+            // Advance outer.
             self.current_outer = None;
         }
     }
@@ -152,7 +208,11 @@ impl Executor for NestedLoopJoin {
 
     fn explain(&self, indent: usize) -> String {
         let pad = "  ".repeat(indent);
-        let mut out = format!("{}NestedLoopJoin\n", pad);
+        let marker = match self.kind {
+            JoinKind::Inner => "",
+            JoinKind::LeftOuter => "(outer)",
+        };
+        let mut out = format!("{}NestedLoopJoin{}\n", pad, marker);
         out.push_str(&self.outer.explain(indent + 1));
         // The inner side was consumed at construction time so we can't
         // recurse into it for EXPLAIN. Render a placeholder so plan
@@ -222,7 +282,7 @@ impl<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout>
                 actual: outer_key_cols.len(),
             });
         }
-        let schema = Arc::new(concat_schemas(outer.schema(), inner_table.schema()));
+        let schema = Arc::new(concat_schemas(outer.schema(), inner_table.schema(), false));
         Ok(Self {
             schema,
             outer,
@@ -357,11 +417,10 @@ impl<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout> J
 ///
 /// ## Limitations
 ///
-/// - **Equi-join only.** The join condition must be `outer.col =
-///   inner.col`. Non-equi predicates (`<`, range) fall back to
-///   `NestedLoopJoin` and are not lowered here.
-/// - **Inner only.** No LEFT/RIGHT/FULL outer joins; matching the
-///   `NestedLoopJoin` story.
+/// - **Equi-join key required.** The hash key is one `outer.col =
+///   inner.col` conjunct. Extra ON conjuncts ride the `residual` (H3b);
+///   a fully non-equi ON falls back to `NestedLoopJoin`.
+/// - **Inner and LEFT OUTER** (H3b via `new_left_outer`); no RIGHT/FULL.
 /// - **NULL-skipping.** NULLs in either join column never match
 ///   (standard SQL equi-join semantics). The `HashMap` uses `Value`'s
 ///   own `Hash` (derived in P13.3) so other types hash deterministically.
@@ -370,31 +429,86 @@ impl<E: crate::storage::StorageEngine + 'static, L: crate::layout::DataLayout> J
 pub struct HashJoin {
     schema: Arc<Schema>,
     outer: Box<dyn Executor>,
-    inner_table: std::collections::HashMap<crate::types::Value, Vec<crate::execution::Tuple>>,
+    inner_table: std::collections::HashMap<Value, Vec<crate::execution::Tuple>>,
     outer_key_col: usize,
+    kind: JoinKind,
+    /// Residual ON predicate (H3b): the compound-ON conjuncts beyond the
+    /// hashed equi key (Q13's `o_comment NOT LIKE …`), evaluated per
+    /// candidate `(outer, inner)` pair. `None` is a bare equi join.
+    residual: Option<JoinPredicate>,
+    /// Right-side column count — the width of the NULL pad a `LeftOuter`
+    /// probe emits when no candidate survives.
+    right_width: usize,
     /// Cached current outer row + probe cursor through matched inner rows.
     current_outer: Option<crate::execution::Tuple>,
     matches_for_current: Vec<crate::execution::Tuple>,
     match_cursor: usize,
+    /// Whether the current outer row emitted any surviving pair — drives
+    /// the LEFT OUTER pad (emit `outer ++ NULLs` iff this stayed false).
+    emitted_current: bool,
 }
 
 impl HashJoin {
-    /// Construct. Drains `inner` immediately to build the hash table.
-    /// `outer_key_col` / `inner_key_col` are the column positions of
-    /// the join keys within each side's tuple.
+    /// Inner equi-join. Drains `inner` immediately to build the hash table.
+    /// `outer_key_col` / `inner_key_col` are the column positions of the
+    /// join keys within each side's tuple.
     pub fn new(
+        outer: Box<dyn Executor>,
+        inner: Box<dyn Executor>,
+        outer_key_col: usize,
+        inner_key_col: usize,
+    ) -> Result<Self> {
+        Self::build(
+            outer,
+            inner,
+            outer_key_col,
+            inner_key_col,
+            JoinKind::Inner,
+            None,
+        )
+    }
+
+    /// LEFT OUTER equi-join (H3b) with an optional `residual` ON. The hash
+    /// key is the equi conjunct; `residual` is the rest of a compound ON
+    /// (Q13's `NOT LIKE`), checked per candidate pair. An outer row whose
+    /// candidates all fail the residual — or which has no candidate at all,
+    /// including a NULL key — emits padded with NULLs.
+    pub fn new_left_outer(
+        outer: Box<dyn Executor>,
+        inner: Box<dyn Executor>,
+        outer_key_col: usize,
+        inner_key_col: usize,
+        residual: Option<JoinPredicate>,
+    ) -> Result<Self> {
+        Self::build(
+            outer,
+            inner,
+            outer_key_col,
+            inner_key_col,
+            JoinKind::LeftOuter,
+            residual,
+        )
+    }
+
+    fn build(
         outer: Box<dyn Executor>,
         mut inner: Box<dyn Executor>,
         outer_key_col: usize,
         inner_key_col: usize,
+        kind: JoinKind,
+        residual: Option<JoinPredicate>,
     ) -> Result<Self> {
-        let schema = Arc::new(concat_schemas(outer.schema(), inner.schema()));
-        let mut inner_table: std::collections::HashMap<
-            crate::types::Value,
-            Vec<crate::execution::Tuple>,
-        > = std::collections::HashMap::new();
+        let right_width = inner.schema().columns.len();
+        let right_nullable = matches!(kind, JoinKind::LeftOuter);
+        let schema = Arc::new(concat_schemas(
+            outer.schema(),
+            inner.schema(),
+            right_nullable,
+        ));
+        let mut inner_table: std::collections::HashMap<Value, Vec<crate::execution::Tuple>> =
+            std::collections::HashMap::new();
         while let Some(row) = inner.next()? {
-            if matches!(row[inner_key_col], crate::types::Value::Null) {
+            if matches!(row[inner_key_col], Value::Null) {
                 // SQL equi-join: NULL never matches.
                 continue;
             }
@@ -410,9 +524,13 @@ impl HashJoin {
             outer,
             inner_table,
             outer_key_col,
+            kind,
+            residual,
+            right_width,
             current_outer: None,
             matches_for_current: Vec::new(),
             match_cursor: 0,
+            emitted_current: false,
         })
     }
 }
@@ -420,14 +538,36 @@ impl HashJoin {
 impl Executor for HashJoin {
     fn next(&mut self) -> Result<Option<crate::execution::Tuple>> {
         loop {
-            // Drain pending matches for the current outer row first.
-            if self.match_cursor < self.matches_for_current.len() {
-                let inner = &self.matches_for_current[self.match_cursor];
-                self.match_cursor += 1;
-                let outer = self.current_outer.as_ref().unwrap();
-                let mut joined = outer.clone();
-                joined.extend_from_slice(inner);
-                return Ok(Some(joined));
+            // Emit the next surviving pair for the current outer row. A
+            // candidate survives iff the residual ON (if any) holds — the
+            // hash key already matched the equi conjunct.
+            if self.current_outer.is_some() {
+                while self.match_cursor < self.matches_for_current.len() {
+                    let idx = self.match_cursor;
+                    self.match_cursor += 1;
+                    let passes = match &self.residual {
+                        Some(f) => f(
+                            self.current_outer.as_ref().unwrap(),
+                            &self.matches_for_current[idx],
+                        ),
+                        None => true,
+                    };
+                    if passes {
+                        self.emitted_current = true;
+                        let mut joined = self.current_outer.as_ref().unwrap().clone();
+                        joined.extend_from_slice(&self.matches_for_current[idx]);
+                        return Ok(Some(joined));
+                    }
+                }
+                // Candidates exhausted. LEFT OUTER (H3b): pad the outer row
+                // once when nothing survived, then advance (`take()` clears
+                // `current_outer` so the pad fires at most once).
+                if matches!(self.kind, JoinKind::LeftOuter) && !self.emitted_current {
+                    let mut joined = self.current_outer.take().unwrap();
+                    joined.extend(std::iter::repeat_n(Value::Null, self.right_width));
+                    return Ok(Some(joined));
+                }
+                self.current_outer = None;
             }
             // Need a new outer row.
             let row = match self.outer.next()? {
@@ -435,7 +575,9 @@ impl Executor for HashJoin {
                 None => return Ok(None),
             };
             let key = &row[self.outer_key_col];
-            self.matches_for_current = if matches!(key, crate::types::Value::Null) {
+            self.matches_for_current = if matches!(key, Value::Null) {
+                // NULL key never matches; a LEFT OUTER row still pads (the
+                // empty candidate set flows through the pad path above).
                 Vec::new()
             } else {
                 // Probe with the same canonical form the build side used.
@@ -443,6 +585,7 @@ impl Executor for HashJoin {
                 self.inner_table.get(&key).cloned().unwrap_or_default()
             };
             self.match_cursor = 0;
+            self.emitted_current = false;
             self.current_outer = Some(row);
         }
     }
@@ -453,9 +596,14 @@ impl Executor for HashJoin {
 
     fn explain(&self, indent: usize) -> String {
         let pad = "  ".repeat(indent);
+        let marker = match self.kind {
+            JoinKind::Inner => "",
+            JoinKind::LeftOuter => "left_outer, ",
+        };
         let mut out = format!(
-            "{}HashJoin(outer_key={}, build_size={})\n",
+            "{}HashJoin({}outer_key={}, build_size={})\n",
             pad,
+            marker,
             self.outer_key_col,
             self.inner_table.len()
         );
@@ -586,7 +734,7 @@ impl MergeJoin {
                 right.schema().columns.len()
             )));
         }
-        let schema = Arc::new(concat_schemas(left.schema(), right.schema()));
+        let schema = Arc::new(concat_schemas(left.schema(), right.schema(), false));
         Ok(Self {
             schema,
             left,
@@ -789,22 +937,24 @@ impl JoinStrategy for MergeJoin {
 
 /// Build the output schema for a join: outer columns then inner columns,
 /// with column names disambiguated by table-name prefix when both sides
-/// have a column of the same name.
-fn concat_schemas(outer: &Schema, inner: &Schema) -> Schema {
+/// have a column of the same name. `right_nullable` forces every right
+/// column nullable — a LEFT OUTER join can NULL-pad them (H3b, R1) even
+/// when the base column is `NOT NULL`.
+fn concat_schemas(outer: &Schema, inner: &Schema, right_nullable: bool) -> Schema {
     let mut columns: Vec<ColumnDef> = Vec::with_capacity(outer.columns.len() + inner.columns.len());
     columns.extend_from_slice(&outer.columns);
     for col in &inner.columns {
-        let qualified = if outer.columns.iter().any(|c| c.name == col.name) {
-            ColumnDef {
-                name: format!("{}.{}", inner.name, col.name),
-                ty: col.ty,
-                nullable: col.nullable,
-                default: col.default.clone(),
-            }
+        let name = if outer.columns.iter().any(|c| c.name == col.name) {
+            format!("{}.{}", inner.name, col.name)
         } else {
-            col.clone()
+            col.name.clone()
         };
-        columns.push(qualified);
+        columns.push(ColumnDef {
+            name,
+            ty: col.ty,
+            nullable: col.nullable || right_nullable,
+            default: col.default.clone(),
+        });
     }
     Schema {
         name: format!("{}_join_{}", outer.name, inner.name),

@@ -17,10 +17,10 @@ use crate::common::{Error, Result};
 use crate::execution::{
     AggregateFn, Compute, Delete, Executor, Filter, HashAggregate, HashJoin, IndexNestedLoopJoin,
     IndexScan, Insert, JoinPredicate, Limit, MergeJoin, NestedLoopJoin, PkLookup, Projection,
-    SeqScan, SetExpr, Sort, SortDir, Update,
+    SeqScan, SetExpr, Sort, SortDir, Tuple, Update,
 };
 use crate::layout::RowLayout;
-use crate::sql::ir::logical::{AggregateSpec, OrderDir};
+use crate::sql::ir::logical::{AggregateSpec, JoinKind, OrderDir};
 use crate::sql::ir::physical::PhysOp;
 use crate::storage::StorageEngine;
 use crate::table::{IndexHandle, Table};
@@ -73,12 +73,19 @@ where
             let child = build_executor(input, engine, catalog)?;
             Ok(Box::new(Compute::new(child, exprs.clone())?))
         }
-        PhysOp::NestedLoopJoin { outer, inner, on } => {
+        PhysOp::NestedLoopJoin {
+            outer,
+            inner,
+            on,
+            kind,
+        } => {
             let outer_ex = build_executor(outer, engine, catalog)?;
             let inner_ex = build_executor(inner, engine, catalog)?;
             // Reconstruct the join predicate over the concatenated
             // `outer || inner` tuple — column indices are tuple-global because
             // joins are lowered in textual order. `None` is a cross product.
+            // Under LEFT OUTER this is the FULL ON (R1): the whole predicate
+            // gates the match, and the operator pads unmatched outer rows.
             let pred_fn: JoinPredicate = match on {
                 Some(p) => {
                     let f = p.clone().compile();
@@ -90,7 +97,12 @@ where
                 }
                 None => Box::new(|_, _| true),
             };
-            Ok(Box::new(NestedLoopJoin::new(outer_ex, inner_ex, pred_fn)?))
+            match kind {
+                JoinKind::Inner => Ok(Box::new(NestedLoopJoin::new(outer_ex, inner_ex, pred_fn)?)),
+                JoinKind::LeftOuter => Ok(Box::new(NestedLoopJoin::new_left_outer(
+                    outer_ex, inner_ex, pred_fn,
+                )?)),
+            }
         }
         PhysOp::IndexNestedLoopJoin {
             outer,
@@ -113,15 +125,42 @@ where
             inner,
             outer_key_col,
             inner_key_col,
+            kind,
+            residual,
         } => {
             let outer_ex = build_executor(outer, engine, catalog)?;
             let inner_ex = build_executor(inner, engine, catalog)?;
-            Ok(Box::new(HashJoin::new(
-                outer_ex,
-                inner_ex,
-                *outer_key_col,
-                *inner_key_col,
-            )?))
+            match kind {
+                JoinKind::Inner => Ok(Box::new(HashJoin::new(
+                    outer_ex,
+                    inner_ex,
+                    *outer_key_col,
+                    *inner_key_col,
+                )?)),
+                JoinKind::LeftOuter => {
+                    // Compile the residual ON (compound-ON conjuncts beyond
+                    // the hashed equi key) over the concatenated pair, same
+                    // coordinates as the NLJ predicate above.
+                    let residual_fn: Option<JoinPredicate> = match residual {
+                        Some(p) => {
+                            let f = p.clone().compile();
+                            Some(Box::new(move |outer: &Tuple, inner: &Tuple| {
+                                let mut combined = outer.clone();
+                                combined.extend_from_slice(inner);
+                                f(&combined)
+                            }))
+                        }
+                        None => None,
+                    };
+                    Ok(Box::new(HashJoin::new_left_outer(
+                        outer_ex,
+                        inner_ex,
+                        *outer_key_col,
+                        *inner_key_col,
+                        residual_fn,
+                    )?))
+                }
+            }
         }
         PhysOp::MergeJoin {
             left,

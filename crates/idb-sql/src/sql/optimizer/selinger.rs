@@ -34,7 +34,7 @@ use crate::catalog::system_tables::ColumnStats;
 use crate::catalog::{Catalog, TableId};
 use crate::common::Result;
 use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
-use crate::sql::ir::logical::{AggregateSpec, JoinClause, LogicalPlan, OrderDir};
+use crate::sql::ir::logical::{AggregateSpec, JoinClause, JoinKind, LogicalPlan, OrderDir};
 use crate::sql::optimizer::column_map::ColumnRemap;
 use crate::sql::optimizer::cost::{CostModel, DefaultCostModel};
 use crate::sql::optimizer::join_order::{
@@ -256,6 +256,15 @@ pub(crate) fn build_join_graph<CatE: StorageEngine>(
     catalog: &Catalog<CatE>,
     stats: &QueryStats,
 ) -> Result<Option<JoinGraph>> {
+    // No-reorder rule (H3b): outer joins are not commutative or associative
+    // with the joins around them — reordering across one would change which
+    // left rows get null-padded (a different query). The DP reorders Inner
+    // joins only; ANY non-Inner kind bails the whole SELECT to textual
+    // lowering, where the outer join keeps its written position. Explicit on
+    // kind, not an incidental consequence of the equi-ON edge test below.
+    if joins.iter().any(|j| j.kind != JoinKind::Inner) {
+        return Ok(None);
+    }
     let mut names = vec![table.to_string()];
     let mut aliases: Vec<Option<String>> = vec![None];
     for j in joins {
@@ -457,6 +466,9 @@ fn rewrite_select(
             right_table: graph.names[*rel].clone(),
             right_alias: graph.aliases[*rel].clone(),
             on: Some(on),
+            // Reorder only runs on Inner-only queries (build_join_graph bails
+            // on any outer join), so every rewritten join is Inner.
+            kind: JoinKind::Inner,
         });
     }
 

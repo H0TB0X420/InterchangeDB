@@ -206,6 +206,13 @@ fn join_is_equivalent() {
         &mut s,
         "SELECT a.i_id, b.s_qty FROM item a JOIN stock b ON a.i_id = b.s_id",
     );
+    // H3b LEFT OUTER: items 4 and 5 have no stock row (stock has ids 1..3), so
+    // they emit padded with NULL s_qty. The outer join bridges through the
+    // same ExecutorSource, so Push must reproduce the pads byte-for-byte.
+    assert_equivalent(
+        &mut s,
+        "SELECT a.i_id, b.s_qty FROM item a LEFT OUTER JOIN stock b ON a.i_id = b.s_id",
+    );
 }
 
 #[test]

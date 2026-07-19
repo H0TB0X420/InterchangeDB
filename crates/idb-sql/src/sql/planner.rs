@@ -22,7 +22,7 @@
 use crate::catalog::{Catalog, ColumnDef, Schema};
 use crate::common::Result;
 use crate::sql::ir::expr::{Expression, Predicate};
-use crate::sql::ir::logical::LogicalPlan;
+use crate::sql::ir::logical::{JoinKind, LogicalPlan};
 use crate::sql::ir::physical::PhysOp;
 use crate::sql::optimizer::cost::{CostModel, DefaultCostModel};
 use crate::sql::optimizer::join_order::JoinAlgorithm;
@@ -367,10 +367,12 @@ where
         let right_indexes = catalog.indexes_for_table(right_schema.table_id, &right_schema)?;
         let right_cols = right_schema.columns.len();
         let right_table = join.right_table.clone();
+        let join_kind = join.kind;
 
         // Phase C.1: promote a residual equi-predicate connecting the outer to
         // this right table into the join's ON — only when the join has no
-        // explicit ON (a comma/cross join).
+        // explicit ON (a comma/cross join). A LEFT OUTER join always carries an
+        // ON (binder invariant), so this never fires for one.
         let mut on = join.on;
         if on.is_none() {
             if let Some(pos) = residual.iter().position(|c| {
@@ -384,104 +386,114 @@ where
         // Phase C.2: pull this right table's single-table predicates out of the
         // residual to push onto its inner leaf. They carry global join-tuple
         // indices; `build_right_leaf` rebases them to the table's local columns.
+        //
+        // R2 (H3b): this pushdown is INVALID below a LEFT OUTER join — the
+        // right side is null-padded, and a WHERE conjunct on a right column
+        // must run ABOVE the pad (it drops padded rows), never below it (which
+        // would re-filter the right table before padding and change which left
+        // rows pad). So for an outer join we push NOTHING onto the inner leaf;
+        // right-referencing conjuncts stay in `residual` → a Filter above the
+        // join. Left-side pushdown stays valid and already happened at the left
+        // leaf. Gated on kind, not incidental.
         let mut right_preds = Vec::new();
-        let mut keep = Vec::new();
-        for c in residual.drain(..) {
-            let mut cols = Vec::new();
-            referenced_columns(&c, &mut cols);
-            let right_only = !cols.is_empty()
-                && cols
-                    .iter()
-                    .all(|&col| col >= right_range.start && col < right_range.end);
-            if right_only {
-                right_preds.push(c);
-            } else {
-                keep.push(c);
+        if join_kind == JoinKind::Inner {
+            let mut keep = Vec::new();
+            for c in residual.drain(..) {
+                let mut cols = Vec::new();
+                referenced_columns(&c, &mut cols);
+                let right_only = !cols.is_empty()
+                    && cols
+                        .iter()
+                        .all(|&col| col >= right_range.start && col < right_range.end);
+                if right_only {
+                    right_preds.push(c);
+                } else {
+                    keep.push(c);
+                }
             }
+            residual = keep;
         }
-        residual = keep;
 
-        let next: PhysOp = match selection {
-            // Phase 11 heuristic + Phase D: INLJ when the inner is indexed on
-            // the key, HashJoin for an equi-key without a usable index, else NLJ.
-            JoinSelection::Heuristic => {
-                let inlj = on
-                    .as_ref()
-                    .and_then(|p| try_match_inlj(p, outer_offset, &right_indexes));
-                if let Some((outer_col, handle)) = inlj {
-                    // INLJ probes the index; its right predicates can't ride the
-                    // probe, so they return to the residual (a Filter on top).
-                    residual.extend(right_preds);
-                    PhysOp::IndexNestedLoopJoin {
-                        outer: Box::new(current),
-                        inner_table: right_table,
-                        inner_index: handle.def.name.clone(),
-                        outer_key_cols: vec![outer_col],
+        let next: PhysOp = match join_kind {
+            // LEFT OUTER (H3b): only two algorithms are candidates —
+            // hash-outer (with a residual ON) when a single equi conjunct is
+            // extractable, else NLJ-outer running the full ON per pair. INLJ
+            // and MergeJoin are STRUCTURALLY excluded (never candidates), not
+            // guarded at runtime: neither can null-pad. `right_preds` is empty
+            // here (R2 gated the pushdown off), so the inner leaf is unfiltered.
+            JoinKind::LeftOuter => {
+                let on_pred = on.expect("binder guarantees a LEFT OUTER join carries an ON");
+                let split = split_outer_hash_on(&on_pred, outer_offset);
+                let use_hash = match selection {
+                    JoinSelection::Heuristic => split.is_some(),
+                    JoinSelection::CostBased { cost_model, stats } => {
+                        let inner_card = stats.row_count(right_schema.table_id);
+                        let edge_sel = match &split {
+                            Some(((_, inner_col), _)) => join_selectivity(
+                                0,
+                                stats.ndv(right_schema.table_id, *inner_col as u32),
+                            ),
+                            None => 1.0,
+                        };
+                        // Choose with the pre-join outer cardinality; hash-outer
+                        // only competes when an equi key exists.
+                        let chosen = split.is_some()
+                            && matches!(
+                                choose_join_algorithm(
+                                    *cost_model,
+                                    outer_card,
+                                    inner_card,
+                                    edge_sel,
+                                    true,
+                                    false,
+                                ),
+                                JoinAlgorithm::Hash
+                            );
+                        // A LEFT OUTER emits at least every outer row — floor the
+                        // running estimate at `outer_card`.
+                        outer_card = (outer_card * inner_card * edge_sel)
+                            .max(outer_card)
+                            .max(1.0);
+                        chosen
                     }
-                } else if let Some((outer_col, inner_col)) = on
-                    .as_ref()
-                    .and_then(|p| extract_equi_join_keys(p, outer_offset))
-                {
+                };
+                let inner_leaf = build_right_leaf(
+                    right_preds,
+                    &right_schema,
+                    &right_table,
+                    &right_indexes,
+                    right_range.start,
+                );
+                if use_hash {
+                    let ((outer_col, inner_col), residual_on) =
+                        split.expect("hash-outer chosen only when an equi key exists");
                     PhysOp::HashJoin {
                         outer: Box::new(current),
-                        inner: Box::new(build_right_leaf(
-                            right_preds,
-                            &right_schema,
-                            &right_table,
-                            &right_indexes,
-                            right_range.start,
-                        )),
+                        inner: Box::new(inner_leaf),
                         outer_key_col: outer_col,
                         inner_key_col: inner_col,
+                        kind: JoinKind::LeftOuter,
+                        residual: residual_on,
                     }
                 } else {
                     PhysOp::NestedLoopJoin {
                         outer: Box::new(current),
-                        inner: Box::new(build_right_leaf(
-                            right_preds,
-                            &right_schema,
-                            &right_table,
-                            &right_indexes,
-                            right_range.start,
-                        )),
-                        on,
+                        inner: Box::new(inner_leaf),
+                        on: Some(on_pred),
+                        kind: JoinKind::LeftOuter,
                     }
                 }
             }
-            // P14.13a cost-based: cheapest of NLJ / Hash / INLJ, textual order
-            // preserved. Now reads the promoted `on` and pushes right predicates.
-            JoinSelection::CostBased { cost_model, stats } => {
-                let keys = on
-                    .as_ref()
-                    .and_then(|p| extract_equi_join_keys(p, outer_offset));
-                let inlj = on
-                    .as_ref()
-                    .and_then(|p| try_match_inlj(p, outer_offset, &right_indexes));
-                let inner_card = stats.row_count(right_schema.table_id);
-                // NOTE (P14.13a): the outer join key can't be mapped back to a
-                // (table, col) for its NDV until P14.12, so selectivity uses the
-                // inner key's NDV only — adequate for Hash-vs-NLJ (cardinality-
-                // driven).
-                let inner_ndv = keys
-                    .map(|(_, ic)| stats.ndv(right_schema.table_id, ic as u32))
-                    .unwrap_or(0);
-                let edge_sel = if keys.is_some() {
-                    join_selectivity(0, inner_ndv)
-                } else {
-                    1.0
-                };
-                let algorithm = choose_join_algorithm(
-                    *cost_model,
-                    outer_card,
-                    inner_card,
-                    edge_sel,
-                    keys.is_some(),
-                    inlj.is_some(),
-                );
-                outer_card = (outer_card * inner_card * edge_sel).max(1.0);
-                match algorithm {
-                    JoinAlgorithm::IndexNestedLoop => {
-                        let (outer_col, handle) = inlj.expect("INLJ chosen only when available");
+            // Phase 11 heuristic + Phase D: INLJ when the inner is indexed on
+            // the key, HashJoin for an equi-key without a usable index, else NLJ.
+            JoinKind::Inner => match selection {
+                JoinSelection::Heuristic => {
+                    let inlj = on
+                        .as_ref()
+                        .and_then(|p| try_match_inlj(p, outer_offset, &right_indexes));
+                    if let Some((outer_col, handle)) = inlj {
+                        // INLJ probes the index; its right predicates can't ride the
+                        // probe, so they return to the residual (a Filter on top).
                         residual.extend(right_preds);
                         PhysOp::IndexNestedLoopJoin {
                             outer: Box::new(current),
@@ -489,10 +501,10 @@ where
                             inner_index: handle.def.name.clone(),
                             outer_key_cols: vec![outer_col],
                         }
-                    }
-                    JoinAlgorithm::Hash => {
-                        let (outer_col, inner_col) =
-                            keys.expect("Hash chosen only when equi-keys exist");
+                    } else if let Some((outer_col, inner_col)) = on
+                        .as_ref()
+                        .and_then(|p| extract_equi_join_keys(p, outer_offset))
+                    {
                         PhysOp::HashJoin {
                             outer: Box::new(current),
                             inner: Box::new(build_right_leaf(
@@ -504,21 +516,100 @@ where
                             )),
                             outer_key_col: outer_col,
                             inner_key_col: inner_col,
+                            kind: JoinKind::Inner,
+                            residual: None,
+                        }
+                    } else {
+                        PhysOp::NestedLoopJoin {
+                            outer: Box::new(current),
+                            inner: Box::new(build_right_leaf(
+                                right_preds,
+                                &right_schema,
+                                &right_table,
+                                &right_indexes,
+                                right_range.start,
+                            )),
+                            on,
+                            kind: JoinKind::Inner,
                         }
                     }
-                    JoinAlgorithm::NestedLoop => PhysOp::NestedLoopJoin {
-                        outer: Box::new(current),
-                        inner: Box::new(build_right_leaf(
-                            right_preds,
-                            &right_schema,
-                            &right_table,
-                            &right_indexes,
-                            right_range.start,
-                        )),
-                        on,
-                    },
                 }
-            }
+                // P14.13a cost-based: cheapest of NLJ / Hash / INLJ, textual order
+                // preserved. Now reads the promoted `on` and pushes right predicates.
+                JoinSelection::CostBased { cost_model, stats } => {
+                    let keys = on
+                        .as_ref()
+                        .and_then(|p| extract_equi_join_keys(p, outer_offset));
+                    let inlj = on
+                        .as_ref()
+                        .and_then(|p| try_match_inlj(p, outer_offset, &right_indexes));
+                    let inner_card = stats.row_count(right_schema.table_id);
+                    // NOTE (P14.13a): the outer join key can't be mapped back to a
+                    // (table, col) for its NDV until P14.12, so selectivity uses the
+                    // inner key's NDV only — adequate for Hash-vs-NLJ (cardinality-
+                    // driven).
+                    let inner_ndv = keys
+                        .map(|(_, ic)| stats.ndv(right_schema.table_id, ic as u32))
+                        .unwrap_or(0);
+                    let edge_sel = if keys.is_some() {
+                        join_selectivity(0, inner_ndv)
+                    } else {
+                        1.0
+                    };
+                    let algorithm = choose_join_algorithm(
+                        *cost_model,
+                        outer_card,
+                        inner_card,
+                        edge_sel,
+                        keys.is_some(),
+                        inlj.is_some(),
+                    );
+                    outer_card = (outer_card * inner_card * edge_sel).max(1.0);
+                    match algorithm {
+                        JoinAlgorithm::IndexNestedLoop => {
+                            let (outer_col, handle) =
+                                inlj.expect("INLJ chosen only when available");
+                            residual.extend(right_preds);
+                            PhysOp::IndexNestedLoopJoin {
+                                outer: Box::new(current),
+                                inner_table: right_table,
+                                inner_index: handle.def.name.clone(),
+                                outer_key_cols: vec![outer_col],
+                            }
+                        }
+                        JoinAlgorithm::Hash => {
+                            let (outer_col, inner_col) =
+                                keys.expect("Hash chosen only when equi-keys exist");
+                            PhysOp::HashJoin {
+                                outer: Box::new(current),
+                                inner: Box::new(build_right_leaf(
+                                    right_preds,
+                                    &right_schema,
+                                    &right_table,
+                                    &right_indexes,
+                                    right_range.start,
+                                )),
+                                outer_key_col: outer_col,
+                                inner_key_col: inner_col,
+                                kind: JoinKind::Inner,
+                                residual: None,
+                            }
+                        }
+                        JoinAlgorithm::NestedLoop => PhysOp::NestedLoopJoin {
+                            outer: Box::new(current),
+                            inner: Box::new(build_right_leaf(
+                                right_preds,
+                                &right_schema,
+                                &right_table,
+                                &right_indexes,
+                                right_range.start,
+                            )),
+                            on,
+                            kind: JoinKind::Inner,
+                        },
+                    }
+                }
+            },
         };
         outer_offset += right_cols;
         current = next;
@@ -650,6 +741,33 @@ fn extract_equi_join_keys(pred: &Predicate, outer_offset: usize) -> Option<(usiz
         return None;
     };
     Some((outer_col, inner_col_global - outer_offset))
+}
+
+/// Split a LEFT OUTER join's ON into a single hashable equi conjunct and
+/// the residual (the remaining conjuncts, ANDed) for a hash-outer lowering.
+/// Returns `((outer_col, inner_col_local), residual)` when some conjunct is
+/// a `Column = Column` equi across the outer/inner boundary; `None` when
+/// none is — the caller then lowers NLJ-outer, running the full ON per
+/// pair. The residual keeps global concatenated-tuple coordinates: the
+/// operator evaluates it over `outer ++ inner`, exactly like the NLJ
+/// predicate. R1: the equi conjunct + residual together are the WHOLE ON,
+/// so nothing is dropped or hoisted — the compound ON stays at the join.
+fn split_outer_hash_on(
+    on: &Predicate,
+    outer_offset: usize,
+) -> Option<((usize, usize), Option<Predicate>)> {
+    let conjuncts = flatten_conjuncts(on.clone());
+    let pos = conjuncts
+        .iter()
+        .position(|c| extract_equi_join_keys(c, outer_offset).is_some())?;
+    let keys =
+        extract_equi_join_keys(&conjuncts[pos], outer_offset).expect("position just matched");
+    let residual: Vec<Predicate> = conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, c)| (i != pos).then_some(c))
+        .collect();
+    Some((keys, and_all(residual)))
 }
 
 /// Pick the cheapest join algorithm under `cost_model` for one

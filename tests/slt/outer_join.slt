@@ -1,0 +1,272 @@
+# LEFT OUTER JOIN (H3b) — the TPC-H Q13 join. Two semantic rules are pinned
+# where they visibly differ:
+#   R1: the ON filters the MATCH; the WHERE filters the padded RESULT. For an
+#       outer join these are different queries.
+#   R2: a WHERE conjunct on the null-padded RIGHT side runs ABOVE the join
+#       (it drops padded rows) — it must NOT be pushed below the pad.
+#
+# Dataset: four customers; carol's only order is a "special requests" order,
+# dave has no order at all. Order 14 is an orphan (no matching customer) — a
+# LEFT OUTER on `cust` drops it, proving unmatched RIGHT rows vanish.
+
+statement ok
+CREATE TABLE cust (c_id INT PRIMARY KEY, c_name VARCHAR(10))
+
+statement ok
+CREATE TABLE ord (o_id INT PRIMARY KEY, o_cid INT, o_val INT, o_comment VARCHAR(30))
+
+statement ok
+INSERT INTO cust VALUES (1, 'alice'), (2, 'bob'), (3, 'carol'), (4, 'dave')
+
+statement ok
+INSERT INTO ord VALUES
+  (10, 1, 100, 'regular order'),
+  (11, 1, 200, 'special requests here'),
+  (12, 2, 300, 'normal'),
+  (13, 3, 400, 'has special requests inside'),
+  (14, 9, 500, 'orphan no cust')
+
+# ---- basic LOJ with unmatched lefts ----------------------------------------
+# dave (c_id 4) matches no order → padded with NULLs. The orphan order 14
+# (o_cid 9) has no customer, so it never appears.
+query ITII rowsort
+SELECT c_id, c_name, o_id, o_val FROM cust LEFT OUTER JOIN ord ON c_id = o_cid
+----
+1 alice 10 100
+1 alice 11 200
+2 bob 12 300
+3 carol 13 400
+4 dave NULL NULL
+
+# ---- plan shape: heuristic lowers a single-equi outer ON to hash-outer -----
+# The `left_outer` marker distinguishes it; inner rendering is byte-unchanged.
+query T
+EXPLAIN SELECT c_id, c_name, o_id, o_val FROM cust LEFT OUTER JOIN ord ON c_id = o_cid
+----
+Projection([0, 1, 2, 4])
+HashJoin(left_outer, outer_key=0, inner_key=1)
+SeqScan(cust)
+SeqScan(ord)
+
+# ---- R1 PIN: same extra conjunct in ON vs in WHERE → different result sets --
+# In the ON, `o_val >= 300` filters the MATCH: alice's orders (100, 200) both
+# fail it, so alice matches nothing and is PADDED; dave is padded as always.
+# Four rows, two of them NULL-padded.
+query II rowsort
+SELECT c_id, o_val FROM cust LEFT OUTER JOIN ord ON c_id = o_cid AND o_val >= 300
+----
+1 NULL
+2 300
+3 400
+4 NULL
+
+# In the WHERE, `o_val >= 300` filters the padded RESULT: alice's two matched
+# rows are dropped and she never reappears; dave's padded NULL fails NULL>=300
+# (UNKNOWN) and is dropped. Only the two genuinely-matching rows survive — a
+# different result set from the ON form above. That difference IS R1.
+query II rowsort
+SELECT c_id, o_val FROM cust LEFT OUTER JOIN ord ON c_id = o_cid WHERE o_val >= 300
+----
+2 300
+3 400
+
+# ---- R2 PIN: a WHERE on a right column must not be pushed below the pad -----
+# WHERE `o_val < 350` above the join keeps alice's two orders and bob's, and
+# DROPS carol's matched row (400) — carol had a match, so she is not padded;
+# she simply disappears. dave's padded NULL fails NULL<350 and drops. Result:
+# three rows, NO carol. Were the predicate wrongly pushed onto `ord` below the
+# join, carol's order 13 would be filtered first, carol would then match
+# nothing and reappear PADDED as (3, NULL) — a fifth row. The three-row answer
+# with no carol is the proof the pushdown was gated off (R2).
+query II rowsort
+SELECT c_id, o_val FROM cust LEFT OUTER JOIN ord ON c_id = o_cid WHERE o_val < 350
+----
+1 100
+1 200
+2 300
+
+# Plan shape for the R2 case: the WHERE conjunct sits in a Filter ABOVE the
+# join; SeqScan(ord) below the join is UNFILTERED (no pushdown). Structural R2.
+query T
+EXPLAIN SELECT c_id, o_val FROM cust LEFT OUTER JOIN ord ON c_id = o_cid WHERE o_val < 350
+----
+Projection([0, 4])
+Filter
+HashJoin(left_outer, outer_key=0, inner_key=1)
+SeqScan(cust)
+SeqScan(ord)
+
+# The SAME predicate `o_val < 350` in the ON pads carol (her only order fails
+# the match) — padded rows SURVIVE. Five rows, two NULL-padded. Contrast with
+# the three-row WHERE form directly above: R1 and R2 together.
+query II rowsort
+SELECT c_id, o_val FROM cust LEFT OUTER JOIN ord ON c_id = o_cid AND o_val < 350
+----
+1 100
+1 200
+2 300
+3 NULL
+4 NULL
+
+# ---- all-unmatched: no left row matches → every left row pads ---------------
+# c_id (1..4) never equals any o_val (100..500), so no pair matches.
+query II rowsort
+SELECT c_id, o_id FROM cust LEFT OUTER JOIN ord ON c_id = o_val
+----
+1 NULL
+2 NULL
+3 NULL
+4 NULL
+
+# ---- empty right table: every left row pads --------------------------------
+statement ok
+CREATE TABLE empt (e_id INT PRIMARY KEY, e_cid INT)
+
+query II rowsort
+SELECT c_id, e_id FROM cust LEFT OUTER JOIN empt ON c_id = e_cid
+----
+1 NULL
+2 NULL
+3 NULL
+4 NULL
+
+# ---- NULL join keys: the left row pads, never joins ------------------------
+# lk_key is NULL for lk_id 2; a NULL equi key matches nothing (not even another
+# NULL), but the left row is still preserved and padded.
+statement ok
+CREATE TABLE lk (lk_id INT PRIMARY KEY, lk_key INT)
+
+statement ok
+CREATE TABLE rk (rk_id INT PRIMARY KEY, rk_key INT)
+
+statement ok
+INSERT INTO lk VALUES (1, 10), (2, NULL), (3, 30)
+
+statement ok
+INSERT INTO rk VALUES (100, 10), (101, 30)
+
+query II rowsort
+SELECT lk_id, rk_id FROM lk LEFT OUTER JOIN rk ON lk_key = rk_key
+----
+1 100
+2 NULL
+3 101
+
+# ---- COUNT(right_col) over padded NULLs — Q13's c_count inner shape ---------
+# COUNT(o_id) counts non-NULL, so dave's padded row (o_id NULL) contributes 0:
+# a LEFT OUTER + GROUP BY yields a zero count, never a missing group. This is
+# the exact shape of Q13's inner block (per-customer order count).
+query II rowsort
+SELECT c_id, COUNT(o_id) FROM cust LEFT OUTER JOIN ord ON c_id = o_cid GROUP BY c_id
+----
+1 2
+2 1
+3 1
+4 0
+
+# ---- COUNT(*) vs COUNT(right_col) over a pad — Q13's COUNT(o_orderkey) risk ---
+# A pad is a REAL row; only its right columns are NULL. So for dave (padded):
+# COUNT(*) counts the row → 1, but COUNT(o_id) counts non-NULL o_id → 0. The
+# two columns MUST differ on the padded group. Confusing them is the exact
+# shape of Q13's risk: c_count must be COUNT(o_orderkey) (0 for a no-order
+# customer), never COUNT(*) (which would read 1 and wrongly bucket him).
+query III rowsort
+SELECT c_id, COUNT(*), COUNT(o_id) FROM cust LEFT OUTER JOIN ord ON c_id = o_cid GROUP BY c_id
+----
+1 2 2
+2 1 1
+3 1 1
+4 1 0
+
+# ---- Q13 inner shape end-to-end with the verbatim compound ON (incl NOT LIKE)
+# `c_custkey = o_custkey AND o_comment NOT LIKE '%special%requests%'`. carol's
+# only order is a special-requests order, so under the compound ON she matches
+# NOTHING and her count is 0 — where the plain-ON count above was 1. alice's
+# special-requests order (11) is excluded, dropping her count from 2 to 1.
+query II rowsort
+SELECT c_id, COUNT(o_id) FROM cust LEFT OUTER JOIN ord
+  ON c_id = o_cid AND o_comment NOT LIKE '%special%requests%'
+  GROUP BY c_id
+----
+1 1
+2 1
+3 0
+4 0
+
+# ---- MIXED chain: one INNER and one LEFT OUTER join in a single statement --
+# The pushdown rule is PER-JOIN, not per-statement: a WHERE conjunct on an
+# INNER-joined table's column still pushes to that table's leaf (R2 only gates
+# the OUTER side). These two queries pin both chain orderings.
+#
+# `ship` records which orders were shipped (only order 11); `acct` gives each
+# customer a balance (one row per customer).
+statement ok
+CREATE TABLE ship (sh_id INT PRIMARY KEY, sh_oid INT, sh_status VARCHAR(10))
+
+statement ok
+CREATE TABLE acct (ac_cid INT PRIMARY KEY, ac_bal INT)
+
+statement ok
+INSERT INTO ship VALUES (500, 11, 'sent')
+
+statement ok
+INSERT INTO acct VALUES (1, 100), (2, 40), (3, 80), (4, 60)
+
+# ---- forward order: A JOIN B ... LEFT OUTER JOIN C -------------------------
+# `cust JOIN ord` is INNER, then LEFT OUTER JOIN ship. WHERE `o_val >= 200` is
+# on `ord`, an inner-joined table, so it pushes to ord's leaf. Inner join keeps
+# orders 11/12/13 (order 10's 100 fails, dave has no order, orphan 14 no cust).
+# The outer join then pads orders 12 and 13 (unshipped) — two padded rows
+# SURVIVE into the output; only order 11 has a status.
+query IIT rowsort
+SELECT o_id, o_val, sh_status FROM cust JOIN ord ON c_id = o_cid
+  LEFT OUTER JOIN ship ON o_id = sh_oid WHERE o_val >= 200
+----
+11 200 sent
+12 300 NULL
+13 400 NULL
+
+# EXPLAIN golden: the filtered inner leaf and the unfiltered outer leaf sit in
+# the same tree. `o_val >= 200` is a Filter directly above SeqScan(ord) (inner
+# pushdown fired), while SeqScan(ship) — the null-supplying outer leaf — is bare
+# (R2 gated its pushdown off; here nothing even referenced ship).
+query T
+EXPLAIN SELECT o_id, o_val, sh_status FROM cust JOIN ord ON c_id = o_cid
+  LEFT OUTER JOIN ship ON o_id = sh_oid WHERE o_val >= 200
+----
+Projection([2, 4, 8])
+HashJoin(left_outer, outer_key=2, inner_key=1)
+HashJoin(outer_key=0, inner_key=1)
+SeqScan(cust)
+Filter
+SeqScan(ord)
+SeqScan(ship)
+
+# ---- reverse order: A LEFT OUTER JOIN B ... JOIN C -------------------------
+# `cust LEFT OUTER JOIN ord` pads dave (no order); then INNER JOIN acct on the
+# customer key. WHERE `ac_bal >= 50` is on `acct`, an inner-joined table, so it
+# pushes to acct's leaf — dropping bob (balance 40). dave's PADDED row (o_id
+# NULL) still joins acct (a pad keeps its left/customer columns) and survives
+# because his balance 60 passes the filter: a padded row flowing THROUGH a later
+# inner join into the final output.
+query III rowsort
+SELECT c_id, o_id, ac_bal FROM cust LEFT OUTER JOIN ord ON c_id = o_cid
+  JOIN acct ON c_id = ac_cid WHERE ac_bal >= 50
+----
+1 10 100
+1 11 100
+3 13 80
+4 NULL 60
+
+# ---- rejection contracts ---------------------------------------------------
+# RIGHT and FULL OUTER are named rejections (unsupported, not silent mis-plans).
+statement error RIGHT OUTER JOIN not supported
+SELECT c_id FROM cust RIGHT OUTER JOIN ord ON c_id = o_cid
+
+statement error FULL OUTER JOIN not supported
+SELECT c_id FROM cust FULL OUTER JOIN ord ON c_id = o_cid
+
+# A LEFT OUTER join without an ON is meaningless (nothing can leave a row
+# unmatched) → loud rejection.
+statement error LEFT OUTER JOIN requires an ON clause
+SELECT c_id FROM cust LEFT OUTER JOIN ord

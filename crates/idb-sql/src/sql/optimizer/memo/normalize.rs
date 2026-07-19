@@ -23,7 +23,7 @@ use crate::catalog::system_tables::ColumnStats;
 use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
 use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
-use crate::sql::ir::logical::{AggregateSpec, LogicalPlan, OrderDir};
+use crate::sql::ir::logical::{AggregateSpec, JoinKind, LogicalPlan, OrderDir};
 use crate::sql::optimizer::column_map::textual_base;
 use crate::sql::optimizer::join_order::{RelId, MAX_RELATIONS};
 use crate::sql::optimizer::selectivity::{estimate_predicate_selectivity, join_selectivity};
@@ -150,6 +150,17 @@ pub(crate) fn normalize<CatE: StorageEngine>(
     else {
         return Ok(None);
     };
+
+    // No-reorder rule (H3b): the memo only searches Inner join cores. An
+    // outer join is not commutative or associative with its neighbours —
+    // reordering across one changes which left rows get null-padded — so ANY
+    // non-Inner kind bails the whole query to the D8 textual fallback, where
+    // the outer join keeps its written position. Explicit on kind, matching
+    // `build_join_graph`; the equi-ON edge test below would only bail
+    // incidentally (and not at all for a bare `col = col` outer ON).
+    if joins.iter().any(|j| j.kind != JoinKind::Inner) {
+        return Ok(None);
+    }
 
     // The memo keys groups by a u32 bitmask (D2) — same hard bound as the
     // Selinger DP. Wider queries fall back (D8).

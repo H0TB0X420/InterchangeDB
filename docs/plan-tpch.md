@@ -283,6 +283,30 @@ Q12/Q14/Q19 predicate shapes complete.
 - H3b: LEFT OUTER JOIN (Q13) — binder + NLJ/hash outer variants; excluded
   from join reordering (see below).
 
+**H3b executed (2026-07-19).** `JoinKind{Inner, LeftOuter}` through
+binder/IR/planner/executors: NLJ-outer (full ON per pair, pad unmatched
+left with right-width NULLs) and hash-outer (hash the single equi
+conjunct, evaluate residual ON per candidate — Q13's verbatim compound
+`ON c_custkey = o_custkey AND o_comment NOT LIKE …` runs at hash speed);
+INLJ/Merge structurally never lower for outer. The two semantic rules
+are law and test-pinned where they visibly differ: ON filters the match
+while WHERE filters the padded result (R1), and right-side WHERE
+conjuncts never push below the null-padding (R2 — the Phase C.2
+pushdown gate keys on join kind per iteration; the outer right leaf is
+always an unfiltered scan, EXPLAIN-pinned). Cost-based planners bail
+explicitly on any non-Inner join — previously only incidental; a bare
+equi outer ON would have become a reorderable edge. Outer cardinality
+floored at the left input (a LOJ emits ≥ every left row). Review: zero
+correctness findings (compound-ON splitting, NULL-key padding,
+bail-before-routing order, left-side pushdown validity all held);
+coverage gaps fixed pre-commit — mixed Inner+LeftOuter chains both
+directions (incl. a padded row flowing through a later inner join, and
+per-join pushdown gating pinned in one EXPLAIN), and the COUNT(*) = 1
+vs COUNT(o_id) = 0 distinction on padded rows (Q13's exact risk).
+Tests 1360 → 1362. Q13's join layer complete; its derived-table shell
+is H4a. Draws: right leaf of an outer join takes no index paths
+(recorded lever); RIGHT/FULL OUTER remain loud rejections.
+
 Gates: `scalar.slt`; Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19 end-to-end on a
 hand-checked micro-dataset; Q13 after H3b.
 

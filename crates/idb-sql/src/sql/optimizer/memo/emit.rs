@@ -20,6 +20,7 @@
 //!      `selinger::rewrite_select`.
 
 use crate::sql::ir::expr::{CompareOp, Expression, Predicate};
+use crate::sql::ir::logical::JoinKind;
 use crate::sql::ir::physical::PhysOp;
 use crate::sql::optimizer::column_map::ColumnRemap;
 use crate::sql::optimizer::join_order::RelId;
@@ -357,10 +358,13 @@ impl EmitContext<'_> {
                 .collect(),
         );
         debug_assert!(on.is_some(), "split invariant: at least one edge");
+        // The memo only optimizes Inner join cores — normalize bails (D8) on
+        // any outer join, so every join it emits is Inner.
         PhysOp::NestedLoopJoin {
             outer: Box::new(outer_op),
             inner: Box::new(inner_op),
             on,
+            kind: JoinKind::Inner,
         }
     }
 
@@ -382,6 +386,9 @@ impl EmitContext<'_> {
             inner: Box::new(inner_op),
             outer_key_col: self.node_coord(outer_col_global, node_start),
             inner_key_col: self.node_coord(inner_col_global, node_start + outer_width),
+            // Memo cores are Inner-only (normalize D8-bails on outer joins).
+            kind: JoinKind::Inner,
+            residual: None,
         };
         // Non-key edges: residual join filter (single-key limitation, §5).
         filter_above(join, self.residual_edge_filter(edges, node_start))
