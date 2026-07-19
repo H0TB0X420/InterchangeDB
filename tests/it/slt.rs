@@ -162,3 +162,8 @@ fn slt_group_by() {
 fn slt_aggregate_expr() {
     run_slt("aggregate_expr.slt");
 }
+
+#[test]
+fn slt_computed_select() {
+    run_slt("computed_select.slt");
+}

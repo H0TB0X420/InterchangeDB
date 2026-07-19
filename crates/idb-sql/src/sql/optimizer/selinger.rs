@@ -175,6 +175,7 @@ fn maybe_reorder<CatE: StorageEngine>(
             joins,
             projection,
             aggregates,
+            select_list,
             filter,
             order_by,
             having,
@@ -193,6 +194,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                     joins,
                     projection,
                     aggregates,
+                    select_list,
                     filter,
                     order_by,
                     having,
@@ -219,6 +221,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                     joins,
                     projection,
                     aggregates,
+                    select_list,
                     filter,
                     order_by,
                     having,
@@ -230,6 +233,7 @@ fn maybe_reorder<CatE: StorageEngine>(
                 &best.order,
                 projection,
                 aggregates,
+                select_list,
                 filter,
                 order_by,
                 having,
@@ -431,6 +435,7 @@ fn rewrite_select(
     order: &JoinOrder,
     projection: Vec<usize>,
     aggregates: Vec<AggregateSpec>,
+    select_list: Vec<Expression>,
     filter: Option<Predicate>,
     order_by: Vec<(usize, OrderDir)>,
     having: Option<Predicate>,
@@ -456,16 +461,23 @@ fn rewrite_select(
     }
 
     // Coordinate rule (see LogicalPlan::Select): with aggregates present,
-    // `order_by` and `having` index the aggregate OUTPUT row — invariant
-    // under table reorder, so they must NOT be remapped. Without
-    // aggregates, `order_by` is input-space like everything else.
-    let order_by = if aggregates.is_empty() {
-        order_by
-            .into_iter()
-            .map(|(c, d)| (remap.apply_index(c), d))
-            .collect()
+    // `order_by`, `having`, and `select_list` index the aggregate OUTPUT
+    // row — invariant under table reorder, so they must NOT be remapped.
+    // Without aggregates, `order_by` and `select_list` are input-space like
+    // everything else.
+    let (order_by, select_list) = if aggregates.is_empty() {
+        (
+            order_by
+                .into_iter()
+                .map(|(c, d)| (remap.apply_index(c), d))
+                .collect(),
+            select_list
+                .into_iter()
+                .map(|e| remap.apply_expression(e))
+                .collect(),
+        )
     } else {
-        order_by
+        (order_by, select_list)
     };
     LogicalPlan::Select {
         table: graph.names[first_rel].clone(),
@@ -478,6 +490,7 @@ fn rewrite_select(
             .into_iter()
             .map(|a| remap_aggregate(a, &remap))
             .collect(),
+        select_list,
         filter: filter.map(|f| remap.apply_predicate(f)),
         order_by,
         having,

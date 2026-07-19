@@ -15,9 +15,9 @@ use std::sync::Arc;
 use crate::catalog::Catalog;
 use crate::common::{Error, Result};
 use crate::execution::{
-    AggregateFn, Delete, Executor, Filter, HashAggregate, HashJoin, IndexNestedLoopJoin, IndexScan,
-    Insert, JoinPredicate, Limit, MergeJoin, NestedLoopJoin, PkLookup, Projection, SeqScan,
-    SetExpr, Sort, SortDir, Update,
+    AggregateFn, Compute, Delete, Executor, Filter, HashAggregate, HashJoin, IndexNestedLoopJoin,
+    IndexScan, Insert, JoinPredicate, Limit, MergeJoin, NestedLoopJoin, PkLookup, Projection,
+    SeqScan, SetExpr, Sort, SortDir, Update,
 };
 use crate::layout::RowLayout;
 use crate::sql::ir::logical::{AggregateSpec, OrderDir};
@@ -68,6 +68,10 @@ where
         PhysOp::Projection { input, cols } => {
             let child = build_executor(input, engine, catalog)?;
             Ok(Box::new(Projection::new(child, cols.clone())?))
+        }
+        PhysOp::Compute { input, exprs } => {
+            let child = build_executor(input, engine, catalog)?;
+            Ok(Box::new(Compute::new(child, exprs.clone())?))
         }
         PhysOp::NestedLoopJoin { outer, inner, on } => {
             let outer_ex = build_executor(outer, engine, catalog)?;

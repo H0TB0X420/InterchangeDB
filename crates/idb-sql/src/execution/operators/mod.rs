@@ -2,6 +2,7 @@
 //! (plus its inline tests); the `Executor` trait they implement and the
 //! flat re-exports live one level up in `execution`.
 
+pub mod compute;
 pub mod delete;
 pub mod filter;
 pub mod hash_aggregate;

@@ -83,6 +83,10 @@ fn select_shapes_are_equivalent() {
         "SELECT SUM(i_price) FROM item",
         "SELECT MIN(i_price) FROM item",
         "SELECT MAX(i_price) FROM item",
+        // H2b: an ungrouped computed display runs as the native ComputeSink
+        // (a bare column mixed with an arithmetic item) — prove it against
+        // Volcano's Compute operator.
+        "SELECT i_id, i_price * 2 FROM item WHERE i_id > 1",
     ];
     for q in queries {
         assert_equivalent(&mut s, q);
@@ -125,10 +129,39 @@ fn grouped_aggregate_is_equivalent() {
         // native push sink; the compiled arg closure must agree with pull.
         "SELECT kind, SUM(amt * 2) FROM ev GROUP BY kind",
         "SELECT kind, MIN(amt + 1), AVG(amt) FROM ev GROUP BY kind",
+        // H2b: free display order — a Compute reorders the grouped push
+        // sink's output (native aggregate feeding the native ComputeSink).
+        "SELECT COUNT(*), kind FROM ev GROUP BY kind",
     ];
     for q in queries {
         assert_equivalent(&mut s, q);
     }
+
+    // H2b: TPC-H Q14's post-aggregate arithmetic over a grouped push
+    // aggregate — the native grouped sink feeds the native ComputeSink, so
+    // this proves BOTH push kernels against Volcano on the Q14 shape.
+    // `100.00 * (SUM(x) / SUM(y))` parenthesizes the division first (H2a's
+    // equal-scale Div rule; the left-associative form is uninferable).
+    s.execute(
+        "CREATE TABLE q14 (q_id INT PRIMARY KEY, grp VARCHAR(8), x DECIMAL(12,2), y DECIMAL(12,2))",
+    )
+    .unwrap();
+    for (id, grp, x, y) in [
+        (1, "'a'", "10.00", "40.00"),
+        (2, "'a'", "30.00", "60.00"),
+        (3, "'b'", "25.00", "50.00"),
+        (4, "'b'", "25.00", "50.00"),
+    ] {
+        s.execute(&format!(
+            "INSERT INTO q14 VALUES ({}, {}, {}, {})",
+            id, grp, x, y
+        ))
+        .unwrap();
+    }
+    assert_equivalent(
+        &mut s,
+        "SELECT grp, 100.00 * (SUM(x) / SUM(y)) FROM q14 GROUP BY grp",
+    );
 }
 
 #[test]

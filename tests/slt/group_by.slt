@@ -125,8 +125,15 @@ SELECT region, COUNT(*) FROM orders GROUP BY status
 statement error GROUP BY column 'status' must appear in the SELECT list
 SELECT region, COUNT(*) FROM orders GROUP BY region, status
 
-statement error group columns must precede aggregates in the SELECT list
+# H2b lifted H1's keys-before-aggregates restriction: display order is
+# free. The aggregate output row is still [region, COUNT] (keys then
+# aggregates); a Compute reorders it to the written [COUNT, region].
+query IT
 SELECT COUNT(*), region FROM orders GROUP BY region
+----
+2 NULL
+3 east
+2 west
 
 statement error SELECT DISTINCT not supported
 SELECT DISTINCT region FROM orders

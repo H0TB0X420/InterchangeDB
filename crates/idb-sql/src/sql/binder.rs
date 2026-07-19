@@ -422,11 +422,11 @@ impl<E: StorageEngine> Binder<E> {
             });
         }
 
-        // Projection + aggregates: empty Vec / empty Vec = SELECT *.
-        let (projection, aggregates) = bind_select_items(&scope, &select.projection)?;
-
         // GROUP BY clause → input-space plain columns. H1 scope:
-        // expressions and Snowflake-style ALL reject loudly.
+        // expressions and Snowflake-style ALL reject loudly. Parsed BEFORE
+        // the SELECT items because whether the query is aggregated (which
+        // fixes each item's coordinate space) depends on the GROUP BY
+        // clause as well as on aggregate calls in the list.
         let group_cols: Vec<usize> = match &select.group_by {
             ast::GroupByExpr::Expressions(exprs, modifiers) => {
                 if !modifiers.is_empty() {
@@ -443,6 +443,12 @@ impl<E: StorageEngine> Binder<E> {
                 return Err(Error::SqlParse("binder: GROUP BY ALL not supported".into()))
             }
         };
+
+        // Projection + aggregates + display list. Empty projection/aggregates
+        // = SELECT *; empty select_list = identity display (the zero-churn
+        // invariant — see LogicalPlan::Select).
+        let (projection, aggregates, select_list) =
+            bind_select_items(&scope, &select.projection, &group_cols)?;
 
         // Grouping rules. The IR carries group keys IN `projection`
         // (LogicalPlan::Select's contract), so the GROUP BY clause and the
@@ -535,6 +541,7 @@ impl<E: StorageEngine> Binder<E> {
             joins,
             projection,
             aggregates,
+            select_list,
             filter,
             order_by,
             having,
@@ -809,74 +816,250 @@ fn column_index_qualified(scope: &Scope, qualifier: &str, name: &str) -> Result<
     )))
 }
 
-/// Bind SELECT items into projection columns + aggregate specs.
+/// Bind SELECT items into `(projection, aggregates, select_list)`.
 ///
-/// Returns `(projection, aggregates)`:
-/// - Both empty: `SELECT *`.
-/// - Only projection non-empty: column projection (`SELECT a, b.c FROM …`).
-/// - Only aggregates non-empty: whole-table aggregation
-///   (`SELECT COUNT(*), SUM(x) FROM …`).
-/// - Both non-empty: GROUP BY — the caller (`bind_query`) validates the
-///   mix against the GROUP BY clause. The two vecs lose the SELECT
-///   list's interleaving, and aggregate output is keys-then-aggregates,
-///   so any interleaving other than keys-first would silently reorder
-///   the user's columns — rejected here instead.
+/// - `projection` (H1 meaning): grouped → the group keys in
+///   first-appearance order; ungrouped bare-only list → the projected
+///   columns; ungrouped with any computed item → EMPTY (the `Compute`
+///   built from `select_list` replaces the Projection).
+/// - `aggregates`: aggregate specs extracted from the items, deduped by
+///   `PartialEq`, in first-encounter order.
+/// - `select_list` (H2b): the display row — one `Expression` per item, or
+///   EMPTY when the display is the identity over its coordinate space (the
+///   zero-churn invariant; see `LogicalPlan::Select`). Space follows the
+///   aggregate rule: input tuple when unaggregated, aggregate output row
+///   (keys ++ aggregates) otherwise.
+///
+/// A query is *aggregated* iff a GROUP BY clause is present or any item
+/// contains an aggregate call. The two regimes bind separately: the
+/// aggregated path resolves items into aggregate-output coordinates; the
+/// unaggregated path binds items straight against the input scope.
 fn bind_select_items(
     scope: &Scope,
     items: &[ast::SelectItem],
-) -> Result<(Vec<usize>, Vec<AggregateSpec>)> {
+    group_cols: &[usize],
+) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<Expression>)> {
     // Single Wildcard → SELECT *.
     if items.len() == 1 && matches!(items[0], ast::SelectItem::Wildcard(_)) {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
 
-    let mut projection: Vec<usize> = Vec::new();
-    let mut aggregates: Vec<AggregateSpec> = Vec::new();
+    // Unwrap each item to its expression (an alias is display-only here).
+    let mut exprs: Vec<&AstExpr> = Vec::with_capacity(items.len());
     for it in items {
-        let expr = match it {
-            ast::SelectItem::UnnamedExpr(e) => e,
-            ast::SelectItem::ExprWithAlias { expr, .. } => expr,
+        match it {
+            ast::SelectItem::UnnamedExpr(e) => exprs.push(e),
+            ast::SelectItem::ExprWithAlias { expr, .. } => exprs.push(expr),
             other => {
                 return Err(Error::SqlParse(format!(
                     "binder: projection item shape unsupported: {:?}",
                     other
                 )))
             }
-        };
-        match expr {
-            AstExpr::Identifier(ident) => {
-                if !aggregates.is_empty() {
-                    return Err(Error::SqlParse(
-                        "binder: group columns must precede aggregates in the SELECT list".into(),
-                    ));
-                }
-                projection.push(column_index(scope, &ident.value)?);
-            }
-            AstExpr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                if !aggregates.is_empty() {
-                    return Err(Error::SqlParse(
-                        "binder: group columns must precede aggregates in the SELECT list".into(),
-                    ));
-                }
-                projection.push(column_index_qualified(
-                    scope,
-                    &parts[0].value,
-                    &parts[1].value,
-                )?);
-            }
-            AstExpr::Function(func) => {
-                aggregates.push(bind_aggregate_function(scope, func)?);
-            }
-            other => {
-                return Err(Error::SqlParse(format!(
-                    "binder: projection expression shape unsupported: {:?}",
-                    other
-                )))
-            }
         }
     }
 
-    Ok((projection, aggregates))
+    let aggregated = !group_cols.is_empty() || exprs.iter().any(|e| expr_contains_aggregate(e));
+    if aggregated {
+        bind_select_items_grouped(scope, &exprs)
+    } else {
+        bind_select_items_ungrouped(scope, &exprs)
+    }
+}
+
+/// Unaggregated display: bind each item against the input scope. A list of
+/// only bare columns keeps today's projection path (a `Projection` selects
+/// / reorders them, `select_list` empty — zero churn, including pure
+/// reorderings like `SELECT b, a`). Any computed item switches to the
+/// `Compute` path: `projection` empty, `select_list` carries every item in
+/// input coordinates.
+fn bind_select_items_ungrouped(
+    scope: &Scope,
+    exprs: &[&AstExpr],
+) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<Expression>)> {
+    let bound: Vec<Expression> = exprs
+        .iter()
+        .map(|e| bind_expression(scope, (*e).clone()))
+        .collect::<Result<Vec<_>>>()?;
+    if bound.iter().all(|e| matches!(e, Expression::Column(_))) {
+        let projection = bound
+            .iter()
+            .map(|e| match e {
+                Expression::Column(i) => *i,
+                _ => unreachable!("guarded by the all-Column check above"),
+            })
+            .collect();
+        Ok((projection, Vec::new(), Vec::new()))
+    } else {
+        Ok((Vec::new(), Vec::new(), bound))
+    }
+}
+
+/// Aggregated display, in two passes. Pass 1 collects the top-level
+/// bare-column items — the group keys, first-appearance order — into
+/// `projection`; the aggregate output row is exactly these keys followed
+/// by the aggregates, so a key's output position is its index in
+/// `projection`. Pass 2 binds every item into that output space,
+/// extracting aggregate calls into `aggregates` (deduped) and resolving
+/// each bare column — wherever it appears — to its key position (a non-key
+/// column errors). An identity display (keys then aggregates, in order)
+/// elides to an empty `select_list`. Two passes so pass 2's key lookups see
+/// the complete key set regardless of display order (`SELECT COUNT(*),
+/// region`).
+fn bind_select_items_grouped(
+    scope: &Scope,
+    exprs: &[&AstExpr],
+) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<Expression>)> {
+    // Pass 1: group keys = the top-level bare-column items, deduped.
+    let mut projection: Vec<usize> = Vec::new();
+    for e in exprs {
+        if let Some(col) = as_bare_column(scope, e)? {
+            if !projection.contains(&col) {
+                projection.push(col);
+            }
+        }
+    }
+    // Pass 2: bind each item into aggregate-output coordinates.
+    let mut aggregates: Vec<AggregateSpec> = Vec::new();
+    let mut select_list: Vec<Expression> = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        select_list.push(bind_output_expr(scope, e, &projection, &mut aggregates)?);
+    }
+    if is_identity_select_list(&select_list) {
+        select_list.clear();
+    }
+    Ok((projection, aggregates, select_list))
+}
+
+/// The tuple-global column index if `e` is a plain column reference
+/// (`Identifier` or two-part `CompoundIdentifier`), else `None`. `Err` only
+/// when it *is* a column shape but names an unknown column.
+fn as_bare_column(scope: &Scope, e: &AstExpr) -> Result<Option<usize>> {
+    match e {
+        AstExpr::Identifier(ident) => Ok(Some(column_index(scope, &ident.value)?)),
+        AstExpr::CompoundIdentifier(parts) if parts.len() == 2 => Ok(Some(column_index_qualified(
+            scope,
+            &parts[0].value,
+            &parts[1].value,
+        )?)),
+        // A parenthesized column is still a bare column: unwrap so pass 1
+        // registers `(region)` as a group key (matching `bind_output_expr`,
+        // `bind_having_predicate`, `bind_expression`, and `bind_predicate`,
+        // which all unwrap `Nested` before resolving columns).
+        AstExpr::Nested(inner) => as_bare_column(scope, inner),
+        _ => Ok(None),
+    }
+}
+
+/// Bind one SELECT item into aggregate-output coordinates. Aggregate calls
+/// are extracted into `aggregates` (deduped by `PartialEq`) and referenced
+/// by their output slot (`projection.len()` + position); bare columns
+/// resolve to their group-key position; arithmetic recurses.
+fn bind_output_expr(
+    scope: &Scope,
+    e: &AstExpr,
+    projection: &[usize],
+    aggregates: &mut Vec<AggregateSpec>,
+) -> Result<Expression> {
+    match e {
+        AstExpr::Function(func) => {
+            let spec = bind_aggregate_function(scope, func)?;
+            let pos = match aggregates.iter().position(|a| *a == spec) {
+                Some(pos) => pos,
+                None => {
+                    aggregates.push(spec);
+                    aggregates.len() - 1
+                }
+            };
+            Ok(Expression::Column(projection.len() + pos))
+        }
+        AstExpr::Identifier(_) | AstExpr::CompoundIdentifier(_) => {
+            let col = as_bare_column(scope, e)?.ok_or_else(|| {
+                Error::SqlParse(format!("binder: unsupported column reference: {:?}", e))
+            })?;
+            match projection.iter().position(|&p| p == col) {
+                Some(pos) => Ok(Expression::Column(pos)),
+                None => Err(Error::SqlParse(format!(
+                    "binder: column '{}' must be a group key",
+                    column_name_at(scope, col)
+                ))),
+            }
+        }
+        AstExpr::BinaryOp { left, op, right } => {
+            let arith_op = map_arith_op(op)?;
+            let l = bind_output_expr(scope, left, projection, aggregates)?;
+            let r = bind_output_expr(scope, right, projection, aggregates)?;
+            // NO literal alignment in output space (H2b): aggregate outputs
+            // carry their own scales, and Div still requires equal scales,
+            // so the left-associative `100.00 * SUM(x) / SUM(y)` is
+            // uninferable and errs loudly at build — a recorded limitation
+            // (Q14 writes the working form `100.00 * (SUM(x) / SUM(y))`),
+            // not silenced here.
+            Ok(Expression::BinaryOp {
+                op: arith_op,
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        }
+        AstExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match &**expr {
+            AstExpr::Value(AstValue::Number(n, _)) => Ok(Expression::Literal(
+                ast_value_to_value_unconstrained(AstValue::Number(format!("-{}", n), false))?,
+            )),
+            other => {
+                let inner = bind_output_expr(scope, other, projection, aggregates)?;
+                Ok(Expression::BinaryOp {
+                    op: BinaryOp::Sub,
+                    left: Box::new(Expression::Literal(Value::Int64(0))),
+                    right: Box::new(inner),
+                })
+            }
+        },
+        AstExpr::Value(v) => Ok(Expression::Literal(ast_value_to_value_unconstrained(
+            v.clone(),
+        )?)),
+        AstExpr::Nested(inner) => bind_output_expr(scope, inner, projection, aggregates),
+        other => Err(Error::SqlParse(format!(
+            "binder: SELECT item shape unsupported: {:?}",
+            other
+        ))),
+    }
+}
+
+/// True if an AST expression contains an aggregate call anywhere — the
+/// signal (with a GROUP BY clause) that a query is aggregated. Only
+/// aggregate-named functions count; unsupported non-aggregate functions are
+/// rejected later by binding.
+fn expr_contains_aggregate(e: &AstExpr) -> bool {
+    match e {
+        AstExpr::Function(func) => is_aggregate_name(&object_name_to_string(&func.name)),
+        AstExpr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        AstExpr::UnaryOp { expr, .. } => expr_contains_aggregate(expr),
+        AstExpr::Nested(inner) => expr_contains_aggregate(inner),
+        _ => false,
+    }
+}
+
+/// The function names the binder treats as aggregates.
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
+    )
+}
+
+/// A `select_list` that is exactly `[Column(0), Column(1), …, Column(n-1)]`
+/// — the identity display over its coordinate space — elides to empty (the
+/// zero-churn invariant): the plan then reproduces the pre-H2b shape (bare
+/// projection, or keys-then-aggregates straight out of the aggregate).
+fn is_identity_select_list(list: &[Expression]) -> bool {
+    list.iter()
+        .enumerate()
+        .all(|(i, e)| matches!(e, Expression::Column(c) if *c == i))
 }
 
 /// Reverse of `column_index`: the display name of joined-tuple position
@@ -1859,6 +2042,7 @@ mod tests {
                 joins,
                 projection,
                 aggregates,
+                select_list,
                 filter,
                 order_by,
                 having,
@@ -1869,6 +2053,7 @@ mod tests {
                 assert!(aggregates.is_empty());
                 assert!(order_by.is_empty());
                 assert!(projection.is_empty(), "SELECT * → empty projection");
+                assert!(select_list.is_empty(), "SELECT * → identity display");
                 assert!(filter.is_none());
                 assert!(having.is_none());
                 assert!(limit.is_none());

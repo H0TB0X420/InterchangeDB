@@ -136,6 +136,45 @@ Int32-column × Int64-column arithmetic errs loudly rather than aligning
 (no consumer); Decimal Mul scale growth unbounded in inference
 (runtime-asserted; scope ends at 6 here).
 
+**H2b executed (2026-07-18).** Change, generic: computed projections land
+as a display layer — one new IR field (`select_list: Vec<Expression>`),
+one new physical op (`Compute`, above Sort / below Limit), one coordinate
+rule reused verbatim (input space when unaggregated, aggregate-output
+space otherwise — remapped through the shared `apply_expression` walker
+IFF unaggregated, cloned through when aggregated, exactly like
+`order_by`). An EMPTY `select_list` is the identity display, so every
+pre-H2b query keeps its exact plan shape (the zero-churn invariant — all
+prior EXPLAIN goldens passed unmodified). Repo-specific: the binder reworks
+`bind_select_items` into aggregate-extraction form (two passes over the
+items — pass 1 collects group keys, pass 2 binds each item into output
+coordinates, deduping aggregates by `PartialEq`), lifting H1's
+keys-before-aggregates restriction (`SELECT COUNT(*), region` now works);
+a bare column inside a computed grouped item must be a group key; identity
+display elides to empty (`is_identity_select_list`). The `Compute`
+operator (Volcano) and native `ComputeSink` (Push) compile the exprs once
+and share `build_compute_schema`, which infers the output type via
+`Expression::column_type` and refuses an untypeable display with the same
+loud "cannot infer" both models raise identically. NO literal alignment in
+output space: the left-associative `100.00 * SUM(x) / SUM(y)` is scale4 ÷
+scale2 → uninferable (recorded as an error contract; the working form
+divides first). Gains: Q14/Q8/Q17's post-aggregate arithmetic shape plans
+and runs through all three planners (corpus += input-space remap and
+output-space no-remap cases) and both exec models (grouped Q14 proven
+byte-identical); tests 1324 → 1328. Review findings (Sonnet pass) fixed
+before commit: (1) CONFIRMED — pass 1's `as_bare_column` didn't unwrap
+parenthesized expressions, so `SELECT (region), COUNT(*) … GROUP BY
+region` false-errored when the parens were the key's sole occurrence;
+Nested-recursion arm added + repro pinned. (2) Compute passthrough
+columns hardcoded nullable instead of inheriting — latent metadata trap,
+now per-arm. (3) The aggregate-dedup shape (`SUM(x), SUM(x)*2` → one
+spec, two refs) was traced-correct but untested — pinned with values +
+EXPLAIN golden. Review also proved the elision check structurally unable
+to fire on a non-identity list and independently recomputed the decimal
+expectations. Draws (recorded limits): a group key referenced only
+inside an expression (never projected bare) still errs (H1's "keys must
+be projected" holds); left-associative Decimal division is uninferable
+pending the division-semantics fix noted under H3.
+
 ### H3 — scalar and predicate surface
 
 - DATE: **decided 2026-07-18** — new `Value::Date(i32 days)` with its own
@@ -154,6 +193,19 @@ Int32-column × Int64-column arithmetic errs loudly rather than aligning
 - CASE: new `Expression` variant (Q8, Q12, Q14 use it *inside* SUM — lands
   on H2's expression plumbing).
 - EXTRACT(YEAR): expression function over Date (Q7, Q8, Q9).
+- Decimal division semantics (**decided 2026-07-18** — the Q14 fix):
+  replace the equal-scale-only `div_keeping_scale` runtime rule with true
+  division at result scale `max(s1, s2)` (rescale operands, integer
+  division with round-half-up, checked overflow → NULL as today), so
+  Q14's verbatim left-associative `100.00 * sum(..) / sum(..)`
+  (scale 4 ÷ scale 2) is legal. Inference's Div arm mirrors:
+  `Some(Decimal{p, max(s1, s2)})`, no equal-scale bail. Ripples to
+  update, all recorded in H2a/H2b as temporary: `align_target` drops Div
+  (no longer needed), `column_type_decimal_rules`' mismatched-Div → Some,
+  `aggregate_expr.slt`'s uninferable-div contract and H2b's
+  left-associative Q14 error contract both flip to positive tests with
+  hand-computed values. Audit `AvgDecimal`'s finalize division for
+  consistency with the new rule.
 - H3b: LEFT OUTER JOIN (Q13) — binder + NLJ/hash outer variants; excluded
   from join reordering (see below).
 

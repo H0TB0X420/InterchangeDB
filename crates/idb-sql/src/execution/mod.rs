@@ -31,6 +31,7 @@ pub mod push;
 pub(crate) mod test_util;
 
 pub use model::{ExecModel, ExecutionModel, Volcano};
+pub use operators::compute::Compute;
 pub use operators::delete::Delete;
 pub use operators::filter::Filter;
 pub use operators::hash_aggregate::{AggregateFn, HashAggregate};

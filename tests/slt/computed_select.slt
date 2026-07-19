@@ -1,0 +1,165 @@
+# H2b: computed projections — row-level arithmetic (`SELECT a + b`),
+# free display order (`SELECT COUNT(*), region`), and TPC-H Q14's
+# post-aggregate arithmetic (`100.00 * SUM(x) / SUM(y)`). The `Compute`
+# operator carries the display; an identity display stays empty (the
+# zero-churn invariant), so only genuinely computed shapes appear here.
+#
+# Decimal scales are load-bearing and asserted at exact stored scale:
+#   x, y, 100.00           scale 2
+#   SUM(x) / SUM(y)         scale 2   (equal-scale Div keeps the scale)
+#   100.00 * (…)            scale 4   (Mul sums scales: 2 + 2)
+
+# ---- ungrouped row-level arithmetic --------------------------------------
+
+statement ok
+CREATE TABLE nums (pk INT PRIMARY KEY, a INT, b INT, c INT)
+
+statement ok
+INSERT INTO nums VALUES (1, 10, 3, 2), (2, 20, 4, 0), (3, 5, NULL, 5)
+
+# `a + b`, `a * 2`, and a bare `a` mixed in. Row 3's b is NULL, so `a + b`
+# propagates NULL; `a * 2` aligns the literal to Int32 (no NULL landmine).
+#   (10+3,  10*2, 10) = (13, 20, 10)
+#   (20+4,  20*2, 20) = (24, 40, 20)
+#   (5+NULL, 5*2,  5) = (NULL, 10, 5)
+query III
+SELECT a + b, a * 2, a FROM nums ORDER BY pk
+----
+13 20 10
+24 40 20
+NULL 10 5
+
+# Division by zero yields NULL for that row's value (row 2 is 20 / 0).
+#   10/2 = 5, 20/0 = NULL, 5/5 = 1
+query I
+SELECT a / c FROM nums ORDER BY pk
+----
+5
+NULL
+1
+
+# ---- display-order freedom (grouped) -------------------------------------
+
+statement ok
+CREATE TABLE sales (pk INT PRIMARY KEY, region VARCHAR(8), total BIGINT)
+
+statement ok
+INSERT INTO sales VALUES (1, 'east', 100), (2, 'west', 200), (3, 'east', 300), (4, 'west', 50), (5, 'east', 20)
+
+# H2b lifts the keys-before-aggregates rule: COUNT is written before the
+# key. The aggregate output row is [region, COUNT]; a Compute reorders it
+# to the written [COUNT, region]. Canonical key order (east, west).
+#   east {100,300,20} → 3 ; west {200,50} → 2
+query IT
+SELECT COUNT(*), region FROM sales GROUP BY region
+----
+3 east
+2 west
+
+# A parenthesized bare group key as the SOLE occurrence of that key. Pass 1
+# must unwrap `(region)` to register it as a group key; without the unwrap it
+# false-errors "must be a group key". Identity display [region, COUNT] elides
+# the Compute, so this exercises the binder pass-1 fix, not the operator.
+#   east {100,300,20} → 3 ; west {200,50} → 2
+query TI
+SELECT (region), COUNT(*) FROM sales GROUP BY region
+----
+east 3
+west 2
+
+# Post-aggregate arithmetic over a group key. total is BIGINT, so SUM
+# (Int64) and MIN (Int64 — preserves the argument type) share a type and
+# their difference infers.
+#   east: SUM=420, MIN=20 → 400
+#   west: SUM=250, MIN=50 → 200
+query TI
+SELECT region, SUM(total) - MIN(total) FROM sales GROUP BY region ORDER BY region
+----
+east 400
+west 200
+
+# Aggregate dedup: `SUM(total)` appears twice (bare, and inside `* 2`), so
+# it binds to ONE aggregate whose output column is referenced twice by the
+# Compute. total is BIGINT (Int64); the literal 2 keeps the product Int64.
+#   east: SUM=100+300+20=420 ; 420 * 2 = 840
+#   west: SUM=200+50=250      ; 250 * 2 = 500
+query TII
+SELECT region, SUM(total), SUM(total) * 2 FROM sales GROUP BY region ORDER BY region
+----
+east 420 840
+west 250 500
+
+# ---- Q14 shape: 100.00 * SUM(x) / SUM(y) over DECIMAL(12,2) --------------
+
+statement ok
+CREATE TABLE parts (pk INT PRIMARY KEY, typ VARCHAR(8), x DECIMAL(12,2), y DECIMAL(12,2))
+
+statement ok
+INSERT INTO parts VALUES (1, 'A', 10.00, 40.00), (2, 'A', 30.00, 60.00), (3, 'B', 25.00, 50.00), (4, 'B', 25.00, 50.00)
+
+# The WORKING form divides FIRST, so the division is equal-scale:
+#   SUM(x)/SUM(y)  scale2 / scale2 → scale2
+#   100.00 * (…)   scale2 * scale2 → scale4
+# Ungrouped: SUM(x)=90.00, SUM(y)=200.00 → 90.00/200.00 = 0.45 → ×100.00 = 45.0000
+query R
+SELECT 100.00 * (SUM(x) / SUM(y)) FROM parts
+----
+45.0000
+
+# Grouped, same working form.
+#   A: SUM(x)=40.00, SUM(y)=100.00 → 0.40 → 40.0000
+#   B: SUM(x)=50.00, SUM(y)=100.00 → 0.50 → 50.0000
+query TR
+SELECT typ, 100.00 * (SUM(x) / SUM(y)) FROM parts GROUP BY typ ORDER BY typ
+----
+A 40.0000
+B 50.0000
+
+# The LEFT-ASSOCIATIVE form parses as (100.00 * SUM(x)) / SUM(y): 100.00 *
+# SUM(x) is scale2 * scale2 = scale4, then scale4 / scale2 breaks the
+# equal-scale Div rule (H2a) → uninferable → loud error. A faithfully
+# recorded H2b limitation (division scale semantics are NOT fixed here);
+# the working form above parenthesizes the division first.
+statement error cannot infer
+SELECT 100.00 * SUM(x) / SUM(y) FROM parts
+
+# ---- error contracts -----------------------------------------------------
+
+# A non-key bare column inside a computed item in a grouped query: `total`
+# appears bare inside the difference and is not a group key.
+statement error must be a group key
+SELECT region, SUM(total) - total FROM sales GROUP BY region
+
+# An uninferable computed item: Varchar + Int has no arithmetic, so the
+# Compute schema builder refuses to type it (the same loud "cannot infer"
+# the aggregate kernel makes for an untypeable argument).
+statement error cannot infer
+SELECT region + 1 FROM sales
+
+# ---- EXPLAIN goldens: the Compute tree -----------------------------------
+
+# Ungrouped arithmetic: projection is empty, so Compute sits directly over
+# the scan (it subsumes the Projection). Columns render `c{i}`.
+query T
+EXPLAIN SELECT a + b, a FROM nums
+----
+Compute[(c1 + c2), c1]
+SeqScan(nums)
+
+# Grouped display-order: Compute over HashAggregate, reordering the
+# aggregate output row [region, COUNT] into the written [COUNT, region].
+query T
+EXPLAIN SELECT COUNT(*), region FROM sales GROUP BY region
+----
+Compute[c1, c0]
+HashAggregate[group=(c1), COUNT(*)]
+SeqScan(sales)
+
+# Aggregate dedup: one SUM in the HashAggregate; the Compute references its
+# output column (c1) twice — bare, and inside `(c1 * 2)`.
+query T
+EXPLAIN SELECT region, SUM(total), SUM(total) * 2 FROM sales GROUP BY region
+----
+Compute[c0, c1, (c1 * 2)]
+HashAggregate[group=(c1), SUM(c2)]
+SeqScan(sales)

@@ -189,6 +189,7 @@ pub(crate) fn query(relations: Vec<RelInfo>, edges: Vec<Edge>) -> NormalizedQuer
         spine: SpineParts {
             projection: Vec::new(),
             aggregates: Vec::new(),
+            select_list: Vec::new(),
             order_by: Vec::new(),
             having: None,
             limit: None,

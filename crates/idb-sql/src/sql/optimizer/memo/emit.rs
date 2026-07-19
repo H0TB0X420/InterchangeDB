@@ -99,6 +99,20 @@ pub(crate) fn emit(
         .iter()
         .map(|&col| context.remap.apply_index(col))
         .collect();
+    // `select_list` follows the same coordinate rule as `order_by`: grouped
+    // → aggregate-output space, remap-invariant, cloned through; unaggregated
+    // → input space, every column remapped to the physical layout.
+    let select_list = if query.spine.aggregates.is_empty() {
+        query
+            .spine
+            .select_list
+            .iter()
+            .cloned()
+            .map(|e| context.remap.apply_expression(e))
+            .collect()
+    } else {
+        query.spine.select_list.clone()
+    };
     apply_select_spine(
         core,
         residual,
@@ -106,6 +120,7 @@ pub(crate) fn emit(
         order_by,
         query.spine.having.clone(),
         projection,
+        select_list,
         query.spine.limit,
     )
 }

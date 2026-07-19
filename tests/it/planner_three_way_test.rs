@@ -165,6 +165,16 @@ const CORPUS: &[&str] = &[
     // order actually reorder, making the remap non-identity.
     "SELECT c_b, SUM(c_val * 2) FROM c GROUP BY c_b",
     "SELECT a_val, SUM(c_val + b_val) FROM c JOIN b ON c_b = b_id JOIN a ON b_a = a_id GROUP BY a_val",
+    // H2b computed projections. The ungrouped one is the 3-relation
+    // worst-textual-order shape (big table c first) so the Selinger/memo
+    // reorder actually fires: its INPUT-space `select_list` (`a_val +
+    // c_val`) must be remapped through `apply_expression` under the
+    // reorder, exactly like a WHERE/projection column. The grouped one puts
+    // the computed item in aggregate-OUTPUT space (`SUM(c_val) - COUNT(*)`):
+    // that space is remap-invariant, so `select_list` must pass through the
+    // reorder UNTOUCHED — a wrongful remap here would corrupt the display.
+    "SELECT a_val + c_val FROM c JOIN b ON c_b = b_id JOIN a ON b_a = a_id WHERE c_val < 3",
+    "SELECT a_val, SUM(c_val) - COUNT(*) FROM c JOIN b ON c_b = b_id JOIN a ON b_a = a_id GROUP BY a_val",
 ];
 
 fn rows(session: &mut Session<BTreeEngine>, sql: &str) -> Vec<Vec<Value>> {

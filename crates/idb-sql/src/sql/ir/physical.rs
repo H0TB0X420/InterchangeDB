@@ -65,6 +65,17 @@ pub enum PhysOp {
         cols: Vec<usize>,
     },
 
+    /// Row-level computed projection (H2b): emit one output column per
+    /// `Expression`, evaluated against the input tuple. Subsumes
+    /// `Projection` when the display is more than a column subset/reorder
+    /// (`SELECT a + b`, `SELECT 100.00 * SUM(x) / SUM(y)`, reorderings like
+    /// `SELECT COUNT(*), region`). Coordinates match the binder rule: input
+    /// tuple when the plan is unaggregated, aggregate output row otherwise.
+    Compute {
+        input: Box<PhysOp>,
+        exprs: Vec<Expression>,
+    },
+
     /// Block nested-loop join. `inner` is the materialized side (today always
     /// a `SeqScan` of the right table). `on` is the ON predicate over the
     /// concatenated `outer || inner` tuple; `None` is a cross join.
@@ -162,6 +173,16 @@ impl PhysOp {
             }
             PhysOp::Projection { input, cols } => {
                 format!("{pad}Projection({cols:?})\n{}", input.explain(indent + 1))
+            }
+            PhysOp::Compute { input, exprs } => {
+                // Each expr renders through `Expression::Display` (`Column(i)
+                // → c{i}`), so `SELECT a + b` reads `Compute[(c0 + c1)]`.
+                let items: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
+                format!(
+                    "{pad}Compute[{}]\n{}",
+                    items.join(", "),
+                    input.explain(indent + 1)
+                )
             }
             PhysOp::NestedLoopJoin { outer, inner, .. } => format!(
                 "{pad}NestedLoopJoin\n{}{}",

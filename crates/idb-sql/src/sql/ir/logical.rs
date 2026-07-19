@@ -60,25 +60,44 @@ pub enum LogicalPlan {
     ///   aggregation (no GROUP BY).
     /// - Both non-empty: GROUP BY — `projection` holds the group-key
     ///   columns (the binder enforces that the GROUP BY clause and the
-    ///   projected plain columns coincide, keys listed before aggregates).
-    ///   The aggregate output row is keys in projection order, then
-    ///   aggregates in `aggregates` order.
+    ///   projected plain columns coincide). The aggregate output row is
+    ///   keys in projection order, then aggregates in `aggregates` order.
+    ///   H2b lifts H1's keys-before-aggregates ordering: display order is
+    ///   free (`SELECT COUNT(*), region`), carried by `select_list`.
     ///
-    /// Coordinate rule: when `aggregates` is non-empty, `order_by` and
-    /// `having` index the aggregate OUTPUT row (keys ++ aggregates), not
-    /// the input tuple — the input scope no longer exists above the
-    /// aggregate. When `aggregates` is empty they index the input tuple
-    /// like `filter` does.
+    /// Coordinate rule: when `aggregates` is non-empty, `order_by`,
+    /// `having`, and `select_list` index the aggregate OUTPUT row (keys ++
+    /// aggregates), not the input tuple — the input scope no longer exists
+    /// above the aggregate. When `aggregates` is empty they index the input
+    /// tuple like `filter` does.
+    ///
+    /// `select_list` is H2b's display layer — the final output row as a
+    /// list of `Expression`s (`SELECT a + b`, `SELECT 100.00 * SUM(x) /
+    /// SUM(y)`, or a mere reordering `SELECT COUNT(*), region`). It is
+    /// EMPTY for every query whose display is the identity over its space
+    /// (bare projection, or keys-then-aggregates in order) — the zero-churn
+    /// invariant: an empty `select_list` reproduces exactly the pre-H2b
+    /// plan shape. When non-empty, the spine lowers it to a `Compute`
+    /// (above Sort, below Limit) that replaces the bare Projection.
     Select {
         table: String,
         joins: Vec<JoinClause>,
         /// Column indices in the requested output order. Empty = `SELECT *`
         /// (when aggregates is also empty) or whole-table aggregation (when
-        /// aggregates is non-empty).
+        /// aggregates is non-empty). H1 meaning unchanged: bare column
+        /// projection (ungrouped) or the group keys in first-appearance
+        /// order (grouped). Empty in the ungrouped-computed case (`Compute`
+        /// replaces the Projection).
         projection: Vec<usize>,
         /// Aggregate functions to compute over the rows. Empty means no
         /// aggregation.
         aggregates: Vec<AggregateSpec>,
+        /// H2b computed projections — the display row. EMPTY = identity
+        /// display (see the type-level coordinate rule). Non-empty =
+        /// per-column output `Expression`s; when `aggregates` is empty they
+        /// index the input tuple (like `filter`), otherwise the aggregate
+        /// output row (like `order_by` / `having`).
+        select_list: Vec<Expression>,
         filter: Option<Predicate>,
         /// `ORDER BY (col, dir)+`. Column indices are tuple-global (same
         /// scope as `projection` / `filter`) — except under GROUP BY; see
@@ -185,6 +204,7 @@ impl LogicalPlan {
                 joins,
                 projection,
                 aggregates,
+                select_list,
                 filter,
                 order_by,
                 having,
@@ -211,11 +231,16 @@ impl LogicalPlan {
                     Some(p) => Some(p.substitute_params(params)?),
                     None => None,
                 };
+                let select_list = select_list
+                    .into_iter()
+                    .map(|e| e.substitute_params(params))
+                    .collect::<crate::common::Result<Vec<_>>>()?;
                 Ok(LogicalPlan::Select {
                     table,
                     joins,
                     projection,
                     aggregates,
+                    select_list,
                     filter,
                     order_by,
                     having,

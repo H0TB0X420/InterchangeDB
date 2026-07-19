@@ -50,6 +50,7 @@ use crate::catalog::{Catalog, Schema};
 use crate::common::Result;
 use crate::execution::build::{build_executor, translate_aggregate_spec};
 use crate::execution::model::ExecutionModel;
+use crate::execution::operators::compute::{build_compute_schema, ColumnEvaluator};
 use crate::execution::operators::hash_aggregate::{
     build_aggregate_schema, compare_keys, finalize_state, update_state, AggState, ArgEvaluator,
     MAX_GROUP_COUNT,
@@ -126,6 +127,26 @@ impl Sink for ProjectionSink {
     fn push(&mut self, tuple: Tuple) -> Result<Flow> {
         let projected = self.cols.iter().map(|&i| tuple[i].clone()).collect();
         self.out.push(projected)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.out.finish()
+    }
+}
+
+/// Row-level computed projection (H2b) as a native push sink — a linear
+/// pipeline operator like `ProjectionSink`: evaluate each compiled
+/// expression, push the assembled row, and pass the downstream `Flow`
+/// straight through. `finish` forwards end-of-input.
+struct ComputeSink {
+    evals: Vec<ColumnEvaluator>,
+    out: Box<dyn Sink>,
+}
+
+impl Sink for ComputeSink {
+    fn push(&mut self, tuple: Tuple) -> Result<Flow> {
+        let row = self.evals.iter().map(|f| f(&tuple)).collect();
+        self.out.push(row)
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -341,6 +362,17 @@ where
                 }
             }
             Ok((source, project_schema(&in_schema, cols)))
+        }
+        PhysOp::Compute { input, exprs } => {
+            let evals = exprs.iter().cloned().map(Expression::compile).collect();
+            let sink = Box::new(ComputeSink { evals, out });
+            let (source, in_schema) = build_push(input, sink, engine, catalog)?;
+            // Infer/validate the output schema from the recursion's input
+            // schema — the same loud "cannot infer" refusal `Compute::new`
+            // makes, so a bad plan fails identically under both models
+            // (never a per-row panic in the sink's evaluators).
+            let out_schema = build_compute_schema(&in_schema, exprs)?;
+            Ok((source, out_schema))
         }
         // Grouped aggregation runs as a native push sink (H1 decision:
         // accumulate-on-push/emit-on-finish is the shape push models are

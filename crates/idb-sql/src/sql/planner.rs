@@ -220,13 +220,23 @@ where
             joins,
             projection,
             aggregates,
+            select_list,
             filter,
             order_by,
             having,
             limit,
         } => {
             let physop = plan_select(
-                table, joins, projection, aggregates, filter, order_by, having, limit, catalog,
+                table,
+                joins,
+                projection,
+                aggregates,
+                select_list,
+                filter,
+                order_by,
+                having,
+                limit,
+                catalog,
                 selection,
             )?;
             Ok(PhysicalPlan::Query(physop))
@@ -259,6 +269,7 @@ fn plan_select<CatE>(
     joins: Vec<crate::sql::ir::logical::JoinClause>,
     projection: Vec<usize>,
     aggregates: Vec<crate::sql::ir::logical::AggregateSpec>,
+    select_list: Vec<Expression>,
     filter: Option<Predicate>,
     order_by: Vec<(usize, crate::sql::ir::logical::OrderDir)>,
     having: Option<Predicate>,
@@ -514,17 +525,29 @@ where
     }
 
     Ok(apply_select_spine(
-        current, residual, aggregates, order_by, having, projection, limit,
+        current,
+        residual,
+        aggregates,
+        order_by,
+        having,
+        projection,
+        select_list,
+        limit,
     ))
 }
 
 /// Apply the fixed statement spine above an optimized core (D3): residual
-/// Filter → HashAggregate → HAVING Filter → Sort → Projection → Limit.
-/// Factored from `plan_select`'s tail (T17-A.4) so the memo planner's
-/// emission applies the identical spine; column indices in every argument
-/// must already be in the core's output coordinates — except `having`,
-/// whose indices are in the aggregate OUTPUT row (the binder's coordinate
-/// rule), which no core optimization can move.
+/// Filter → HashAggregate → HAVING Filter → Sort → Projection/Compute →
+/// Limit. Factored from `plan_select`'s tail (T17-A.4) so the memo
+/// planner's emission applies the identical spine; column indices in every
+/// argument must already be in the core's output coordinates — except
+/// `having` (and `select_list`/`order_by` when aggregated), whose indices
+/// are in the aggregate OUTPUT row (the binder's coordinate rule), which no
+/// core optimization can move.
+// CLIPPY-ALLOW(too_many_arguments): the spine mirrors the Select display
+// fields (residual/aggregates/order_by/having/projection/select_list/limit);
+// a params struct would just rename them without simplifying the two callers.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_select_spine(
     mut current: PhysOp,
     residual: Vec<Predicate>,
@@ -532,10 +555,17 @@ pub(crate) fn apply_select_spine(
     order_by: Vec<(usize, crate::sql::ir::logical::OrderDir)>,
     having: Option<Predicate>,
     projection: Vec<usize>,
+    select_list: Vec<Expression>,
     limit: Option<usize>,
 ) -> PhysOp {
     // Binder invariant: HAVING only exists alongside aggregates.
     assert!(having.is_none() || !aggregates.is_empty());
+    // Negative space (binder invariant): a non-empty `select_list` is a
+    // display over either the aggregate output row (grouped keeps
+    // `projection` as its keys) or, when unaggregated, a core whose columns
+    // the Compute reads directly — in which case `projection` is empty (the
+    // Compute subsumes the Projection).
+    assert!(select_list.is_empty() || (!aggregates.is_empty() || projection.is_empty()));
     if let Some(pred) = and_all(residual) {
         current = PhysOp::Filter {
             input: Box::new(current),
@@ -578,6 +608,16 @@ pub(crate) fn apply_select_spine(
         current = PhysOp::Projection {
             input: Box::new(current),
             cols: projection,
+        };
+    }
+    // H2b: the computed display sits AFTER Sort (sort keys are pre-Compute
+    // coordinates — same reasoning as Sort-before-Projection above) and
+    // BEFORE Limit. A non-empty `select_list` subsumes the bare Projection,
+    // so the two are mutually exclusive above (the assert guarantees it).
+    if !select_list.is_empty() {
+        current = PhysOp::Compute {
+            input: Box::new(current),
+            exprs: select_list,
         };
     }
     if let Some(n) = limit {
@@ -1544,6 +1584,7 @@ Limit(3)
             joins: vec![],
             projection: vec![],
             aggregates: vec![],
+            select_list: vec![],
             filter: None,
             order_by: vec![],
             having: None,
