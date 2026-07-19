@@ -133,7 +133,23 @@ fn setup() -> (Session<BTreeEngine>, tempfile::TempDir) {
         session.execute(sql).unwrap();
     }
 
-    for table in ["a", "b", "c", "ja", "jb", "dt"] {
+    // String table for the H3.3 LIKE parity query: LIKE evaluates identically
+    // in every planner, but the cost-based planners route it through
+    // `estimate_predicate_selectivity`, so this proves they still return the
+    // SAME rows under the new predicate (costing may differ, results may not).
+    session
+        .execute("CREATE TABLE st (st_id INT PRIMARY KEY, st_name VARCHAR(16))")
+        .unwrap();
+    for sql in [
+        "INSERT INTO st VALUES (1, 'apple')",
+        "INSERT INTO st VALUES (2, 'apricot')",
+        "INSERT INTO st VALUES (3, 'banana')",
+        "INSERT INTO st VALUES (4, 'cherry')",
+    ] {
+        session.execute(sql).unwrap();
+    }
+
+    for table in ["a", "b", "c", "ja", "jb", "dt", "st"] {
         session.execute(&format!("ANALYZE TABLE {table}")).unwrap();
     }
     (session, dir)
@@ -198,6 +214,12 @@ const CORPUS: &[&str] = &[
     // selectivity and ANALYZE unit tests (date_range_uses_histogram_not_fallback,
     // analyze_builds_equi_width_histogram_for_date_columns), not here.
     "SELECT dt_id FROM dt WHERE dt_date >= DATE '1994-01-01' AND dt_date < DATE '1995-01-01'",
+    // H3.3 predicate surface. IN-list desugars to an Or-chain the planners
+    // already handle; LIKE is the new predicate that the cost-based planners
+    // must cost (via `estimate_predicate_selectivity`) without diverging on
+    // results. Both assert results-only parity across all three planners.
+    "SELECT c_val FROM c WHERE c_val IN (1, 3, 5)",
+    "SELECT st_id FROM st WHERE st_name LIKE 'ap%'",
 ];
 
 fn rows(session: &mut Session<BTreeEngine>, sql: &str) -> Vec<Vec<Value>> {

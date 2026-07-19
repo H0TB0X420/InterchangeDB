@@ -884,6 +884,8 @@ pub(crate) fn referenced_columns(pred: &Predicate, out: &mut Vec<usize>) {
             referenced_columns(b, out);
         }
         Predicate::Not(p) => referenced_columns(p, out),
+        Predicate::Like { expr, .. } => columns_in_expr(expr, out),
+        Predicate::IsNull(expr) => columns_in_expr(expr, out),
     }
 }
 
@@ -897,6 +899,20 @@ fn columns_in_expr(expr: &Expression, out: &mut Vec<usize>) {
             columns_in_expr(right, out);
         }
         Expression::ExtractYear(arg) => columns_in_expr(arg, out),
+        // A CASE references columns in its branch conditions (via
+        // `referenced_columns`) and its branch/else results.
+        Expression::Case {
+            branches,
+            else_expr,
+        } => {
+            for (pred, result) in branches {
+                referenced_columns(pred, out);
+                columns_in_expr(result, out);
+            }
+            if let Some(e) = else_expr {
+                columns_in_expr(e, out);
+            }
+        }
     }
 }
 
@@ -1045,6 +1061,16 @@ fn shift_expr(expr: Expression, delta: isize) -> Expression {
             right: Box::new(shift_expr(*right, delta)),
         },
         Expression::ExtractYear(arg) => Expression::ExtractYear(Box::new(shift_expr(*arg, delta))),
+        Expression::Case {
+            branches,
+            else_expr,
+        } => Expression::Case {
+            branches: branches
+                .into_iter()
+                .map(|(pred, result)| (shift_predicate(pred, delta), shift_expr(result, delta)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(shift_expr(*e, delta))),
+        },
     }
 }
 
@@ -1065,6 +1091,11 @@ pub(crate) fn shift_predicate(pred: Predicate, delta: isize) -> Predicate {
             Box::new(shift_predicate(*b, delta)),
         ),
         Predicate::Not(p) => Predicate::Not(Box::new(shift_predicate(*p, delta))),
+        Predicate::Like { expr, pattern } => Predicate::Like {
+            expr: shift_expr(expr, delta),
+            pattern,
+        },
+        Predicate::IsNull(expr) => Predicate::IsNull(shift_expr(expr, delta)),
     }
 }
 

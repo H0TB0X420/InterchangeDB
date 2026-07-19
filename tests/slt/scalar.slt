@@ -1,0 +1,249 @@
+# H3.3: the scalar/predicate surface — BETWEEN, IN-list, LIKE, searched
+# CASE, and IS [NOT] NULL. BETWEEN and IN are binder desugarings (into
+# And/compare and an Or-chain of equalities); LIKE, CASE, and IS NULL are new
+# IR (a `Predicate::Like`, an `Expression::Case`, a `Predicate::IsNull`). All
+# expectations below are hand-computed and pinned; the 3VL (Kleene) behavior
+# on NULL operands is exercised throughout.
+
+statement ok
+CREATE TABLE t (id INT PRIMARY KEY, n INT, s VARCHAR(16), d DECIMAL(12,2))
+
+# id4 has a NULL n AND a NULL d; id5 has a NULL s. These NULLs drive the
+# three-valued-logic assertions (a NULL operand makes a predicate UNKNOWN, so
+# the row is dropped under WHERE — and, critically, NOT UNKNOWN stays UNKNOWN,
+# so a negated predicate drops the NULL row too, never keeps it).
+statement ok
+INSERT INTO t VALUES
+  (1, 10, 'apple',     100.00),
+  (2, 20, 'apricot',   200.00),
+  (3, 30, 'banana',    300.00),
+  (4, NULL, 'cherry',  NULL),
+  (5, 25, NULL,        250.00),
+  (6, 15, 'blueberry', 150.00)
+
+# ============================================================================
+# BETWEEN  (desugars to `expr >= low AND expr <= high`)
+# ============================================================================
+
+# n in [15, 25]: id2 (20), id5 (25), id6 (15). id1 (10) and id3 (30) are out
+# of range; id4 (NULL n) is UNKNOWN on both bounds → dropped.
+query I
+SELECT id FROM t WHERE n BETWEEN 15 AND 25 ORDER BY id
+----
+2
+5
+6
+
+# NOT BETWEEN: the strict complement over NON-NULL rows only. id1 (10 < 15) and
+# id3 (30 > 25) qualify; id4 (NULL n) is NOT(UNKNOWN) = UNKNOWN → still dropped
+# (the 3VL point — a NULL is in NEITHER `BETWEEN` nor `NOT BETWEEN`).
+query I
+SELECT id FROM t WHERE n NOT BETWEEN 15 AND 25 ORDER BY id
+----
+1
+3
+
+# ============================================================================
+# IN-list  (desugars to an Or-chain of equalities)
+# ============================================================================
+
+# n IN (10, 30): id1 (10), id3 (30).
+query I
+SELECT id FROM t WHERE n IN (10, 30) ORDER BY id
+----
+1
+3
+
+# A NULL in the list is harmless for the POSITIVE form: `n IN (20, NULL)` is
+# `n=20 OR n=NULL`. For id2, that's TRUE OR UNKNOWN = TRUE (kept). Every other
+# row is FALSE OR UNKNOWN = UNKNOWN (dropped). So a matching value still wins.
+query I
+SELECT id FROM t WHERE n IN (20, NULL) ORDER BY id
+----
+2
+
+# WHY (3VL pin): `n NOT IN (10, NULL)` = `NOT (n=10 OR n=NULL)`. For n=10 the
+# inner OR is TRUE → NOT TRUE = FALSE. For every other value it is
+# FALSE-OR-UNKNOWN = UNKNOWN → NOT UNKNOWN = UNKNOWN. So a `NOT IN` list that
+# contains a NULL returns ZERO rows, always — the classic SQL footgun. This
+# empty result set is the pin.
+query I
+SELECT id FROM t WHERE n NOT IN (10, NULL) ORDER BY id
+----
+
+# ============================================================================
+# LIKE  (glob: % = any run incl. empty, _ = exactly one char)
+# ============================================================================
+
+# Prefix: anchored at the start. 'apple', 'apricot'. NULL s (id5) → UNKNOWN.
+query I
+SELECT id FROM t WHERE s LIKE 'ap%' ORDER BY id
+----
+1
+2
+
+# Contains: floating substring 'err'. 'cherry' (id4), 'blueberry' (id6).
+query I
+SELECT id FROM t WHERE s LIKE '%err%' ORDER BY id
+----
+4
+6
+
+# Suffix: anchored at the end. 'banana' ends in 'na' (id3).
+query I
+SELECT id FROM t WHERE s LIKE '%na' ORDER BY id
+----
+3
+
+# `_` matches exactly one character: 'a__le' is a,_,_,l,e (5 chars) → 'apple'
+# (a-p-p-l-e). 'apricot' is 7 chars, so it does NOT match.
+query I
+SELECT id FROM t WHERE s LIKE 'a__le' ORDER BY id
+----
+1
+
+# `_` and `%` combined: 'a_r%' = 'a', any one char, then 'r', then any run.
+# 'apricot' (a-p-r-…) matches; 'apple' (a-p-p-…) does not (3rd char is 'p').
+query I
+SELECT id FROM t WHERE s LIKE 'a_r%' ORDER BY id
+----
+2
+
+# NOT LIKE: complement over NON-NULL s. 'banana' (3), 'cherry' (4),
+# 'blueberry' (6). NULL s (id5) is NOT(UNKNOWN) = UNKNOWN → dropped.
+query I
+SELECT id FROM t WHERE s NOT LIKE 'ap%' ORDER BY id
+----
+3
+4
+6
+
+# LIKE on a non-string operand is refused at bind time.
+statement error LIKE requires a Varchar/Char operand
+SELECT id FROM t WHERE n LIKE '1%'
+
+# ESCAPE is not supported (loud, named refusal).
+statement error LIKE ... ESCAPE is not supported
+SELECT id FROM t WHERE s LIKE 'a!%' ESCAPE '!'
+
+# ILIKE (case-insensitive) is not supported.
+statement error ILIKE
+SELECT id FROM t WHERE s ILIKE 'AP%'
+
+# ============================================================================
+# searched CASE  (Expression::Case — branch order, 3VL fall-through, coercion)
+# ============================================================================
+
+# Branch order (first TRUE wins) AND Unknown fall-through: for a NULL n both
+# `n > 20` and `n <= 20` are UNKNOWN, so control falls through to ELSE.
+#   id1 n=10  → not>20, <=20 T → 2
+#   id2 n=20  → not>20, <=20 T → 2
+#   id3 n=30  → >20 T          → 1
+#   id4 n=NULL→ UNK, UNK       → ELSE 3
+#   id5 n=25  → >20 T          → 1
+#   id6 n=15  → not>20, <=20 T → 2
+query II
+SELECT id, CASE WHEN n > 20 THEN 1 WHEN n <= 20 THEN 2 ELSE 3 END FROM t ORDER BY id
+----
+1 2
+2 2
+3 1
+4 3
+5 1
+6 2
+
+# Literal-coercion Q14 shape INSIDE SUM: `THEN d ELSE 0`. `d` is DECIMAL(12,2)
+# but the bare `0` binds at the default Int64 width; the binder coerces it to
+# the Decimal branch's type (→ 0.00) so the CASE unifies to Decimal and SUM
+# accumulates a Decimal. Only the two 'ap%' rows contribute d (100.00 +
+# 200.00); the four non-matching rows (incl. NULL s and NULL d) take ELSE 0.00.
+# SUM = 300.00.
+query R
+SELECT SUM(CASE WHEN s LIKE 'ap%' THEN d ELSE 0 END) FROM t
+----
+300.00
+
+# A no-ELSE CASE and its explicit `ELSE NULL` twin are SEMANTICALLY IDENTICAL —
+# a non-matching row yields NULL either way, and SUM ignores NULLs — and must
+# BOTH type as Decimal at build. Before the fix the `ELSE NULL` form collapsed
+# to an uninferable type (the bare NULL branch's None propagated through the
+# type unification) and errored where the no-ELSE form succeeded. Only id1/id2
+# (`ap%`) contribute d (100.00 + 200.00); every other row is NULL and drops out
+# of the SUM → 300.00, matching the `ELSE 0` query above.
+query R
+SELECT SUM(CASE WHEN s LIKE 'ap%' THEN d END) FROM t
+----
+300.00
+
+query R
+SELECT SUM(CASE WHEN s LIKE 'ap%' THEN d ELSE NULL END) FROM t
+----
+300.00
+
+# Type-mismatch across branches (Int vs Varchar) can't be coerced → the CASE
+# is uninferable → the loud "cannot infer" contract at build.
+statement error cannot infer
+SELECT id, CASE WHEN n > 5 THEN 1 ELSE 'x' END FROM t
+
+# Simple CASE (an operand after CASE) is a named refusal — searched CASE only.
+statement error searched CASE
+SELECT id, CASE n WHEN 1 THEN 100 ELSE 200 END FROM t
+
+# ============================================================================
+# IS [NOT] NULL  (Predicate::IsNull — always total, never UNKNOWN)
+# ============================================================================
+
+# d IS NULL: only id4.
+query I
+SELECT id FROM t WHERE d IS NULL ORDER BY id
+----
+4
+
+# s IS NOT NULL: everyone except id5.
+query I
+SELECT id FROM t WHERE s IS NOT NULL ORDER BY id
+----
+1
+2
+3
+4
+6
+
+# IS NULL over an EXPRESSION (not just a column): `n + 5` is NULL exactly when
+# n is NULL (arithmetic propagates NULL), so only id4 qualifies.
+query I
+SELECT id FROM t WHERE (n + 5) IS NULL ORDER BY id
+----
+4
+
+# ============================================================================
+# Q12 shape end-to-end: SUM(CASE …) grouped, with the IN-list WHERE filter.
+# ============================================================================
+
+statement ok
+CREATE TABLE lineorder (lo_id INT PRIMARY KEY, l_shipmode VARCHAR(10), o_priority VARCHAR(10))
+
+statement ok
+INSERT INTO lineorder VALUES
+  (1, 'MAIL', '1-URGENT'),
+  (2, 'SHIP', '2-HIGH'),
+  (3, 'AIR',  '1-URGENT'),
+  (4, 'MAIL', '3-MEDIUM'),
+  (5, 'SHIP', '5-LOW'),
+  (6, 'RAIL', '2-HIGH')
+
+# TPC-H Q12 core: per ship mode (restricted to MAIL/SHIP via IN-list), count
+# the high-priority lines with `SUM(CASE WHEN prio IN {URGENT,HIGH} THEN 1 ELSE
+# 0 END)`. WHERE keeps rows 1,2,4,5 (AIR, RAIL dropped).
+#   MAIL: lo1 (1-URGENT → 1) + lo4 (3-MEDIUM → 0) = 1
+#   SHIP: lo2 (2-HIGH → 1)  + lo5 (5-LOW → 0)     = 1
+query TI
+SELECT l_shipmode,
+       SUM(CASE WHEN o_priority = '1-URGENT' OR o_priority = '2-HIGH' THEN 1 ELSE 0 END)
+FROM lineorder
+WHERE l_shipmode IN ('MAIL', 'SHIP')
+GROUP BY l_shipmode
+ORDER BY l_shipmode
+----
+MAIL 1
+SHIP 1

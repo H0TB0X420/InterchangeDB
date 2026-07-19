@@ -234,6 +234,28 @@ recorded separate increment; INTERVAL only folds against literal dates.
   dates to dates; a distinct type keeps encoding and rendering honest
   (rejected: reusing `Timestamp` — midnight-µs display lies, 4 wasted key
   bytes per component).
+**H3.3 executed (2026-07-19).** BETWEEN and IN-list land as pure binder
+desugars (3VL-exact: the classic `NOT IN (…, NULL)` → zero rows is
+pinned; the Or-chain estimator already did inclusion–exclusion, closing
+the recorded Q19 risk); LIKE as `Predicate::Like` with a compile-once,
+bounded %-segment matcher (Unicode-correct by construction — chars, not
+bytes; overlap-guarded anchors; every adversarial case hand-executed in
+review) and documented selectivity constants (literal-first-char prefix
+0.1 / contains 0.25); searched CASE as `Expression::Case` (3VL
+fall-through, bind-time integer-literal branch coercion for the
+Q12/Q14 `ELSE 0` shape, scale-based Decimal unification); IS [NOT] NULL
+(never UNKNOWN by design). Review: matcher and NOT-IN traces fully
+held; three findings fixed pre-commit — CASE typed `ELSE NULL`
+differently from omitted ELSE (NULL-literal branches now skip typing,
+both spellings identical; the fix also caught the mixed
+`THEN 0 ELSE NULL` coercion bail), IN-lists gained an explicit
+`MAX_IN_LIST_ITEMS = 1000` bound (Or-chain depth = recursion depth in
+compile/remap/drop — the flatten_conjuncts lesson applied), and `'_x%'`
+reclassified to the contains bucket. Recorded levers: per-row
+`Vec<char>` alloc in LIKE (ASCII fast path), IS NULL true null-fraction
+selectivity (needs row count beside ColumnStats). Tests 1347 → 1360.
+Q12/Q14/Q19 predicate shapes complete.
+
 - Date literals + `INTERVAL` arithmetic: **fold at bind time** — every TPC-H
   date expression is literal-only (`date '1994-01-01' + interval '1' year`),
   so planners see a plain `Compare` with a literal. Zero planner impact.
@@ -263,6 +285,20 @@ recorded separate increment; INTERVAL only folds against literal dates.
 
 Gates: `scalar.slt`; Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19 end-to-end on a
 hand-checked micro-dataset; Q13 after H3b.
+
+**Scope discovery (2026-07-19, recorded).** Q7/Q8/Q9/Q13/Q22 use
+derived tables (FROM-subqueries) — verbatim, their `l_year`-style
+grouping keys are plain columns OF the derived table, so expression
+GROUP BY keys are NOT on the verbatim critical path (they'd only unlock
+flattened rewrites). Reorder: the expression-group-keys increment is
+parked (general SQL value, corpus-era); H3b (outer join) runs next;
+derived tables are promoted to H4's first stage — uncorrelated by
+construction, they unlock Q7/Q8/Q9 outright, Q13 with H3b, and Q22's
+inner shells. Design note for H4: derived tables break the
+"leaf = catalog table" assumption in all three planners — likely
+landing shape is plan-inner-query → materialize → anonymous table
+source at the executor layer with D8-style planner fallbacks first,
+optimization across the boundary recorded as a lever.
 
 ### H4 — subqueries, staged
 

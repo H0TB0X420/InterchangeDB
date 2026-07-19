@@ -14,6 +14,11 @@
 //! - `AND a b` → independence: `s(a) * s(b)`.
 //! - `OR  a b` → independence: `s(a) + s(b) - s(a)*s(b)`.
 //! - `NOT a` → `1 - s(a)`.
+//! - `LIKE` → a fixed default: `LIKE_PREFIX_SELECTIVITY` when the pattern's
+//!   first char is a literal (neither '%' nor '_'), `LIKE_CONTAINS_SELECTIVITY`
+//!   otherwise.
+//! - `IS NULL` → `IS_NULL_FALLBACK` (see the constant for why the true null
+//!   fraction isn't wired here).
 //!
 //! Independence is wrong in the general case (TPC-H notoriously breaks
 //! it on `nation`/`region` joins), but it's the standard first-cut
@@ -45,6 +50,27 @@ pub const JOIN_FALLBACK: f64 = EQ_FALLBACK;
 /// degenerate plans look infinitely cheap.
 pub const MIN_SELECTIVITY: f64 = 1e-9;
 
+/// Selectivity for a `LIKE` whose pattern anchors a literal first char
+/// (neither the '%' nor the '_' wildcard), e.g. `p_type LIKE 'PROMO%'`. A
+/// literal prefix hits a contiguous key range, so it is treated as MORE
+/// selective than a floating `%…%` contains match. An O10-style documented
+/// default (like `RANGE_FALLBACK`) — real pattern-length estimation is a
+/// recorded lever.
+pub const LIKE_PREFIX_SELECTIVITY: f64 = 0.1;
+
+/// Selectivity for a `LIKE` whose first char is a wildcard ('%' or '_'), a
+/// contains/suffix match with no literal anchor (e.g. `%green%`, `_x%`). No
+/// range anchor, so a looser default than a prefix.
+pub const LIKE_CONTAINS_SELECTIVITY: f64 = 0.25;
+
+/// Selectivity default for `col IS [NOT] NULL` (`IS NOT NULL` reaches it
+/// through the `Not` arm's `1 - s`). `ColumnStats` carries `null_count`,
+/// but `estimate_predicate_selectivity` has no row count in scope to turn
+/// that into a fraction — row count lives on `TableStats`, a separate
+/// struct not threaded through here — so we use a fixed default. Wiring the
+/// true null fraction is a recorded lever.
+pub const IS_NULL_FALLBACK: f64 = 0.1;
+
 /// Estimate the selectivity of `pred` against rows of a single
 /// (possibly joined) schema. `column_stats[i]` is the stats row for
 /// the column at tuple-global index `i`, or `None` if unanalyzed.
@@ -68,6 +94,22 @@ pub fn estimate_predicate_selectivity(
             let s = estimate_predicate_selectivity(inner, column_stats);
             1.0 - s
         }
+        // WHY a constant: we don't estimate LIKE from the pattern's literal
+        // content or the column's value distribution (a recorded lever). This
+        // is a purely SYNTACTIC heuristic: a pattern counts as prefix-anchored
+        // only when its FIRST char is a literal — neither the multi-char
+        // wildcard '%' nor the single-char wildcard '_'. Such a literal prefix
+        // (`'PROMO%'`) anchors a key range and is treated as more selective
+        // than a floating contains. A leading wildcard of either kind
+        // (`'%green%'`, `'_x%'`) has no anchor, so it falls to the looser
+        // contains bucket — matching how real optimizers rank the two shapes.
+        Predicate::Like { pattern, .. } => match pattern.chars().next() {
+            Some(first) if first != '%' && first != '_' => LIKE_PREFIX_SELECTIVITY,
+            _ => LIKE_CONTAINS_SELECTIVITY,
+        },
+        // WHY a constant: see `IS_NULL_FALLBACK` — the row count needed to
+        // turn `null_count` into a fraction isn't in scope here.
+        Predicate::IsNull(_) => IS_NULL_FALLBACK,
     };
     raw.clamp(MIN_SELECTIVITY, 1.0)
 }
@@ -462,5 +504,54 @@ mod tests {
     fn join_selectivity_ndv_one_is_full_pass() {
         // A constant column (NDV 1) on both sides → every row matches.
         assert!((join_selectivity(1, 1) - 1.0).abs() < 1e-9);
+    }
+
+    // ---- LIKE / IS NULL selectivity (H3.3) ----
+
+    fn like_pred(col: usize, pattern: &str) -> Predicate {
+        Predicate::Like {
+            expr: Expression::Column(col),
+            pattern: pattern.to_string(),
+        }
+    }
+
+    #[test]
+    fn like_prefix_is_more_selective_than_contains() {
+        // Anchored prefix `'PROMO%'` → the prefix constant; a leading `%`
+        // (`'%green%'`) → the looser contains constant. Prefix < contains.
+        let prefix = estimate_predicate_selectivity(&like_pred(0, "PROMO%"), &[None]);
+        let contains = estimate_predicate_selectivity(&like_pred(0, "%green%"), &[None]);
+        assert!((prefix - LIKE_PREFIX_SELECTIVITY).abs() < 1e-9);
+        assert!((contains - LIKE_CONTAINS_SELECTIVITY).abs() < 1e-9);
+        assert!(prefix < contains, "prefix should be more selective");
+        // A suffix `'%abc'` also has a leading `%` → contains bucket.
+        let suffix = estimate_predicate_selectivity(&like_pred(0, "%abc"), &[None]);
+        assert!((suffix - LIKE_CONTAINS_SELECTIVITY).abs() < 1e-9);
+        // A leading single-char wildcard `'_x%'` is NOT prefix-anchored (its
+        // first char is the '_' wildcard, not a literal), so it lands in the
+        // contains bucket — the misclassification this fix corrects.
+        let underscore = estimate_predicate_selectivity(&like_pred(0, "_x%"), &[None]);
+        assert!((underscore - LIKE_CONTAINS_SELECTIVITY).abs() < 1e-9);
+    }
+
+    #[test]
+    fn not_like_is_the_complement() {
+        // NOT LIKE rides the `Not` arm: 1 - s.
+        let like = like_pred(0, "PROMO%");
+        let not = Predicate::Not(Box::new(like_pred(0, "PROMO%")));
+        let s = estimate_predicate_selectivity(&like, &[None]);
+        let ns = estimate_predicate_selectivity(&not, &[None]);
+        assert!((s + ns - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn is_null_and_is_not_null_use_the_default() {
+        // IS NULL → the documented default; IS NOT NULL → its complement.
+        let is_null = Predicate::IsNull(Expression::Column(0));
+        let s = estimate_predicate_selectivity(&is_null, &[None]);
+        assert!((s - IS_NULL_FALLBACK).abs() < 1e-9);
+        let is_not_null = Predicate::Not(Box::new(Predicate::IsNull(Expression::Column(0))));
+        let ns = estimate_predicate_selectivity(&is_not_null, &[None]);
+        assert!((ns - (1.0 - IS_NULL_FALLBACK)).abs() < 1e-9);
     }
 }

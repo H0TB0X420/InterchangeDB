@@ -1548,6 +1548,12 @@ fn bind_expression(scope: &Scope, e: AstExpr) -> Result<Expression> {
         AstExpr::Interval(_) => Err(Error::SqlParse(
             "binder: INTERVAL is only supported as `DATE '…' ± INTERVAL '…' DAY|MONTH|YEAR`".into(),
         )),
+        AstExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => bind_case(scope, operand, conditions, results, else_result),
         AstExpr::Nested(inner) => bind_expression(scope, *inner),
         other => Err(Error::SqlParse(format!(
             "binder: expression shape unsupported: {:?}",
@@ -1611,6 +1617,131 @@ fn align_target(op: BinaryOp, other: Option<ColumnType>) -> Option<ColumnType> {
             Some(ty)
         }
         _ => None,
+    }
+}
+
+/// Bind a searched `CASE WHEN … THEN … [ELSE …] END`. Simple CASE
+/// (`CASE <operand> WHEN v THEN …`) is a loud refusal. Each WHEN binds as a
+/// predicate and each THEN/ELSE as an expression, all against the input
+/// `scope` (so a CASE inside `SUM(…)` resolves the same columns the
+/// aggregate sees). Bare integer-literal branches are then coerced toward
+/// the non-literal branches' type (see `coerce_case_literal_branches`).
+fn bind_case(
+    scope: &Scope,
+    operand: Option<Box<AstExpr>>,
+    conditions: Vec<AstExpr>,
+    results: Vec<AstExpr>,
+    else_result: Option<Box<AstExpr>>,
+) -> Result<Expression> {
+    if operand.is_some() {
+        return Err(Error::SqlParse(
+            "binder: only searched CASE (CASE WHEN … THEN … END) is supported, not simple CASE \
+             (CASE <expr> WHEN …)"
+                .into(),
+        ));
+    }
+    // sqlparser pairs conditions[i] with results[i] for a searched CASE.
+    let mut branches: Vec<(Predicate, Expression)> = Vec::with_capacity(conditions.len());
+    for (cond, result) in conditions.into_iter().zip(results.into_iter()) {
+        let pred = bind_predicate(scope, cond)?;
+        let expr = bind_expression(scope, result)?;
+        branches.push((pred, expr));
+    }
+    let mut else_expr = match else_result {
+        Some(e) => Some(Box::new(bind_expression(scope, *e)?)),
+        None => None,
+    };
+    coerce_case_literal_branches(scope, &mut branches, &mut else_expr);
+    Ok(Expression::Case {
+        branches,
+        else_expr,
+    })
+}
+
+/// Coerce every bare integer-literal CASE result branch toward the type the
+/// NON-literal branches agree on, when that shared type is Int32 or a
+/// Decimal. This is the TPC-H Q12/Q14 shape: `CASE WHEN … THEN price ELSE 0
+/// END` binds `0` at the default Int64 width, which would fail
+/// `Expression::column_type`'s strict same-type unification against a
+/// `Decimal` THEN branch and make the CASE (and any aggregate over it)
+/// uninferable. Coercing `0` to the Decimal side via `coerce_exact` — the
+/// same value-preserving mechanism `align_numeric_literal` uses for
+/// arithmetic — lets it unify to the Decimal type instead.
+///
+/// If the non-literal branches DON'T agree on a single Int32/Decimal type
+/// (e.g. a Varchar branch, or mixed types), no coercion happens and the
+/// strict unification in `column_type` errors loudly at build — the
+/// intended type-mismatch contract.
+fn coerce_case_literal_branches(
+    scope: &Scope,
+    branches: &mut [(Predicate, Expression)],
+    else_expr: &mut Option<Box<Expression>>,
+) {
+    let types = scope_column_types(scope);
+
+    // Pass 1: the single Int32/Decimal type shared by all non-integer-literal
+    // result branches, or `None` if they disagree / aren't Int32/Decimal.
+    let mut target: Option<ColumnType> = None;
+    {
+        let results = branches
+            .iter()
+            .map(|(_, result)| result)
+            .chain(else_expr.as_deref());
+        for result in results {
+            if is_bare_integer_literal(result) {
+                continue;
+            }
+            // Same rule as `Expression::column_type`'s Case arm: a bare NULL
+            // literal carries no type. Skip it so its `None` isn't read as a
+            // non-Int32/Decimal branch that bails the pass (leaving genuine
+            // integer literals uncoerced). It is never itself coerced — pass 2
+            // only rewrites integer literals.
+            if matches!(result, Expression::Literal(Value::Null)) {
+                continue;
+            }
+            match result.column_type(&types) {
+                Some(ty @ (ColumnType::Int32 | ColumnType::Decimal { .. })) => match target {
+                    None => target = Some(ty),
+                    Some(existing) if existing == ty => {}
+                    // Disagreement — bail; the build-time unification errors.
+                    Some(_) => return,
+                },
+                // A non-Int32/Decimal (or uninferable) non-literal branch:
+                // there's nothing to coerce integer literals toward.
+                _ => return,
+            }
+        }
+    }
+    let target = match target {
+        Some(ty) => ty,
+        // Every branch is a bare integer literal (e.g. `THEN 1 ELSE 0`) —
+        // they already share Int64 and unify on their own; nothing to do.
+        None => return,
+    };
+
+    // Pass 2: rewrite each bare integer-literal branch to the target type.
+    for (_, result) in branches.iter_mut() {
+        coerce_integer_literal_to(result, &target);
+    }
+    if let Some(result) = else_expr.as_deref_mut() {
+        coerce_integer_literal_to(result, &target);
+    }
+}
+
+/// True when `e` is a bare `Int32`/`Int64` literal — the branch shape
+/// `coerce_case_literal_branches` may retype.
+fn is_bare_integer_literal(e: &Expression) -> bool {
+    matches!(e, Expression::Literal(Value::Int32(_) | Value::Int64(_)))
+}
+
+/// Replace a bare integer-literal expression with the same value coerced to
+/// `target`, when `coerce_exact` finds a value-preserving representation.
+/// Non-literals and unrepresentable literals are left untouched.
+fn coerce_integer_literal_to(e: &mut Expression, target: &ColumnType) {
+    if let Expression::Literal(v @ (Value::Int32(_) | Value::Int64(_))) = e {
+        if let Some(coerced) = v.coerce_exact(target) {
+            *e = Expression::Literal(coerced);
+        }
     }
 }
 
@@ -1881,20 +2012,7 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
             }
             cmp => {
                 let cmp_op = map_compare_op(&cmp)?;
-                let l = bind_expression(scope, *left)?;
-                let r = bind_expression(scope, *right)?;
-                // O13: reconcile a literal operand with the compared
-                // column's type here, where the type is known. Runtime
-                // comparison is already exact across numeric
-                // representations; the narrowing matters for the ACCESS
-                // PATH — PkLookup/IndexScan lowering key-encodes the
-                // literal against the column type strictly.
-                let (l, r) = narrow_compare_operands(scope, l, r);
-                Ok(Predicate::Compare {
-                    op: cmp_op,
-                    left: l,
-                    right: r,
-                })
+                bind_compare(scope, cmp_op, *left, *right)
             }
         },
         AstExpr::UnaryOp {
@@ -1904,12 +2022,159 @@ fn bind_predicate(scope: &Scope, e: AstExpr) -> Result<Predicate> {
             let inner = bind_predicate(scope, *expr)?;
             Ok(Predicate::Not(Box::new(inner)))
         }
+        // BETWEEN desugars to `expr >= low AND expr <= high`; NOT BETWEEN
+        // wraps the whole thing in NOT. Kleene-correct: a NULL `expr` makes
+        // both comparisons UNKNOWN, so BETWEEN is UNKNOWN and NOT BETWEEN is
+        // NOT(UNKNOWN)=UNKNOWN — both drop the row under WHERE, matching SQL.
+        // Range selectivity falls out of the existing And/compare estimation.
+        AstExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let lower = bind_compare(scope, CompareOp::Gte, (*expr).clone(), *low)?;
+            let upper = bind_compare(scope, CompareOp::Lte, *expr, *high)?;
+            let between = Predicate::And(Box::new(lower), Box::new(upper));
+            Ok(maybe_negate(between, negated))
+        }
+        // IN-list desugars to an OR-chain of equalities: `expr = a OR expr = b
+        // OR …`. This is 3VL-EXACT for SQL: with a NULL in the list,
+        // `x IN (1, NULL)` is TRUE when x=1 else UNKNOWN (never FALSE), and
+        // `x NOT IN (1, NULL)` is NOT(UNKNOWN)=UNKNOWN → zero rows — the
+        // classic behavior, reproduced for free by Kleene OR/NOT (pinned in
+        // scalar.slt). Selectivity rides the existing Or-chain estimator.
+        AstExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if list.is_empty() {
+                return Err(Error::SqlParse(
+                    "binder: IN-list requires at least one value".into(),
+                ));
+            }
+            // WHY bound: the desugared Or-chain's depth equals the item count,
+            // and every later pass that walks a Predicate — compile_3vl,
+            // substitute_params, apply_predicate, shift_predicate, and Drop —
+            // recurses to that same depth, so an unbounded list is an
+            // unbounded native-stack risk (the repo rule that took
+            // `flatten_conjuncts` iterative). 1000 is orders of magnitude above
+            // TPC-H's largest IN-list (3), so it never refuses a real query.
+            const MAX_IN_LIST_ITEMS: usize = 1000;
+            if list.len() > MAX_IN_LIST_ITEMS {
+                return Err(Error::SqlParse(format!(
+                    "binder: IN-list has {} items, exceeding MAX_IN_LIST_ITEMS ({}) — the \
+                     desugared OR-chain and the predicate passes that walk it recurse to a depth \
+                     equal to the item count",
+                    list.len(),
+                    MAX_IN_LIST_ITEMS
+                )));
+            }
+            let mut chain: Option<Predicate> = None;
+            for item in list {
+                let eq = bind_compare(scope, CompareOp::Eq, (*expr).clone(), item)?;
+                chain = Some(match chain {
+                    None => eq,
+                    Some(acc) => Predicate::Or(Box::new(acc), Box::new(eq)),
+                });
+            }
+            let chain = chain.expect("non-empty list guarantees a chain");
+            Ok(maybe_negate(chain, negated))
+        }
+        AstExpr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => bind_like(scope, negated, *expr, *pattern, escape_char),
+        // ILIKE (case-insensitive) has different matching semantics we don't
+        // implement — a loud, named refusal rather than a silent LIKE.
+        AstExpr::ILike { .. } => Err(Error::SqlParse(
+            "binder: ILIKE (case-insensitive LIKE) is not supported".into(),
+        )),
+        // IS NULL / IS NOT NULL over any expression. The predicate is total
+        // (never UNKNOWN), so IS NOT NULL is a plain NOT wrap.
+        AstExpr::IsNull(inner) => Ok(Predicate::IsNull(bind_expression(scope, *inner)?)),
+        AstExpr::IsNotNull(inner) => Ok(Predicate::Not(Box::new(Predicate::IsNull(
+            bind_expression(scope, *inner)?,
+        )))),
         AstExpr::Nested(inner) => bind_predicate(scope, *inner),
         other => Err(Error::SqlParse(format!(
             "binder: predicate shape unsupported: {:?}",
             other
         ))),
     }
+}
+
+/// Bind a comparison `left <op> right` with O13 operand narrowing — the
+/// shared path for a plain comparison and for BETWEEN/IN desugaring.
+/// Narrowing reconciles a literal operand with the compared column's type
+/// (where the type is known here): runtime comparison is already exact
+/// across numeric representations, but PkLookup/IndexScan lowering
+/// key-encodes the literal against the column type strictly.
+fn bind_compare(scope: &Scope, op: CompareOp, left: AstExpr, right: AstExpr) -> Result<Predicate> {
+    let l = bind_expression(scope, left)?;
+    let r = bind_expression(scope, right)?;
+    let (l, r) = narrow_compare_operands(scope, l, r);
+    Ok(Predicate::Compare {
+        op,
+        left: l,
+        right: r,
+    })
+}
+
+/// Wrap `pred` in `Not` when `negated` — the shared tail of BETWEEN, IN,
+/// and LIKE desugaring.
+fn maybe_negate(pred: Predicate, negated: bool) -> Predicate {
+    if negated {
+        Predicate::Not(Box::new(pred))
+    } else {
+        pred
+    }
+}
+
+/// Bind `expr LIKE pattern` into `Predicate::Like` (NOT LIKE → `Not`).
+/// The pattern must be a string literal and `expr` must infer Varchar/Char;
+/// ESCAPE is refused. All three refusals are loud and named.
+fn bind_like(
+    scope: &Scope,
+    negated: bool,
+    expr: AstExpr,
+    pattern: AstExpr,
+    escape_char: Option<String>,
+) -> Result<Predicate> {
+    if escape_char.is_some() {
+        return Err(Error::SqlParse(
+            "binder: LIKE ... ESCAPE is not supported".into(),
+        ));
+    }
+    let pattern = match pattern {
+        AstExpr::Value(AstValue::SingleQuotedString(s)) => s,
+        other => {
+            return Err(Error::SqlParse(format!(
+                "binder: LIKE pattern must be a string literal, got {other:?}"
+            )))
+        }
+    };
+    let operand = bind_expression(scope, expr)?;
+    // The operand must be a string; refuse anything else at bind time rather
+    // than let a non-string silently evaluate to UNKNOWN every row.
+    match operand.column_type(&scope_column_types(scope)) {
+        Some(ColumnType::Varchar(_) | ColumnType::Char(_)) => {}
+        other => {
+            return Err(Error::SqlParse(format!(
+                "binder: LIKE requires a Varchar/Char operand, got {other:?}"
+            )))
+        }
+    }
+    Ok(maybe_negate(
+        Predicate::Like {
+            expr: operand,
+            pattern,
+        },
+        negated,
+    ))
 }
 
 /// When one comparison operand is a column and the other a literal, narrow
@@ -2358,6 +2623,29 @@ mod tests {
         let stmts = parse("SELECT bogus FROM warehouse").unwrap();
         let err = binder.bind(stmts.into_iter().next().unwrap()).unwrap_err();
         assert!(matches!(err, Error::SqlParse(ref m) if m.contains("bogus")));
+    }
+
+    #[test]
+    fn select_in_list_over_max_items_errors() {
+        // The IN-list desugars to an Or-chain whose depth equals the item
+        // count, and the predicate passes that later walk it recurse that
+        // deep, so the binder refuses a list past MAX_IN_LIST_ITEMS (1000)
+        // rather than risk a native-stack overflow. A 1001-item list
+        // (`0..=1000`) trips the named refusal. No 1001-item slt exists (it
+        // would be unwieldy); this unit test is the guard instead.
+        let (binder, _dir) = binder_with_warehouse();
+        let items = (0..=1000)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT w_id FROM warehouse WHERE w_id IN ({items})");
+        let stmts = parse(&sql).unwrap();
+        let err = binder.bind(stmts.into_iter().next().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, Error::SqlParse(ref m)
+                if m.contains("MAX_IN_LIST_ITEMS") && m.contains("1001") && m.contains("1000")),
+            "expected a MAX_IN_LIST_ITEMS refusal naming the count and limit, got: {err:?}"
+        );
     }
 
     // ---- UPDATE ----

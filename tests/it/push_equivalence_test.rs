@@ -132,6 +132,10 @@ fn grouped_aggregate_is_equivalent() {
         // H2b: free display order — a Compute reorders the grouped push
         // sink's output (native aggregate feeding the native ComputeSink).
         "SELECT COUNT(*), kind FROM ev GROUP BY kind",
+        // H3.3: a searched CASE inside a grouped aggregate (the Q12 shape) —
+        // the branch predicates and results compile once and run through the
+        // same native push sink; this pins the CASE closure against pull.
+        "SELECT kind, SUM(CASE WHEN amt > 30 THEN 1 ELSE 0 END) FROM ev GROUP BY kind",
     ];
     for q in queries {
         assert_equivalent(&mut s, q);

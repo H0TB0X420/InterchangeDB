@@ -178,3 +178,8 @@ fn slt_computed_select() {
 fn slt_date() {
     run_slt("date.slt");
 }
+
+#[test]
+fn slt_scalar() {
+    run_slt("scalar.slt");
+}

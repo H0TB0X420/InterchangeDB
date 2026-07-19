@@ -128,6 +128,20 @@ impl ColumnRemap {
             Expression::ExtractYear(arg) => {
                 Expression::ExtractYear(Box::new(self.apply_expression(*arg)))
             }
+            // Remap columns inside BOTH the branch conditions (via
+            // `apply_predicate`) and the branch/else results.
+            Expression::Case {
+                branches,
+                else_expr,
+            } => Expression::Case {
+                branches: branches
+                    .into_iter()
+                    .map(|(pred, result)| {
+                        (self.apply_predicate(pred), self.apply_expression(result))
+                    })
+                    .collect(),
+                else_expr: else_expr.map(|e| Box::new(self.apply_expression(*e))),
+            },
         }
     }
 
@@ -148,6 +162,11 @@ impl ColumnRemap {
                 Box::new(self.apply_predicate(*b)),
             ),
             Predicate::Not(p) => Predicate::Not(Box::new(self.apply_predicate(*p))),
+            Predicate::Like { expr, pattern } => Predicate::Like {
+                expr: self.apply_expression(expr),
+                pattern,
+            },
+            Predicate::IsNull(expr) => Predicate::IsNull(self.apply_expression(expr)),
         }
     }
 }
