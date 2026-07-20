@@ -82,6 +82,7 @@ mod sql_e2e_test;
 mod stats_persistence_test;
 mod torn_page_recovery_test;
 mod tpcc_transactions_test;
+mod tpch_harness_test;
 mod txn_database_test;
 mod txn_engine_test;
 mod txn_isolation_test;
