@@ -1,0 +1,5 @@
+# TPC-H oracle expected outputs are written by DuckDB with CRLF line
+# endings. Pin them so git does not normalize to LF on every oracle
+# re-run (which would churn the diff and desync the committed baseline
+# from a fresh --csv-out). The harness parser accepts either ending.
+tests/tpch/expected/*.csv -text
