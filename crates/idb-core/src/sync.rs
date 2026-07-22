@@ -1,7 +1,7 @@
 //! Synchronization-primitive shim for deterministic concurrency testing.
 //!
 //! The buffer pool's lock and atomic types are imported through this one
-//! module so a single `cfg` switch can swap them for [`shuttle`]'s
+//! module so a single `cfg` switch can swap them for `shuttle`'s
 //! instrumented versions during model checking (Q-30 / `docs/stability.md`
 //! pillar C), without touching any call site.
 //!

@@ -40,9 +40,9 @@
 //! - [`common`] - Shared primitives (PageId, FrameId, Error, config)
 //! - [`buffer`] - Buffer pool management and eviction policies
 //! - [`storage`] - Disk I/O and page formats
-//! - [`index`] - Index structures (B-tree)
+//! - [`engines`] - Pluggable storage engines (B+Tree, LSM)
 //! - [`wal`] - Write-ahead logging and crash recovery
-//! - [`concurrency`] - Transaction management and MVCC
+//! - [`txn`] - Transaction management and MVCC
 //! - [`execution`] - Query execution
 //!
 //! # Quick Start
