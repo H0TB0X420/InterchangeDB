@@ -336,47 +336,23 @@ where
     let mut current: PhysOp;
     let mut residual: Vec<Predicate> = Vec::new();
     if joins.is_empty() {
-        if let Some(scan) = derived_leaves.get(&table_name) {
-            // Derived head, no joins: the DerivedScan leaf with the whole WHERE
-            // as a Filter ABOVE it (no pushdown into the subplan, no index).
-            current = scan.clone();
-            residual.extend(filter.map(flatten_conjuncts).unwrap_or_default());
-        } else if let Some(pred) = filter {
-            if let Some(pk) = try_lower_pk_lookup(&pred, &left_schema) {
-                current = PhysOp::PkLookup {
-                    table: table_name.clone(),
-                    pk,
-                };
-            } else {
-                match try_lower_index_predicate(pred, &left_indexes) {
-                    IndexLowering::Matched {
-                        handle,
-                        prefix,
-                        recheck,
-                    } => {
-                        current = PhysOp::IndexScan {
-                            table: table_name.clone(),
-                            index: handle.def.name.clone(),
-                            prefix,
-                        };
-                        // MVCC recheck (see IndexLowering::Matched). With no
-                        // joins, `residual` becomes the Filter directly above
-                        // this leaf.
-                        residual.push(recheck);
-                    }
-                    IndexLowering::Unmatched(pred) => {
-                        current = PhysOp::SeqScan {
-                            table: table_name.clone(),
-                        };
-                        residual.push(pred);
-                    }
-                }
-            }
-        } else {
-            current = PhysOp::SeqScan {
-                table: table_name.clone(),
-            };
-        }
+        // Single table: flatten the WHERE and route every conjunct through the
+        // same leaf builder the joins path uses. An indexable equality conjunct
+        // lowers to an IndexScan/PkLookup seek even when ANDed with other
+        // predicates (the non-lowered conjuncts + MVCC recheck ride as a Filter
+        // baked onto the leaf, so `residual` stays empty here). Previously the
+        // whole conjunction went to `try_lower_index_predicate`, which matches
+        // only a bare equality — so `WHERE indexed = ? AND …` fell back to a
+        // full SeqScan. That is the H6 finding: correlated inners (Q4/Q20/Q21)
+        // full-scanned per outer row despite an index on the correlation key.
+        let left_preds = filter.map(flatten_conjuncts).unwrap_or_default();
+        current = build_left_leaf(
+            left_preds,
+            &left_schema,
+            &table_name,
+            &left_indexes,
+            &derived_leaves,
+        );
     } else {
         let mut left_preds = Vec::new();
         for conjunct in filter.map(flatten_conjuncts).unwrap_or_default() {

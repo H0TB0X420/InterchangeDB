@@ -448,6 +448,20 @@ const TABLE_NAMES: [&str; 8] = [
     "region", "nation", "supplier", "part", "partsupp", "customer", "orders", "lineitem",
 ];
 
+/// Auxiliary secondary indexes on the correlation keys of the correlated
+/// subqueries — Q4/Q21 seek `lineitem` by `l_orderkey`, Q17/Q20 by `l_partkey`,
+/// Q22 seeks `orders` by `o_custkey`. Without them each correlated inner
+/// full-scans its table PER OUTER ROW (measured: ~99.97% of Q4/Q17 wall-clock
+/// is the inner scan, planning 0.03%); with them the inner's equality on the
+/// correlation key lowers to an `IndexScan` seek (per `create_index.slt`).
+/// Created AFTER the load so each backfills once over the full table. Answers
+/// are unchanged — indexes shift execution strategy, never results.
+const INDEXES: [&str; 3] = [
+    "CREATE INDEX lineitem_by_orderkey ON lineitem (l_orderkey)",
+    "CREATE INDEX lineitem_by_partkey ON lineitem (l_partkey)",
+    "CREATE INDEX orders_by_custkey ON orders (o_custkey)",
+];
+
 // ---------------------------------------------------------------------------
 // Generated dataset
 // ---------------------------------------------------------------------------
@@ -1088,7 +1102,31 @@ fn open_db(leaf_max_size: u16) -> Db {
     let engine = BTreeEngine::with_sizes(bpm, leaf_max_size, 64, 0).expect("engine");
     let database =
         Arc::new(Database::open_with_sync_mode(&dir, engine, SyncMode::NoSync).expect("open"));
-    let catalog = Arc::new(Catalog::open(database.engine_arc().clone()).expect("catalog"));
+    // `open_persistent` (not `open`) so the correlation-key indexes get a real
+    // per-index storage engine — `open` records index metadata but builds no
+    // backend, so a seek would fault with "no engine registered". The opener is
+    // IN-MEMORY (MemoryDiskManager), matching the in-memory table engine above:
+    // the default file-backed opener would route every correlated index seek
+    // (74k+ per Q21 config) to disk, turning the sweep into an I/O storm.
+    // `dir.join("indexes")` is required by the signature but unused by RAM.
+    let catalog = Arc::new(
+        Catalog::open_persistent(
+            database.engine_arc().clone(),
+            dir.join("indexes"),
+            Arc::new(|backend, _id, _dir| match backend {
+                interchangedb::catalog::IndexBackend::BTree => {
+                    let bpm = BufferPoolManager::new(4096, MemoryDiskManager::new());
+                    let engine: Arc<dyn interchangedb::storage::StorageEngine> =
+                        Arc::new(BTreeEngine::new(bpm)?);
+                    Ok(engine)
+                }
+                interchangedb::catalog::IndexBackend::Lsm => {
+                    unreachable!("tpch harness creates only btree indexes")
+                }
+            }),
+        )
+        .expect("catalog"),
+    );
     Db {
         session: Session::new(database.clone(), catalog.clone()),
         database,
@@ -1130,6 +1168,11 @@ fn load(session: &mut Session<BTreeEngine>, dataset: &Dataset) {
                 .unwrap_or_else(|e| panic!("insert into {name} failed: {e}"));
         }
         session.execute("COMMIT").expect("commit load txn");
+    }
+    for sql in INDEXES {
+        session
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("create index failed [{sql}]: {e}"));
     }
 }
 

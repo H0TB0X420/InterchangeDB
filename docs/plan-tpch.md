@@ -541,6 +541,58 @@ per-row binder/planner); target: Q21 completes and oracle-validates at
 SF 0.01 in all six configs, zero result changes anywhere else; Q4's
 worst cells (~100s volcano) should also collapse. Decorrelation
 (semi-join rewrite) remains a recorded lever beyond H6.
+
+**H6 EXECUTED (2026-07-22) — redefined by measurement; the spec above was
+wrong about the bottleneck.** Instrumenting the per-outer-row correlated
+closure (plan bucket = `substitute_outer_refs` + `planner::plan`; exec
+bucket = `model.execute`) measured **plan = 0.03–0.04%** of the per-row
+cost on Q4/Q17. The dominating cost is the ~126ms full **scan** of the
+inner table per outer row, NOT planning — so plan-caching (the spec)
+targets ~0.03% and cannot make Q21 feasible. The real lever is turning
+each inner scan into an index **seek**. Two-part change, both
+answer-preserving (IndexScan + MVCC recheck ≡ SeqScan + Filter, per
+`create_index.slt`):
+1. **Indexes on the correlation keys** (`src/bin/tpch.rs`): secondary
+   indexes on `lineitem(l_orderkey)` (Q4/Q21), `lineitem(l_partkey)`
+   (Q17/Q20), `orders(o_custkey)` (Q22), created after load (backfill).
+   The harness catalog moved to `open_persistent` with an **in-memory**
+   index opener (`MemoryDiskManager`): the default file-backed opener
+   routed 74k+ seeks/Q21-config to disk and stalled the sweep in
+   uninterruptible I/O wait.
+2. **Conjunctive index lowering** (`crates/idb-sql/src/sql/planner.rs`):
+   the single-table no-joins path passed the WHOLE `WHERE` to
+   `try_lower_index_predicate`, which matches only a bare equality — so
+   `WHERE indexed = ? AND …` fell back to SeqScan (the documented
+   "AND-decomposition lands in a later phase"). Routed it through the
+   existing `build_left_leaf` (already used by the joins path), which
+   flattens conjuncts, lowers the first indexable equality to a seek, and
+   ANDs the rest into the leaf Filter. General (every conjunctive
+   single-table filter), not correlated-specific. Indexes ALONE fixed only
+   the single-equality inners (Q17 23×, Q22 4×); the conjunctive ones (Q4,
+   Q20, Q21) needed this second part.
+
+Gains — authoritative numbers from the validated in-memory sweep
+(rule-based/volcano cell, SF 0.01; baselines from the pre-H6 timings doc):
+**Q21 ∞→18.6s** (rb/vol; 9.8–11.5s on the cost-based configs — feasible
+across all six, 74,776 inner seeks), **Q4 ~100s→0.1s**, **Q20 27.4s→0.1s**,
+**Q17 9s→0.5s**, **Q22 7.6s→0.2s**. NOTE the two-stage speedup: the planner
+fix alone (with the *disk*-backed default opener) took Q4 to 1.49s; the
+in-memory opener then took it to 0.1s — index seeks against RAM vs a
+file-backed BPM. Full 22×6 sweep re-validated **132/132 PASS** against
+DuckDB v1.3.0 (was 126/132; Q21×6 now green). `cargo test --workspace`
+green — no plan-shape assertion flipped (nothing paired a conjunct with an
+index before). With the scan cost gone, the optimizer/executor signal is finally
+visible: cost-based planners beat rule-based on Q21 (memo/selinger ~10s vs
+rule-based 18.6s) and Q5 (0.2s vs 2.2s); push ≤ volcano on the correlated
+queries. New quirk to chase: **memo Q12 ≈ 6.9s** vs selinger 0.2s (correct,
+slow — a memo cost artifact).
+
+Retired / remaining levers: plan-caching (the original spec) is **retired**
+as negligible — the one place it still shows is Q21, where 74,776 per-row
+plans cost 1.66s (17% of Q21's 10s post-index); cache the inner plan THERE
+and nowhere else if Q21 ever needs <~8.5s. Decorrelation (semi-join) stays
+the further lever (better asymptotics than index-NL apply at large outer
+cardinality).
 **Correction (2026-07-19, ledger honesty):** the sweep's three Q4
 timeouts were first recorded here as a cost-model gap — WRONG. Solo
 reruns pass all three (33–80s); they were contention artifacts of
