@@ -1,6 +1,6 @@
 //! Phase 17 — Volcano-style memo planner (17-A: parity core).
 //!
-//! Pipeline (module per stage, per `docs/phase_17_plan.md` §2):
+//! Pipeline (module per stage):
 //!
 //! ```text
 //!   LogicalPlan::Select

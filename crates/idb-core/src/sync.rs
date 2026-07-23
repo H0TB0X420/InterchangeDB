@@ -13,8 +13,8 @@
 //! a prod-vs-test switch is unavoidable.
 //!
 //! Production stays on `parking_lot` (a deliberate performance choice — the
-//! per-page-hit replacer mutex is the documented hot-path bottleneck; see
-//! `docs/scalability-investigation.md`). `parking_lot`'s `lock()/read()/
+//! per-page-hit replacer mutex is the documented hot-path bottleneck).
+//! `parking_lot`'s `lock()/read()/
 //! write()` return a guard directly, whereas `shuttle` mirrors `std::sync`
 //! and returns a `Result`. The thin wrappers below absorb that one API
 //! difference so every call site uses the same guard-returning API under both

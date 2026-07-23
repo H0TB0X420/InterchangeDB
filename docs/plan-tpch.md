@@ -227,7 +227,7 @@ failing region structurally unreachable. (2) The rescale-overflow test
 was exercising a different overflow branch than its name claimed —
 renamed honestly; `rescale_mantissa`'s check documented as
 defense-in-depth (unreachable from valid Decimals; serde doesn't
-re-validate). (3) `docs/optimizer-review.md` O4 status corrected to
+re-validate). (3) the O4 review item status corrected to
 FIXED. Gains: tests 1328 → 1331; Q14 runs verbatim. Draws: none new;
 Decimal Mul at extreme scale pairs now errs loudly at bind/build instead
 of silently NULLing at runtime.

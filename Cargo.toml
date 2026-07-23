@@ -117,7 +117,7 @@ shuttle = ["dep:shuttle", "idb-core/shuttle"]
 [profile.dev]
 # Full debuginfo dominates ld64 link time and we rarely step-debug; line
 # tables keep panic locations and test-failure backtraces legible at a
-# fraction of the link cost. Measured rationale: docs/plan-build-times.md.
+# fraction of the link cost.
 debug = "line-tables-only"
 
 [profile.dev.package."*"]

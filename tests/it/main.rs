@@ -3,7 +3,7 @@
 //! Every module below was a standalone tests/*.rs binary; each one
 //! statically linked the whole lib, so a one-line src/ edit relinked 88
 //! binaries. One harness links once. Slow suites live in the sibling
-//! `stress` harness. Measured rationale: docs/plan-build-times.md.
+//! `stress` harness.
 
 mod common;
 

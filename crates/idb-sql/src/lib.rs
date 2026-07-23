@@ -2,7 +2,7 @@
 //! pipeline (parse → bind → plan), and the executors. Depends on the
 //! contracts in `idb-core` only — never on the storage implementations.
 //! That property is enforced by this crate's `[dependencies]` and is the
-//! workspace split's thesis (docs/plan-workspace-split.md).
+//! workspace split's thesis.
 pub mod catalog;
 pub mod execution;
 pub mod layout;

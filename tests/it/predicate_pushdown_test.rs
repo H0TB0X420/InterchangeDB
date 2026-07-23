@@ -1,5 +1,5 @@
 //! Multi-way-join correctness for predicate pushdown + equi-key promotion
-//! (docs/plan-predicate-pushdown.md, Phases A–D).
+//! (Phases A–D).
 //!
 //! The 2-table StockLevel test exercises the pushdown at one arity; TPC-H joins
 //! 3–8 tables, where the column **rebasing** offset (global → table-local) for an

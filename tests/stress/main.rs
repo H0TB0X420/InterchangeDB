@@ -1,6 +1,6 @@
 //! The `stress` harness: slow stress/scale/soak suites, separately
 //! invocable (`cargo test --test stress`) so the everyday `it` loop
-//! stays lean (build-times P2). See docs/plan-build-times.md.
+//! stays lean.
 
 mod btree_scale_test;
 mod concurrency_stress_test;

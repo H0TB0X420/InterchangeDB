@@ -121,8 +121,8 @@ impl PlannerStrategy for RuleBasedPlanner {
 /// `PlannerStrategy::plan` is generic over the catalog's storage engine, so
 /// the trait isn't object-safe. The planner set is closed and known (rule-based,
 /// Selinger now; Volcano, Cascades later), so an enum is the right
-/// pragmatic swap. See plan.md P14.14 for the Option-C refactor (rework
-/// the trait to be object-safe) if an *open* set is ever needed.
+/// pragmatic swap. The Option-C refactor (rework the trait to be
+/// object-safe) is the escape hatch if an *open* set is ever needed.
 pub enum Planner {
     RuleBased(RuleBasedPlanner),
     Selinger(SelingerPlanner<DefaultCostModel>),
@@ -997,7 +997,7 @@ pub(crate) fn try_lower_index_predicate(
 // the *unfiltered* left table. These helpers split the conjunction and route
 // each conjunct to the table it constrains, so a single-table predicate
 // shrinks its base scan before the join sees it. (Right-side pushdown and
-// join-key promotion are Phase C; see `docs/plan-predicate-pushdown.md`.)
+// join-key promotion are Phase C.)
 // ---------------------------------------------------------------------------
 
 /// Flatten a predicate's top-level `AND` chain into its conjuncts. `Or`, `Not`,

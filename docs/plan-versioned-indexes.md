@@ -1,7 +1,7 @@
 # Versioned Secondary Indexes — Design
 
 Status: DESIGN (no code). Closes the unversioned-index cluster found in the
-2026-07-01 executor/optimizer review (`docs/review-fix-plan.md` §0):
+2026-07-01 executor/optimizer review:
 E1/O12's remaining false-negative half plus abort and crash divergence.
 
 ---

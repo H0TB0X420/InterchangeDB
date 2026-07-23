@@ -2,7 +2,7 @@
 //! under `tests/slt/`, run against a full `Session` on the default tier
 //! (memory engine + WAL `NoSync`). Adopted from production practice
 //! (RisingWave / Databend / DataFusion all test SQL through
-//! `sqllogictest-rs`; see `docs/build-times/production-practice.md`) —
+//! `sqllogictest-rs`) —
 //! editing a SQL test no longer recompiles anything, and the same corpus
 //! can later run against every engine config.
 //!
